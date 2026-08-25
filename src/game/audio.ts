@@ -19,12 +19,30 @@
  *   scheduled audible lub, delayMs before it sounds. hud.ts registers its
  *   beatPulse() here on mount so the visual pulse lands on the sound.
  *
- * Loop voices (both null-safe: null without WebAudio, stop() idempotent):
+ * Loop voices (stop() always idempotent):
  * - sfx.droneBuzz() — { setIntensity(0..1), stop } fixed-pitch hover buzz.
+ *   Returns null without WebAudio.
  * - sfx.machineSpinup() — { setProgress(0..1), stop } gear-up countdown
  *   voice: distant machinery waking up. progress sweeps pitch 50→180Hz,
  *   lowpass 350→2200Hz, AM 18→40Hz and level 0→~0.09 (capped so it stays
  *   distant) on short smoothed ramps — call setProgress freely, no zipper.
+ *   Returns null without WebAudio.
+ * - sfx.treeCrackle() — { setIntensity(0..1), stop } burning-tree voice:
+ *   irregular bandpassed pops (3→8/s with jitter as intensity rises).
+ *   ALWAYS returns a handle (silent no-op without WebAudio) — no null check.
+ * - sfx.minigun() — { setSpin(0..1), shot(), stop() } rotary-gun voice: two
+ *   detuned saws through a bandpass with barrel-pass AM make the whine
+ *   (pitch/brightness/AM rate/level all follow setSpin); shot() layers a
+ *   heavy per-round tick, round-robin detuned, sized for ~24/s. The
+ *   viewmodel drives it: setSpin every frame from the spin-up state, shot()
+ *   per fired round, stop() on unmount/holster. ALWAYS returns a handle
+ *   (silent no-op without WebAudio) — no null check.
+ *
+ * Phase-3 material one-shots: paperTear() (drywall skin ripping off in
+ * plates), charSnap() (charred wood breaking — higher/shorter than
+ * studSnap). crumble()/woodCrumble() now seat a low rumble bed + drifting
+ * dust hiss under the bursts, scaling with `size`, for the heavy slow-lobby
+ * collapse feel.
  */
 
 /** Health at/below which the low-HP heartbeat (audio + HUD pulse) engages. */
@@ -174,6 +192,19 @@ export type HeartbeatHandle = {
   stop: () => void
 }
 
+/** Handle returned by sfx.treeCrackle() — the burning-tree pop loop. */
+export type TreeCrackleHandle = {
+  setIntensity: (v: number) => void
+  stop: () => void
+}
+
+/** Handle returned by sfx.minigun() — whine loop + per-shot tick. */
+export type MinigunHandle = {
+  setSpin: (v: number) => void
+  shot: () => void
+  stop: () => void
+}
+
 export const sfx = {
   resume(): void {
     ensureContext()
@@ -279,6 +310,27 @@ export const sfx = {
     burst({ duration: 0.12, gain: 0.07 * intensity, filterType: 'highpass', freq: 3800 * v }, 0.025)
   },
 
+  /**
+   * Dry gypsum rip — a drywall plate tearing off the studs. Two short bright
+   * noise tears (bandpass sweeping through the 1.4–2.6kHz paper band, 60–90ms)
+   * a hair apart, then a papery crumple tail of tiny high crinkles falling
+   * away. Round-robin detuned — plates rip in runs.
+   */
+  paperTear(): void {
+    const v = rr()
+    burst({ duration: 0.06 + Math.random() * 0.02, gain: 0.5, freq: 1400 * v, freqEnd: 2600 * v, q: 1.5 })
+    burst(
+      { duration: 0.07 + Math.random() * 0.02, gain: 0.42, freq: 2500 * v, freqEnd: 1450 * v, q: 1.5 },
+      0.045 + Math.random() * 0.025,
+    )
+    // papery crumple tail
+    let at = 0.09
+    for (let i = 0; i < 3; i++) {
+      at += 0.03 + Math.random() * 0.045
+      burst({ duration: 0.025, gain: 0.13 - i * 0.035, filterType: 'highpass', freq: 3200 + Math.random() * 2200 }, at)
+    }
+  },
+
   /** Sharp wood crack: hot burst + resonant body + trailing splinter ticks. */
   studSnap(): void {
     const v = rr()
@@ -292,6 +344,23 @@ export const sfx = {
     }
   },
 
+  /**
+   * Brittle charcoal crack — charred wood breaking like a stick of charcoal.
+   * Higher and shorter than studSnap: a hot 2kHz-up snap, a small dry knock
+   * (no meaty body), and one or two glassy shard ticks.
+   */
+  charSnap(): void {
+    const v = rr()
+    burst({ duration: 0.028, gain: 0.75, filterType: 'highpass', freq: 2100 * v, q: 0.8 })
+    thump(320 * v, 0.05, 0.28)
+    const ticks = 1 + Math.floor(Math.random() * 2)
+    let at = 0
+    for (let i = 0; i < ticks; i++) {
+      at += 0.02 + Math.random() * 0.03
+      burst({ duration: 0.018, gain: 0.16, freq: 3200 + Math.random() * 2600, q: 4 }, at)
+    }
+  },
+
   /** Dull wood knock — the stud takes the hit but holds. */
   studHit(): void {
     const v = rr()
@@ -299,7 +368,14 @@ export const sfx = {
     burst({ duration: 0.04, gain: 0.22, freq: 750 * v, q: 1.4 })
   },
 
+  /** Rubble fall, weighted: low rumble bed + dust hiss under the bursts. */
   crumble(size: number): void {
+    const heavy = Math.min(1, size / 24)
+    // rumble bed — the collapse reads heavy, not just clicky
+    burst({ duration: 0.28 + 0.3 * heavy, gain: 0.22 + 0.3 * heavy, filterType: 'lowpass', freq: 240, freqEnd: 80 })
+    thump(52, 0.26 + 0.22 * heavy, 0.28 + 0.25 * heavy)
+    // dust drifting after the impacts
+    burst({ duration: 0.3 + 0.35 * heavy, gain: 0.05 + 0.07 * heavy, filterType: 'highpass', freq: 4500 }, 0.06)
     const n = Math.min(6, 1 + Math.floor(size / 8))
     for (let i = 0; i < n; i++) {
       burst(
@@ -312,6 +388,11 @@ export const sfx = {
 
   /** Framing gives way: rubble like crumble, laced with studSnap cracks. */
   woodCrumble(size: number): void {
+    const heavy = Math.min(1, size / 24)
+    // lighter rumble than masonry, same dust
+    burst({ duration: 0.24 + 0.26 * heavy, gain: 0.18 + 0.26 * heavy, filterType: 'lowpass', freq: 220, freqEnd: 85 })
+    thump(58, 0.24 + 0.2 * heavy, 0.24 + 0.2 * heavy)
+    burst({ duration: 0.28 + 0.3 * heavy, gain: 0.05 + 0.06 * heavy, filterType: 'highpass', freq: 4200 }, 0.05)
     const n = Math.min(5, 1 + Math.floor(size / 8))
     for (let i = 0; i < n; i++) {
       const at = i * 0.05 + Math.random() * 0.03
@@ -528,6 +609,139 @@ export const sfx = {
         gain.gain.setTargetAtTime(0.0001, c.currentTime, 0.05)
         osc.stop(c.currentTime + 0.35)
         lfo.stop(c.currentTime + 0.35)
+      },
+    }
+  },
+
+  /**
+   * Burning-tree crackle loop — irregular pops through a bandpass, scheduled
+   * 3→8 pops/s (with ±40% jitter per gap) as intensity rises 0→1; pop level
+   * scales with intensity and every third-or-so pop lands a small ember
+   * knock. Same 100ms-lookahead interval scheduler as heartbeat(), so pops
+   * keep firing through tab hiccups. setIntensity(0) keeps the timer alive
+   * but silent; stop() is idempotent. ALWAYS returns a handle — a silent
+   * no-op without WebAudio, so callers never null-check.
+   */
+  treeCrackle(): TreeCrackleHandle {
+    const c = ensureContext()
+    let intensity = 0
+    let stopped = false
+    const LOOKAHEAD = 0.35
+    let nextPop = c ? c.currentTime + 0.05 : 0
+    const schedule = () => {
+      if (!c || !master) return
+      const now = c.currentTime
+      if (nextPop < now) nextPop = now + 0.02 // resync after throttling
+      while (nextPop < now + LOOKAHEAD) {
+        if (intensity > 0.01) {
+          const when = nextPop - now
+          const v = rr()
+          burst(
+            {
+              duration: 0.025 + Math.random() * 0.04,
+              gain: (0.08 + 0.22 * intensity) * (0.7 + Math.random() * 0.6),
+              freq: (900 + Math.random() * 1900) * v,
+              q: 2.5,
+            },
+            when,
+          )
+          if (Math.random() < 0.3) thump(110 + Math.random() * 90, 0.06, 0.12 * intensity, when)
+        }
+        const rate = 3 + 5 * intensity // pops per second
+        nextPop += (1 / rate) * (0.6 + Math.random() * 0.8) // jitter
+      }
+    }
+    const timer = c ? setInterval(schedule, 100) : null
+    if (c) schedule()
+    return {
+      setIntensity: (v: number) => {
+        intensity = Math.min(1, Math.max(0, v))
+      },
+      stop: () => {
+        if (stopped) return
+        stopped = true
+        if (timer) clearInterval(timer)
+      },
+    }
+  },
+
+  /**
+   * Rotary-gun voice. The whine is two slightly detuned sawtooths through a
+   * bandpass with an AM tremolo at the barrel-pass rate: setSpin(0..1)
+   * sweeps pitch 70→450Hz, brightness 400→3000Hz, AM 0→27Hz and level
+   * 0→~0.11 on short smoothed ramps (drive it every frame, no zipper; spin 0
+   * is silent). shot() fires the per-round heavy tick — hot highpass crack,
+   * mid snap, low thump — round-robin detuned and sized short enough for a
+   * ~24/s cadence without smearing the limiter. stop() ramps the whine out
+   * and kills the oscillators; idempotent, and setSpin/shot after stop are
+   * no-ops. ALWAYS returns a handle — silent no-op without WebAudio.
+   */
+  minigun(): MinigunHandle {
+    const c = ensureContext()
+    if (!c || !master) {
+      return { setSpin: () => {}, shot: () => {}, stop: () => {} }
+    }
+    const oscA = c.createOscillator()
+    oscA.type = 'sawtooth'
+    oscA.frequency.value = 70
+    const oscB = c.createOscillator()
+    oscB.type = 'sawtooth'
+    oscB.frequency.value = 70 * 1.011 // beating between the pair = mechanical
+    const filter = c.createBiquadFilter()
+    filter.type = 'bandpass'
+    filter.frequency.value = 400
+    filter.Q.value = 1.1
+    // AM at the barrel-pass rate — six barrels sweeping past the ear.
+    const am = c.createGain()
+    am.gain.value = 0.75
+    const lfo = c.createOscillator()
+    lfo.frequency.value = 0
+    const lfoDepth = c.createGain()
+    lfoDepth.gain.value = 0.25
+    lfo.connect(lfoDepth)
+    lfoDepth.connect(am.gain)
+    const gain = c.createGain()
+    gain.gain.value = 0
+    oscA.connect(filter)
+    oscB.connect(filter)
+    filter.connect(am)
+    am.connect(gain)
+    gain.connect(master)
+    oscA.start()
+    oscB.start()
+    lfo.start()
+    let stopped = false
+    oscA.onended = () => {
+      gain.disconnect()
+      lfoDepth.disconnect()
+    }
+    return {
+      setSpin: (s: number) => {
+        if (stopped) return
+        const x = Math.min(1, Math.max(0, s))
+        const t = c.currentTime
+        const f = 70 + 380 * x
+        oscA.frequency.setTargetAtTime(f, t, 0.06)
+        oscB.frequency.setTargetAtTime(f * 1.011, t, 0.06)
+        filter.frequency.setTargetAtTime(400 + 2600 * x, t, 0.06)
+        lfo.frequency.setTargetAtTime(27 * x, t, 0.06)
+        gain.gain.setTargetAtTime(x < 0.02 ? 0 : Math.min(0.11, 0.02 + 0.1 * x), t, 0.05)
+      },
+      shot: () => {
+        if (stopped) return
+        const v = rr()
+        burst({ duration: 0.035, gain: 0.55, filterType: 'highpass', freq: 1500 * v, q: 0.7 })
+        burst({ duration: 0.03, gain: 0.25, freq: 2800 * v, q: 1.2 })
+        thump(95 * v, 0.06, 0.4)
+      },
+      stop: () => {
+        if (stopped) return
+        stopped = true
+        gain.gain.setTargetAtTime(0.0001, c.currentTime, 0.06)
+        const end = c.currentTime + 0.4
+        oscA.stop(end)
+        oscB.stop(end)
+        lfo.stop(end)
       },
     }
   },

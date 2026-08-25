@@ -1,8 +1,8 @@
 'use client'
 
 import { useFrame, useThree } from '@react-three/fiber'
-import { useRef } from 'react'
-import type { Group, Mesh } from 'three'
+import { useEffect, useRef } from 'react'
+import type { Group, Mesh, Object3D } from 'three'
 import type { WeaponId } from '../store'
 import { useBoots } from '../store'
 import { sfx } from './audio'
@@ -10,7 +10,14 @@ import { MOVE } from './movement'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { fire } from './shooting'
-import { HammerModel, KnifeModel, MUZZLE_OFFSETS, PistolModel, RifleModel } from './weapon-models'
+import {
+  HammerModel,
+  KnifeModel,
+  MinigunModel,
+  MUZZLE_OFFSETS,
+  PistolModel,
+  RifleModel,
+} from './weapon-models'
 import { WEAPONS } from './weapons'
 import type { GameWorld } from './world'
 
@@ -30,15 +37,38 @@ import type { GameWorld } from './world'
  * stock running off the bottom-right corner. Every part stays > 0.11 in front
  * of the camera through recoil (+0.07 z) and draw-in, clear of the near plane.
  */
-const POSES: Record<WeaponId, { pos: [number, number, number]; rot: [number, number, number] }> = {
+/** store.ts gains 'minigun' in WeaponId this round (builder-3x3 agent); this
+ * cast bridges until it lands and collapses to a no-op after. */
+const MINIGUN = 'minigun' as WeaponId
+
+// The `| 'minigun'` widening is a no-op once WeaponId includes it.
+const POSES: Record<
+  WeaponId | 'minigun',
+  { pos: [number, number, number]; rot: [number, number, number] }
+> = {
   knife: { pos: [0.3, -0.3, -0.42], rot: [0.05, -0.24, 0.12] },
   pistol: { pos: [0.3, -0.28, -0.45], rot: [0, -0.07, 0.03] },
   rifle: { pos: [0.33, -0.3, -0.5], rot: [0.01, -0.09, 0.04] },
+  // The big one rides lower and closer to center — it's huge, most of the
+  // drum should sit at the bottom-right edge with the barrels crossing in.
+  minigun: { pos: [0.22, -0.36, -0.56], rot: [0.01, -0.05, 0.02] },
   builder: { pos: [0.32, -0.33, -0.46], rot: [0.07, -0.28, 0.14] },
 }
 
 const DRAW_TIME = 0.14
 const DIP_TIME = 0.3
+/** Barrel cluster speed at full spin (rad/s) and spin-down time (s). */
+const BARREL_SPIN_RATE = 28
+const SPIN_DOWN_TIME = 0.9
+const TWO_PI = Math.PI * 2
+
+/** audio.ts gains sfx.minigun() this round (audio agent) — feature-detect so
+ * the trigger works either way; shots fall back to rifle cracks until then. */
+type MinigunSfxHandle = { setSpin: (v: number) => void; shot: () => void; stop: () => void }
+function makeMinigunSfx(): MinigunSfxHandle | null {
+  const factory = (sfx as unknown as { minigun?: () => MinigunSfxHandle | null }).minigun
+  return factory ? factory.call(sfx) : null
+}
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v)
 
@@ -72,6 +102,22 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const droop = useRef(0)
   const prevStaggered = useRef(false)
 
+  // Rotary spin state (minigun): 0..1 spin level, accumulated barrel angle,
+  // the tagged barrel-cluster node, and the live whine handle.
+  const spinT = useRef(0)
+  const spinAngle = useRef(0)
+  const barrelsRef = useRef<Object3D | null>(null)
+  const spinSfx = useRef<MinigunSfxHandle | null>(null)
+
+  // Kill the whine if the session unmounts mid-spin.
+  useEffect(
+    () => () => {
+      spinSfx.current?.stop()
+      spinSfx.current = null
+    },
+    [],
+  )
+
   useFrame((_, rawDt) => {
     const session = getSession()
     const rig = rigRef.current
@@ -88,6 +134,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       else if (action === 'Digit2') switchWeapon('pistol')
       else if (action === 'Digit3') switchWeapon('rifle')
       else if (action === 'Digit4' || action === 'KeyB') switchWeapon('builder')
+      else if (action === 'Digit5') switchWeapon(MINIGUN)
       else if (action === 'WheelUp' || action === 'WheelDown') {
         const list = [...state.owned, 'builder' as const]
         const at = list.indexOf(state.weapon)
@@ -124,23 +171,60 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     }
     drawT.current = Math.min(1, drawT.current + dt / DRAW_TIME)
 
+    // --- Rotary spin-up ----------------------------------------------------
+    // Holding fire on a spinUp weapon first accelerates the barrels (no
+    // shots); at full spin the trigger block below runs the 24/s stream.
+    // Release (or switch/stagger) winds it back down — the whine follows.
+    const heldDef = current !== 'builder' ? WEAPONS[current] : undefined
+    const wantsSpin = heldDef?.spinUp !== undefined && firing && !staggered
+    spinT.current = wantsSpin
+      ? Math.min(1, spinT.current + dt / (heldDef?.spinUp ?? 1))
+      : Math.max(0, spinT.current - dt / SPIN_DOWN_TIME)
+    spinAngle.current = (spinAngle.current + spinT.current * BARREL_SPIN_RATE * dt) % TWO_PI
+    if (barrelsRef.current) barrelsRef.current.rotation.z = spinAngle.current
+    if (spinT.current > 0) {
+      if (!spinSfx.current) spinSfx.current = makeMinigunSfx()
+      spinSfx.current?.setSpin(spinT.current)
+    } else if (spinSfx.current) {
+      spinSfx.current.stop()
+      spinSfx.current = null
+    }
+
     if (current !== 'builder' && !staggered) {
       const def = WEAPONS[current]
-      const wantsShot = def.auto ? firing : firing && !prevFiring.current
+      const spunUp = def.spinUp === undefined || spinT.current >= 1
+      const wantsShot = (def.auto ? firing : firing && !prevFiring.current) && spunUp
       if (wantsShot && cooldown.current <= 0) {
-        cooldown.current = 1 / def.rate
+        // Carry the frame-grid remainder (capped at one interval) so fast
+        // rates average true — at 60fps a plain reset turns 24/s into 20/s.
+        cooldown.current = Math.max(cooldown.current, -1 / def.rate) + 1 / def.rate
         if (def.melee) {
           swingT.current = 0
           sfx.knifeSwing()
         } else {
           recoilT.current = 0
-          flashT.current = 0.045
+          flashT.current = def.id === 'minigun' ? 0.03 : 0.045
           playerRig.recoil += def.kick
-          const gun = def.id === 'pistol' ? 'pistol' : 'rifle'
-          const muzzle = MUZZLE_OFFSETS[gun]
-          if (flashRef.current) flashRef.current.position.set(muzzle[0], muzzle[1], muzzle[2])
-          if (gun === 'pistol') sfx.pistolShot()
-          else sfx.rifleShot()
+          const muzzle = def.id === 'knife' ? MUZZLE_OFFSETS.rifle : MUZZLE_OFFSETS[def.id]
+          const flash = flashRef.current
+          if (flash) {
+            flash.position.set(muzzle[0], muzzle[1], muzzle[2])
+            if (def.id === 'minigun') {
+              // Rapid flicker: random roll + size per shot so the near-
+              // continuous stream shimmers instead of freezing into a card.
+              flash.rotation.z = Math.random() * TWO_PI
+              const fs = 1.4 + Math.random()
+              flash.scale.set(fs, fs, 1)
+            } else {
+              flash.rotation.z = 0
+              flash.scale.set(1, 1, 1)
+            }
+          }
+          if (def.id === 'pistol') sfx.pistolShot()
+          else if (def.id === 'minigun') {
+            if (spinSfx.current) spinSfx.current.shot()
+            else sfx.rifleShot() // fallback until audio.ts ships sfx.minigun()
+          } else sfx.rifleShot()
         }
         const outcome = fire(world, def)
         if (outcome === 'bot') {
@@ -203,12 +287,18 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const swing = 1 - swingT.current
     const recoil = 1 - recoilT.current
 
+    // Rotary rumble: tiny high-frequency shake scaling with barrel spin,
+    // hotter while the trigger is held. Exactly zero when the barrels rest.
+    const rumble = spinT.current * (firing ? 1 : 0.35)
+    const rumX = rumble > 0 ? Math.sin(breathT.current * 71) * 0.0035 * rumble : 0
+    const rumY = rumble > 0 ? Math.sin(breathT.current * 57 + 1.3) * 0.003 * rumble : 0
+
     const p = poseRef.current
     if (p) {
       const sag = droop.current
       p.position.set(
-        pose.pos[0] + bobX + breatheX + lagYaw.current * 0.35,
-        pose.pos[1] + bobY + breatheY - dip - draw * 0.24 - swing * 0.1 + lagPitch.current * 0.3 - sag * 0.06,
+        pose.pos[0] + bobX + breatheX + lagYaw.current * 0.35 + rumX,
+        pose.pos[1] + bobY + breatheY - dip - draw * 0.24 - swing * 0.1 + lagPitch.current * 0.3 - sag * 0.06 + rumY,
         pose.pos[2] + recoil * 0.07,
       )
       p.rotation.set(
@@ -222,6 +312,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const showKnife = weapon === 'knife'
   const showPistol = weapon === 'pistol'
   const showRifle = weapon === 'rifle'
+  const showMinigun = weapon === MINIGUN
   const showBuilder = weapon === 'builder'
 
   return (
@@ -236,6 +327,22 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         </group>
         <group visible={showRifle}>
           <RifleModel />
+        </group>
+        <group
+          visible={showMinigun}
+          ref={(g: Group | null) => {
+            // Find the tagged barrel cluster once on mount; the frame loop
+            // spins it (idle 0 → ~28 rad/s at full spin).
+            if (!g) {
+              barrelsRef.current = null
+              return
+            }
+            g.traverse((o) => {
+              if (o.userData.role === 'barrels') barrelsRef.current = o
+            })
+          }}
+        >
+          <MinigunModel />
         </group>
         <group visible={showBuilder}>
           <HammerModel />

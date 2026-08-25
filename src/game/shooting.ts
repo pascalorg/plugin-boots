@@ -1,6 +1,7 @@
 import { Color, Matrix4, Ray, Vector3 } from 'three'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
+import { spawnDust } from './dust'
 import {
   damageStud,
   damageTarget,
@@ -185,6 +186,7 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
     for (let i = 0; i < 3; i++) {
       spawnDebris(_point.x, _point.y, _point.z, 0.035, SPARK, 1.4, 0.6)
     }
+    spawnDust(_point.x, _point.y, _point.z, 0.25)
     if (weapon.melee) sfx.knifeHit()
     else sfx.voxelCrunch(0.25)
     return 'solid'

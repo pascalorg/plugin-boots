@@ -2,6 +2,7 @@ import { Box3, Color, Matrix4, type Mesh, Vector3 } from 'three'
 import { create } from 'zustand'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
+import { spawnDust, spawnHaze } from './dust'
 import { hideForGame } from './session'
 import {
   buildVoxelGrid,
@@ -397,6 +398,15 @@ function crumbleIslands(target: VoxelTarget): void {
   }
   target.revision++
   useDestruction.getState().bump()
+  // One lingering haze plume per collapse, rising from the first lost voxel.
+  const first = islands[0]?.[0]
+  if (first !== undefined) {
+    spawnHaze(
+      target.grid.centers[first * 3]!,
+      target.grid.centers[first * 3 + 1]!,
+      target.grid.centers[first * 3 + 2]!,
+    )
+  }
   // Broken framing in the collapse → wood-laced rubble; pure drywall otherwise.
   let framingGone = false
   for (const stud of target.studs) {
@@ -437,6 +447,8 @@ export function damageTarget(
       2.6,
     )
   }
+  // Impact dust puff scaled by how much material the carve took out.
+  spawnDust(point.x, point.y, point.z, Math.min(1, 0.25 + removed.length / 30))
   // Walls get the papery drywallCrunch from shooting.ts; only plain volumes
   // voice their own crunch here (avoids the two sounds layering).
   if (target.kind !== 'wall') sfx.voxelCrunch(Math.min(1, removed.length / 12))

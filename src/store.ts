@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'builder'
+export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'minigun' | 'builder'
 export type BuildPiece = 'wall' | 'floor' | 'ramp'
 
 /** A build-mode placement, in world space. Game-only until Keep converts it

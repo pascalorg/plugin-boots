@@ -108,8 +108,8 @@ Placements accumulate in the store (never in the scene). After `Esc`, the
 panel shows **Keep** / **Discard**: Keep converts wall panels into real
 `wall` nodes (`start/end/height/thickness`) in one batch (undoable); floors
 become `slab` nodes if the schema cooperates, else stay game-only (labeled).
-Paint tool (slot `5`, roadmap): spray-tint a wall's game copy; Keep patches
-the node's material.
+Paint tool (roadmap, slot TBD — `5` is now the heavy rotary gun): spray-tint
+a wall's game copy; Keep patches the node's material.
 
 ### You don't die (the death dynamic)
 No respawn, no teleport-to-spawn — dying breaks the flow and the fiction.

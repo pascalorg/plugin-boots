@@ -6,6 +6,7 @@ import { Builder, PlacedPieces } from './builder'
 import { clearDebris, Debris } from './debris'
 import { resetDestruction, useDestruction } from './destruction'
 import { Doors, doorsDebug } from './doors'
+import { clearDust, DustSystem } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, resetGlass } from './glass'
@@ -13,6 +14,7 @@ import { GunTable } from './guntable'
 import { Nature } from './nature'
 import { Player, playerDebug } from './player'
 import { fire } from './shooting'
+import { GameSky } from './sky'
 import { Viewmodel } from './viewmodel'
 import { VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
@@ -37,7 +39,8 @@ function ActiveGame() {
     // Dev/E2E handle — lets headless tests aim and fire deterministically.
     ;(globalThis as Record<string, unknown>).__boots = {
       world,
-      fire: (weapon: 'pistol' | 'rifle' | 'knife' = 'rifle') => fire(world, WEAPONS[weapon]),
+      fire: (weapon: 'pistol' | 'rifle' | 'knife' | 'minigun' = 'rifle') =>
+        fire(world, WEAPONS[weapon]),
       teleport: (x: number, z: number, yaw: number, pitch?: number) =>
         playerDebug.teleport?.(x, z, yaw, pitch),
       state: () => useBoots.getState(),
@@ -71,6 +74,7 @@ function ActiveGame() {
       resetDestruction()
       resetGlass()
       clearDebris()
+      clearDust()
     }
   }, [world])
 
@@ -81,6 +85,8 @@ function ActiveGame() {
       <VoxelWalls />
       <GlassCracks />
       <Debris />
+      <DustSystem />
+      <GameSky world={world} />
       <GunTable world={world} />
       <Doors world={world} />
       <PlacedPieces world={world} />

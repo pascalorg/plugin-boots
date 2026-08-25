@@ -5,16 +5,27 @@ import { useLayoutEffect, useRef } from 'react'
 import { Color, DynamicDrawUsage, Euler, type InstancedMesh, Matrix4, Quaternion, Vector3 } from 'three'
 
 /**
- * One global ring buffer of tumbling debris cubes — voxel chunks, sparks,
- * glass shards all ride the same InstancedMesh. Hand-rolled ballistics:
- * gravity, one damped ground bounce, shrink-out. No physics engine; a few
- * hundred live pieces cost one draw call.
+ * One global ring buffer of tumbling debris — voxel chunks, sparks, glass
+ * shards AND flat plate shards all ride the same InstancedMesh (non-uniform
+ * scale turns the unit cube into a plate). Hand-rolled ballistics: cubes get
+ * gravity + one damped ground bounce; flat shards fall papery — strong air
+ * drag, reduced effective gravity, slow fluttery tumble with tilt-driven
+ * side-slip. Shrink-out at end of life. No physics engine; a few hundred
+ * live pieces cost one draw call.
+ *
+ * API (callers may feature-check the named exports):
+ *   spawnDebris(x, y, z, size, color, speed, ttl?)  — classic cube chunk.
+ *   spawnFlatDebris(x, y, z, w, h, color)           — drywall/paper plate,
+ *     w×h meters, slow flutter, ~3s life.
+ *   clearDebris()                                   — session teardown.
  */
 
-const CAPACITY = 512
+const CAPACITY = 768
 
 type DebrisSlot = {
   alive: boolean
+  /** Flat-plate mode: flutter physics + non-uniform scale. */
+  flat: boolean
   px: number
   py: number
   pz: number
@@ -27,7 +38,12 @@ type DebrisSlot = {
   wx: number
   wy: number
   wz: number
-  size: number
+  /** Draw scale per axis (cubes: all = size; plates: w × h × sliver). */
+  sx: number
+  sy: number
+  sz: number
+  /** Rest half-height for the ground plane check. */
+  ground: number
   ttl: number
   ttl0: number
   bounced: boolean
@@ -35,6 +51,7 @@ type DebrisSlot = {
 
 const slots: DebrisSlot[] = Array.from({ length: CAPACITY }, () => ({
   alive: false,
+  flat: false,
   px: 0,
   py: 0,
   pz: 0,
@@ -47,7 +64,10 @@ const slots: DebrisSlot[] = Array.from({ length: CAPACITY }, () => ({
   wx: 0,
   wy: 0,
   wz: 0,
-  size: 0.1,
+  sx: 0.1,
+  sy: 0.1,
+  sz: 0.1,
+  ground: 0.05,
   ttl: 0,
   ttl0: 1,
   bounced: false,
@@ -70,6 +90,7 @@ export function spawnDebris(
   cursor = (cursor + 1) % CAPACITY
   if (!slot.alive) liveCount++
   slot.alive = true
+  slot.flat = false
   slot.px = x
   slot.py = y
   slot.pz = z
@@ -84,8 +105,49 @@ export function spawnDebris(
   slot.wx = (Math.random() - 0.5) * 9
   slot.wy = (Math.random() - 0.5) * 9
   slot.wz = (Math.random() - 0.5) * 9
-  slot.size = size
+  slot.sx = size
+  slot.sy = size
+  slot.sz = size
+  slot.ground = size / 2
   slot.ttl = ttl * (0.7 + Math.random() * 0.6)
+  slot.ttl0 = slot.ttl
+  slot.bounced = false
+}
+
+/** How thin a plate shard draws (meters) — a drywall sliver, not a voxel. */
+const PLATE_THICKNESS = 0.016
+
+/**
+ * Flat plate shard — torn drywall paper/board. Gentle outward pop, then a
+ * slow fluttery fall (air drag + tilt side-slip in the frame loop).
+ */
+export function spawnFlatDebris(x: number, y: number, z: number, w: number, h: number, color: Color): void {
+  const slot = slots[cursor]!
+  colors[cursor]!.copy(color).offsetHSL(0, 0, (Math.random() - 0.5) * 0.06)
+  cursor = (cursor + 1) % CAPACITY
+  if (!slot.alive) liveCount++
+  slot.alive = true
+  slot.flat = true
+  slot.px = x
+  slot.py = y
+  slot.pz = z
+  const theta = Math.random() * Math.PI * 2
+  const speed = 0.5 + Math.random() * 0.9
+  slot.vx = Math.cos(theta) * speed
+  slot.vy = 0.3 + Math.random() * 0.9
+  slot.vz = Math.sin(theta) * speed
+  slot.rx = Math.random() * Math.PI
+  slot.ry = Math.random() * Math.PI
+  slot.rz = Math.random() * Math.PI
+  // Slow flutter — plates see-saw, they don't spin like chunks.
+  slot.wx = (Math.random() - 0.5) * 4.4
+  slot.wy = (Math.random() - 0.5) * 1.8
+  slot.wz = (Math.random() - 0.5) * 4.4
+  slot.sx = Math.max(0.05, w)
+  slot.sy = Math.max(0.05, h)
+  slot.sz = PLATE_THICKNESS
+  slot.ground = 0.045
+  slot.ttl = 2.6 + Math.random() * 1.5
   slot.ttl0 = slot.ttl
   slot.bounced = false
 }
@@ -96,6 +158,11 @@ export function clearDebris(): void {
 }
 
 const GRAVITY = 14
+/** Flat shards: effective-gravity fraction + linear air-drag coefficient. */
+const FLAT_GRAVITY = 0.4
+const FLAT_DRAG = 2.4
+/** Tilt-driven horizontal side-slip strength — the "flutter" drift. */
+const FLUTTER = 1.1
 const _matrix = new Matrix4()
 const _quat = new Quaternion()
 const _euler = new Euler()
@@ -130,17 +197,36 @@ export function Debris() {
         mesh.setMatrixAt(i, ZERO)
         continue
       }
-      s.vy -= GRAVITY * dt
+      if (s.flat) {
+        // Papery fall: weak gravity, strong drag, tilt pushes it sideways.
+        s.vy -= GRAVITY * FLAT_GRAVITY * dt
+        const drag = 1 / (1 + FLAT_DRAG * dt)
+        s.vx = s.vx * drag + Math.sin(s.rz) * FLUTTER * dt
+        s.vy *= drag
+        s.vz = s.vz * drag + Math.sin(s.rx) * FLUTTER * dt
+      } else {
+        s.vy -= GRAVITY * dt
+      }
       s.px += s.vx * dt
       s.py += s.vy * dt
       s.pz += s.vz * dt
       s.rx += s.wx * dt
       s.ry += s.wy * dt
       s.rz += s.wz * dt
-      const half = s.size / 2
+      const half = s.ground
       if (s.py < half && s.vy < 0) {
         s.py = half
-        if (s.bounced) {
+        if (s.flat) {
+          // Plates don't bounce — they slap down and settle.
+          s.vy = 0
+          const settle = 1 / (1 + 9 * dt)
+          s.vx *= settle
+          s.vz *= settle
+          s.wx *= settle
+          s.wy *= settle
+          s.wz *= settle
+          s.bounced = true
+        } else if (s.bounced) {
           s.vx *= 0.7
           s.vy = 0
           s.vz *= 0.7
@@ -152,11 +238,10 @@ export function Debris() {
         }
       }
       const fade = Math.min(1, s.ttl / (s.ttl0 * 0.3))
-      const scale = s.size * fade
       _euler.set(s.rx, s.ry, s.rz)
       _quat.setFromEuler(_euler)
       _pos.set(s.px, s.py, s.pz)
-      _scale.setScalar(scale)
+      _scale.set(s.sx * fade, s.sy * fade, s.sz * fade)
       _matrix.compose(_pos, _quat, _scale)
       mesh.setMatrixAt(i, _matrix)
       mesh.setColorAt(i, colors[i]!)

@@ -326,3 +326,43 @@ Rough / next:
   part of the deploy runbook now.
 
 Checks: `bun run check-types` clean, `bun test` 84 pass / 2429 expects.
+
+## Phase 2, Round 4 + close — 2026-08-25 (heavy gun, atmosphere, manager seams)
+
+- **Arsenal** (weapons.ts / weapon-models.tsx / viewmodel.tsx / guntable.tsx /
+  audio.ts): new `minigun` — 24/s auto, 10 dmg, 0.15 m holes, wide spread,
+  tiny constant kick, `spinUp: 0.45` (held trigger accelerates barrels
+  before the first round; release spins down). Real `MinigunModel` on a
+  second "heavy" table mirrored BEHIND spawn ("E — The big one"); viewmodel
+  drives rotary spin state, per-shot flash, and the new `sfx.minigun()`
+  voice (twin detuned saws + barrel-pass AM whine, round-robin shot ticks).
+- **Atmosphere** (dust.tsx NEW / sky.tsx NEW / debris.tsx / audio.ts):
+  `spawnDust`/`spawnHaze` camera-facing quad pools (one draw call each,
+  strict caps, zero per-frame allocs) — impact puffs + lingering collapse
+  haze; `GameSky` overcast warm-gray dome (BackSide sphere + CanvasTexture,
+  zero per-frame cost) replaces the editor void during sessions; debris
+  gains flat "plate" shards with papery flutter (`spawnFlatDebris`);
+  crumbles seat a low rumble + dust-hiss bed. Phase-3 one-shots pre-built,
+  no callers yet by design: `paperTear`, `charSnap`, `treeCrackle`.
+- **Manager seam close**: WeaponId widened with 'minigun' in store.ts (the
+  round's bridge casts now no-ops); `Digit5` added to input ACTIONS so the
+  viewmodel's slot-5 switch actually receives the key; `<DustSystem/>` +
+  `<GameSky/>` mounted in game-root (with `clearDust()` in teardown);
+  dust wired to its call sites — bullet-chip puff on non-destructible
+  impacts (shooting.ts), carve-scaled puff in `damageTarget` and one haze
+  plume per island crumble (destruction.ts); `__boots.fire` accepts
+  'minigun'. player.tsx shove-comment numbers corrected to QA-measured
+  slides (dog ≈0.24 m / droid ≈0.28 m / drone ≈0.34 m — crisp-stop trims
+  the old v/friction estimates); MASTERPLAN paint-tool slot note fixed
+  (slot 5 is now the heavy gun).
+
+Rough / next (morning):
+- This round is type/test-clean but NOT live-QA'd (last headless pass was
+  p2r3, pre-minigun): QA the heavy-table pickup, spin-up feel, dust/haze
+  density, sky dome look, flat-shard flutter.
+- Wire paperTear/charSnap/treeCrackle + spawnFlatDebris call sites
+  (drywall skin plates want paperTear + flat shards).
+- Still open from r3: roofed-box live QA (ramp onto a placed roof), doors
+  untested on blank-canvas QA scenes (seed a door into the QA recipe).
+
+Checks: `bun run check-types` clean, `bun test` 84 pass / 2429 expects.

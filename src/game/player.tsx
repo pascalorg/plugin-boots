@@ -56,9 +56,11 @@ const STAGGER_TIME = 2.5 // s
 const STAGGER_RECOVER_HP = 40
 const SHOVE_PER_DAMAGE = 2.5 / 12 // m/s of knockback per point of damage
 /** Floor so every hit READS as a shove: light hits (dog nips at 9 dmg would
- * be 1.875 m/s ≈ 0.27 m of slide) get lifted to ~0.31 m of slide at ground
- * friction 7. Applied BEFORE the mercy dampening, so downed nudges scale off
- * the floored value — the stagger-causing hit itself stays full power. */
+ * be 1.875 m/s) get lifted to 2.2 m/s. Measured slide through the real
+ * stepVelocity (friction 7 + MOVE.stopSpeed crisp-stop trimming the tail,
+ * dt=1/30): dog ≈ 0.24 m, droid ≈ 0.28 m, drone ≈ 0.34 m. Applied BEFORE
+ * the mercy dampening, so downed nudges scale off the floored value — the
+ * stagger-causing hit itself stays full power. */
 const SHOVE_MIN = 2.2
 const SHOVE_MAX = 6
 /** Mercy-window shoves are dampened: downed hits nudge, they don't juggle.

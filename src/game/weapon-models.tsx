@@ -15,9 +15,10 @@
  * accent) so the shapes separate at a glance. Static JSX only.
  */
 
-export const MUZZLE_OFFSETS: Record<'pistol' | 'rifle', [number, number, number]> = {
+export const MUZZLE_OFFSETS: Record<'pistol' | 'rifle' | 'minigun', [number, number, number]> = {
   pistol: [0, 0.05, -0.26],
   rifle: [0, 0.055, -0.61],
+  minigun: [0, 0.07, -0.82],
 }
 
 const STEEL = '#2b2e33'
@@ -240,6 +241,121 @@ export function RifleModel() {
       <mesh position={[0, 0.016, 0.295]}>
         <boxGeometry args={[0.048, 0.082, 0.026]} />
         <meshStandardMaterial color={WOOD_DARK} roughness={0.85} />
+      </mesh>
+    </group>
+  )
+}
+
+/** Six barrel sockets around the rotary axis (x, y offsets in barrel-group space). */
+const MINIGUN_RING = 0.048
+const MINIGUN_BARRELS: ReadonlyArray<readonly [number, number]> = [0, 1, 2, 3, 4, 5].map((i) => {
+  const a = (i / 6) * Math.PI * 2
+  return [Math.cos(a) * MINIGUN_RING, Math.sin(a) * MINIGUN_RING] as const
+})
+
+/**
+ * The big one: six-barrel rotary gun. The barrel cluster lives in a child
+ * group tagged userData={{ role: 'barrels' }} whose origin IS the spin axis
+ * (bore center) — the viewmodel finds it by that tag and drives rotation.z
+ * (idle 0 → ~28 rad/s at full spin). Reads heavy at viewmodel range: fat
+ * rear drum, top carry handle, hanging ammo box with a feed chute.
+ */
+export function MinigunModel() {
+  return (
+    <group>
+      {/* Rear grip at the origin, raked like the rifle's. */}
+      <mesh position={[0, -0.05, 0.02]} rotation={[0.34, 0, 0]}>
+        <boxGeometry args={[0.044, 0.12, 0.055]} />
+        <meshStandardMaterial color={POLYMER} roughness={0.7} />
+      </mesh>
+      <mesh position={[0, -0.104, 0.04]} rotation={[0.34, 0, 0]}>
+        <boxGeometry args={[0.047, 0.016, 0.059]} />
+        <meshStandardMaterial color={POLYMER_DARK} roughness={0.8} />
+      </mesh>
+      {/* Trigger: accent pop under the receiver. */}
+      <mesh position={[0, -0.012, -0.045]} rotation={[0.25, 0, 0]}>
+        <boxGeometry args={[0.01, 0.034, 0.01]} />
+        <meshStandardMaterial color={ACCENT_LIGHT} metalness={0.3} roughness={0.4} />
+      </mesh>
+      {/* Rear housing: boxy block the grip hangs off. */}
+      <mesh position={[0, 0.05, 0.03]}>
+        <boxGeometry args={[0.11, 0.13, 0.16]} />
+        <meshStandardMaterial color={POLYMER_DARK} roughness={0.7} />
+      </mesh>
+      {/* Main drum: the fat rotor housing — the silhouette's mass. */}
+      <mesh position={[0, 0.07, -0.1]} rotation={[Math.PI / 2, 0, 0]}>
+        <cylinderGeometry args={[0.095, 0.095, 0.28, 14]} />
+        <meshStandardMaterial color={STEEL} metalness={0.4} roughness={0.45} />
+      </mesh>
+      {/* Drum front plate: lighter ring the barrels emerge from. */}
+      <mesh position={[0, 0.07, -0.245]} rotation={[Math.PI / 2, 0, 0]}>
+        <cylinderGeometry args={[0.088, 0.088, 0.025, 14]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
+      </mesh>
+      {/* Accent band around the drum: the one blue pop. */}
+      <mesh position={[0, 0.07, -0.02]} rotation={[Math.PI / 2, 0, 0]}>
+        <cylinderGeometry args={[0.098, 0.098, 0.03, 14]} />
+        <meshStandardMaterial color={ACCENT} metalness={0.3} roughness={0.5} />
+      </mesh>
+      {/* Barrel cluster: spins around this group's z axis (the bore line). */}
+      <group position={[0, 0.07, -0.26]} userData={{ role: 'barrels' }}>
+        {MINIGUN_BARRELS.map(([x, y], i) => (
+          <mesh key={i} position={[x, y, -0.26]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[0.016, 0.016, 0.52, 8]} />
+            <meshStandardMaterial
+              color={i % 2 ? STEEL_DARK : STEEL}
+              metalness={0.5}
+              roughness={0.35}
+            />
+          </mesh>
+        ))}
+        {/* Central shaft the barrels ride on. */}
+        <mesh position={[0, 0, -0.24]} rotation={[Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[0.02, 0.02, 0.46, 8]} />
+          <meshStandardMaterial color={STEEL_DARK} metalness={0.5} roughness={0.4} />
+        </mesh>
+        {/* Mid clamp + muzzle retaining plate — spin with the cluster so the
+            rotation reads even when the thin barrels blur together. */}
+        <mesh position={[0, 0, -0.3]} rotation={[Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[0.072, 0.072, 0.024, 12]} />
+          <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
+        </mesh>
+        <mesh position={[0, 0, -0.5]} rotation={[Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[0.068, 0.068, 0.03, 12]} />
+          <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
+        </mesh>
+      </group>
+      {/* Carry handle: arch over the drum. */}
+      <mesh position={[0, 0.2, -0.1]}>
+        <boxGeometry args={[0.034, 0.022, 0.2]} />
+        <meshStandardMaterial color={POLYMER} roughness={0.7} />
+      </mesh>
+      <mesh position={[0, 0.175, -0.015]}>
+        <boxGeometry args={[0.026, 0.04, 0.024]} />
+        <meshStandardMaterial color={POLYMER} roughness={0.7} />
+      </mesh>
+      <mesh position={[0, 0.175, -0.185]}>
+        <boxGeometry args={[0.026, 0.04, 0.024]} />
+        <meshStandardMaterial color={POLYMER} roughness={0.7} />
+      </mesh>
+      {/* Front support grip under the drum. */}
+      <mesh position={[0, -0.04, -0.2]} rotation={[-0.12, 0, 0]}>
+        <boxGeometry args={[0.038, 0.11, 0.045]} />
+        <meshStandardMaterial color={WOOD_DARK} roughness={0.8} />
+      </mesh>
+      {/* Ammo box hint: hangs off the left flank, accent lid + feed chute. */}
+      <mesh position={[-0.115, -0.01, 0.0]}>
+        <boxGeometry args={[0.1, 0.13, 0.17]} />
+        <meshStandardMaterial color={POLYMER_DARK} roughness={0.75} />
+      </mesh>
+      <mesh position={[-0.115, 0.058, 0.0]}>
+        <boxGeometry args={[0.102, 0.012, 0.172]} />
+        <meshStandardMaterial color={ACCENT} roughness={0.5} />
+      </mesh>
+      {/* Feed chute: angled link from box lid into the receiver flank. */}
+      <mesh position={[-0.082, 0.075, 0.0]} rotation={[0, 0, 0.6]}>
+        <boxGeometry args={[0.075, 0.03, 0.07]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.35} roughness={0.5} />
       </mesh>
     </group>
   )
