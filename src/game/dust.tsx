@@ -298,6 +298,14 @@ export function dustCounts(): { puffs: number; haze: number } {
   return { puffs: puffLive, haze: hazeLive }
 }
 
+/**
+ * Plain-data dump for the `__boots.dust()` debug handle (game-root
+ * feature-detects this export). Counts + caps only — never live refs.
+ */
+export function dustDebug(): Record<string, unknown> {
+  return { puffs: puffLive, haze: hazeLive, puffCap: PUFF_CAP, hazeCap: HAZE_CAP }
+}
+
 // --- Rendering ---------------------------------------------------------
 
 const TILE = 128

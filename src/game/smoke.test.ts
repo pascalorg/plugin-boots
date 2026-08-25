@@ -282,12 +282,24 @@ describe('voxel collision hands over from the host collider', () => {
 
 describe('unsupported islands crumble after the settle delay', () => {
   test('severing the wall drops everything above the cut', async () => {
+    // A dedicated 6m wall: on the short 2m wall a full-length cut tears
+    // more than half of every sheet, so the round-2 sheet fly-off (by
+    // design) beats the island timer to the top rows. Across 6m each
+    // ~1.2m sheet only loses its cut band (<50%, <4 carves), leaving the
+    // disconnected top for the flood-fill to find.
+    const wall = boxCollider('wall-long', 'wall', [6, 2.7, 0.12], [0, 1.35, 0])
     const world = makeWorld()
-    // A horizontal cut across the full 2m length at y = 2.0.
-    for (let x = -1; x <= 1.001; x += 0.25) {
-      damageTarget(world, 'wall-1', new Vector3(x, 2.0, 0), 0.4)
+    world.colliders.push(wall)
+    world.walls.set('wall-long', {
+      node: { id: 'wall-long', start: [-3, 0], end: [3, 0], height: 2.7, thickness: 0.12 },
+      root: wall.root,
+      meshes: [wall.mesh],
+    })
+    // A horizontal cut across the full 6m length at y = 2.0.
+    for (let x = -3; x <= 3.001; x += 0.5) {
+      damageTarget(world, 'wall-long', new Vector3(x, 2.0, 0), 0.4)
     }
-    const target = useDestruction.getState().targets.get('wall-1')!
+    const target = useDestruction.getState().targets.get('wall-long')!
     const afterCarve = target.grid.aliveCount
     // Rows above the cut are still alive but disconnected…
     let above = 0

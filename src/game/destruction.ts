@@ -42,15 +42,28 @@ import { bvhFor, type GameWorld } from './world'
  *                             change; re-read the map when it does.
  *   VoxelTarget               { nodeId, kind: 'wall' | 'volume', grid,
  *                             baseColor, studs: StudMember[],
+ *                             sheets: SheetMember[], sheetByCell,
  *                             removedQueue, revision }
  *   StudMember                { id, center, size, yaw, hp, broken } —
  *                             renderers should skip `broken` studs.
+ *   SheetMember               LOGICAL drywall sheet — a ~1.2 × 2.4 m group
+ *                             of EXISTING skin voxels on one wall face (no
+ *                             rendered board plane of its own, so nothing
+ *                             can ever sit coplanar with the skin). Carves
+ *                             count `hits` + `torn` cells; at 4 hits or
+ *                             half the sheet torn the WHOLE sheet flies off
+ *                             (flownOff, shreds + plume, cells removed).
  * Voxelize / damage
  *   ensureVoxelTarget(world, nodeId)   voxelize ANY collider group (walls,
  *                             doors, slabs, roofs, items…). Walls get the
  *                             skins + studs anatomy; everything else is a
  *                             plain adaptive volume (≤ 1600 voxels).
  *                             `ensureVoxelWall` is a legacy alias.
+ *   prevoxelizeTick(world, budgetMs?)   voxelize the scene's remaining
+ *                             walls a few per tick (host meshes hide in the
+ *                             SAME tick, via the ensureVoxelTarget path).
+ *                             Returns true once every wall is done — drive
+ *                             it from a useFrame until then.
  *   damageTarget(world, nodeId, point, radius, direction?)   carve a sphere
  *                             at a world point (voxelizes on first hit);
  *                             direction aims the tear dust plume. Returns
@@ -90,6 +103,36 @@ export type StudMember = {
 /** Legacy alias — studs now carry id/hp/broken on top of the old shape. */
 export type StudBox = StudMember
 
+/**
+ * One LOGICAL drywall sheet: a per-face, ~1.2 × 2.4 m tile of existing skin
+ * voxel indices. Sheets never render anything themselves — the skin voxels
+ * ARE the sheet — so no plane can ever z-fight the wall face. Carving cells
+ * out of a sheet bumps `torn` (cells) and `hits` (carves); when a sheet has
+ * taken SHEET_FLY_HITS carves or lost SHEET_FLY_TORN of its cells, the rest
+ * of it tears off the wall in one go (`flownOff`): every remaining cell dies,
+ * shreds fly, one big plume erupts.
+ */
+export type SheetMember = {
+  id: number
+  /** Mean world-space position of the sheet's cells. */
+  center: [number, number, number]
+  /** Grid-local extents (metres) of the sheet's cell block. */
+  size: [number, number, number]
+  yaw: number
+  /** 0 = min-face skin, 1 = max-face skin (along the thickness axis). */
+  side: number
+  /** Outward face normal, world-space — aims the fly-off plume. */
+  normal: [number, number, number]
+  /** Carves that removed at least one of this sheet's cells. */
+  hits: number
+  /** Cells torn out so far (carves, crumbles, and the final fly-off). */
+  torn: number
+  cellCount: number
+  flownOff: boolean
+  /** Voxel indices into the target grid (internal bookkeeping). */
+  cells: number[]
+}
+
 export type VoxelTarget = {
   nodeId: string
   /** 'wall' targets carry the skins + studs anatomy; 'volume' is plain. */
@@ -97,6 +140,10 @@ export type VoxelTarget = {
   grid: VoxelGridData
   baseColor: Color
   studs: StudMember[]
+  /** Logical drywall sheets (walls only; empty for plain volumes). */
+  sheets: SheetMember[]
+  /** Voxel index → sheet id (−1 / out of range = no sheet). */
+  sheetByCell: Int32Array
   /** Voxel indices removed since the renderer last drained the queue. */
   removedQueue: number[]
   /** Bumped on every change so the renderer knows to re-upload. */
@@ -274,6 +321,110 @@ function buildStuds(
   return studs
 }
 
+/** Real-world drywall board footprint the logical sheets tile at. */
+const SHEET_W = 1.2
+const SHEET_H = 2.4
+/** Carves into one sheet before the rest of it flies off the wall. */
+const SHEET_FLY_HITS = 4
+/** …or this fraction of its cells torn, whichever comes first. */
+const SHEET_FLY_TORN = 0.5
+
+const EMPTY_SHEET_MAP = new Int32Array(0)
+
+/**
+ * Group a wall grid's skin voxels into logical drywall sheets: split by
+ * face (side of the thickness axis — the axis with the smallest physical
+ * extent, same rule as dropInteriorCells), then tile ~1.2 m along the wall
+ * run and ~2.4 m up. Remainder tiles merge into their neighbor so no sliver
+ * sheets exist. Works on yaw-local grids too — tiling runs on grid coords,
+ * centers/normals come out world-space.
+ */
+function buildSheets(grid: VoxelGridData): { sheets: SheetMember[]; sheetByCell: Int32Array } {
+  const sheets: SheetMember[] = []
+  const sheetByCell = new Int32Array(grid.count).fill(-1)
+  if (grid.count === 0) return { sheets, sheetByCell }
+  const spans = [grid.nx, grid.ny, grid.nz]
+  const cells = [grid.cellX, grid.cellY, grid.cellZ]
+  // Thickness axis: smallest physical extent. Run axis: the other plan
+  // axis; vertical axis: y (unless the target lies flat — then z stands in).
+  let t = 0
+  if (spans[1]! * cells[1]! < spans[t]! * cells[t]!) t = 1
+  if (spans[2]! * cells[2]! < spans[t]! * cells[t]!) t = 2
+  const u = t === 0 ? 2 : 0
+  const v = t === 1 ? 2 : 1
+  const tileU = Math.max(1, Math.round(SHEET_W / cells[u]!))
+  const tileV = Math.max(1, Math.round(SHEET_H / cells[v]!))
+  const nTilesU = Math.max(1, Math.round(spans[u]! / tileU))
+  const nTilesV = Math.max(1, Math.round(spans[v]! / tileV))
+
+  const groups = new Map<number, number[]>()
+  for (let i = 0; i < grid.count; i++) {
+    const side = grid.coords[i * 3 + t]! * 2 < spans[t]! - 1 ? 0 : 1
+    const tu = Math.min(nTilesU - 1, Math.floor(grid.coords[i * 3 + u]! / tileU))
+    const tv = Math.min(nTilesV - 1, Math.floor(grid.coords[i * 3 + v]! / tileV))
+    const key = (side * nTilesV + tv) * nTilesU + tu
+    let list = groups.get(key)
+    if (!list) groups.set(key, (list = []))
+    list.push(i)
+  }
+
+  const cos = Math.cos(grid.yaw)
+  const sin = Math.sin(grid.yaw)
+  for (const [key, list] of groups) {
+    const side = Math.floor(key / (nTilesU * nTilesV))
+    let cx = 0
+    let cy = 0
+    let cz = 0
+    const min = [Infinity, Infinity, Infinity]
+    const max = [-Infinity, -Infinity, -Infinity]
+    for (const i of list) {
+      cx += grid.centers[i * 3]!
+      cy += grid.centers[i * 3 + 1]!
+      cz += grid.centers[i * 3 + 2]!
+      for (let a = 0; a < 3; a++) {
+        const c = grid.coords[i * 3 + a]!
+        if (c < min[a]!) min[a] = c
+        if (c > max[a]!) max[a] = c
+      }
+    }
+    // Outward face normal: the ± thickness axis in the grid's local frame,
+    // rotated out to world (same local→world convention as grid centers).
+    const sign = side === 0 ? -1 : 1
+    let nX = 0
+    let nY = 0
+    let nZ = 0
+    if (t === 0) {
+      nX = cos * sign
+      nZ = sin * sign
+    } else if (t === 1) {
+      nY = sign
+    } else {
+      nX = -sin * sign
+      nZ = cos * sign
+    }
+    const id = sheets.length
+    for (const i of list) sheetByCell[i] = id
+    sheets.push({
+      id,
+      center: [cx / list.length, cy / list.length, cz / list.length],
+      size: [
+        (max[0]! - min[0]! + 1) * cells[0]!,
+        (max[1]! - min[1]! + 1) * cells[1]!,
+        (max[2]! - min[2]! + 1) * cells[2]!,
+      ],
+      yaw: grid.yaw,
+      side,
+      normal: [nX, nY, nZ],
+      hits: 0,
+      torn: 0,
+      cellCount: list.length,
+      flownOff: false,
+      cells: list,
+    })
+  }
+  return { sheets, sheetByCell }
+}
+
 function targetBaseColor(meshes: Mesh[]): Color {
   for (const mesh of meshes) {
     const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
@@ -353,12 +504,15 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   }
   if (grid.count === 0) return null
 
+  const sheetInfo = wall ? buildSheets(grid) : null
   const target: VoxelTarget = {
     nodeId,
     kind: wall ? 'wall' : 'volume',
     grid,
     baseColor: targetBaseColor(meshes),
     studs: wall ? buildStuds(wall, grid) : [],
+    sheets: sheetInfo?.sheets ?? [],
+    sheetByCell: sheetInfo?.sheetByCell ?? EMPTY_SHEET_MAP,
     removedQueue: [],
     revision: 0,
   }
@@ -376,6 +530,35 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
 /** Legacy alias — works for any node kind now, not just walls. */
 export const ensureVoxelWall = ensureVoxelTarget
 
+const now: () => number =
+  typeof performance !== 'undefined' ? () => performance.now() : () => Date.now()
+
+/**
+ * Pre-clad the scene's walls in voxels a few per tick, so the building
+ * already reads voxel at session start instead of walls flipping on first
+ * hit. Every wall goes through ensureVoxelTarget — host meshes hide and
+ * colliders hand over IN THE SAME TICK a wall voxelizes, never later.
+ * Returns true once every wall in the snapshot has a target; drive it from
+ * a per-frame loop until then (game-root's Prevoxelize does).
+ */
+export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
+  const deadline = now() + budgetMs
+  const targets = useDestruction.getState().targets
+  for (const nodeId of world.walls.keys()) {
+    if (targets.has(nodeId) || prevoxelizeSkip.has(nodeId)) continue
+    if (now() >= deadline) return false
+    if (!ensureVoxelTarget(world, nodeId)) {
+      // Degenerate wall (no meshes / empty grid) — it can never voxelize,
+      // so don't let it wedge the driver in a forever-false loop.
+      prevoxelizeSkip.add(nodeId)
+    }
+  }
+  return true
+}
+
+/** Walls ensureVoxelTarget refused (degenerate) — skipped on later ticks. */
+const prevoxelizeSkip = new Set<string>()
+
 const islandTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 function crumbleIslands(target: VoxelTarget): void {
@@ -389,6 +572,10 @@ function crumbleIslands(target: VoxelTarget): void {
       target.grid.alive[idx] = 0
       target.grid.aliveCount--
       target.removedQueue.push(idx)
+      // Sheet bookkeeping only (torn cells) — crumbles never count as hits
+      // and never trigger a fly-off; the cells are already gone.
+      const sheetId = target.sheetByCell[idx]
+      if (sheetId !== undefined && sheetId >= 0) target.sheets[sheetId]!.torn++
       spawnDebris(
         target.grid.centers[idx * 3]!,
         target.grid.centers[idx * 3 + 1]!,
@@ -420,6 +607,81 @@ function crumbleIslands(target: VoxelTarget): void {
   }
   if (framingGone) sfx.woodCrumble(total)
   else sfx.crumble(total)
+}
+
+const _sheetCenter = new Vector3()
+const _sheetNormal = new Vector3()
+
+/**
+ * The WHOLE remaining sheet tears off the wall in one go: every live cell
+ * dies (queued for the renderer like any removal), shreds fly, one massive
+ * plume erupts out of the face, paper-tear + crumble voice it. Caller bumps
+ * happen here so a fly-off inside a carve still uploads this frame.
+ */
+function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector3): void {
+  sheet.flownOff = true
+  let freed = 0
+  for (const idx of sheet.cells) {
+    if (!target.grid.alive[idx]) continue
+    target.grid.alive[idx] = 0
+    target.grid.aliveCount--
+    target.removedQueue.push(idx)
+    sheet.torn++
+    freed++
+  }
+  target.revision++
+  useDestruction.getState().bump()
+  // Shreds — flat-ish chunks sampled across the sheet's own cells.
+  if (sheet.cells.length > 0) {
+    const shards = Math.min(14, 6 + Math.round(freed / 8))
+    for (let n = 0; n < shards; n++) {
+      const idx = sheet.cells[Math.floor(Math.random() * sheet.cells.length)]!
+      spawnDebris(
+        target.grid.centers[idx * 3]!,
+        target.grid.centers[idx * 3 + 1]!,
+        target.grid.centers[idx * 3 + 2]!,
+        target.grid.cell * (0.9 + Math.random() * 0.9),
+        target.baseColor,
+        2.2,
+        3.2,
+      )
+    }
+  }
+  _sheetCenter.set(sheet.center[0], sheet.center[1], sheet.center[2])
+  _sheetNormal.set(sheet.normal[0], sheet.normal[1], sheet.normal[2])
+  spawnDust(_sheetCenter, 1, {
+    kind: 'plume',
+    normal: _sheetNormal,
+    direction: direction ? _plumeDir.copy(direction) : undefined,
+  })
+  sfx.paperTear()
+  sfx.crumble(freed)
+}
+
+/**
+ * Per-carve sheet accounting: every removed cell bumps its sheet's `torn`,
+ * every sheet the carve touched takes one `hit`, and any sheet past the
+ * fly-off thresholds (SHEET_FLY_HITS carves or SHEET_FLY_TORN of its cells)
+ * tears off wholesale. This is what makes drywall die FAST: four pistol
+ * rounds into one board and the entire board leaves the wall.
+ */
+function noteSheetCarve(target: VoxelTarget, removed: number[], direction?: Vector3): void {
+  if (target.sheets.length === 0) return
+  const touched = new Set<SheetMember>()
+  for (const idx of removed) {
+    const sheetId = target.sheetByCell[idx]
+    if (sheetId === undefined || sheetId < 0) continue
+    const sheet = target.sheets[sheetId]!
+    sheet.torn++
+    touched.add(sheet)
+  }
+  for (const sheet of touched) {
+    if (sheet.flownOff) continue
+    sheet.hits++
+    if (sheet.hits >= SHEET_FLY_HITS || sheet.torn >= sheet.cellCount * SHEET_FLY_TORN) {
+      flySheetOff(target, sheet, direction)
+    }
+  }
 }
 
 /** Carve a sphere out of any target at a world point (voxelizes on first
@@ -461,6 +723,8 @@ export function damageTarget(
       kind: 'plume',
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
+    // Sheet accounting (hits + torn cells) — may fly whole sheets off.
+    noteSheetCarve(target, removed, direction)
   } else {
     spawnDust(point, Math.min(1, 0.25 + removed.length / 30), {
       kind: 'puff',
@@ -694,5 +958,6 @@ export function dropTarget(nodeId: string): void {
 export function resetDestruction(): void {
   for (const timer of islandTimers.values()) clearTimeout(timer)
   islandTimers.clear()
+  prevoxelizeSkip.clear()
   useDestruction.getState().reset()
 }
