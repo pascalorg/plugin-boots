@@ -80,3 +80,44 @@ Rough / next:
 - Headless fps floor ~3.5 (software GL) — validate smoothness on real HW.
 
 Checks: `bun run check-types` clean, `bun test` 44 pass / 1828 expects.
+
+## Round 3 — 2026-08-25 (live QA + diagonal-wall hotfix)
+
+Live QA round (host UI at :3002, 4-wall room + door + standalone wall): no
+worker source edits; wiring agent drove a full in-browser pass.
+
+- **Doors on E** — PASS live: prompt in range, swings away from player,
+  walk-through, close from inside, blocks again. `__boots.doors` works.
+- **Door vs destruction** — PASS: rifle voxelizes the door, prompt stands
+  down, toggle becomes a no-op.
+- **Dual skins + studs** — PASS on axis-aligned walls: thin per-axis slab
+  returns, outer skin / cavity+stud / inner skin all read, knife peels the
+  outer skin only, capsule collides with live skins.
+- **Viewmodel v2** — PASS: all three weapons low-right, muzzle toward
+  center, no crosshair clipping. Knife silhouette weakest.
+- **Console/exit/fps** — zero pageerrors, Esc restores scene pristine
+  twice, ~120 fps steady through heavy destruction.
+
+**Hotfix (manager)** — QA caught a severe regression: any wall >~5° off
+world axes (i.e. every wall drawn in the rotated 3D view) vaporized on
+first shot — `ensureVoxelTarget` ran `dropInteriorCells` on the legacy
+isotropic branch too, and for deep diagonal AABBs the min physical extent
+is the wall HEIGHT, keeping only top/bottom rows. Fix: skinning now runs
+only in the anatomy branch, `dropInteriorCells` gained a `maxThickness`
+bail (destruction passes `MAX_ANATOMY_THICKNESS`), and voxel.test.ts got a
+diagonal-volume pass-through case.
+
+Rough / next:
+- Diagonal walls keep the legacy isotropic volume (no skins/cavity) — needs
+  live re-verify post-hotfix; true anatomy would need an OBB-aligned grid.
+- doors.tsx samples held keys per frame; a sub-frame E tap can be missed —
+  consume the one-shot `KeyE` action instead.
+- Knife viewmodel handle still reads slightly tube-like.
+- Studs render slightly proud of the outer skin on voxelized walls (tan
+  strips on the intact face) — okay-cartoony, could inset.
+- Prop visuals stay intact while their colliders carve (guntable) — visual
+  break-apart still open.
+- Editor camera slightly more zoomed-out after exit (camera-controls state
+  only, scene data untouched).
+
+Checks: `bun run check-types` clean, `bun test` 45 pass / 1830 expects.

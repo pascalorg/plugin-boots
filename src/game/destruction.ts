@@ -258,17 +258,23 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     if (extent > 0.001 && extent <= MAX_ANATOMY_THICKNESS) {
       const layers = Math.max(3, Math.ceil(extent / 0.15 - 1e-6))
       const thicknessCell = extent / layers
-      grid = buildVoxelGrid(
-        sources,
-        _bounds.clone(),
-        0.15,
-        false,
-        thicknessAxis === 'x' ? { x: thicknessCell } : { z: thicknessCell },
+      grid = dropInteriorCells(
+        buildVoxelGrid(
+          sources,
+          _bounds.clone(),
+          0.15,
+          false,
+          thicknessAxis === 'x' ? { x: thicknessCell } : { z: thicknessCell },
+        ),
+        MAX_ANATOMY_THICKNESS,
       )
     } else {
+      // Diagonal walls have no thin world axis: their AABB is metres deep on
+      // both plan axes, so the min-extent axis dropInteriorCells would pick
+      // is the wall HEIGHT — skinning here deletes the whole wall body and
+      // leaves only top/bottom rows. Keep the full isotropic volume instead.
       grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, false)
     }
-    grid = dropInteriorCells(grid)
   } else {
     grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
   }

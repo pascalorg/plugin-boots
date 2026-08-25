@@ -166,9 +166,12 @@ export function buildVoxelGrid(
  * stud cavity between them becomes empty space. A cell is interior when,
  * along that axis, it is neither within one cell of the min face nor of the
  * max face. Grids ≤ 2 cells thick have no interior and are returned
- * unchanged (same object).
+ * unchanged (same object). Pass `maxThickness` to also bail (same object)
+ * when even the thinnest axis is physically thicker than a plausible wall —
+ * diagonal walls voxelize as deep isotropic volumes whose min extent is the
+ * wall HEIGHT, and skinning those would delete the entire wall body.
  */
-export function dropInteriorCells(grid: VoxelGridData): VoxelGridData {
+export function dropInteriorCells(grid: VoxelGridData, maxThickness = Infinity): VoxelGridData {
   let axis = 0
   let span = grid.nx
   let extent = grid.nx * grid.cellX
@@ -180,8 +183,9 @@ export function dropInteriorCells(grid: VoxelGridData): VoxelGridData {
   if (grid.nz * grid.cellZ < extent) {
     axis = 2
     span = grid.nz
+    extent = grid.nz * grid.cellZ
   }
-  if (span <= 2) return grid
+  if (span <= 2 || extent > maxThickness) return grid
 
   const coords: number[] = []
   const centers: number[] = []

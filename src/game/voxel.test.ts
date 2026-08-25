@@ -106,6 +106,19 @@ describe('dropInteriorCells', () => {
     expect(dropInteriorCells(grid)).toBe(grid)
   })
 
+  test('diagonal-wall volumes (no axis under maxThickness) pass through unchanged', () => {
+    // A 45° wall voxelizes from its world AABB: metres deep on BOTH plan
+    // axes, so the min physical extent is the wall HEIGHT — skinning that
+    // would keep only the top and bottom rows and vaporize the wall body.
+    const geometry = new BoxGeometry(3, 2.6, 3)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-1.5, -1.3, -1.5), new Vector3(1.5, 1.3, 1.5))
+    const grid = buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.2)
+    expect(dropInteriorCells(grid, 0.35)).toBe(grid)
+    // Without the guard it would still skin (this is what ate diagonal walls).
+    expect(dropInteriorCells(grid).count).toBeLessThan(grid.count)
+  })
+
   test('picks the smallest axis when it is not z', () => {
     // 3 × 5 × 10 box: x is the thickness axis.
     const geometry = new BoxGeometry(0.6, 1, 2)
