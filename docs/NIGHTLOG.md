@@ -121,3 +121,42 @@ Rough / next:
   only, scene data untouched).
 
 Checks: `bun run check-types` clean, `bun test` 45 pass / 1830 expects.
+
+## Round 4 — 2026-08-25 (diagonal anatomy + QA sweep)
+
+Landed:
+- Diagonal walls get REAL anatomy: `VoxelGridData.yaw` (grid axis-aligned in
+  a Y-rotated local frame, centers stay world), `buildDiagonalWallGrid` in
+  destruction.ts — dual skins + cavity + breakable studs at any wall angle.
+  raycastVoxels/removeSphere/collideVoxelTargets rotate queries internally;
+  legacy grids take yaw==0 fast paths (byte-identical). 5 new voxel tests.
+- Renderer wired for yaw grids (voxel-walls.tsx): instances now rotate
+  [0, -yaw, 0] like studs — fixes QA's "venetian blinds" on diagonals.
+- Stud depth derived from the grid's skin cells (`studDepth`): studs no
+  longer render proud of intact drywall; smoke test re-derived (4.982) with
+  a formula-robust `> 4.98` regression guard.
+- Doors: tap-robust E via the one-shot action queue at useFrame priority -1
+  (strips only KeyE, only when a door acts; guntable keeps keys-sampling).
+  hud.ts `prompt()` clear branch now blanks textContent, so the doors-side
+  blank-space workaround was dropped.
+- Everything breaks: gun-table visible meshes ARE the colliders now (type
+  'item') so its voxel replica is table-shaped and display guns blow off;
+  builder pieces likewise self-colliding (type 'block'). New
+  `dropTarget(nodeId)` in destruction.ts wired into builder G-undo so an
+  undone voxelized piece drops its replica.
+- Knife viewmodel reworked (blade-dominant, wood/steel grip); pistol mag
+  baseplate flushed to the raked grip.
+- Live QA (rotated room, 4 diagonal walls + door + table): axis-wall
+  regression PASS, door tap/walk-through/stand-down PASS, prop carve PASS,
+  island collapse sweep PASS, exit hygiene PASS twice, 120 fps steady.
+
+Rough / next:
+- Diagonal yaw-grid rendering fixed post-QA — needs one live screenshot to
+  confirm the venetian-blind read is gone.
+- Guns one-shot studs (damage 24-34 vs STUD_HP 3) — feel call for the owner.
+- Bots deal ~45 hp/s at melee; a god-mode/bots-off toggle would deflake
+  headless QA.
+- guntable E is still keys-sampled (fine while it's hold-adjacent; queue
+  pattern available if tap-robustness is wanted — one stripper per key).
+
+Checks: `bun run check-types` clean, `bun test` 50 pass / 2337 expects.

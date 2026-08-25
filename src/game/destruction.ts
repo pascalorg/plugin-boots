@@ -1,4 +1,4 @@
-import { Box3, Color, type Mesh, Vector3 } from 'three'
+import { Box3, Color, Matrix4, type Mesh, Vector3 } from 'three'
 import { create } from 'zustand'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
@@ -11,6 +11,7 @@ import {
   raycastYawObb,
   removeSphere,
   type VoxelGridData,
+  type VoxelSource,
 } from './voxel'
 import { bvhFor, type GameWorld } from './world'
 
@@ -27,7 +28,10 @@ import { bvhFor, type GameWorld } from './world'
  * length/height keep ~0.15 m cells — then interior layers are dropped
  * (`dropInteriorCells`), leaving TWO thin drywall skins with the stud
  * cavity between them, and the studs are first-class breakable members
- * with their own hp.
+ * with their own hp. DIAGONAL walls (no thin world axis) get the same
+ * anatomy from a grid built in the wall's yaw-local frame (grid.yaw —
+ * centers stay world-space); only degenerate segments fall back to the
+ * plain isotropic volume.
  *
  * ── API (build against this) ──────────────────────────────────────────
  * State
@@ -126,6 +130,10 @@ export const useDestruction = create<DestructionState>((set) => {
 
 const _bounds = new Box3()
 const _size = new Vector3()
+const _localBounds = new Box3()
+const _meshBox = new Box3()
+const _toLocal = new Matrix4()
+const _meshToLocal = new Matrix4()
 
 /** Above this world-axis thickness the node is not a thin axis-aligned wall
  * (diagonal walls, piers) — no skin/cavity layering, legacy grid instead. */
@@ -136,7 +144,67 @@ const STUD_WIDTH = 0.038
 const STUD_HP = 3
 const WOOD = new Color('#8a6a43')
 
-function buildStuds(wall: GameWorld['walls'] extends Map<string, infer V> ? V : never): StudMember[] {
+/** Stud depth that fits STRICTLY inside the cavity between the two drywall
+ * skins. Anatomy grids pin the thickness axis to a thinner cell than the
+ * 0.15 m length/height cells, and that cell IS the skin thickness
+ * (extent/layers) — so the cavity spans cell × (layers − 2), minus a hair
+ * of clearance so intact outer faces never show wood. Isotropic grids
+ * (diagonal walls — no skins, full volume) keep the legacy near-full depth. */
+function studDepth(grid: VoxelGridData, thickness: number): number {
+  if (grid.cellX !== grid.cellZ) {
+    const skinCell = Math.min(grid.cellX, grid.cellZ)
+    const layers = grid.cellX < grid.cellZ ? grid.nx : grid.nz
+    return Math.max(0.02, skinCell * (layers - 2) - 0.004)
+  }
+  return Math.max(0.06, thickness - 0.05)
+}
+
+type WallEntry = GameWorld['walls'] extends Map<string, infer V> ? V : never
+
+/**
+ * Anatomy grid for DIAGONAL walls — walls with no thin WORLD axis, the
+ * common case when rooms are drawn in the rotated 3D view. Their world AABB
+ * is metres deep on both plan axes, so the axis-aligned skinning path can't
+ * see the thickness; instead the grid is built in the wall's yaw-local
+ * frame (segment yaw, same convention as the studs), where the thickness
+ * axis is thin again and the usual pinned-cell + dropInteriorCells anatomy
+ * applies. Centers stay world-space so rendering, debris, and collision
+ * push-out are untouched. Returns null when the segment is degenerate or
+ * the local extent still isn't wall-like — callers keep the legacy
+ * isotropic volume then.
+ */
+function buildDiagonalWallGrid(wall: WallEntry, sources: VoxelSource[]): VoxelGridData | null {
+  const { start, end } = wall.node
+  const dx = end[0] - start[0]
+  const dz = end[1] - start[1]
+  if (Math.hypot(dx, dz) < 0.3) return null
+  const yaw = Math.atan2(dz, dx)
+  _toLocal.makeRotationY(yaw)
+  _localBounds.makeEmpty()
+  for (const mesh of wall.meshes) {
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+    _meshBox
+      .copy(mesh.geometry.boundingBox!)
+      .applyMatrix4(_meshToLocal.multiplyMatrices(_toLocal, mesh.matrixWorld))
+    _localBounds.union(_meshBox)
+  }
+  if (_localBounds.isEmpty()) return null
+  _localBounds.getSize(_size)
+  // In the yaw frame the segment runs along local X, thickness along local Z.
+  const extent = _size.z
+  if (extent <= 0.001 || extent > MAX_ANATOMY_THICKNESS || extent > _size.x) return null
+  const layers = Math.max(3, Math.ceil(extent / 0.15 - 1e-6))
+  const grid = dropInteriorCells(
+    buildVoxelGrid(sources, _localBounds.clone(), 0.15, false, { z: extent / layers }, yaw),
+    MAX_ANATOMY_THICKNESS,
+  )
+  return grid.count > 0 ? grid : null
+}
+
+function buildStuds(
+  wall: GameWorld['walls'] extends Map<string, infer V> ? V : never,
+  grid: VoxelGridData,
+): StudMember[] {
   const { start, end } = wall.node
   const thickness = wall.node.thickness ?? 0.15
   if (thickness < 0.09) return []
@@ -146,7 +214,7 @@ function buildStuds(wall: GameWorld['walls'] extends Map<string, infer V> ? V : 
   const length = Math.hypot(dx, dz)
   if (length < 0.3) return []
   const yaw = Math.atan2(dz, dx)
-  const depth = Math.max(0.06, thickness - 0.05)
+  const depth = studDepth(grid, thickness)
   // The wall's meshes live in a level whose Y offset we take from their
   // world bounds (start/end are level-local XZ but match world XZ in the
   // common single-transform case; the voxel grid corrects any drift).
@@ -271,9 +339,10 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     } else {
       // Diagonal walls have no thin world axis: their AABB is metres deep on
       // both plan axes, so the min-extent axis dropInteriorCells would pick
-      // is the wall HEIGHT — skinning here deletes the whole wall body and
-      // leaves only top/bottom rows. Keep the full isotropic volume instead.
-      grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, false)
+      // is the wall HEIGHT — skinning the world grid deletes the whole wall
+      // body. Build the same anatomy in the wall's yaw-local frame instead;
+      // degenerate segments keep the full isotropic volume.
+      grid = buildDiagonalWallGrid(wall, sources) ?? buildVoxelGrid(sources, _bounds.clone(), 0.15, false)
     }
   } else {
     grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
@@ -285,7 +354,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     kind: wall ? 'wall' : 'volume',
     grid,
     baseColor: targetBaseColor(meshes),
-    studs: wall ? buildStuds(wall) : [],
+    studs: wall ? buildStuds(wall, grid) : [],
     removedQueue: [],
     revision: 0,
   }
@@ -519,12 +588,23 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
     // Sphere radius keys off the LARGEST cell — any smaller and the capsule
     // could slip between skin voxels spaced a full length-cell apart.
     const r = grid.cell * 0.55
-    const minX = Math.floor((pos.x - radius - r - grid.origin.x) / grid.cellX)
-    const maxX = Math.floor((pos.x + radius + r - grid.origin.x) / grid.cellX)
+    // Yaw grids index cells in their local frame; a vertical capsule stays
+    // a vertical capsule under a Y rotation, so only its XZ center moves.
+    // The push-out below runs on world centers and needs no rotation.
+    let px = pos.x
+    let pz = pos.z
+    if (grid.yaw !== 0) {
+      const cos = Math.cos(grid.yaw)
+      const sin = Math.sin(grid.yaw)
+      px = pos.x * cos + pos.z * sin
+      pz = -pos.x * sin + pos.z * cos
+    }
+    const minX = Math.floor((px - radius - r - grid.origin.x) / grid.cellX)
+    const maxX = Math.floor((px + radius + r - grid.origin.x) / grid.cellX)
     const minY = Math.floor((pos.y - r - grid.origin.y) / grid.cellY)
     const maxY = Math.floor((pos.y + height + r - grid.origin.y) / grid.cellY)
-    const minZ = Math.floor((pos.z - radius - r - grid.origin.z) / grid.cellZ)
-    const maxZ = Math.floor((pos.z + radius + r - grid.origin.z) / grid.cellZ)
+    const minZ = Math.floor((pz - radius - r - grid.origin.z) / grid.cellZ)
+    const maxZ = Math.floor((pz + radius + r - grid.origin.z) / grid.cellZ)
     if (maxX < 0 || maxY < 0 || maxZ < 0) continue
     for (let iz = Math.max(0, minZ); iz <= Math.min(grid.nz - 1, maxZ); iz++) {
       for (let iy = Math.max(0, minY); iy <= Math.min(grid.ny - 1, maxY); iy++) {
@@ -567,6 +647,19 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
 
 /** Legacy alias. */
 export const collideVoxelWalls = collideVoxelTargets
+
+/** Forget one voxel target (builder G-undo unmounts its source mesh): the
+ * replica unmounts and any pending island collapse for it is cancelled.
+ * No-op if the node never voxelized. */
+export function dropTarget(nodeId: string): void {
+  const timer = islandTimers.get(nodeId)
+  if (timer !== undefined) {
+    clearTimeout(timer)
+    islandTimers.delete(nodeId)
+  }
+  const state = useDestruction.getState()
+  if (state.targets.delete(nodeId)) state.bump()
+}
 
 export function resetDestruction(): void {
   for (const timer of islandTimers.values()) clearTimeout(timer)

@@ -118,6 +118,7 @@ export class Hud {
     }
     if (this.promptOwner !== null && this.promptOwner !== owner) return
     this.promptOwner = null
+    this.promptEl.textContent = ''
     this.promptEl.style.opacity = '0'
   }
 

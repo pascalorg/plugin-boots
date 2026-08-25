@@ -4,12 +4,15 @@ import type { MeshBVH } from 'three-mesh-bvh'
 /**
  * Voxel destruction core — the "walls crumble piece by piece" feel.
  *
- * A damaged wall's meshes are sampled into a world-axis-aligned voxel grid
- * (the three-mesh-bvh `voxelize` recipe: shell cells via `intersectsBox`
- * OBB tests, interior cells via the backface-raycast trick), then rendered
- * elsewhere as one InstancedMesh. This module is renderer-free math:
- * build, radius removal, DDA ray-walk, and the flood-fill that finds
- * disconnected islands so they can crumble.
+ * A damaged wall's meshes are sampled into a voxel grid (the three-mesh-bvh
+ * `voxelize` recipe: shell cells via `intersectsBox` OBB tests, interior
+ * cells via the backface-raycast trick), then rendered elsewhere as one
+ * InstancedMesh. Grids are world-axis-aligned by default; a grid built with
+ * a `yaw` is axis-aligned in a Y-rotated LOCAL frame instead (diagonal
+ * walls), with queries rotating into that frame and `centers` staying
+ * world-space. This module is renderer-free math: build, radius removal,
+ * DDA ray-walk, and the flood-fill that finds disconnected islands so they
+ * can crumble.
  */
 
 export type VoxelSource = {
@@ -29,7 +32,13 @@ export type VoxelGridData = {
   nx: number
   ny: number
   nz: number
-  /** World-space min corner of cell (0,0,0). */
+  /** Grid-axes rotation about world Y (radians); 0 = world-aligned. When
+   * set, `origin` and cell indexing live in the yaw-local frame (world
+   * rotated by +yaw about the Y axis through the world origin) while
+   * `centers` stay world-space. Same convention as the studs: local→world
+   * renders as rotation [0, −yaw, 0]. */
+  yaw: number
+  /** Min corner of cell (0,0,0) — world-space, or yaw-local when yaw ≠ 0. */
   origin: { x: number; y: number; z: number }
   count: number
   /** Grid coords, 3 per voxel. */
@@ -44,6 +53,7 @@ export type VoxelGridData = {
 
 const _box = new Box3()
 const _mat = new Matrix4()
+const _yawMat = new Matrix4()
 const _ray = new Ray()
 const _p = new Vector3()
 
@@ -63,6 +73,7 @@ const spanOf = (extent: number, cell: number) =>
 
 export function buildVoxelGrid(
   sources: VoxelSource[],
+  /** Sources' AABB — world-space, or in the yaw-local frame when yaw ≠ 0. */
   worldBounds: Box3,
   preferredCell = 0.15,
   /** True for chunky volumes (doors, slabs, furniture): sizes the cell so
@@ -70,6 +81,9 @@ export function buildVoxelGrid(
    * thin-wall occupancy discount. */
   solid = false,
   cellSizes?: VoxelCellOverride,
+  /** Rotate the grid axes about world Y — diagonal walls build in their
+   * own frame so the thickness axis is thin again (see VoxelGridData.yaw). */
+  yaw = 0,
 ): VoxelGridData {
   const size = new Vector3()
   worldBounds.getSize(size)
@@ -95,7 +109,17 @@ export function buildVoxelGrid(
   const nz = spanOf(size.z, cellZ)
   const origin = worldBounds.min
 
-  const inverses = sources.map((s) => _mat.clone().copy(s.matrixWorld).invert())
+  // Yaw grids sample cells that are axis-aligned in the LOCAL frame — fold
+  // the local→world rotation into each mesh inverse so the OBB shell test
+  // and the interior backface ray consume local-frame coordinates directly.
+  if (yaw !== 0) _yawMat.makeRotationY(-yaw)
+  const inverses = sources.map((s) => {
+    const inverse = _mat.clone().copy(s.matrixWorld).invert()
+    if (yaw !== 0) inverse.multiply(_yawMat)
+    return inverse
+  })
+  const cosYaw = Math.cos(yaw)
+  const sinYaw = Math.sin(yaw)
 
   const coords: number[] = []
   const centers: number[] = []
@@ -134,7 +158,10 @@ export function buildVoxelGrid(
         if (coords.length / 3 >= MAX_VOXELS) continue
         index.set(gridKey(ix, iy, iz, nx, ny), coords.length / 3)
         coords.push(ix, iy, iz)
-        centers.push(cx, cy, cz)
+        // Centers are ALWAYS world-space — rendering, debris, and distance
+        // checks never need to know about the yaw frame.
+        if (yaw === 0) centers.push(cx, cy, cz)
+        else centers.push(cx * cosYaw - cz * sinYaw, cy, cx * sinYaw + cz * cosYaw)
       }
     }
   }
@@ -148,6 +175,7 @@ export function buildVoxelGrid(
     nx,
     ny,
     nz,
+    yaw,
     origin: { x: origin.x, y: origin.y, z: origin.z },
     count,
     coords: Int16Array.from(coords),
@@ -212,6 +240,7 @@ export function dropInteriorCells(grid: VoxelGridData, maxThickness = Infinity):
     nx: grid.nx,
     ny: grid.ny,
     nz: grid.nz,
+    yaw: grid.yaw,
     origin: grid.origin,
     count: coords.length / 3,
     coords: Int16Array.from(coords),
@@ -316,13 +345,23 @@ export function removeSphere(
   radius: number,
 ): number[] {
   const removed: number[] = []
-  const { cellX, cellY, cellZ, origin, nx, ny, nz } = grid
-  const minX = Math.max(0, Math.floor((x - radius - origin.x) / cellX))
-  const maxX = Math.min(nx - 1, Math.floor((x + radius - origin.x) / cellX))
+  const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
+  // Yaw grids index cells in their local frame — rotate the query point for
+  // the cell-range bounds (the r² check below stays world vs world centers).
+  let lx = x
+  let lz = z
+  if (yaw !== 0) {
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    lx = x * cos + z * sin
+    lz = -x * sin + z * cos
+  }
+  const minX = Math.max(0, Math.floor((lx - radius - origin.x) / cellX))
+  const maxX = Math.min(nx - 1, Math.floor((lx + radius - origin.x) / cellX))
   const minY = Math.max(0, Math.floor((y - radius - origin.y) / cellY))
   const maxY = Math.min(ny - 1, Math.floor((y + radius - origin.y) / cellY))
-  const minZ = Math.max(0, Math.floor((z - radius - origin.z) / cellZ))
-  const maxZ = Math.min(nz - 1, Math.floor((z + radius - origin.z) / cellZ))
+  const minZ = Math.max(0, Math.floor((lz - radius - origin.z) / cellZ))
+  const maxZ = Math.min(nz - 1, Math.floor((lz + radius - origin.z) / cellZ))
   const r2 = radius * radius
   for (let iz = minZ; iz <= maxZ; iz++) {
     for (let iy = minY; iy <= maxY; iy++) {
@@ -346,8 +385,10 @@ export type VoxelRayHit = { index: number; distance: number }
 
 /**
  * Amanatides–Woo DDA walk through the grid; returns the first LIVE voxel the
- * ray crosses, or null. The grid is world-axis-aligned so this is exact and
- * far cheaper than any mesh raycast.
+ * ray crosses, or null. The grid is axis-aligned in its own frame so this is
+ * exact and far cheaper than any mesh raycast — yaw grids just rotate the
+ * WORLD ray into the local frame first (Y rotations preserve distances, so
+ * the returned distance is valid in world space as-is).
  */
 export function raycastVoxels(
   grid: VoxelGridData,
@@ -359,7 +400,17 @@ export function raycastVoxels(
   dz: number,
   maxDist: number,
 ): VoxelRayHit | null {
-  const { cellX, cellY, cellZ, origin, nx, ny, nz } = grid
+  const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
+  if (yaw !== 0) {
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    const lox = ox * cos + oz * sin
+    oz = -ox * sin + oz * cos
+    ox = lox
+    const ldx = dx * cos + dz * sin
+    dz = -dx * sin + dz * cos
+    dx = ldx
+  }
   // Clip the ray to the grid AABB first.
   const boundsMaxX = origin.x + nx * cellX
   const boundsMaxY = origin.y + ny * cellY

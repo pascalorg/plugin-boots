@@ -1,11 +1,12 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { useMemo, useRef, useState } from 'react'
-import { BoxGeometry, Matrix4, Mesh, type Group } from 'three'
-import { type BuildPiece, useBoots } from '../store'
+import { useEffect, useRef, useState } from 'react'
+import { BoxGeometry, Matrix4, type Group, type Mesh } from 'three'
+import { type BuildPiece, type PlacedPiece, useBoots } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
+import { dropTarget } from './destruction'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -63,22 +64,17 @@ function snapGhost(piece: BuildPiece): GhostState {
   }
 }
 
-/** Solid, collidable render of everything placed this session. */
-export function PlacedPieces({ world }: { world: GameWorld }) {
-  const placed = useBoots((s) => s.placed)
-  const colliderByPiece = useRef(new Map<number, ColliderEntry>())
+/** One placed piece: the RENDERED mesh doubles as its collider, so when the
+ * piece voxelizes the destruction manager ledger-hides the mesh the player
+ * sees and the voxel replica takes over. Pieces are immutable once placed —
+ * register on mount, disable on unmount (undo). */
+function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorld }) {
+  const meshRef = useRef<Mesh>(null)
 
-  // Register colliders for new pieces; disable removed ones.
-  const seen = useRef(new Set<number>())
-  const live = new Set(placed.map((p) => p.id))
-  for (const piece of placed) {
-    if (seen.current.has(piece.id)) continue
-    seen.current.add(piece.id)
-    const mesh = new Mesh(geometryFor(piece.piece))
-    const pose = piecePose(piece.piece, piece.position[1])
-    mesh.position.set(piece.position[0], pose.y, piece.position[2])
-    mesh.rotation.set(piece.piece === 'ramp' ? pose.tilt : 0, piece.yaw, 0, 'YXZ')
-    mesh.updateMatrixWorld(true)
+  useEffect(() => {
+    const mesh = meshRef.current
+    if (!mesh) return
+    mesh.updateWorldMatrix(true, false)
     if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
     const entry: ColliderEntry = {
       mesh,
@@ -87,35 +83,39 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
       worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
       root: mesh,
       nodeId: `__boots-piece-${piece.id}`,
-      nodeType: 'boots-piece',
+      nodeType: 'block',
     }
     world.colliders.push(entry)
-    colliderByPiece.current.set(piece.id, entry)
-  }
-  for (const [id, entry] of colliderByPiece.current) {
-    if (!live.has(id)) {
+    return () => {
       entry.disabled = true
-      colliderByPiece.current.delete(id)
-      seen.current.delete(id)
+      // If the piece had voxelized, drop the replica too (G-undo would
+      // otherwise leave carved voxels floating until exit).
+      dropTarget(entry.nodeId)
     }
-  }
+  }, [world, piece])
 
+  const pose = piecePose(piece.piece, piece.position[1])
+  return (
+    <mesh
+      castShadow
+      geometry={geometryFor(piece.piece)}
+      position={[piece.position[0], pose.y, piece.position[2]]}
+      ref={meshRef}
+      rotation={[piece.piece === 'ramp' ? pose.tilt : 0, piece.yaw, 0, 'YXZ']}
+    >
+      <meshStandardMaterial color="#9aa8b5" roughness={0.7} metalness={0.15} />
+    </mesh>
+  )
+}
+
+/** Solid, collidable render of everything placed this session. */
+export function PlacedPieces({ world }: { world: GameWorld }) {
+  const placed = useBoots((s) => s.placed)
   return (
     <group userData={{ __boots: true }}>
-      {placed.map((piece) => {
-        const pose = piecePose(piece.piece, piece.position[1])
-        return (
-          <mesh
-            castShadow
-            key={piece.id}
-            position={[piece.position[0], pose.y, piece.position[2]]}
-            rotation={[piece.piece === 'ramp' ? pose.tilt : 0, piece.yaw, 0, 'YXZ']}
-          >
-            <boxGeometry args={PIECE_DIMS[piece.piece]} />
-            <meshStandardMaterial color="#9aa8b5" roughness={0.7} metalness={0.15} />
-          </mesh>
-        )
-      })}
+      {placed.map((piece) => (
+        <PlacedPieceMesh key={piece.id} piece={piece} world={world} />
+      ))}
     </group>
   )
 }

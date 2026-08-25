@@ -149,7 +149,6 @@ function buildDoorState(entry: DoorEntry, world: GameWorld): DoorState | null {
 export function Doors({ world }: { world: GameWorld }) {
   const doorsRef = useRef<Map<string, DoorState> | null>(null)
   const tableRef = useRef<Vector3 | null>(null)
-  const prevE = useRef(false)
   const lastPrompt = useRef<string | null>(null)
 
   useEffect(() => {
@@ -184,6 +183,12 @@ export function Doors({ world }: { world: GameWorld }) {
     }
   }, [world])
 
+  // Priority -1: R3F runs subscribers in ascending priority order, so this
+  // executes before every default-0 callback — critically the viewmodel,
+  // whose consumeActions() drains the one-shot input queue we take 'KeyE'
+  // from (negative priorities keep auto-render; only >0 goes manual).
+  // Reading playerRig here is one callback earlier than before — at most a
+  // frame of proximity staleness, irrelevant at INTERACT_RANGE.
   useFrame((_, rawDt) => {
     const session = getSession()
     const doors = doorsRef.current
@@ -231,14 +236,37 @@ export function Doors({ world }: { world: GameWorld }) {
     const prompt = nearest ? (nearest.open ? 'E — Close door' : 'E — Open door') : null
     if (prompt !== lastPrompt.current) {
       lastPrompt.current = prompt
+      // hud.prompt(null, 'doors') clears text + fades while we own the line;
+      // we run at priority -1, so a same-frame guntable show lands after us.
       session.hud.prompt(prompt, 'doors')
     }
 
-    // E edge — our own prev ref; the viewmodel owns consumeActions.
-    const ePressed = session.input.state.keys.has('KeyE')
-    if (ePressed && !prevE.current && nearest) toggleDoor(nearest)
-    prevE.current = ePressed
-  })
+    // E — take the one-shot 'KeyE' action from the input queue so a tap
+    // whose keydown+keyup both land inside one frame still registers
+    // (per-frame keys sampling misses it). This callback runs at priority
+    // -1, before the viewmodel's consumeActions() drain; we strip only our
+    // KeyE entries, in place, and only while a door has the press. The gun
+    // table keeps its priority: while it is busy `nearest` is null, the
+    // queue is left alone, and it reads the keys set — never the queue.
+    if (nearest) {
+      const actions = session.input.state.actions
+      let tapped = false
+      let write = 0
+      for (let read = 0; read < actions.length; read++) {
+        const action = actions[read]!
+        if (action === 'KeyE') {
+          tapped = true
+        } else {
+          if (write !== read) actions[write] = action
+          write++
+        }
+      }
+      if (tapped) {
+        actions.length = write
+        toggleDoor(nearest)
+      }
+    }
+  }, -1)
 
   return null
 }

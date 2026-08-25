@@ -222,6 +222,86 @@ describe('anisotropic wall grids', () => {
   })
 })
 
+describe('yaw-aligned wall grids', () => {
+  const YAW = Math.PI / 4
+
+  /** The 2m × 1m × 0.12m wall again, but yawed 45° in the world (the mesh
+   * renders with rotation [0, −yaw, 0], per the stud convention) and its
+   * grid built in the wall's local frame — bounds/cell override are the
+   * exact values the axis-aligned twin in 'anisotropic wall grids' uses. */
+  function yawWallGrid() {
+    const geometry = new BoxGeometry(2, 1, 0.12)
+    const bvh = new MeshBVH(geometry)
+    const matrixWorld = new Matrix4().makeRotationY(-YAW)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.06), new Vector3(1, 0.5, 0.06))
+    return buildVoxelGrid([{ bvh, matrixWorld }], bounds, 0.15, false, { z: 0.12 / 3 }, YAW)
+  }
+
+  test('occupancy matches the axis-aligned twin; centers are world-space', () => {
+    const grid = yawWallGrid()
+    expect(grid.yaw).toBe(YAW)
+    expect(grid.nx).toBe(14)
+    expect(grid.ny).toBe(7)
+    expect(grid.nz).toBe(3)
+    expect(grid.count).toBe(14 * 7 * 3)
+    // Centers hug the DIAGONAL wall plane (normal (−sin, 0, cos) through the
+    // origin): never farther than half the wall thickness.
+    const nxp = -Math.sin(YAW)
+    const nzp = Math.cos(YAW)
+    let maxAbsZ = 0
+    for (let i = 0; i < grid.count; i++) {
+      const wx = grid.centers[i * 3]!
+      const wz = grid.centers[i * 3 + 2]!
+      expect(Math.abs(wx * nxp + wz * nzp)).toBeLessThan(0.061)
+      maxAbsZ = Math.max(maxAbsZ, Math.abs(wz))
+    }
+    // …and they really are rotated into the world: the wall run reaches far
+    // outside the |z| ≤ 0.06 slab its axis-aligned twin lives in.
+    expect(maxAbsZ).toBeGreaterThan(0.5)
+  })
+
+  test('dropInteriorCells keeps the two skins and carries yaw', () => {
+    const skinned = dropInteriorCells(yawWallGrid())
+    expect(skinned.yaw).toBe(YAW)
+    expect(skinned.count).toBe(14 * 7 * 2)
+    expect(skinned.aliveCount).toBe(skinned.count)
+    for (let i = 0; i < skinned.count; i++) {
+      const iz = skinned.coords[i * 3 + 2]!
+      expect(iz === 0 || iz === 2).toBe(true)
+    }
+  })
+
+  test('world-space DDA: outer skin, then inner skin through a carved hole', () => {
+    const skinned = dropInteriorCells(yawWallGrid())
+    // Fire along the wall's outward normal from 5m out — same geometry as
+    // the axis-aligned twin test, rotated 45°.
+    const nx = -Math.sin(YAW)
+    const nz = Math.cos(YAW)
+    const first = raycastVoxels(skinned, nx * 5, 0, nz * 5, -nx, 0, -nz, 20)
+    expect(first).not.toBeNull()
+    expect(first!.distance).toBeCloseTo(4.94, 3)
+    // Carve the outer-skin voxel on the ray's path — removeSphere takes the
+    // WORLD point (local (0, 0, 0.04) rotated out). Exactly one voxel dies,
+    // and the ray now crosses the cavity to the inner skin.
+    const removed = removeSphere(skinned, nx * 0.04, 0, nz * 0.04, 0.05)
+    expect(removed).toHaveLength(1)
+    const second = raycastVoxels(skinned, nx * 5, 0, nz * 5, -nx, 0, -nz, 20)
+    expect(second).not.toBeNull()
+    expect(second!.distance).toBeCloseTo(5.02, 3)
+  })
+
+  test('a ray passing beside the diagonal wall misses', () => {
+    const skinned = dropInteriorCells(yawWallGrid())
+    // Straight down world −Z from beyond the wall's end: it crosses the
+    // wall PLANE well past the run — a clean miss.
+    expect(raycastVoxels(skinned, -2, 0, 5, 0, 0, -1, 20)).toBeNull()
+  })
+
+  test('world-aligned grids report yaw 0', () => {
+    expect(wallGrid().yaw).toBe(0)
+  })
+})
+
 describe('raycastYawObb', () => {
   test('hits an axis-aligned box straight on', () => {
     const t = raycastYawObb(0, 0, 5, 0, 0, -1, 0, 0, 0, 0.5, 0.5, 0.5, 0, 20)

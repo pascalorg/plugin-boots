@@ -45,9 +45,9 @@ export function PistolModel() {
         <boxGeometry args={[0.043, 0.062, 0.052]} />
         <meshStandardMaterial color={POLYMER_DARK} roughness={0.85} />
       </mesh>
-      {/* Magazine baseplate: accent pop at the bottom of the grip. */}
-      <mesh position={[0, -0.112, 0.05]} rotation={[0.32, 0, 0]}>
-        <boxGeometry args={[0.044, 0.018, 0.06]} />
+      {/* Magazine baseplate: accent cap tucked flush on the grip's raked axis. */}
+      <mesh position={[0, -0.116, 0.008]} rotation={[0.32, 0, 0]}>
+        <boxGeometry args={[0.042, 0.014, 0.057]} />
         <meshStandardMaterial color={ACCENT} roughness={0.5} />
       </mesh>
       {/* Beavertail: little shelf where the hand meets the slide. */}
@@ -248,53 +248,50 @@ export function RifleModel() {
 export function KnifeModel() {
   return (
     <group>
-      {/* Handle. */}
-      <mesh position={[0, -0.012, 0.05]} rotation={[0.08, 0, 0]}>
-        <boxGeometry args={[0.03, 0.038, 0.125]} />
-        <meshStandardMaterial color="#2d2a26" roughness={0.8} />
+      {/* Grip: short contoured wood handle, raked slightly downward. */}
+      <mesh position={[0, -0.014, 0.052]} rotation={[0.12, 0, 0]}>
+        <boxGeometry args={[0.028, 0.04, 0.075]} />
+        <meshStandardMaterial color={WOOD} roughness={0.8} />
       </mesh>
-      {/* Wrap rings: three slightly-proud bands along the handle. */}
-      <mesh position={[0, -0.01, 0.022]} rotation={[0.08, 0, 0]}>
-        <boxGeometry args={[0.033, 0.041, 0.012]} />
-        <meshStandardMaterial color="#3d3830" roughness={0.85} />
+      {/* Palm swell: proud dark band at the middle of the grip. */}
+      <mesh position={[0, -0.017, 0.055]} rotation={[0.12, 0, 0]}>
+        <boxGeometry args={[0.032, 0.046, 0.034]} />
+        <meshStandardMaterial color={WOOD_DARK} roughness={0.85} />
       </mesh>
-      <mesh position={[0, -0.012, 0.052]} rotation={[0.08, 0, 0]}>
-        <boxGeometry args={[0.033, 0.041, 0.012]} />
-        <meshStandardMaterial color="#3d3830" roughness={0.85} />
+      {/* Bolster: steel collar where the grip meets the guard. */}
+      <mesh position={[0, -0.008, 0.01]} rotation={[0.12, 0, 0]}>
+        <boxGeometry args={[0.03, 0.044, 0.02]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
       </mesh>
-      <mesh position={[0, -0.014, 0.082]} rotation={[0.08, 0, 0]}>
-        <boxGeometry args={[0.033, 0.041, 0.012]} />
-        <meshStandardMaterial color="#3d3830" roughness={0.85} />
-      </mesh>
-      {/* Pommel. */}
-      <mesh position={[0, -0.006, 0.12]}>
-        <boxGeometry args={[0.034, 0.042, 0.018]} />
+      {/* Pommel: steel cap ends the grip. */}
+      <mesh position={[0, -0.025, 0.094]} rotation={[0.12, 0, 0]}>
+        <boxGeometry args={[0.032, 0.046, 0.016]} />
         <meshStandardMaterial color={STEEL_LIGHT} metalness={0.4} roughness={0.4} />
       </mesh>
-      {/* Cross guard: wide flat bar. */}
-      <mesh position={[0, -0.012, -0.022]}>
-        <boxGeometry args={[0.022, 0.07, 0.014]} />
+      {/* Cross guard: wide flat steel bar. */}
+      <mesh position={[0, -0.004, -0.004]}>
+        <boxGeometry args={[0.02, 0.078, 0.013]} />
         <meshStandardMaterial color={STEEL_LIGHT} metalness={0.5} roughness={0.35} />
       </mesh>
-      {/* Blade: thin, tall, slight upward sweep. */}
-      <mesh position={[0, 0.004, -0.135]} rotation={[0.04, 0, 0]}>
-        <boxGeometry args={[0.008, 0.05, 0.2]} />
+      {/* Blade belly: wide at the ricasso, dominates the silhouette. */}
+      <mesh position={[0, 0.002, -0.068]}>
+        <boxGeometry args={[0.009, 0.062, 0.115]} />
         <meshStandardMaterial color={BLADE} metalness={0.7} roughness={0.25} />
       </mesh>
-      {/* Fuller: dark groove line along the spine side. */}
-      <mesh position={[0, 0.016, -0.125]} rotation={[0.04, 0, 0]}>
-        <boxGeometry args={[0.0095, 0.012, 0.16]} />
+      {/* Taper: flattened cone runs the blade out to the tip. */}
+      <mesh position={[0, 0.002, -0.168]} rotation={[-Math.PI / 2, 0, 0]} scale={[0.15, 1, 1]}>
+        <coneGeometry args={[0.031, 0.086, 4]} />
+        <meshStandardMaterial color={BLADE} metalness={0.7} roughness={0.25} />
+      </mesh>
+      {/* Spine: darker flat strip along the top of the belly. */}
+      <mesh position={[0, 0.029, -0.062]}>
+        <boxGeometry args={[0.011, 0.009, 0.1]} />
         <meshStandardMaterial color={STEEL} metalness={0.5} roughness={0.4} />
       </mesh>
       {/* Cutting edge: bright strip along the underside. */}
-      <mesh position={[0, -0.019, -0.13]} rotation={[0.04, 0, 0]}>
-        <boxGeometry args={[0.006, 0.01, 0.19]} />
+      <mesh position={[0, -0.027, -0.066]}>
+        <boxGeometry args={[0.006, 0.009, 0.108]} />
         <meshStandardMaterial color={BLADE_EDGE} metalness={0.75} roughness={0.2} />
-      </mesh>
-      {/* Tip: flattened cone taper. */}
-      <mesh position={[0, 0.006, -0.25]} rotation={[-Math.PI / 2, 0, 0]} scale={[0.16, 1, 1]}>
-        <coneGeometry args={[0.025, 0.055, 4]} />
-        <meshStandardMaterial color={BLADE} metalness={0.7} roughness={0.25} />
       </mesh>
     </group>
   )

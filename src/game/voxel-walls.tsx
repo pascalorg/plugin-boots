@@ -34,6 +34,7 @@ const _scale = new Vector3()
 const _quat = new Quaternion()
 const _color = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
+const UP = new Vector3(0, 1, 0)
 
 // Shared stud materials — swapped per mesh on damage, never mutated.
 const STUD_WOOD = new MeshStandardMaterial({ color: '#b08d57', roughness: 0.85 })
@@ -76,7 +77,11 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
     // Per-axis scale: anisotropic wall grids have thin skin cells along the
     // thickness axis — a uniform grid.cell cube would visually fill the cavity.
     _scale.set(grid.cellX * 0.99, grid.cellY * 0.99, grid.cellZ * 0.99)
-    _quat.identity()
+    // Yaw-local grids (diagonal walls): cells are axis-aligned in the grid's
+    // rotated frame — rotate each instance out to world (matches stud meshes'
+    // rotation={[0, -yaw, 0]}). World-aligned grids keep identity.
+    if (grid.yaw === 0) _quat.identity()
+    else _quat.setFromAxisAngle(UP, -grid.yaw)
     for (let i = 0; i < grid.count; i++) {
       if (grid.alive[i]) {
         _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)

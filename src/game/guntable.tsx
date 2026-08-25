@@ -2,9 +2,10 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useMemo, useRef } from 'react'
-import { BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import { Matrix4, type Mesh, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { useDestruction } from './destruction'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -12,7 +13,10 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 /**
  * The gun table: spawns a few steps from the player, guns laid out on top.
  * Walk up, press E, gear up. Also a real collider so it blocks movement
- * and eats bullets like any other prop.
+ * and eats bullets like any other prop — the RENDERED meshes double as the
+ * colliders, so when the table voxelizes the destruction manager hides the
+ * very top + legs the player sees and the voxel replica takes over
+ * ("everything should be able to break apart").
  */
 
 const TABLE_SIZE: [number, number, number] = [1.7, 0.06, 0.8]
@@ -32,33 +36,41 @@ export function GunTable({ world }: { world: GameWorld }) {
   const position = useMemo(() => tablePosition(world), [world])
   const spinRef = useRef<Mesh>(null)
   const spinRef2 = useRef<Mesh>(null)
+  const solidRefs = useRef<(Mesh | null)[]>([])
   const prevE = useRef(false)
   const promptShown = useRef(false)
 
   const geared = useBoots((s) => s.owned.includes('rifle'))
+  // Once the table voxelizes its solid meshes are ledger-hidden; the display
+  // guns aren't colliders, so drop them here (blown off with the first hit).
+  const broken = useDestruction((s) => s.targets.has('__boots-table'))
 
-  // Register the tabletop as a collider for the session.
+  // Register the rendered top + legs as colliders for the session. Using the
+  // visible meshes themselves (not an invisible proxy) means voxelization
+  // hides exactly what the player sees, and the voxel volume is table-shaped
+  // — shoot the legs out and the top crumbles as an unsupported island.
   useEffect(() => {
-    const mesh = new Mesh(new BoxGeometry(TABLE_SIZE[0], TABLE_HEIGHT, TABLE_SIZE[2]))
-    mesh.position.set(position.x, TABLE_HEIGHT / 2, position.z)
-    mesh.rotation.y = world.spawnYaw
-    mesh.updateMatrixWorld(true)
-    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
-    const worldBox = mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld)
-    const entry: ColliderEntry = {
-      mesh,
-      bvh: bvhFor(mesh),
-      inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
-      worldBox,
-      root: mesh,
-      nodeId: '__boots-table',
-      nodeType: 'prop',
+    const entries: ColliderEntry[] = []
+    for (const mesh of solidRefs.current) {
+      if (!mesh) continue
+      mesh.updateWorldMatrix(true, false)
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+      const entry: ColliderEntry = {
+        mesh,
+        bvh: bvhFor(mesh),
+        inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+        worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+        root: mesh,
+        nodeId: '__boots-table',
+        nodeType: 'item',
+      }
+      world.colliders.push(entry)
+      entries.push(entry)
     }
-    world.colliders.push(entry)
     return () => {
-      entry.disabled = true
+      for (const entry of entries) entry.disabled = true
     }
-  }, [world, position])
+  }, [world])
 
   useFrame((state, dt) => {
     const session = getSession()
@@ -89,7 +101,13 @@ export function GunTable({ world }: { world: GameWorld }) {
   return (
     <group position={[position.x, 0, position.z]} rotation={[0, world.spawnYaw, 0]} userData={{ __boots: true }}>
       {/* top */}
-      <mesh castShadow position={[0, TABLE_HEIGHT, 0]}>
+      <mesh
+        castShadow
+        position={[0, TABLE_HEIGHT, 0]}
+        ref={(mesh) => {
+          solidRefs.current[0] = mesh
+        }}
+      >
         <boxGeometry args={TABLE_SIZE} />
         <meshStandardMaterial color="#6e5137" roughness={0.8} />
       </mesh>
@@ -100,12 +118,18 @@ export function GunTable({ world }: { world: GameWorld }) {
         [-0.75, 0.32],
         [0.75, 0.32],
       ].map(([x, z], i) => (
-        <mesh key={i} position={[x!, TABLE_HEIGHT / 2, z!]}>
+        <mesh
+          key={i}
+          position={[x!, TABLE_HEIGHT / 2, z!]}
+          ref={(mesh) => {
+            solidRefs.current[i + 1] = mesh
+          }}
+        >
           <boxGeometry args={[0.07, TABLE_HEIGHT, 0.07]} />
           <meshStandardMaterial color="#54402c" roughness={0.85} />
         </mesh>
       ))}
-      {!geared && (
+      {!geared && !broken && (
         <>
           {/* pistol on display */}
           <mesh position={[-0.4, TABLE_HEIGHT + 0.12, 0]} ref={spinRef}>

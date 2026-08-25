@@ -198,7 +198,12 @@ describe('studs: expose, chip, snap', () => {
     expect(exposed).not.toBeNull()
     expect(exposed!.nodeId).toBe('wall-1')
     expect(exposed!.studId).toBe(3)
-    expect(exposed!.distance).toBeCloseTo(4.965, 2)
+    // Stud depth fits strictly inside the cavity: skins are 0.04 m cells
+    // (0.12/3 layers), depth = 0.04 × (3 − 2) − 0.004 clearance = 0.036,
+    // so the front face sits at z = 0.018 — behind the skin inner face
+    // (z = 0.02), never proud of the intact outer skin.
+    expect(exposed!.distance).toBeCloseTo(4.982, 2)
+    expect(exposed!.distance).toBeGreaterThan(5 - 0.02)
 
     // Knife whittles: 3 hp → 2.
     expect(fire(world, KNIFE)).toBe('wall')
