@@ -38,7 +38,7 @@ export const bootsHostPanel: PluginHostPanel = {
   component: () => import('./panel'),
   pluginId: bootsPlugin.id,
   description:
-    "Alpha access — new and evolving fast. It's a game: jump in and the editor becomes a first-person shooter set in the building you're editing. Break the walls, hold off the machines, keep what you build. Bring your construction boots. ⚠ Not OSHA compliant. Esc, and nothing happened.",
+    'Alpha access — First person build and protect from AI robot zombies. Break the walls, hold off the machines, keep what you build. Bring your construction boots. ⚠ Not OSHA compliant. Esc, and nothing happened.',
   creator: {
     name: 'Pascal',
     url: 'https://github.com/pascalorg',
