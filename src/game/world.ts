@@ -46,6 +46,22 @@ export type DoorEntry = {
   colliderIndices: number[]
 }
 
+/**
+ * A hard-surface footprint projected onto the ground plane: the XZ triangles
+ * of one road / driveway / pad mesh plus their bounds. Nature scatter rejects
+ * any sample that lands on (or within a margin of) one of these — no grass
+ * blades poking through asphalt.
+ */
+export type RoadFootprint = {
+  /** World-space XZ triangles, packed 6 floats each: ax,az,bx,bz,cx,cz. */
+  triangles: Float32Array
+  /** XZ bounds of all triangles — cheap pre-filter before triangle tests. */
+  minX: number
+  minZ: number
+  maxX: number
+  maxZ: number
+}
+
 export type GameWorld = {
   colliders: ColliderEntry[]
   /** wall nodeId → its colliders' indices + node data (for stud generation). */
@@ -58,6 +74,11 @@ export type GameWorld = {
    * collectWorld always returns it (possibly empty); hand-built test
    * worlds carry `overlayRoots: []`. */
   overlayRoots: Object3D[]
+  /** Hard-surface XZ footprints (Streetscape road networks + flat host
+   * pads: driveway slabs, parking-spot items, patio blocks). Optional so
+   * hand-built test worlds don't have to carry it; collectWorld always
+   * fills it (possibly empty). */
+  roadFootprints?: RoadFootprint[]
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -93,9 +114,54 @@ const SOLID_KINDS = [
 
 /** Registry kinds the Bones plugin registers for its overlay renderers
  * (framing/CMU X-ray, lumber, service runs, devices). They draw members
- * INSIDE walls, so once a wall voxelizes they'd read as an unbreakable
- * ghost layer — collected here so the session can hide them wholesale. */
-const OVERLAY_KINDS = ['bones:framing', 'bones:lumber', 'bones:service', 'bones:device']
+ * INSIDE walls — the wall-layer face buckets (gypsum/sheathing/cladding)
+ * are BY DESIGN exactly flush with the drawn wall face (plugin-bones
+ * engines/wall-layers.ts) — so once a wall voxelizes they'd read as an
+ * unbreakable, z-fighting "drywall" ghost coplanar with the voxel skins.
+ * Collected here so the session can hide them wholesale. Exported so QA
+ * can assert the exact match set. */
+export const OVERLAY_KINDS = ['bones:framing', 'bones:lumber', 'bones:service', 'bones:device']
+
+/** Kind PREFIXES treated as overlay renderers in addition to the explicit
+ * list above. Audit 2026-08-25: `bones:framing|lumber|service|device` are
+ * the only kinds plugin-bones registers TODAY (grep of every useRegistry
+ * call), but bones ships new engines regularly — any future `bones:*` kind
+ * is engineering overlay by construction, and missing one here would
+ * resurrect the unbreakable-face bug. Prefix-swept against every kind the
+ * host registry has ever seen, so no code change is needed when bones adds
+ * one. Exported so QA can assert the predicate. */
+export const OVERLAY_KIND_PREFIXES = ['bones:']
+
+/** Name prefixes of overlay objects parented OUTSIDE any registered root —
+ * bones' framing renderer re-parents cross-level "foreign" groups (gable
+ * gypsum/sheathing/cladding, cross-level roof framing) onto LEVEL
+ * Object3Ds and names them `bones-foreign-<levelId>`
+ * (plugin-bones framing/renderer.tsx buildGroups). Audit 2026-08-25: that
+ * is the ONLY out-of-root attachment in all of plugin-bones (the sole
+ * scene-graph `.add` not under a registered root). The per-frame hider in
+ * game-root.tsx and countCoplanarSuspects below both match through this
+ * single exported list so QA can assert the predicate. */
+export const OVERLAY_NAME_PREFIXES = ['bones-foreign-']
+
+/** The per-frame hider's name predicate — single source of truth over
+ * OVERLAY_NAME_PREFIXES. */
+export function isOverlayName(name: string): boolean {
+  if (!name) return false
+  for (const prefix of OVERLAY_NAME_PREFIXES) if (name.startsWith(prefix)) return true
+  return false
+}
+
+/** Every registry kind currently treated as overlay: the explicit list plus
+ * any registered kind matching OVERLAY_KIND_PREFIXES. */
+function overlayKinds(): string[] {
+  const kinds = new Set(OVERLAY_KINDS)
+  // `Object.keys` on the host's Proxy-backed byType map enumerates every
+  // kind that ever registered — built-ins and plugin kinds alike.
+  for (const kind of Object.keys(sceneRegistry.byType)) {
+    if (OVERLAY_KIND_PREFIXES.some((prefix) => kind.startsWith(prefix))) kinds.add(kind)
+  }
+  return [...kinds]
+}
 
 const bvhCache = new WeakMap<BufferGeometry, MeshBVH>()
 
@@ -180,7 +246,7 @@ function collectMeshes(root: Object3D): Mesh[] {
  */
 export function collectOverlayRoots(): Object3D[] {
   const overlayRoots: Object3D[] = []
-  for (const kind of OVERLAY_KINDS) {
+  for (const kind of overlayKinds()) {
     const ids = sceneRegistry.byType[kind]
     if (!ids) continue
     for (const id of ids) {
@@ -189,6 +255,265 @@ export function collectOverlayRoots(): Object3D[] {
     }
   }
   return overlayRoots
+}
+
+/**
+ * QA / owner-repro probe: count the meshes that would ACTUALLY RENDER right
+ * now and match the bones overlay patterns — descendants of a registered
+ * overlay root (OVERLAY_KINDS + OVERLAY_KIND_PREFIXES) or of an object whose
+ * name matches OVERLAY_NAME_PREFIXES. "Would render" = self and every
+ * ancestor visible AND a non-empty layer mask (the per-frame hider's two
+ * mechanisms), so during a game session this MUST be 0; any non-zero count
+ * is an unbreakable coplanar face waiting to be reported, and the traversal
+ * path tells QA exactly which hide is being undone. Exposed on `__boots`
+ * by game-root. Pure and read-only — never mutates the scene.
+ */
+export function countCoplanarSuspects(sceneRoot: Object3D): number {
+  const overlayRoots = new Set(collectOverlayRoots())
+  let count = 0
+  const walk = (object: Object3D, inOverlay: boolean): void => {
+    // An invisible ancestor culls the whole subtree in three.js — nothing
+    // below it renders, so nothing below it is a suspect.
+    if (!object.visible) return
+    const overlay = inOverlay || overlayRoots.has(object) || isOverlayName(object.name)
+    if (
+      overlay &&
+      (object as { isMesh?: boolean }).isMesh === true &&
+      object.layers.mask !== 0
+    ) {
+      count++
+    }
+    for (const child of object.children) walk(child, overlay)
+  }
+  walk(sceneRoot, false)
+  return count
+}
+
+// ---------------------------------------------------------------------------
+// Road / hard-surface footprints (nature-scatter rejection)
+// ---------------------------------------------------------------------------
+
+/** Registry kinds whose meshes ARE road surface. The community host ships
+ * `@pascal-app/plugin-streetscape`, whose road-network renderer registers
+ * under this kind and names every paved mesh `road-*` (segment surfaces,
+ * junction bands, sidewalks/curbs/gutters, medians, markings, roundabout
+ * islands). */
+const ROAD_KINDS = ['streetscape:road-network']
+
+/** Road-network meshes that are NOT pavement on the ground: editor-only
+ * ghosts (`*-preview`), invisible pick targets (`road-edge-hit`,
+ * `road-curb-corner-hit`), validation badges, manual-boundary handles and
+ * approach hits, elevated `road-bridge-*` decks/piers (grass under a bridge
+ * is fine), and `road-earthwork-*` embankment slopes (those WANT grass). */
+const ROAD_MESH_EXCLUDE = /preview|hit|validation|boundary|approach|earthwork|bridge/
+
+/** Solid kinds that double as hard-surface ground pads when they lie flat
+ * near the ground: driveway/patio slabs, flat catalog items (the
+ * `parking-spot` asphalt pad is 0.12 m thick), and block pavers. */
+const PAD_KINDS = new Set(['slab', 'item', 'block'])
+/** A pad is "flat" when its world AABB is at most this tall… */
+const PAD_MAX_THICKNESS = 0.35
+/** …and starts at most this far above the ground plane. */
+const PAD_MAX_BASE_Y = 0.6
+
+/** Triangles whose lowest vertex sits above this are skipped — an elevated
+ * deck is not ground the scatter plane (y = 0) could poke through. */
+const FOOTPRINT_MAX_Y = 1.5
+/** Degenerate XZ triangles (vertical faces seen from above) carry no area
+ * worth testing; the scatter margin already covers their sliver. */
+const FOOTPRINT_MIN_AREA = 1e-6
+/** Meshes past this vertex count fall back to their world AABB rectangle —
+ * a footprint is a coarse mask, not a render. */
+const FOOTPRINT_VERTEX_BUDGET = 30000
+
+/** Keep grass at least this far (m) from any hard-surface edge. */
+export const ROAD_SCATTER_MARGIN = 0.3
+
+const _fpA = new Vector3()
+const _fpB = new Vector3()
+const _fpC = new Vector3()
+
+/**
+ * World-space triangles of a mesh projected to XZ, packed 6 floats per
+ * triangle. Elevated (min y > maxY) and XZ-degenerate triangles are dropped.
+ */
+export function meshFootprintTriangles(mesh: Mesh, maxY = FOOTPRINT_MAX_Y): Float32Array {
+  const geometry = mesh.geometry
+  const position = geometry?.getAttribute?.('position')
+  if (!position || position.count < 3) return new Float32Array(0)
+  mesh.updateWorldMatrix(true, false)
+  const index = geometry.index
+  const triCount = Math.floor((index ? index.count : position.count) / 3)
+  const out: number[] = []
+  for (let t = 0; t < triCount; t++) {
+    const ia = index ? index.getX(t * 3) : t * 3
+    const ib = index ? index.getX(t * 3 + 1) : t * 3 + 1
+    const ic = index ? index.getX(t * 3 + 2) : t * 3 + 2
+    _fpA.fromBufferAttribute(position, ia).applyMatrix4(mesh.matrixWorld)
+    _fpB.fromBufferAttribute(position, ib).applyMatrix4(mesh.matrixWorld)
+    _fpC.fromBufferAttribute(position, ic).applyMatrix4(mesh.matrixWorld)
+    if (Math.min(_fpA.y, _fpB.y, _fpC.y) > maxY) continue
+    const area = Math.abs(
+      (_fpB.x - _fpA.x) * (_fpC.z - _fpA.z) - (_fpC.x - _fpA.x) * (_fpB.z - _fpA.z),
+    )
+    if (area < FOOTPRINT_MIN_AREA) continue
+    out.push(_fpA.x, _fpA.z, _fpB.x, _fpB.z, _fpC.x, _fpC.z)
+  }
+  return new Float32Array(out)
+}
+
+/** Bounds-wrapped footprint, or null when no triangle survived. */
+export function footprintFromTriangles(triangles: Float32Array): RoadFootprint | null {
+  if (triangles.length < 6) return null
+  let minX = Infinity
+  let minZ = Infinity
+  let maxX = -Infinity
+  let maxZ = -Infinity
+  for (let i = 0; i < triangles.length; i += 2) {
+    const x = triangles[i]!
+    const z = triangles[i + 1]!
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (z < minZ) minZ = z
+    if (z > maxZ) maxZ = z
+  }
+  return { triangles, minX, minZ, maxX, maxZ }
+}
+
+/** Squared distance from (px,pz) to segment (ax,az)→(bx,bz) in XZ. */
+function segmentDistSq(
+  px: number,
+  pz: number,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+): number {
+  const dx = bx - ax
+  const dz = bz - az
+  const lengthSq = dx * dx + dz * dz
+  let t = lengthSq > 0 ? ((px - ax) * dx + (pz - az) * dz) / lengthSq : 0
+  t = t < 0 ? 0 : t > 1 ? 1 : t
+  const qx = ax + dx * t - px
+  const qz = az + dz * t - pz
+  return qx * qx + qz * qz
+}
+
+/**
+ * Is the XZ point on (or within `margin` of) any hard-surface footprint?
+ * Winding-agnostic point-in-triangle plus distance-to-edge for the margin;
+ * footprint AABB then per-triangle bounds pre-filter, so the common
+ * off-road sample costs a handful of compares.
+ */
+export function pointOnRoad(
+  footprints: readonly RoadFootprint[] | undefined,
+  x: number,
+  z: number,
+  margin = ROAD_SCATTER_MARGIN,
+): boolean {
+  if (!footprints || footprints.length === 0) return false
+  const marginSq = margin * margin
+  for (const footprint of footprints) {
+    if (
+      x < footprint.minX - margin ||
+      x > footprint.maxX + margin ||
+      z < footprint.minZ - margin ||
+      z > footprint.maxZ + margin
+    ) {
+      continue
+    }
+    const tri = footprint.triangles
+    for (let i = 0; i < tri.length; i += 6) {
+      const ax = tri[i]!
+      const az = tri[i + 1]!
+      const bx = tri[i + 2]!
+      const bz = tri[i + 3]!
+      const cx = tri[i + 4]!
+      const cz = tri[i + 5]!
+      if (x < Math.min(ax, bx, cx) - margin || x > Math.max(ax, bx, cx) + margin) continue
+      if (z < Math.min(az, bz, cz) - margin || z > Math.max(az, bz, cz) + margin) continue
+      const d1 = (bx - ax) * (z - az) - (bz - az) * (x - ax)
+      const d2 = (cx - bx) * (z - bz) - (cz - bz) * (x - bx)
+      const d3 = (ax - cx) * (z - cz) - (az - cz) * (x - cx)
+      const hasNeg = d1 < 0 || d2 < 0 || d3 < 0
+      const hasPos = d1 > 0 || d2 > 0 || d3 > 0
+      if (!(hasNeg && hasPos)) return true
+      if (
+        marginSq > 0 &&
+        (segmentDistSq(x, z, ax, az, bx, bz) <= marginSq ||
+          segmentDistSq(x, z, bx, bz, cx, cz) <= marginSq ||
+          segmentDistSq(x, z, cx, cz, ax, az) <= marginSq)
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+/** Two XZ triangles covering a world AABB — the over-budget mesh fallback. */
+function boxFootprintTriangles(box: Box3): Float32Array {
+  const { min, max } = box
+  // biome-ignore format: two triangles, one per row
+  return new Float32Array([
+    min.x, min.z, max.x, min.z, max.x, max.z,
+    min.x, min.z, max.x, max.z, min.x, max.z,
+  ])
+}
+
+function onHiddenBranch(root: Object3D): boolean {
+  let walker: Object3D | null = root
+  while (walker) {
+    if (!walker.visible) return true
+    walker = walker.parent
+  }
+  return false
+}
+
+/**
+ * Hard-surface footprints the nature scatter must stay off:
+ * 1. Streetscape road networks — every `road-*` surface mesh under each
+ *    registered `streetscape:road-network` root (curved ribbons, junctions,
+ *    sidewalks: exact projected triangles, not boxes).
+ * 2. Flat host pads among the collected colliders — slab / item / block
+ *    meshes lying flat near the ground (driveways, parking pads, patios).
+ * Exported for QA; collectWorld calls it with the fresh collider set.
+ */
+export function collectRoadFootprints(colliders: readonly ColliderEntry[]): RoadFootprint[] {
+  const footprints: RoadFootprint[] = []
+  const push = (triangles: Float32Array) => {
+    const footprint = footprintFromTriangles(triangles)
+    if (footprint) footprints.push(footprint)
+  }
+
+  for (const kind of ROAD_KINDS) {
+    const ids = sceneRegistry.byType[kind]
+    if (!ids) continue
+    for (const id of ids) {
+      const root = sceneRegistry.nodes.get(id)
+      if (!root || onHiddenBranch(root)) continue
+      root.updateWorldMatrix(true, true)
+      for (const mesh of collectMeshes(root)) {
+        if (!mesh.name.startsWith('road-') || ROAD_MESH_EXCLUDE.test(mesh.name)) continue
+        push(meshFootprintTriangles(mesh))
+      }
+    }
+  }
+
+  const size = new Vector3()
+  for (const entry of colliders) {
+    if (!PAD_KINDS.has(entry.nodeType)) continue
+    entry.worldBox.getSize(size)
+    if (size.y > PAD_MAX_THICKNESS || entry.worldBox.min.y > PAD_MAX_BASE_Y) continue
+    const position = entry.mesh.geometry?.getAttribute?.('position')
+    if (position && position.count > FOOTPRINT_VERTEX_BUDGET) {
+      push(boxFootprintTriangles(entry.worldBox))
+    } else {
+      push(meshFootprintTriangles(entry.mesh))
+    }
+  }
+
+  return footprints
 }
 
 export function collectWorld(): GameWorld {
@@ -281,6 +606,7 @@ export function collectWorld(): GameWorld {
   }
 
   const overlayRoots = collectOverlayRoots()
+  const roadFootprints = collectRoadFootprints(colliders)
 
   // Spawn: outside the building along +X of its center, eye toward it.
   const spawn = new Vector3(6, 0, 6)
@@ -304,5 +630,16 @@ export function collectWorld(): GameWorld {
       }
     ).selectedLevelId ?? null
 
-  return { colliders, walls, glass, doors, overlayRoots, buildingAabb, spawn, spawnYaw, levelId }
+  return {
+    colliders,
+    walls,
+    glass,
+    doors,
+    overlayRoots,
+    roadFootprints,
+    buildingAabb,
+    spawn,
+    spawnYaw,
+    levelId,
+  }
 }

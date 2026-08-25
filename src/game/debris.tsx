@@ -206,8 +206,16 @@ export function Debris() {
   useLayoutEffect(() => {
     const mesh = meshRef.current
     mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    for (let i = 0; i < CAPACITY; i++) mesh.setMatrixAt(i, ZERO)
+    for (let i = 0; i < CAPACITY; i++) {
+      mesh.setMatrixAt(i, ZERO)
+      // Prime instanceColor for EVERY slot before the first render: the
+      // host WebGPURenderer compiles the pipeline on first draw, and a mesh
+      // whose first setColorAt lands mid-session gets a pipeline WITHOUT
+      // instanceColor — all debris then renders white (wiring, 2026-08-25).
+      mesh.setColorAt(i, colors[i]!)
+    }
     mesh.instanceMatrix.needsUpdate = true
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
     mesh.frustumCulled = false
     return clearDebris
   }, [])

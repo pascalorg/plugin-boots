@@ -505,8 +505,16 @@ function stepPool(
 
 function initMesh(mesh: InstancedMesh, cap: number): void {
   mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-  for (let i = 0; i < mesh.count; i++) mesh.setMatrixAt(i, ZERO)
+  _color.setRGB(DUST_R, DUST_G, DUST_B)
+  for (let i = 0; i < mesh.count; i++) {
+    mesh.setMatrixAt(i, ZERO)
+    // Prime instanceColor before the first draw — a WebGPU pipeline compiled
+    // without it ignores every later setColorAt, leaving dust pure white
+    // instead of the warm gypsum tint (wiring finding, 2026-08-25).
+    mesh.setColorAt(i, _color)
+  }
   mesh.instanceMatrix.needsUpdate = true
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
   mesh.frustumCulled = false
   const alpha = new InstancedBufferAttribute(new Float32Array(cap), 1)
   alpha.setUsage(DynamicDrawUsage)

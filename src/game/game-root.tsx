@@ -1,6 +1,6 @@
 'use client'
 
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import type { Object3D } from 'three'
 import { useBoots } from '../store'
@@ -28,7 +28,13 @@ import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
 import { VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
-import { collectOverlayRoots, collectWorld, type GameWorld } from './world'
+import {
+  collectOverlayRoots,
+  collectWorld,
+  countCoplanarSuspects,
+  type GameWorld,
+  isOverlayName,
+} from './world'
 
 /**
  * In-canvas game orchestrator, mounted through the plugin's `def.system`
@@ -117,7 +123,9 @@ function ForeignOverlayHide() {
     if (frame.current === 1 || frame.current % 60 === 0) {
       groups.current = []
       scene.traverse((object) => {
-        if (!object.name.startsWith('bones-foreign-')) return
+        // Single exported predicate (world.ts OVERLAY_NAME_PREFIXES) — QA
+        // asserts the same list countCoplanarSuspects matches through.
+        if (!isOverlayName(object.name)) return
         groups.current.push(object)
         object.traverse((child) => {
           if (masks.current.has(child)) return
@@ -136,18 +144,23 @@ function ForeignOverlayHide() {
  * register their nodes asynchronously, so a root that lands after
  * collectWorld's snapshot escapes ActiveGame's mount-time hide and would
  * survive wall voxelization as an unbreakable ghost layer. Re-collects
- * every 15th frame for the first ~2s of the session; hideForGame skips
- * anything already invisible, so repeat sweeps cost nothing and every flip
- * still lands in the session's restore ledger. (Re-parented foreign groups
- * that no root hide can reach are ForeignOverlayHide's job above.)
+ * every 15th frame for the WHOLE session — the old ~2s (120-frame) window
+ * assumed registration only races session start, but bones re-registers
+ * whenever a renderer REMOUNTS (its store recompute / device-reconcile
+ * scene writes / a slow plugin bundle finishing past 2s), and a remounted
+ * root is a brand-new Object3D that defaults `visible = true`: in the
+ * owner's Bones-installed scene that read as an unbreakable drywall face
+ * coplanar with the voxel skins, forever (round 2026-08-25, feedback B).
+ * hideForGame skips anything already invisible, so steady-state sweeps
+ * cost one registry walk every 15 frames and nothing else; every actual
+ * flip still lands in the session's restore ledger, so exit restores the
+ * fresh roots too. (Re-parented foreign groups that no root hide can
+ * reach are ForeignOverlayHide's job above.)
  */
 function OverlaySweep() {
   const frame = useRef(0)
   useFrame(() => {
-    const f = frame.current
-    if (f > 120) return
-    frame.current = f + 1
-    if (f % 15 !== 0) return
+    if (frame.current++ % 15 !== 0) return
     for (const root of collectOverlayRoots()) hideForGame(root)
   })
   return null
@@ -197,6 +210,8 @@ function dumpDestructionMembers(field: 'segments' | 'sheets'): Array<Record<stri
 function ActiveGame() {
   // Snapshot once per session — walls don't move while you shoot them.
   const [world, setWorld] = useState(() => collectWorld())
+  // Stable for the canvas' life — used by the __boots coplanar-suspect probe.
+  const scene = useThree((s) => s.scene)
 
   // Remount healing (Fast Refresh / dev module sync — players never remount
   // mid-session): this component unmounting is NOT the session ending;
@@ -287,6 +302,13 @@ function ActiveGame() {
       sheets: () => dumpDestructionMembers('sheets'),
       // Dust debug — plain-data dump from dust.tsx, never a live ref.
       dust: () => dustDebug(),
+      // Unbreakable-face tripwire (owner round 2026-08-25, feedback B):
+      // visible bones-overlay meshes that would actually render right now —
+      // MUST be 0 during a session; non-zero means a hide was undone or a
+      // pattern was missed (see world.ts countCoplanarSuspects). Counts
+      // via the SAME exported predicates the hiders use, so QA asserting
+      // this asserts the match set itself.
+      countCoplanarSuspects: () => countCoplanarSuspects(scene),
       // Combat-tree dump (trees-destruct.tsx): id/x/z/scale/state/hp/
       // canopyDamage/burnT/charHits per tree; [] outside a session.
       trees: () => treesDebug.dump(),
@@ -304,7 +326,7 @@ function ActiveGame() {
       clearDebris()
       clearDust()
     }
-  }, [world])
+  }, [world, scene])
 
   return (
     <>

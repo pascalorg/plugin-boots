@@ -417,8 +417,12 @@ function syncInstances(
         _scaleV.setScalar(s)
         _matrix.compose(_pos, _quat, _scaleV)
         branches.setMatrixAt(j, _matrix)
-        branches.setColorAt(j, CHARCOAL)
       } else branches.setMatrixAt(j, ZERO)
+      // Color EVERY slot, not just charred ones: the mount-time sync must
+      // create instanceColor before the WebGPU pipeline first compiles, or
+      // branches that appear mid-session render white (wiring, 2026-08-25).
+      // Trunks/canopies/stumps already color unconditionally — same reason.
+      branches.setColorAt(j, CHARCOAL)
     }
     // Stump appears the moment the tree above it is gone.
     if (tree.state === 'stump') setTreeMatrix(stumps, i, tree)

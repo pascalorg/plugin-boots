@@ -16,13 +16,22 @@ import {
   ShapeGeometry,
   Vector3,
 } from 'three'
-import type { GameWorld } from './world'
+import { type GameWorld, pointOnRoad } from './world'
 
 /**
  * The lot: a grass field with scattered flora replacing the editor's flat
  * gray void. Optimization first — one InstancedMesh per species (grass is a
  * single draw call for ~20k blade clusters), no shadows, static transforms,
- * all placement rejected out of the building's footprint.
+ * all placement rejected out of the building's footprint AND off every
+ * hard-surface footprint (Streetscape roads, driveway slabs, parking pads —
+ * world.roadFootprints) so no blade pokes through asphalt.
+ *
+ * The lawn disc itself is NOT cut around roads: roads render at ground +
+ * surfaceThickness (>= 0.1 m in every Streetscape preset), well above the
+ * disc's y = 0.05, so the pavement fully occludes it — and the disc's hole
+ * mechanism only supports a single rectangle fully inside the contour
+ * (overlapping / edge-crossing holes break ShapeGeometry triangulation),
+ * which arbitrary road ribbons would violate.
  */
 
 /** Deterministic RNG so re-entry looks identical. */
@@ -170,10 +179,12 @@ export type Scatter = { matrices: Matrix4[]; colors: Color[] }
 
 /**
  * Deterministic ring scatter around the building, rejecting the footprint
- * (+ pad). `make` fills the matrix and returns the instance color; it may
- * also record placements into its own side arrays — trees-destruct.tsx
- * does exactly that to build combat trees on the same layout. Exported so
- * flora placement stays one algorithm across modules.
+ * (+ pad) and every hard-surface footprint (roads, driveways, pads) with a
+ * 0.3 m clearance margin. `make` fills the matrix and returns the instance
+ * color; it may also record placements into its own side arrays —
+ * trees-destruct.tsx does exactly that to build combat trees on the same
+ * layout (so trees stay off the road too). Exported so flora placement
+ * stays one algorithm across modules.
  */
 export function scatter(
   world: GameWorld,
@@ -208,6 +219,9 @@ export function scatter(
     ) {
       continue
     }
+    // No flora on pavement: roads, driveways, parking pads (default margin
+    // keeps blades clear of the kerb line, not just the centerline).
+    if (pointOnRoad(world.roadFootprints, position.x, position.z)) continue
     const matrix = new Matrix4()
     const t = rMax > rMin ? (radius - rMin) / (rMax - rMin) : 0
     colors.push(make(rand, position, matrix, t))

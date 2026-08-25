@@ -527,3 +527,69 @@ Open for QA (round 4 gate): re-verify (g) volume islands (fixed at the
 root, needs the in-browser repro), (d) trees full loop in-browser, and
 the in-game-vs-editor fps ratio watch item now that grass + prevoxelized
 walls + the grove render from session start.
+
+## Phase 3, Round 4 — 2026-08-25 (QA + wiring verification pass, instanceColor fixes, overlay-hide hardening)
+
+Round outcome: verification round. QA round 3 = FULL PASS (22/22 steps,
+zero pageerrors) and wiring's four-item verification pass = PASS on real
+GPU. Manager integrated the round's two code streams and fixed the one
+new finding. All in: `bun run check-types` clean, `bun test` green.
+
+- **QA r3 (all owner items green in-browser)**: (a) pre-voxelized
+  cladding at spawn, zero shots; (b) sandwich tear — flat drywall plates
+  flutter off, studs snap like charcoal sticks, through-hole from
+  behind; (c) rotary gun on its own second table behind spawn, 120-shot
+  sweep leveled the building (dust at caps); (d) trees ignite/char/snap
+  to stump AND fell-by-trunk; (e) 3x3 mask pocket renders + Keep maps it
+  to a real window node; (f) sky warm gray, blueness −6, breaks visible,
+  pole banding gone; (g) island line-cut collapses same-frame; (h) Esc
+  restore pristine. fps: editor 60.0 → in-game 60.1 on real hardware
+  (vsync-capped, loadavg ~8) — the owner's fluidity is intact.
+- **Wiring r4 verification**: trees full loop headless (fell→stump,
+  ignite→char→snap→stump); volume islands PROVEN in-browser — severed
+  table legs (band emptied around all 4) crumble the top within ~0.4 s,
+  and the shower repro (cut in half) drops the upper half. p3r2's
+  "floating top" was under-severed legs (voxelized legs rasterize ~2
+  cells wide), not the bug. Remount: Turbopack hard-ignores node_modules,
+  so mid-session fleet syncs CANNOT vanish the building on this server;
+  the r3 healing path stays as a dormant safety net.
+- **instanceColor fixes (debris.tsx / trees-destruct.tsx / dust.tsx)**:
+  the host WebGPURenderer compiles a mesh's pipeline on first draw; a
+  mesh whose FIRST `setColorAt` lands mid-session gets a pipeline
+  without instanceColor and renders white forever. Debris now primes all
+  768 slots at mount, charred branch sticks color every slot in
+  syncInstances, and dust primes both pools in initMesh — tree bursts /
+  table rubble / dust now read in material colors (this was also QA r3's
+  "pale char-collapse" watch item).
+- **Overlay-hide hardening (world.ts / game-root.tsx, + owner feedback
+  B "a face that can't be destroyed")**: overlay kinds now swept by
+  `bones:` PREFIX (future bones engines can't resurrect the ghost face),
+  name predicate exported as `isOverlayName` over OVERLAY_NAME_PREFIXES,
+  OverlaySweep runs for the whole session (a bones renderer REMOUNT
+  re-registers fresh visible roots — the old 2s window missed those),
+  and `__boots.countCoplanarSuspects()` is a read-only tripwire QA can
+  assert is 0 in-game. 6 new tests pin the predicates + probe
+  (overlay-hide.test.ts).
+
+- **Grass off the pavement (world.ts / nature.tsx, concurrent worker)**:
+  `collectRoadFootprints` gathers hard-surface XZ footprints — every
+  Streetscape `road-*` surface mesh (exact projected triangles, with
+  preview/hit/bridge/earthwork meshes excluded) plus flat ground pads
+  (slab/item/block under 0.35 m thick near y 0, e.g. driveways and
+  parking pads) — and `scatter()` rejects samples within 0.3 m of any
+  (`pointOnRoad`, AABB pre-filtered). Trees inherit the rejection since
+  trees-destruct builds on the same scatter. 13 tests
+  (road-scatter.test.ts).
+- **bun test rescue (bunfig.toml + src/test-preload.ts, manager)**: the
+  prod hotfix's `useEditor`/`useViewer` imports in session.ts made six
+  test files load @pascal-app/editor|viewer for real under bun — viewer's
+  dist pulls `three/examples/jsm/Addons.js`, whose TTFLoader/LottieLoader
+  use CDN URL imports bun can't resolve offline (ENOENT), and the
+  src-only editor package graph pinned `bun test` at 100% CPU for an
+  hour (six zombie runners killed). Test-only preload now mocks both
+  packages with zustand-shaped stubs; the host bundler keeps the real
+  imports. Suite: 158 pass / 7001 expects in ~0.7 s.
+
+Open: exercise countCoplanarSuspects + overlay hiding against a REAL
+Bones-installed scene in-browser (fixtures so far had overlayRoots 0);
+owner feel-pass on the char-collapse burst now that colors land.

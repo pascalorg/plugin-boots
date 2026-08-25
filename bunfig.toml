@@ -1,0 +1,5 @@
+# Test-only module mocks — see src/test-preload.ts for the full story
+# (@pascal-app/editor|viewer cannot load under bun test: CDN URL imports in
+# three's Addons barrel + a src-only editor package that hangs the runner).
+[test]
+preload = ["./src/test-preload.ts"]
