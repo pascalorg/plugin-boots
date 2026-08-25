@@ -66,33 +66,48 @@ gravity, jump buffering, step-offset. Capsule vs world via BVH `shapecast`
 snap. Eye 1.62 m, run 5.2 m/s, walk-shift 2.6, gravity 15.5, jump 5.0.
 Subtle view-bob + land-dip. FOV 90 during game, restored on exit.
 
-### Weapons
+### Weapons (SHIPPED, phases 1–3)
 Start with the **knife**. A **gun table** spawns near the player: walk up,
-`E` to take. v1 arsenal (generic names, original everything):
+`E` to take. Arsenal (generic names, original everything):
 - Knife — 2 swings/s, chips one voxel, range 1.8 m
 - Pistol — semi-auto, 12+∞, precise, small holes
 - Rifle — full-auto 600 rpm, 30+∞, spread grows, bigger holes
+- **Rotary gun ("THE BIG ONE", slot `5`)** — lives on its OWN second table
+  a bit behind spawn. Multi-barrel viewmodel with visible barrel spin;
+  hold-to-fire spins up before rounds land, then fires near-continuously —
+  sweep the building and it levels (QA: 120-shot sweep, 463 voxels → 0,
+  dust at caps, fps held).
 Hitscan via BVH raycast. Muzzle flash = 2-frame emissive quad. Tracer = fading
-line. Recoil = camera kick + viewmodel spring. `1/2/3` + wheel to switch, `R`
-reloads.
+line. Recoil = camera kick + viewmodel spring. `1/2/3/5` + wheel to switch,
+`R` reloads.
 
-### Destruction (the reason to live)
-- **Voxel walls:** first bullet on a wall hides the host wall object and
-  swaps in a voxel replica: the wall's meshes are voxelized (~0.15 m cells,
-  BVH containment test — door/window cutouts come free), rendered as ONE
-  `InstancedMesh` with per-instance color jitter (that blocky voxel shade).
-  Bullets zero out voxels in a radius; knife chips one; every removal spawns
-  debris. Disconnected islands (flood-fill, throttled) crumble and fall.
-- **Stud reveal (the Bones handshake):** walls thicker than 9 cm get interior
-  framing — studs at 16" o.c. along the wall axis, plates top/bottom —
-  generated from the wall node's `start/end/height/thickness`. Invisible
-  until the shell voxels in front of them are gone. Break a wall, see its
-  bones. (Later: read real members from plugin-bones when it's installed.)
+### Destruction (the reason to live) — SHIPPED, phase 3 anatomy
+Walls are a real **sandwich**, torn down layer by layer:
+- **Pre-voxelized cladding:** walls swap to their voxel replica ON JUMP-IN
+  (not on first hit) — the building already reads as voxels at spawn, with
+  tile joints and per-instance color jitter. Yaw-local grids keep diagonal
+  walls clean. Bullets zero voxels in a radius; knife chips one.
+- **Drywall sheets:** behind the cladding sits a drywall skin built from
+  flat SHEETS — hits tear ragged flat plates off (paper-tear read, shards
+  flutter in the dust); enough damage flings whole sheets. Both faces of
+  the sandwich have skins, so a through-hole shows daylight.
+- **Charcoal-stick framing:** OBB studs at real lumber cross-section
+  (skinnier than a voxel), hp-tracked, snap like charcoal sticks — break a
+  wall, see its bones. Bones-plugin overlay roots (CMU/framing renderers)
+  are hidden for the whole session via `bones:*` prefix sweep +
+  `isOverlayName` predicate; `__boots.countCoplanarSuspects()` is the
+  tripwire (must stay 0).
+- **Island collapse:** disconnected voxel islands (flood-fill, throttled,
+  volume-aware) crumble same-frame — line-cut a wall or sever a shower/
+  table legs and the top drops. Nothing floats.
 - **Glass:** transparent panes under window nodes take crack decals per hit;
   3rd hit (or two overlapping cracks) shatters the pane — instanced shards
   fall, spin, fade. Radial-crack texture drawn on a canvas at runtime.
-- **Debris:** one global instanced ring buffer (512). Gravity, one ground
-  bounce, shrink-out. No physics engine.
+- **Debris + dust:** instanced ring buffers (debris 768, dust 256 puffs +
+  24 haze) — gravity, one bounce, shrink-out; big hits read like a
+  slow-lobby shootout, dust and pieces everywhere. No physics engine.
+  WebGPU gotcha: prime `instanceColor` on every slot BEFORE first draw or
+  the pipeline compiles without it and instances render white forever.
 
 ### Sounds
 All procedural WebAudio (no assets, no copyright): noise-burst gunshots with
@@ -100,16 +115,23 @@ low thump + delay tail, filtered-noise footsteps cadenced by speed, knife
 swish (bandpass sweep), voxel crunch, glass shatter (inharmonic partials),
 pickup clack, build thunk. One AudioContext, master limiter.
 
-### Builder mode (battle-builder grammar)
-Slot `4` (or `B`): build tool with three pieces — **wall / floor / ramp** —
-`Q` cycles. Ghost preview snapped to a 0.5 m grid + 90° yaw in front of the
-player; LMB places a solid, collidable, immediately-destructible panel.
+### Builder mode (battle-builder grammar) — SHIPPED, 3x3 editing
+Slot `4` (or `B`): build tool with three pieces — **wall / floor / roof**
+(everything vertical is a wall, everything inclined is a ROOF — never
+"ramp") — `Q` cycles. Ghost preview snapped to adjacency grid + 90° yaw,
+stacking + hold-to-place runs, `G` undoes; LMB places a solid, collidable,
+immediately-destructible panel.
+**3x3 masks:** each wall piece is a 3x3 cell grid (9-bit mask). Shoot out
+the center cell = window pocket; kill a side column = shorter wall; any
+pocket reads as an opening — and the mask drives the COLLIDER too (shots
+and players pass through pockets).
 Placements accumulate in the store (never in the scene). After `Esc`, the
-panel shows **Keep** / **Discard**: Keep converts wall panels into real
-`wall` nodes (`start/end/height/thickness`) in one batch (undoable); floors
-become `slab` nodes if the schema cooperates, else stay game-only (labeled).
-Paint tool (roadmap, slot TBD — `5` is now the heavy rotary gun): spray-tint
-a wall's game copy; Keep patches the node's material.
+panel shows **Keep** / **Discard**: Keep converts pieces into real nodes in
+one undoable batch — walls become `wall` nodes, a center pocket maps to a
+real WINDOW node on that wall, roof pieces map best-effort onto shed
+`roof-segment` nodes (see keep.ts doc block), fully-dead pieces are
+skipped. Paint tool (roadmap): spray-tint a wall's game copy; Keep patches
+the node's material.
 
 ### You don't die (the death dynamic)
 No respawn, no teleport-to-spawn — dying breaks the flow and the fiction.
@@ -148,11 +170,25 @@ build-battle and block games, not on home-design software:
 player (seek + obstacle ray-probe), melee for vignette damage. 100 hp,
 hitscan-damageable, fall-and-fade death. No navmesh in v1 (Yuka later).
 
-### Nature (the lot)
+### Nature (the lot) — SHIPPED, combat trees
 Replace the flat gray void: a big grass-green ground disc (canvas-noise
-texture), ~25k instanced grass blades in a density-falloff ring OUTSIDE the
-building AABB, low-poly instanced trees/bushes/rocks farther out. One draw
-call per species, no shadows on flora, static (no wind in v1).
+texture), ~25k instanced grass blade clusters in a density-falloff ring
+OUTSIDE the building AABB, low-poly instanced trees farther out. One draw
+call per species, no shadows on flora, static (no wind in v1). Grass and
+trees are rejected off Streetscape road footprints and flat ground pads
+(`collectRoadFootprints` + `pointOnRoad`).
+**Trees are combatants** (trees-destruct.tsx): shoot a trunk and the tree
+voxelizes in its own colors and fells straight down to a stump; canopy
+hits IGNITE it — flame wisps + smoke, charring crown — then it chars into
+charcoal sticks that snap into voxel bursts down to a stump. Voxel bursts
+and char debris render in material colors (instanceColor primed at mount).
+
+### Sky — SHIPPED
+Procedural overcast dome (sky.tsx, CanvasTexture — no shaders): mostly
+warm gray, a touch lighter than pure overcast, with a few subtle brighter
+breaks and softer dark patches. NEVER blue — QA asserts the blue channel
+sits at/below the gray channels (blueness ≤ 0) and the luminance spread
+stays subtle.
 
 ## HUD
 DOM overlay inside the fullscreen element (the canvas' parent): crosshair,
@@ -161,17 +197,26 @@ vignette, and the pill: **Esc to exit**.
 
 ## Delivery ladder
 
-- **T1 (tonight):** game mode infra, movement+collide, knife+pistol+rifle,
+- **T1 — SHIPPED:** game mode infra, movement+collide, knife+pistol+rifle,
   gun table, HUD, audio, nature, voxel wall destruction + debris + stud
   reveal, glass shatter, clean exit/restore.
-- **T2 (tonight if it holds):** builder mode + Keep/Discard into real nodes.
-- **T3:** bots, paint tool, real Bones members, rounds/objectives, co-op.
+- **T2 — SHIPPED:** builder mode + Keep/Discard into real nodes; doors on
+  `E`, material audio, no-death stagger + regen, waves + mercy ring.
+- **T3 (phase 3) — SHIPPED (commit 55eeb3c):** wall sandwich anatomy
+  (pre-voxelized cladding, drywall sheet tearing, charcoal-stick studs),
+  rotary gun + rear table, combat trees (fell/burn/char to stump), dust
+  storm, 3x3 wall masks + window Keep, overcast never-blue sky, volume
+  island collapse, Bones overlay hide. QA r3/r4 full pass, 60 fps in-game.
+- **T4 (next):** owner feel-pass on char-collapse burst, Bones overlay
+  hide against a REAL Bones-installed scene, host plugin-tree destruction
+  path, paint tool, rounds/objectives, co-op.
 
 ## Risks & mitigations
 - Host camera controls fighting the game camera → write pose in a late
   `useFrame` (last write wins) + swallow inputs at capture phase.
 - Voxelization cost on huge walls → adaptive cell size, cap ~1.5k voxels per
-  wall, voxelize lazily on first damage only.
+  wall. (Phase 3 moved voxelization to jump-in — pre-voxelized cladding —
+  so the cost is paid once at session start, not mid-fight.)
 - `bun install` file-dep symlinks (private repo) → rsync real copies into
   both hosts after every install (see project memory); pin `github:#sha`
   once the repo goes public.
