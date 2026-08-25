@@ -14,9 +14,11 @@ import { spawnDebris } from './debris'
  *   spawns, no wave text. Walking, building, breaking walls never wake the
  *   horde; only picking up a gun (pistol/rifle in useBoots.owned) does.
  * - ALERT: the first gun pickup starts a one-shot ALERT_SECONDS countdown
- *   ("They heard you — 5") over a rising machine spin-up, a clack per tick;
- *   at 0 the line flashes HERE THEY COME and the wave director takes over
- *   (WAVE 1). resetBots() re-arms the whole grace→alert cycle.
+ *   ("⚠ AI robot zombies incoming — 5") over a rising machine spin-up, a
+ *   clack per tick; at 0 the line flashes HERE THEY COME and the wave
+ *   director takes over (WAVE 1). `waveState.countdownActive` is true for
+ *   exactly that window — the gun-table siren beacon spins off it.
+ *   resetBots() re-arms the whole grace→alert cycle.
  * - MERCY: while the player is staggered bots never attack — ground bots
  *   hold a 4–6 m ring, drones climb +1 m and hover (see enemies.tsx).
  *
@@ -43,7 +45,19 @@ export type Bot = {
   phase: number
   /** Drone hover seed. */
   seed: number
+  /** Ground bots: seconds of near-zero progress vs intent (wall contact). */
+  blockedT: number
+  /** Ground bots: remaining wall-follow seconds (0 = normal pursuit). */
+  followT: number
+  /** Ground bots: wall-follow tangent side, +1 or -1. */
+  followSign: number
+  /** Drones: extra altitude (m) gained to clear obstacles under the path. */
+  climb: number
 }
+
+/** Ground-bot (droid/dog) capsule for wall push-out — see BOT WALL RULE in
+ * enemies.tsx. y is feet, like the player capsule. */
+export const GROUND_BOT_CAPSULE = { radius: 0.35, height: 1.2 }
 
 export const BOT_STATS: Record<
   BotKind,
@@ -60,7 +74,7 @@ let botId = 1
 /** Dev/E2E toggles — see header. Not used by any gameplay path directly. */
 export const debugFlags = { botsFrozen: false }
 
-/** Length of the "they heard you" countdown after the first gun pickup. */
+/** Length of the "robot zombies incoming" countdown after the first gun pickup. */
 export const ALERT_SECONDS = 5
 
 export const waveState = {
@@ -69,8 +83,16 @@ export const waveState = {
   intermission: 4,
   /** Flips true on the first gun pickup — the lot stays peaceful before. */
   alerted: false,
-  /** Seconds left on the one-shot "they heard you" countdown once alerted. */
+  /** Seconds left on the one-shot alert countdown once alerted. */
   countdown: ALERT_SECONDS,
+  /**
+   * COUNTDOWN THEATRE FLAG — true for exactly the post-pickup alert window
+   * (gun picked up → countdown hits 0), false before, after, and on reset.
+   * Owned by enemies.tsx; the gun-table siren beacon reads it every frame to
+   * spin its red head + run sfx.sirenLoop while the HUD line ticks
+   * "⚠ AI robot zombies incoming — N". Poll it — no events fire.
+   */
+  countdownActive: false,
 }
 
 export function resetBots(): void {
@@ -79,6 +101,7 @@ export function resetBots(): void {
   waveState.intermission = 4
   waveState.alerted = false
   waveState.countdown = ALERT_SECONDS
+  waveState.countdownActive = false
   debugFlags.botsFrozen = false
 }
 
@@ -95,6 +118,10 @@ export function spawnBot(kind: BotKind, x: number, z: number): void {
     attackCooldown: 1,
     phase: Math.random() * Math.PI * 2,
     seed: Math.random() * 1000,
+    blockedT: 0,
+    followT: 0,
+    followSign: 1,
+    climb: 0,
   })
 }
 
