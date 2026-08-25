@@ -52,6 +52,12 @@ export type GameWorld = {
   walls: Map<string, { node: WallNodeLike; root: Object3D; meshes: Mesh[] }>
   glass: GlassPane[]
   doors: DoorEntry[]
+  /** Roots of engineering-overlay renderers (Bones X-ray members). Never
+   * solid or destructible — game-root hides them for the session via the
+   * restore ledger so no unbreakable ghost layer haunts voxelized walls.
+   * Optional only so hand-built test worlds don't have to carry it;
+   * collectWorld always returns it (possibly empty). */
+  overlayRoots?: Object3D[]
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -84,6 +90,12 @@ const SOLID_KINDS = [
   'dormer',
   'elevator',
 ]
+
+/** Registry kinds the Bones plugin registers for its overlay renderers
+ * (framing/CMU X-ray, lumber, service runs, devices). They draw members
+ * INSIDE walls, so once a wall voxelizes they'd read as an unbreakable
+ * ghost layer — collected here so the session can hide them wholesale. */
+const OVERLAY_KINDS = ['bones:framing', 'bones:lumber', 'bones:service', 'bones:device']
 
 const bvhCache = new WeakMap<BufferGeometry, MeshBVH>()
 
@@ -199,6 +211,18 @@ export function collectWorld(): GameWorld {
     }
   }
 
+  // Bones overlay roots — installations may predate any of these kinds, so
+  // guard every byType lookup (the map only has keys something registered).
+  const overlayRoots: Object3D[] = []
+  for (const kind of OVERLAY_KINDS) {
+    const ids = sceneRegistry.byType[kind]
+    if (!ids) continue
+    for (const id of ids) {
+      const root = sceneRegistry.nodes.get(id)
+      if (root) overlayRoots.push(root)
+    }
+  }
+
   // Spawn: outside the building along +X of its center, eye toward it.
   const spawn = new Vector3(6, 0, 6)
   let spawnYaw = Math.PI * 0.75
@@ -221,5 +245,5 @@ export function collectWorld(): GameWorld {
       }
     ).selectedLevelId ?? null
 
-  return { colliders, walls, glass, doors, buildingAabb, spawn, spawnYaw, levelId }
+  return { colliders, walls, glass, doors, overlayRoots, buildingAabb, spawn, spawnYaw, levelId }
 }

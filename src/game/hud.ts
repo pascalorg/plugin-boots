@@ -25,6 +25,10 @@ import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
  *   player.tsx's stagger loop) — heavy red pulse + centered 'shake it off'.
  *   Painted UNDER the directional edge-glow strips (DOM order) so damage
  *   flashes stay readable during a stagger.
+ * - editHint(text | null) — persistent mode-hint line for the builder's F
+ *   edit mode ('F edit · click toggle cells'), on its OWN element above the
+ *   shared prompt() line so door/table prompts never clobber it. Last write
+ *   wins; null hides it. Cleared automatically on unmount.
  */
 
 const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
@@ -36,6 +40,7 @@ const WEAPON_LABEL: Record<string, string> = {
   knife: 'KNIFE',
   pistol: 'PISTOL',
   rifle: 'RIFLE',
+  minigun: 'THE BIG ONE',
   builder: 'BUILD',
 }
 
@@ -44,6 +49,7 @@ export class Hud {
   private weaponEl: HTMLDivElement | null = null
   private healthEl: HTMLDivElement | null = null
   private promptEl: HTMLDivElement | null = null
+  private editHintEl: HTMLDivElement | null = null
   private hitmarkerEl: HTMLDivElement | null = null
   private edgeEls: HTMLDivElement[] | null = null
   private lowHpEl: HTMLDivElement | null = null
@@ -147,6 +153,11 @@ export class Hud {
     )
     this.promptEl = el(
       `position:absolute;left:50%;bottom:96px;transform:translateX(-50%);color:#fff;font:${FONT};background:rgba(0,0,0,0.5);padding:6px 12px;border-radius:6px;opacity:0`,
+    )
+    // Builder edit-mode hint — its own line above prompt() so interaction
+    // prompts (doors, gun table) can come and go without clobbering it.
+    this.editHintEl = el(
+      `position:absolute;left:50%;bottom:132px;transform:translateX(-50%);color:rgba(255,255,255,0.85);font:${FONT};font-size:12px;letter-spacing:0.08em;background:rgba(0,0,0,0.4);padding:4px 10px;border-radius:6px;opacity:0;transition:opacity 0.15s`,
     )
     el(
       `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em`,
@@ -253,6 +264,17 @@ export class Hud {
     if (this.waveEl) this.waveEl.textContent = text ?? ''
   }
 
+  /**
+   * Builder edit-mode hint line ('F edit · click toggle cells'). Persistent
+   * until cleared with null — dedicated element, so the shared prompt()
+   * line stays free for doors/gun-table interactions. Last write wins.
+   */
+  editHint(text: string | null): void {
+    if (!this.editHintEl) return
+    this.editHintEl.textContent = text ?? ''
+    this.editHintEl.style.opacity = text ? '1' : '0'
+  }
+
   hitmarker(): void {
     if (!this.hitmarkerEl) return
     this.hitmarkerEl.style.opacity = '1'
@@ -308,6 +330,7 @@ export class Hud {
     this.hitTimer = this.flashTimer = this.beatTimer = this.relaxTimer = null
     this.root?.remove()
     this.root = null
+    this.editHintEl = null
     this.edgeEls = null
     this.lowHpEl = null
     this.staggerEl = null

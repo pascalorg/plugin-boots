@@ -28,6 +28,7 @@ const GAME_KEYS = new Set([
   'KeyQ',
   'KeyR',
   'KeyB',
+  'KeyF',
   'KeyG',
   'KeyZ',
   'Digit1',

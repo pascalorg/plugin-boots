@@ -7,25 +7,47 @@ import {
   DynamicDrawUsage,
   type InstancedMesh,
   Matrix4,
-  type Mesh,
-  MeshStandardMaterial,
   Quaternion,
   Vector3,
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
 
 /**
- * Renders every voxelized target as one InstancedMesh of voxels (for walls:
- * the two drywall skins), plus the stud cavity revealed as the shell breaks.
- * Voxel removal writes a zero-scale matrix at the voxel's index — indices
- * stay stable, uploads stay small.
+ * Renders every voxelized target as the phase-3 WALL SANDWICH, one
+ * InstancedMesh (= one draw call) per layer per target:
  *
- * Studs are individual meshes (≤ ~40 per wall) driven by StudMember state:
- * intact = wood box, damaged (hp below max) = darker tint + pinched
- * cross-section (the dent), broken = hidden (debris already covered the
- * fall). Chip damage does NOT bump the target revision (only breaks do), so
- * stud visuals sync every frame — an allocation-free pass of plain
- * assignments over a handful of meshes.
+ *   1. SKINS — the two drywall voxel shells, cube voxels with per-instance
+ *      shade jitter and a 1.5% cell inset so faces never merge visually.
+ *      This is the DEFAULT look of every wall from session start (targets
+ *      are pre-voxelized on enter), so it has to read clean and cozy at a
+ *      glance. Voxel removal writes a zero-scale matrix at the voxel's
+ *      index on revision bumps — indices stay stable, uploads stay small.
+ *   2. BOARDS — flat drywall plates behind the voxels (#e8e4dc, faint
+ *      per-plate shade jitter, ~1% per-plate inset for the hairline seam
+ *      read). Torn plates hide via zero-scale.
+ *   3. SEGMENTS — the framing lumber as charcoal-stick segments (real
+ *      skinny cross-section from the member's own size, #b08d57 with
+ *      jitter, ~1% inset so the break points articulate). Broken segments
+ *      hide via zero-scale; chipped ones tint darker and pinch their
+ *      cross-section (the dent).
+ *
+ * Boards/segments sync from a per-frame allocation-free checksum over the
+ * member arrays (hp + broken/torn), NOT the removedQueue — chip damage
+ * never bumps the target revision, and a wholesale matrix re-upload of a
+ * ≤ ~100-instance layer is cheaper than bookkeeping. The skin layer keeps
+ * the classic queue-drain on revision bumps.
+ *
+ * Until destruction-core lands `boards`/`segments` on VoxelTarget this
+ * file reads them as OPTIONAL fields (structural `SandwichMember` shape,
+ * a superset of StudMember) and falls back to rendering `studs` as the
+ * segments layer — which also replaces the old ≤40-meshes-per-wall stud
+ * rendering with a single instanced draw.
+ *
+ * CONTRACT for destruction-core: layer arrays must be fixed-length after
+ * voxelize (breaking marks members `broken`/`torn`; never push/splice),
+ * members carry { id, center, size, yaw, hp?, broken?/torn? }, and any
+ * member state change bumps `revision` OR just mutates hp/flags (both are
+ * picked up — the checksum runs every frame).
  */
 
 const _matrix = new Matrix4()
@@ -36,50 +58,174 @@ const _color = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 const UP = new Vector3(0, 1, 0)
 
-// Shared stud materials — swapped per mesh on damage, never mutated.
-const STUD_WOOD = new MeshStandardMaterial({ color: '#b08d57', roughness: 0.85 })
-const STUD_WOOD_DAMAGED = new MeshStandardMaterial({ color: '#8f6f45', roughness: 0.85 })
+/** Structural superset of destruction.ts's StudMember — boards may use
+ * `torn`, wood uses `broken`; hp is optional for binary members. */
+type SandwichMember = {
+  id: number
+  center: [number, number, number]
+  size: [number, number, number]
+  yaw: number
+  hp?: number
+  broken?: boolean
+  torn?: boolean
+}
 
-/** Apply StudMember state to the stud meshes: visibility, tint, dent. */
-function syncStuds(target: VoxelTarget, refs: (Mesh | null)[], maxHp: number): void {
-  for (let i = 0; i < target.studs.length; i++) {
-    const mesh = refs[i]
-    if (!mesh) continue
-    const stud = target.studs[i]!
-    mesh.visible = !stud.broken
-    if (stud.broken) continue
-    const damaged = stud.hp < maxHp
-    mesh.material = damaged ? STUD_WOOD_DAMAGED : STUD_WOOD
-    if (damaged) {
+/** VoxelTarget with the (soon-canonical) phase-3 layer fields. */
+type SandwichTarget = VoxelTarget & {
+  boards?: SandwichMember[]
+  segments?: SandwichMember[]
+}
+
+const BOARD_BASE = new Color('#e8e4dc')
+const BOARD_DAMAGED = new Color('#d8d1c2')
+const WOOD_BASE = new Color('#b08d57')
+const WOOD_DAMAGED = new Color('#8f6f45')
+
+function isGone(m: SandwichMember): boolean {
+  return m.broken === true || m.torn === true
+}
+
+/** Cheap dirty signal over a member layer — plain arithmetic, no allocs.
+ * Changes whenever any member's hp moves or its broken/torn flag flips. */
+function layerChecksum(members: SandwichMember[]): number {
+  let h = members.length
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i]!
+    h += isGone(m) ? 1013 * (i + 1) : (m.hp ?? 1) * 3 + i
+  }
+  return h
+}
+
+/** Write every member's matrix + color. Gone members get the zero matrix. */
+function uploadLayer(
+  mesh: InstancedMesh,
+  members: SandwichMember[],
+  base: Color,
+  damaged: Color,
+  jitter: number,
+  inset: number,
+  pinch: boolean,
+  maxHp: number,
+): void {
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i]!
+    if (isGone(m)) {
+      mesh.setMatrixAt(i, ZERO)
+      continue
+    }
+    const [sx, sy, sz] = m.size
+    _scale.set(sx * inset, sy * inset, sz * inset)
+    const hp = m.hp ?? maxHp
+    const isDamaged = hp < maxHp
+    if (pinch && isDamaged) {
       // The dent: pinch the cross-section, keep the long axis full length
       // (plates lie sideways, so pick axes by size instead of assuming Y).
-      const pinch = 0.6 + (0.4 * Math.max(0, stud.hp)) / maxHp
-      const [sx, sy, sz] = stud.size
-      if (sx >= sy && sx >= sz) mesh.scale.set(1, pinch, pinch)
-      else if (sy >= sx && sy >= sz) mesh.scale.set(pinch, 1, pinch)
-      else mesh.scale.set(pinch, pinch, 1)
-    } else {
-      mesh.scale.set(1, 1, 1)
+      const p = 0.6 + (0.4 * Math.max(0, hp)) / maxHp
+      if (sx >= sy && sx >= sz) {
+        _scale.y *= p
+        _scale.z *= p
+      } else if (sy >= sx && sy >= sz) {
+        _scale.x *= p
+        _scale.z *= p
+      } else {
+        _scale.x *= p
+        _scale.y *= p
+      }
     }
+    if (m.yaw === 0) _quat.identity()
+    else _quat.setFromAxisAngle(UP, -m.yaw)
+    _pos.set(m.center[0], m.center[1], m.center[2])
+    _matrix.compose(_pos, _quat, _scale)
+    mesh.setMatrixAt(i, _matrix)
+    if (isDamaged) {
+      _color.copy(damaged)
+    } else {
+      const j = ((i * 2654435761) % 97) / 97
+      _color.copy(base).offsetHSL(0, 0, (j - 0.5) * jitter)
+    }
+    mesh.setColorAt(i, _color)
   }
+  mesh.instanceMatrix.needsUpdate = true
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+}
+
+/** One sandwich layer (boards or segments) as a single InstancedMesh. */
+function MemberLayer({
+  members,
+  base,
+  damaged,
+  jitter,
+  inset,
+  pinch,
+  roughness,
+}: {
+  members: SandwichMember[]
+  base: Color
+  damaged: Color
+  jitter: number
+  inset: number
+  pinch: boolean
+  roughness: number
+}) {
+  const meshRef = useRef<InstancedMesh>(null!)
+  const checksum = useRef(Number.NaN)
+  const maxHp = useRef(1)
+
+  useLayoutEffect(() => {
+    const mesh = meshRef.current
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage)
+    mesh.frustumCulled = false
+    // Full hp = the healthiest member at voxelize time (fresh members are
+    // all at max; robust even if we mount mid-fight).
+    let max = 1
+    for (const m of members) if ((m.hp ?? 1) > max) max = m.hp ?? 1
+    maxHp.current = max
+    uploadLayer(mesh, members, base, damaged, jitter, inset, pinch, max)
+    checksum.current = layerChecksum(members)
+  }, [members, base, damaged, jitter, inset, pinch])
+
+  useFrame(() => {
+    const mesh = meshRef.current
+    if (!mesh) return
+    // Chips (hp loss without break) never bump revision, so poll the cheap
+    // checksum every frame and re-upload the whole small layer on change.
+    const h = layerChecksum(members)
+    if (h === checksum.current) return
+    checksum.current = h
+    uploadLayer(mesh, members, base, damaged, jitter, inset, pinch, maxHp.current)
+  })
+
+  return (
+    <instancedMesh args={[undefined, undefined, members.length]} ref={meshRef}>
+      <boxGeometry />
+      <meshStandardMaterial roughness={roughness} />
+    </instancedMesh>
+  )
 }
 
 function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
-  const studRefs = useRef<(Mesh | null)[]>([])
-  const studMaxHp = useRef(1)
   const revision = useRef(-1)
+  const sandwich = wall as SandwichTarget
+  const boards = sandwich.boards
+  // Until destruction-core lands `segments`, the studs render as the wood
+  // layer — same member shape, same single-draw-call path.
+  const segments =
+    sandwich.segments && sandwich.segments.length > 0 ? sandwich.segments : wall.studs
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
     const { grid } = wall
     mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    // Per-axis scale: anisotropic wall grids have thin skin cells along the
-    // thickness axis — a uniform grid.cell cube would visually fill the cavity.
-    _scale.set(grid.cellX * 0.99, grid.cellY * 0.99, grid.cellZ * 0.99)
+    // Per-axis scale with a 1.5% inset: anisotropic wall grids have thin
+    // skin cells along the thickness axis (a uniform grid.cell cube would
+    // visually fill the cavity), and the inset keeps each cube's face from
+    // merging with its neighbors — the clean "block" read walls now wear
+    // from session start.
+    _scale.set(grid.cellX * 0.985, grid.cellY * 0.985, grid.cellZ * 0.985)
     // Yaw-local grids (diagonal walls): cells are axis-aligned in the grid's
-    // rotated frame — rotate each instance out to world (matches stud meshes'
-    // rotation={[0, -yaw, 0]}). World-aligned grids keep identity.
+    // rotated frame — rotate each instance out to world (matches the member
+    // layers' per-member yaw). World-aligned grids keep identity.
     if (grid.yaw === 0) _quat.identity()
     else _quat.setFromAxisAngle(UP, -grid.yaw)
     for (let i = 0; i < grid.count; i++) {
@@ -90,21 +236,18 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
       } else {
         mesh.setMatrixAt(i, ZERO)
       }
-      // Subtle per-voxel shade jitter — the "block" read.
-      const jitter = ((i * 2654435761) % 97) / 97
-      _color.copy(wall.baseColor).offsetHSL(0, 0, (jitter - 0.5) * 0.09)
+      // Per-voxel shade jitter — the "block" read. Two independent hashes:
+      // a value spread plus a whisper of saturation drift so runs of voxels
+      // never band into flat stripes.
+      const j1 = ((i * 2654435761) % 97) / 97
+      const j2 = ((i * 1597334677) % 89) / 89
+      _color.copy(wall.baseColor).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
       mesh.setColorAt(i, _color)
     }
     mesh.instanceMatrix.needsUpdate = true
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
     mesh.frustumCulled = false
     revision.current = wall.revision
-    // Full hp = the healthiest member at voxelize time (fresh studs are
-    // all at max; robust even if we mount mid-fight).
-    let max = 1
-    for (const stud of wall.studs) if (stud.hp > max) max = stud.hp
-    studMaxHp.current = max
-    syncStuds(wall, studRefs.current, max)
   }, [wall])
 
   useFrame(() => {
@@ -112,14 +255,11 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
     if (!mesh) return
     if (revision.current !== wall.revision) {
       revision.current = wall.revision
-      for (const idx of wall.removedQueue.splice(0)) {
-        mesh.setMatrixAt(idx, ZERO)
-      }
+      const queue = wall.removedQueue
+      for (let i = 0; i < queue.length; i++) mesh.setMatrixAt(queue[i]!, ZERO)
+      queue.length = 0
       mesh.instanceMatrix.needsUpdate = true
     }
-    // Studs sync unconditionally: chips (hp loss without break) never bump
-    // revision. Plain assignments only — no allocations.
-    syncStuds(wall, studRefs.current, studMaxHp.current)
   })
 
   return (
@@ -128,19 +268,28 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
         <boxGeometry />
         <meshStandardMaterial roughness={0.92} />
       </instancedMesh>
-      {wall.studs.map((stud, i) => (
-        <mesh
-          key={`${wall.nodeId}-stud-${stud.id}`}
-          material={STUD_WOOD}
-          position={stud.center}
-          ref={(m: Mesh | null) => {
-            studRefs.current[i] = m
-          }}
-          rotation={[0, -stud.yaw, 0]}
-        >
-          <boxGeometry args={stud.size} />
-        </mesh>
-      ))}
+      {boards && boards.length > 0 && (
+        <MemberLayer
+          base={BOARD_BASE}
+          damaged={BOARD_DAMAGED}
+          inset={0.99}
+          jitter={0.05}
+          members={boards}
+          pinch={false}
+          roughness={0.95}
+        />
+      )}
+      {segments.length > 0 && (
+        <MemberLayer
+          base={WOOD_BASE}
+          damaged={WOOD_DAMAGED}
+          inset={0.99}
+          jitter={0.1}
+          members={segments}
+          pinch={true}
+          roughness={0.85}
+        />
+      )}
     </group>
   )
 }

@@ -1,7 +1,10 @@
 import { create } from 'zustand'
 
 export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'minigun' | 'builder'
-export type BuildPiece = 'wall' | 'floor' | 'ramp'
+export type BuildPiece = 'wall' | 'floor' | 'roof'
+
+/** All nine cells of a piece's 3×3 grid alive (see PlacedPiece.mask). */
+export const FULL_MASK = 0b111111111
 
 /** A build-mode placement, in world space. Game-only until Keep converts it
  * into real scene nodes; Discard drops the list. */
@@ -12,6 +15,13 @@ export type PlacedPiece = {
   position: [number, number, number]
   /** Yaw around Y, snapped to 90°. */
   yaw: number
+  /** 9-bit build-battle cell mask — bit (col + row·3) set = cell alive.
+   * Columns run along the piece's local +X (col 0 at −X); wall rows climb
+   * (row 0 = bottom), floor/roof rows run along local +Z (row 0 at −Z —
+   * a roof's LOW edge). 511 (FULL_MASK) = intact piece. Edited in-game
+   * with the builder's F edit mode; Keep reads it to trim walls and
+   * pocket windows/doors. */
+  mask: number
 }
 
 export type BootsPhase = 'editor' | 'game'
@@ -43,7 +53,10 @@ type BootsState = {
   setHealth: (health: number) => void
   setStaggered: (staggered: boolean) => void
   setBuildPiece: (piece: BuildPiece) => void
-  addPlaced: (piece: Omit<PlacedPiece, 'id'>) => void
+  addPlaced: (piece: Omit<PlacedPiece, 'id' | 'mask'> & { mask?: number }) => void
+  /** Replace one placed piece's 9-bit cell mask (builder F edit mode).
+   * The piece object is swapped, so its mesh + collider re-register. */
+  setPlacedMask: (id: number, mask: number) => void
   removeLastPlaced: () => PlacedPiece | undefined
   resolvePlaced: () => void
   setPendingDecision: (pending: boolean) => void
@@ -73,7 +86,14 @@ export const useBoots = create<BootsState>((set, get) => ({
   setHealth: (health) => set({ health }),
   setStaggered: (staggered) => set({ staggered }),
   setBuildPiece: (buildPiece) => set({ buildPiece }),
-  addPlaced: (piece) => set((s) => ({ placed: [...s.placed, { ...piece, id: placedId++ }] })),
+  addPlaced: (piece) =>
+    set((s) => ({
+      placed: [...s.placed, { mask: FULL_MASK, ...piece, id: placedId++ }],
+    })),
+  setPlacedMask: (id, mask) =>
+    set((s) => ({
+      placed: s.placed.map((p) => (p.id === id ? { ...p, mask: mask & FULL_MASK } : p)),
+    })),
   removeLastPlaced: () => {
     const s = get()
     const last = s.placed[s.placed.length - 1]

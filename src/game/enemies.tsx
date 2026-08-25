@@ -126,7 +126,7 @@ export function Enemies({ world }: { world: GameWorld }) {
 
     // Wave director: peaceful grace → one-shot alert countdown → waves.
     if (!waveState.alerted) {
-      if (boots.owned.includes('pistol') || boots.owned.includes('rifle')) {
+      if (boots.owned.includes('pistol') || boots.owned.includes('rifle') || boots.owned.includes('minigun')) {
         waveState.alerted = true
         waveState.countdown = ALERT_SECONDS
         // Distant machine spin-up under the ticking line (stop any stale

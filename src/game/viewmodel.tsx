@@ -141,7 +141,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         const next = list[(at + (action === 'WheelDown' ? 1 : list.length - 1)) % list.length]!
         switchWeapon(next)
       } else if (action === 'KeyQ' && state.weapon === 'builder') {
-        const order = ['wall', 'floor', 'ramp'] as const
+        const order = ['wall', 'floor', 'roof'] as const
         state.setBuildPiece(order[(order.indexOf(state.buildPiece) + 1) % order.length]!)
       }
     }

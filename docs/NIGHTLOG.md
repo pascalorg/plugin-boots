@@ -366,3 +366,62 @@ Rough / next (morning):
   untested on blank-canvas QA scenes (seed a door into the QA recipe).
 
 Checks: `bun run check-types` clean, `bun test` 84 pass / 2429 expects.
+
+## Phase 3, Round 1 — 2026-08-25 (3x3 build grammar, sandwich-ready renderer/routes, manager close)
+
+Two of eight workers (wall-sandwich = destruction core, trees-fire) failed
+to land; everything that touches them is feature-detected and inert until
+their APIs exist, so the tree stays green and live-testable.
+
+- **3x3 build grammar** (store.ts / builder.tsx / keep.ts / builder.test.ts):
+  `BuildPiece` ramp→**roof** rename; every `PlacedPiece` carries a 9-bit
+  `mask` (bit = col + row·3, `FULL_MASK = 511`, `setPlacedMask` swaps the
+  piece so mesh+collider re-register). Pieces render as merged-box geometry
+  of live cells (cached per piece+mask); one merged collider per piece.
+  **F edit mode**: builder equipped + F on a placed piece ≤6 m → 3×3 cell
+  overlay (gold hover / blue live / red dead), LMB toggles a cell, F exits.
+  **Keep mapping**: 511→plain wall; dead end-columns→shorter wall; center
+  pocket→wall+WINDOW node; bottom-center pocket→wall+DOOR node; roofs
+  attempt real shed `roof-segment` nodes (pitch ≈43°); floors game-only.
+  New planning API in builder.tsx (`raycastPieceCell`, `planWallMask`,
+  `trimmedWallSpan`…), re-exported by keep.ts; +31 test suites.
+- **Sandwich-ready renderer** (voxel-walls.tsx): rewritten — skins keep the
+  queue-drain but allocation-free; NEW instanced `MemberLayer` draws
+  `target.boards` (flat drywall plates, hairline seams) and
+  `target.segments` (skinny lumber, chip-tint + pinch) as ONE InstancedMesh
+  each, synced by an alloc-free hp/flag checksum; legacy `studs` render
+  through the same instanced path (≤40 meshes/wall → 1 draw call).
+- **Shot routing** (shooting.ts): priority ladder solid→skin→board→segment
+  →tree→glass→bot with 1 cm near-tie window; phase-3 façade
+  (`raycastBoards`/`damageBoard`/`raycastSegments`/`damageSegment`) is
+  existence-guarded — segments fall back to the legacy stud lane today;
+  carves pass shot direction; every hit class puffs dust;
+  `registerTreeRoutes()` lets the future trees module plug in combat;
+  `FireOutcome` gains 'tree'.
+- **Wiring** (input.ts / world.ts / game-root.tsx / hud.ts): `KeyF` in
+  GAME_KEYS; Bones overlay roots (`bones:framing/lumber/service/device`)
+  collected in `world.overlayRoots` and hidden via the session ledger — the
+  unbreakable X-ray ghost layer is gone; `<Prevoxelize/>` drives
+  `destruction.prevoxelizeTick(world, 2)` per frame (feature-detected,
+  no-ops until wall-sandwich lands); `hud.editHint()` line above prompts;
+  `__boots` debug gains boards()/segments()/trees()/pieces().
+- **Manager close**: minigun now trips the gun-pickup alert (enemies.tsx)
+  and gets a HUD label ('THE BIG ONE'); builder drives `hud.editHint` on
+  edit-mode enter/exit; panel.tsx copy refreshed (roofs try real nodes,
+  slot-5 + F-edit controls, Keep result surfaces windows/doors/roofs).
+
+Rough / next (round 2):
+- wall-sandwich MUST land: pre-voxelized cladding at spawn
+  (`prevoxelizeTick`), `boards`/`segments` members + damage/raycast APIs
+  (contracts pinned in shooting.ts + voxel-walls.tsx doc blocks),
+  paper-tear plates (`spawnFlatDebris` + `sfx.paperTear`), charcoal-stick
+  segments (`sfx.charSnap`), floating-island collapse for item voxels.
+- trees-fire MUST land: trees-destruct.tsx (voxel collapse or ignite→
+  charcoal→stump), `registerTreeRoutes` at init, `sfx.treeCrackle` drive,
+  `<TreesDestruct/>` mount + trees() debug swap in game-root.
+- player.tsx: optional `playerRig.speedScale` so a spun-up heavy gun can
+  slow the carrier (minigun agent's ask).
+- viewmodel Q piece-cycling isn't edit-mode-aware (harmless; builderDebug
+  could expose isEditing).
+
+Checks: `bun run check-types` clean, `bun test` 98 pass / 2489 expects.

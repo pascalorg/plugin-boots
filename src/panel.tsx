@@ -56,8 +56,15 @@ export default function BootsPanel() {
               className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
               onClick={() => {
                 const result = keepPlaced()
+                const extras = [
+                  result.roofs > 0 ? `${result.roofs} roof${result.roofs === 1 ? '' : 's'}` : '',
+                  result.windows > 0 ? `${result.windows} window${result.windows === 1 ? '' : 's'}` : '',
+                  result.doors > 0 ? `${result.doors} door${result.doors === 1 ? '' : 's'}` : '',
+                ]
+                  .filter(Boolean)
+                  .join(', ')
                 setLastKept(
-                  `Kept ${result.kept} wall${result.kept === 1 ? '' : 's'}${
+                  `Kept ${result.kept} wall${result.kept === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
                     result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''
                   }`,
                 )
@@ -79,7 +86,7 @@ export default function BootsPanel() {
           </div>
           {otherCount > 0 && (
             <p className="text-[11px] text-sidebar-foreground/40">
-              Floors & ramps stay game-only for now.
+              Roofs try to become real roof segments; floors stay game-only for now.
             </p>
           )}
         </section>
@@ -93,8 +100,9 @@ export default function BootsPanel() {
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the table</p>
         <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
-        <p>1 knife · 2 pistol · 3 rifle · 4/B build</p>
+        <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one</p>
         <p>Q cycle piece · hold click to place a run · G undo · Esc exit</p>
+        <p>F edits a placed piece's 3×3 cells — pocket the middle for a window.</p>
         <p>Pieces snap to what you've placed — look up to stack walls, cap them with floors.</p>
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
       </section>
