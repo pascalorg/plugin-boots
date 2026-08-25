@@ -336,13 +336,22 @@ export function raycastYawObb(
   return tMin
 }
 
-/** Kill every live voxel within `radius` of a world point. Returns their indices. */
+/** Restrict a removeSphere carve to ONE skin of a layered wall grid: only
+ * cells on `side` of `axis` (0 = min-face layer half, 1 = max-face half —
+ * same split rule as the sheet builder) are removed. The pierce-through fix:
+ * a shot that enters one drywall face must not also delete the far face. */
+export type SkinLimit = { axis: 0 | 1 | 2; side: 0 | 1 }
+
+/** Kill every live voxel within `radius` of a world point. Returns their
+ * indices. Pass `skin` to confine the carve to one face layer of a layered
+ * wall grid (see SkinLimit). */
 export function removeSphere(
   grid: VoxelGridData,
   x: number,
   y: number,
   z: number,
   radius: number,
+  skin?: SkinLimit,
 ): number[] {
   const removed: number[] = []
   const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
@@ -363,11 +372,20 @@ export function removeSphere(
   const minZ = Math.max(0, Math.floor((lz - radius - origin.z) / cellZ))
   const maxZ = Math.min(nz - 1, Math.floor((lz + radius - origin.z) / cellZ))
   const r2 = radius * radius
+  const skinAxis = skin?.axis ?? -1
+  const skinSpan = skinAxis === 0 ? nx : skinAxis === 1 ? ny : nz
   for (let iz = minZ; iz <= maxZ; iz++) {
     for (let iy = minY; iy <= maxY; iy++) {
       for (let ix = minX; ix <= maxX; ix++) {
         const idx = grid.index.get(gridKey(ix, iy, iz, nx, ny))
         if (idx === undefined || !grid.alive[idx]) continue
+        if (skin) {
+          // Same min/max-half split as the sheet builder — cells on the
+          // other face layer survive the carve untouched.
+          const c = grid.coords[idx * 3 + skinAxis]!
+          const side = c * 2 < skinSpan - 1 ? 0 : 1
+          if (side !== skin.side) continue
+        }
         const dx = grid.centers[idx * 3]! - x
         const dy = grid.centers[idx * 3 + 1]! - y
         const dz = grid.centers[idx * 3 + 2]! - z
@@ -488,7 +506,7 @@ export function raycastVoxels(
  * the caller can crumble them into debris.
  */
 export function findUnsupportedIslands(grid: VoxelGridData): number[][] {
-  const { count, coords, nx, ny, index } = grid
+  const { count, coords, nx, ny, nz, index } = grid
   const seen = new Uint8Array(count)
   const stack: number[] = []
   for (let i = 0; i < count; i++) {
@@ -511,7 +529,15 @@ export function findUnsupportedIslands(grid: VoxelGridData): number[][] {
     const iy = coords[i * 3 + 1]!
     const iz = coords[i * 3 + 2]!
     for (const [ax, ay, az] of neighbors) {
-      const j = index.get(gridKey(ix + ax, iy + ay, iz + az, nx, ny))
+      const jx = ix + ax
+      const jy = iy + ay
+      const jz = iz + az
+      // Bounds check BEFORE the key lookup: gridKey is a flat linearization,
+      // so an out-of-range coordinate aliases a real cell elsewhere (e.g.
+      // -y off the base row = the TOP row of the previous z-slab) and the
+      // flood would teleport into floating islands and call them supported.
+      if (jx < 0 || jx >= nx || jy < 0 || jy >= ny || jz < 0 || jz >= nz) continue
+      const j = index.get(gridKey(jx, jy, jz, nx, ny))
       if (j === undefined || seen[j] || !grid.alive[j]) continue
       seen[j] = 1
       stack.push(j)
@@ -532,7 +558,11 @@ export function findUnsupportedIslands(grid: VoxelGridData): number[][] {
       const iy = coords[k * 3 + 1]!
       const iz = coords[k * 3 + 2]!
       for (const [ax, ay, az] of neighbors) {
-        const j = index.get(gridKey(ix + ax, iy + ay, iz + az, nx, ny))
+        const jx = ix + ax
+        const jy = iy + ay
+        const jz = iz + az
+        if (jx < 0 || jx >= nx || jy < 0 || jy >= ny || jz < 0 || jz >= nz) continue
+        const j = index.get(gridKey(jx, jy, jz, nx, ny))
         if (j === undefined || grouped[j] || seen[j] || !grid.alive[j]) continue
         grouped[j] = 1
         work.push(j)

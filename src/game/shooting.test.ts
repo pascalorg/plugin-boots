@@ -72,6 +72,7 @@ function makeWorld(): GameWorld {
     ]),
     glass: [],
     doors: [],
+    overlayRoots: [],
     buildingAabb,
     spawn: new Vector3(6, 0, 6),
     spawnYaw: 0,

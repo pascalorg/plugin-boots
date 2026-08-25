@@ -7,8 +7,6 @@ import {
   CanvasTexture,
   CircleGeometry,
   Color,
-  ConeGeometry,
-  CylinderGeometry,
   type InstancedMesh,
   Matrix4,
   Path,
@@ -168,9 +166,16 @@ function groundGeometry(world: GameWorld): BufferGeometry {
   return geometry
 }
 
-type Scatter = { matrices: Matrix4[]; colors: Color[] }
+export type Scatter = { matrices: Matrix4[]; colors: Color[] }
 
-function scatter(
+/**
+ * Deterministic ring scatter around the building, rejecting the footprint
+ * (+ pad). `make` fills the matrix and returns the instance color; it may
+ * also record placements into its own side arrays — trees-destruct.tsx
+ * does exactly that to build combat trees on the same layout. Exported so
+ * flora placement stays one algorithm across modules.
+ */
+export function scatter(
   world: GameWorld,
   seed: number,
   count: number,
@@ -239,12 +244,6 @@ export function Nature({ world }: { world: GameWorld }) {
 
   const flowerGeometry = useMemo(() => new CircleGeometry(1, 7).rotateX(-Math.PI / 2), [])
 
-  const trunkGeometry = useMemo(
-    () => new CylinderGeometry(0.14, 0.2, 2.4).translate(0, 1.2, 0),
-    [],
-  )
-  const canopyGeometry = useMemo(() => new ConeGeometry(1.5, 3.4, 8).translate(0, 3.6, 0), [])
-
   const grass = useMemo(
     () =>
       // Bias 0.72 packs clumps denser near the building; the distance term
@@ -280,17 +279,9 @@ export function Nature({ world }: { world: GameWorld }) {
     [world],
   )
 
-  const trees = useMemo(
-    () =>
-      scatter(world, 23, 46, 12, 60, (rand, position, matrix) => {
-        _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
-        const s = 0.8 + rand() * 0.9
-        _scale.setScalar(s)
-        matrix.compose(position, _quat, _scale)
-        return new Color('#3f6d33').offsetHSL(0, 0, (rand() - 0.5) * 0.08)
-      }),
-    [world],
-  )
+  // Trees moved to trees-destruct.tsx: they are combat targets now (voxel
+  // fell / burn / char / stump), so the module that damages them owns their
+  // instances. Same scatter algorithm + seed, so the grove looks identical.
 
   const bushes = useMemo(
     () =>
@@ -347,32 +338,6 @@ export function Nature({ world }: { world: GameWorld }) {
         ref={(mesh) => setInstances(mesh, flowers)}
       >
         <meshStandardMaterial roughness={1} />
-      </instancedMesh>
-
-      {/* Trees: trunk + canopy share the scatter transforms. */}
-      <instancedMesh
-        args={[trunkGeometry, undefined, trees.matrices.length]}
-        frustumCulled={false}
-        ref={(mesh) => {
-          if (!mesh) return
-          const trunk = new Color('#6b4f35')
-          for (let i = 0; i < trees.matrices.length; i++) {
-            mesh.setMatrixAt(i, trees.matrices[i]!)
-            mesh.setColorAt(i, trunk)
-          }
-          mesh.count = trees.matrices.length
-          mesh.instanceMatrix.needsUpdate = true
-          if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
-        }}
-      >
-        <meshStandardMaterial roughness={0.95} />
-      </instancedMesh>
-      <instancedMesh
-        args={[canopyGeometry, undefined, trees.matrices.length]}
-        frustumCulled={false}
-        ref={(mesh) => setInstances(mesh, trees)}
-      >
-        <meshStandardMaterial roughness={0.95} />
       </instancedMesh>
 
       <instancedMesh

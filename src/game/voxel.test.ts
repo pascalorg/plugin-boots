@@ -53,6 +53,43 @@ describe('removeSphere', () => {
   })
 })
 
+describe('removeSphere skin limit', () => {
+  test('confines the carve to the entered face layer', () => {
+    // 10 × 5 × 3 box skinned to z-layers 0 and 2 — the wall sandwich.
+    const geometry = new BoxGeometry(2, 1, 0.6)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.3), new Vector3(1, 0.5, 0.3))
+    const grid = dropInteriorCells(
+      buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.2),
+    )
+    // A sphere wide enough to span both skins, limited to the min face.
+    const removed = removeSphere(grid, 0, 0, -0.3, 0.7, { axis: 2, side: 0 })
+    expect(removed.length).toBeGreaterThan(0)
+    for (const idx of removed) expect(grid.coords[idx * 3 + 2]).toBe(0)
+    // The far skin never lost a cell.
+    for (let i = 0; i < grid.count; i++) {
+      if (grid.coords[i * 3 + 2] === 2) expect(grid.alive[i]).toBe(1)
+    }
+    // The same sphere aimed at the far side finishes the job.
+    const removed2 = removeSphere(grid, 0, 0, 0.3, 0.7, { axis: 2, side: 1 })
+    expect(removed2.length).toBeGreaterThan(0)
+    for (const idx of removed2) expect(grid.coords[idx * 3 + 2]).toBe(2)
+  })
+
+  test('no limit removes both skins (the old behavior stays available)', () => {
+    const geometry = new BoxGeometry(2, 1, 0.6)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.3), new Vector3(1, 0.5, 0.3))
+    const grid = dropInteriorCells(
+      buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.2),
+    )
+    const removed = removeSphere(grid, 0, 0, -0.3, 0.7)
+    const layers = new Set(removed.map((idx) => grid.coords[idx * 3 + 2]!))
+    expect(layers.has(0)).toBe(true)
+    expect(layers.has(2)).toBe(true)
+  })
+})
+
 describe('raycastVoxels', () => {
   test('hits the wall face first', () => {
     const grid = wallGrid()
@@ -357,6 +394,37 @@ describe('findUnsupportedIslands', () => {
     expect(islands[0]!.length).toBe(20) // two full rows of 10×1
     for (const idx of islands[0]!) {
       expect(grid.coords[idx * 3 + 1]!).toBeGreaterThan(2)
+    }
+  })
+
+  test('multi-slab SOLID volumes detach too (index-wraparound regression)', () => {
+    // gridKey is a flat linearization, so an unchecked -y neighbor from a
+    // base seed used to alias the TOP row of the previous z-slab — the
+    // flood teleported into the floating half of any nz ≥ 2 solid volume
+    // (the severed-shower bug) and reported zero islands.
+    const geometry = new BoxGeometry(0.9, 2.4, 0.9)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-0.45, -1.2, -0.45), new Vector3(0.45, 1.2, 0.45))
+    const grid = buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.15, true)
+    expect(grid.nz).toBeGreaterThan(1)
+    expect(findUnsupportedIslands(grid)).toHaveLength(0)
+    // Sever at mid-height: kill every cell in rows 7 and 8.
+    let killed = 0
+    for (let i = 0; i < grid.count; i++) {
+      const iy = grid.coords[i * 3 + 1]!
+      if (iy === 7 || iy === 8) {
+        grid.alive[i] = 0
+        grid.aliveCount--
+        killed++
+      }
+    }
+    expect(killed).toBeGreaterThan(0)
+    const islands = findUnsupportedIslands(grid)
+    expect(islands).toHaveLength(1)
+    // The whole top block (rows 9..15) is the island.
+    expect(islands[0]!.length).toBe(grid.nx * grid.nz * (grid.ny - 9))
+    for (const idx of islands[0]!) {
+      expect(grid.coords[idx * 3 + 1]!).toBeGreaterThan(8)
     }
   })
 })

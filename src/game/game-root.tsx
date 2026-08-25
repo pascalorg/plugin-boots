@@ -1,25 +1,29 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Object3D } from 'three'
 import { useBoots } from '../store'
 import { Builder, PlacedPieces } from './builder'
 import { clearDebris, Debris } from './debris'
-import * as destructionApi from './destruction'
-import { resetDestruction, useDestruction, type VoxelTarget } from './destruction'
+import {
+  prevoxelizeTick,
+  resetDestruction,
+  useDestruction,
+  type VoxelTarget,
+} from './destruction'
 import { Doors, doorsDebug } from './doors'
-import * as dustApi from './dust'
-import { clearDust, DustSystem } from './dust'
+import { clearDust, dustDebug, DustSystem } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, resetGlass } from './glass'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
 import { Player, playerDebug } from './player'
-import { hideForGame } from './session'
+import { getSession, hideForGame } from './session'
 import { fire } from './shooting'
 import { GameSky } from './sky'
+import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
 import { VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
@@ -37,20 +41,6 @@ export function GameRoot() {
 }
 
 /**
- * Phase-3 destruction API, feature-detected: pre-clads every wall in voxels
- * over the first frames of a session so the building already LOOKS voxel
- * when you jump in (instead of walls flipping on first hit). Read through
- * the namespace so game-root keeps compiling while destruction.ts's half
- * lands in a parallel branch; once the export exists the driver below runs
- * it automatically.
- */
-const prevoxelizeTick = (
-  destructionApi as {
-    prevoxelizeTick?: (world: GameWorld, budgetMs?: number) => boolean
-  }
-).prevoxelizeTick
-
-/**
  * Spreads prevoxelization across frames (~4 ms budget per tick — a full
  * house clads in well under a second without a hitch), then goes inert
  * once destruction reports every wall done. The very first frame is
@@ -63,7 +53,7 @@ function Prevoxelize({ world }: { world: GameWorld }) {
   useFrame(() => {
     if (done.current) return
     if (frame.current++ === 0) return
-    done.current = prevoxelizeTick ? prevoxelizeTick(world, 4) : true
+    done.current = prevoxelizeTick(world, 4)
   })
   return null
 }
@@ -156,28 +146,34 @@ function OverlaySweep() {
   return null
 }
 
-/** Debug-dump helper: copy one member's primitive fields (+ number tuples
- * like center/size) so `__boots` hands out plain data, never live refs. */
+/** Debug-dump helper: copy one member's primitive fields (+ SHORT number
+ * tuples like center/size/normal) so `__boots` hands out plain data, never
+ * live refs. Long number arrays (SheetMember.cells — internal voxel-index
+ * bookkeeping, hundreds of ints per sheet) are deliberately skipped. */
 function plainMember(member: object, nodeId: string): Record<string, unknown> {
   const out: Record<string, unknown> = { nodeId }
   for (const [key, value] of Object.entries(member)) {
     const t = typeof value
     if (value === null || t === 'number' || t === 'string' || t === 'boolean') out[key] = value
-    else if (Array.isArray(value) && value.every((n) => typeof n === 'number'))
+    else if (
+      Array.isArray(value) &&
+      value.length <= 8 &&
+      value.every((n) => typeof n === 'number')
+    )
       out[key] = [...value]
   }
   return out
 }
 
 /**
- * Dump a named member array of the destruction state — 'boards' (drywall
- * plates) and 'segments' (stud charcoal segments) land with the phase-3
- * anatomy. Checks per-target arrays first, then a store-level
- * nodeId→members Map, so the dump works whichever home the anatomy picks;
- * empty until the fields exist.
+ * Dump a named per-target member array of the destruction state. The
+ * phase-3 anatomy landed both members ON the target: 'segments' (charcoal
+ * framing sticks; `studs` is the same array) and 'sheets' (logical drywall
+ * tear groups) — see the VoxelTarget doc in destruction.ts. Unknown fields
+ * simply dump empty.
  */
-function dumpDestructionMembers(field: string): Array<Record<string, unknown>> {
-  const state = useDestruction.getState() as unknown as Record<string, unknown> & {
+function dumpDestructionMembers(field: 'segments' | 'sheets'): Array<Record<string, unknown>> {
+  const state = useDestruction.getState() as unknown as {
     targets: Map<string, VoxelTarget>
   }
   const out: Array<Record<string, unknown>> = []
@@ -188,21 +184,40 @@ function dumpDestructionMembers(field: string): Array<Record<string, unknown>> {
       if (member && typeof member === 'object') out.push(plainMember(member, target.nodeId))
     }
   }
-  const topLevel = state[field]
-  if (topLevel instanceof Map) {
-    for (const [nodeId, members] of topLevel as Map<unknown, unknown>) {
-      if (!Array.isArray(members)) continue
-      for (const member of members) {
-        if (member && typeof member === 'object') out.push(plainMember(member, String(nodeId)))
-      }
-    }
-  }
   return out
 }
 
 function ActiveGame() {
   // Snapshot once per session — walls don't move while you shoot them.
-  const world = useMemo(() => collectWorld(), [])
+  const [world, setWorld] = useState(() => collectWorld())
+
+  // Remount healing (Fast Refresh / dev module sync — players never remount
+  // mid-session): this component unmounting is NOT the session ending;
+  // exitGame owns that. If we unmount while the session is still live,
+  // give every ledger-hidden host object its visibility back so the
+  // replacement ActiveGame can snapshot a full world — it re-hides
+  // overlays and re-voxelizes walls from scratch anyway (the main effect's
+  // cleanup below resets all destruction state). On a real exit, exitGame
+  // already restored + emptied the ledger and phase is 'editor': no-op.
+  useEffect(
+    () => () => {
+      const session = getSession()
+      if (!session || useBoots.getState().phase !== 'game') return
+      for (const entry of session.hiddenObjects.splice(0)) entry.object.visible = entry.visible
+    },
+    [],
+  )
+
+  // The replacement mount still RENDERS before the old instance's cleanup
+  // restores visibility (React commits new render → old cleanup → new
+  // effects), so the render-time snapshot above can come up empty — the
+  // "building vanished" QA burn. Effects run after the restore: re-collect
+  // once if the snapshot missed every wall.
+  useEffect(() => {
+    if (world.walls.size > 0) return
+    const fresh = collectWorld()
+    if (fresh.walls.size > 0) setWorld(fresh)
+  }, [world])
 
   useEffect(() => {
     // Bones engineering overlays (X-ray framing/CMU, lumber, service runs,
@@ -210,7 +225,7 @@ function ActiveGame() {
     // wall voxelizes they'd survive as an unbreakable ghost layer. Hide the
     // whole overlay roots for the session; exitGame's hiddenObjects ledger
     // restores every visibility flip untouched.
-    for (const root of world.overlayRoots ?? []) hideForGame(root)
+    for (const root of world.overlayRoots) hideForGame(root)
 
     // Dev/E2E handle — lets headless tests aim and fire deterministically.
     ;(globalThis as Record<string, unknown>).__boots = {
@@ -255,22 +270,19 @@ function ActiveGame() {
             broken: stud.broken,
           })),
         ),
-      // Phase-3 anatomy dumps — empty arrays until destruction.ts's
-      // boards/segments/sheets land (see dumpDestructionMembers; sheets are
-      // the logical drywall tear groups of the tear-out rework).
-      boards: () => dumpDestructionMembers('boards'),
+      // Phase-3 anatomy dumps. `segments` = charcoal framing sticks
+      // (id/center/size/yaw/hp/broken); `sheets` = logical drywall tear
+      // groups (id/center/size/yaw/side/normal/hits/torn/cellCount/
+      // flownOff). `boards` is a legacy alias of sheets — the round-1
+      // "drywall plates" idea shipped as the logical-sheet rework.
+      boards: () => dumpDestructionMembers('sheets'),
       segments: () => dumpDestructionMembers('segments'),
       sheets: () => dumpDestructionMembers('sheets'),
-      // Dust debug — feature-detected like prevoxelizeTick: dust.tsx's
-      // rework may export a `dustDebug` dump; a stable key + empty object
-      // until then, never a live ref either way.
-      dust: () => {
-        const dump = (dustApi as { dustDebug?: () => Record<string, unknown> }).dustDebug
-        return dump ? dump() : {}
-      },
-      // Trees list — swaps to trees-destruct's debug dump when that module
-      // lands; a stable key with an empty list until then.
-      trees: () => [] as Array<Record<string, unknown>>,
+      // Dust debug — plain-data dump from dust.tsx, never a live ref.
+      dust: () => dustDebug(),
+      // Combat-tree dump (trees-destruct.tsx): id/x/z/scale/state/hp/
+      // canopyDamage/burnT/charHits per tree; [] outside a session.
+      trees: () => treesDebug.dump(),
       skyMounted: true,
       pieces: () =>
         useBoots.getState().placed.map((p) => ({
@@ -305,6 +317,7 @@ function ActiveGame() {
       <Builder />
       <Enemies world={world} />
       <Nature world={world} />
+      <TreesDestruct world={world} />
     </>
   )
 }

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import {
+  damageSegment,
   damageTarget,
   ensureVoxelTarget,
   prevoxelizeTick,
+  raycastSegments,
   resetDestruction,
   useDestruction,
 } from './destruction'
@@ -63,6 +65,7 @@ function makeWorld(): GameWorld {
     ]),
     glass: [],
     doors: [],
+    overlayRoots: [],
     buildingAabb,
     spawn: new Vector3(6, 0, 6),
     spawnYaw: 0,
@@ -102,6 +105,132 @@ describe('prevoxelizeTick', () => {
     for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
     expect(done).toBe(true)
     expect(prevoxelizeTick(world, 8)).toBe(true) // idempotent once done
+  })
+})
+
+describe('skin-respecting carve (pierce fix)', () => {
+  test('a rifle-size tear opens only the entered skin; the far face holds', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    // Shot entering the z-min face of the 0.12 m wall — the carve sphere
+    // (rifle tearRadius 0.55) spans both skins, but only the entered one
+    // may lose cells.
+    const removed = damageTarget(world, 'wall-1', new Vector3(0, 1.35, -0.06), 0.55, new Vector3(0, 0, 1))
+    expect(removed).toBeGreaterThan(0)
+    for (const sheet of wall.sheets) {
+      if (sheet.side === 1) {
+        expect(sheet.torn).toBe(0)
+        for (const idx of sheet.cells) expect(wall.grid.alive[idx]).toBe(1)
+      }
+    }
+    expect(wall.sheets.some((s) => s.side === 0 && s.torn > 0)).toBe(true)
+  })
+
+  test('a follow-up through the hole tears the far skin', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    damageTarget(world, 'wall-1', new Vector3(0, 1.35, -0.06), 0.55, new Vector3(0, 0, 1))
+    // Second shot sails through the near-skin hole and lands ON the far
+    // face — its entry point is on side 1 now, so side 1 tears.
+    const removed = damageTarget(world, 'wall-1', new Vector3(0, 1.35, 0.02), 0.55, new Vector3(0, 0, 1))
+    expect(removed).toBeGreaterThan(0)
+    expect(wall.sheets.some((s) => s.side === 1 && s.torn > 0)).toBe(true)
+  })
+
+  test('a heavy carve past the pierce gate punches both skins at once', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    damageTarget(world, 'wall-1', new Vector3(0, 1.35, -0.06), 0.65, new Vector3(0, 0, 1))
+    const sides = new Set(wall.sheets.filter((s) => s.torn > 0).map((s) => s.side))
+    expect(sides).toEqual(new Set([0, 1]))
+  })
+})
+
+describe('framing segments (charcoal sticks)', () => {
+  test('walls carry stick segments at the real lumber cross-section; studs aliases the array', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    expect(wall.segments.length).toBeGreaterThan(0)
+    expect(wall.studs).toBe(wall.segments)
+    for (const seg of wall.segments) {
+      expect(seg.hp).toBeGreaterThan(0)
+      expect(seg.broken).toBe(false)
+      // Cross-section is real lumber — every axis but the long one is far
+      // skinnier than the 0.15 m render cell.
+      const sorted = [...seg.size].sort((a, b) => a - b)
+      expect(sorted[0]!).toBeLessThan(0.05)
+      expect(sorted[1]!).toBeLessThan(0.1)
+      // Depth never poked proud of the 0.12 m wall.
+      expect(sorted[1]!).toBeLessThanOrEqual(0.12)
+    }
+    // Vertical 2.6 m lines split into thirds — sticks, not whole studs.
+    const verticals = wall.segments.filter((s) => s.size[1] > s.size[0])
+    expect(verticals.length).toBeGreaterThan(0)
+    for (const seg of verticals) expect(seg.size[1]).toBeLessThan(1)
+    // Ids are array indices (fixed-length member contract).
+    wall.segments.forEach((seg, i) => expect(seg.id).toBe(i))
+    // Volumes carry no framing.
+    expect(ensureVoxelTarget(world, 'slab-1')!.segments.length).toBe(0)
+  })
+
+  test('raycastSegments finds the stick, damageSegment chips then snaps it', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    const hit = raycastSegments(new Vector3(0.2192, 1.35, 5), new Vector3(0, 0, -1), 90)
+    expect(hit).not.toBeNull()
+    expect(hit!.nodeId).toBe('wall-1')
+    expect(hit!.studId).toBe(hit!.segmentId)
+    const seg = wall.segments[hit!.segmentId]!
+    const revBefore = wall.revision
+    // Chip: hp drops, no break, revision untouched (checksum picks it up).
+    expect(damageSegment(world, 'wall-1', seg.id, 1, hit!.point)).toBe(true)
+    expect(seg.hp).toBe(1)
+    expect(seg.broken).toBe(false)
+    expect(wall.revision).toBe(revBefore)
+    // Snap: broken, revision bumped, no underflow, further damage refused.
+    expect(damageSegment(world, 'wall-1', seg.id, 24, hit!.point)).toBe(true)
+    expect(seg.broken).toBe(true)
+    expect(seg.hp).toBe(0)
+    expect(wall.revision).toBe(revBefore + 1)
+    expect(damageSegment(world, 'wall-1', seg.id, 24, hit!.point)).toBe(false)
+    // Broken sticks are transparent to the segment ray.
+    const again = raycastSegments(new Vector3(0.2192, 1.35, 5), new Vector3(0, 0, -1), 90)
+    expect(again?.segmentId).not.toBe(seg.id)
+  })
+})
+
+describe('island collapse on studless volumes (the shower cut)', () => {
+  test('severing an item volume drops the floating top half after the settle delay', async () => {
+    const world = makeWorld()
+    const shower = boxCollider('shower-1', 'item', [0.9, 2.4, 0.9], [20, 1.2, 0])
+    world.colliders.push(shower)
+    const target = ensureVoxelTarget(world, 'shower-1')!
+    expect(target.kind).toBe('volume')
+    const total = target.grid.aliveCount
+    // Cut clean through at y = 1.2 — a 3×3 pattern of carves covers the
+    // full 0.9 × 0.9 cross-section.
+    for (const dx of [-0.3, 0, 0.3]) {
+      for (const dz of [-0.3, 0, 0.3]) {
+        damageTarget(world, 'shower-1', new Vector3(20 + dx, 1.2, dz), 0.35)
+      }
+    }
+    const afterCarve = target.grid.aliveCount
+    expect(afterCarve).toBeLessThan(total)
+    // The top half is still alive but disconnected…
+    let above = 0
+    for (let i = 0; i < target.grid.count; i++) {
+      if (target.grid.alive[i] && target.grid.centers[i * 3 + 1]! > 1.7) above++
+    }
+    expect(above).toBeGreaterThan(0)
+    // …until the island timer fires — then it falls as debris, numerically
+    // visible in aliveCount (the __boots.targets() census field).
+    await new Promise((resolve) => setTimeout(resolve, 260))
+    expect(target.grid.aliveCount).toBeLessThan(afterCarve)
+    for (let i = 0; i < target.grid.count; i++) {
+      if (target.grid.centers[i * 3 + 1]! > 1.7) expect(target.grid.alive[i]).toBe(0)
+    }
+    // The floor-supported bottom survives.
+    expect(target.grid.aliveCount).toBeGreaterThan(0)
   })
 })
 

@@ -94,6 +94,7 @@ function makeWorld(): GameWorld {
     ]),
     glass: [],
     doors: [],
+    overlayRoots: [],
     buildingAabb,
     spawn: new Vector3(6, 0, 6),
     spawnYaw: 0,
@@ -135,10 +136,12 @@ describe('(a) first shot voxelizes a wall with the skins + studs anatomy', () =>
     const target = useDestruction.getState().targets.get('wall-1')
     expect(target).toBeDefined()
     expect(target!.kind).toBe('wall')
-    // 2m at 16" o.c. → 5 studs + top/bottom plates.
-    expect(target!.studs).toHaveLength(7)
+    // 2m at 16" o.c. → 5 stud lines × 3 sticks + 2 plates × 2 runs = 19
+    // charcoal-stick segments; `studs` is the legacy alias of the SAME array.
+    expect(target!.studs).toHaveLength(19)
+    expect(target!.segments).toBe(target!.studs)
     const snapshot = studsSnapshot()
-    expect(snapshot).toHaveLength(7)
+    expect(snapshot).toHaveLength(19)
     for (const stud of snapshot) {
       expect(stud.nodeId).toBe('wall-1')
       expect(stud.hp).toBeGreaterThan(0)
@@ -180,7 +183,9 @@ describe('(a) first shot voxelizes a wall with the skins + studs anatomy', () =>
     const world = makeWorld()
     aimFrom(0, 1.35, 5)
     fire(world, GUN)
-    damageTarget(world, 'wall-1', new Vector3(0, 1.35, 0), 0.5)
+    // Carves under the pierce gate respect the entered skin now (phase-3
+    // pierce fix) — a heavy 0.65 m carve is what blows both faces at once.
+    damageTarget(world, 'wall-1', new Vector3(0, 1.35, 0), 0.65)
     // Nothing behind the wall on this ray → the shot exits the world.
     expect(fire(world, GUN)).toBe('none')
   })
@@ -197,28 +202,32 @@ describe('studs: expose, chip, snap', () => {
     const exposed = raycastStuds(playerRig.position, new Vector3(0, 0, -1), 90)
     expect(exposed).not.toBeNull()
     expect(exposed!.nodeId).toBe('wall-1')
-    expect(exposed!.studId).toBe(3)
-    // Stud depth fits strictly inside the cavity: skins are 0.04 m cells
-    // (0.12/3 layers), depth = 0.04 × (3 − 2) − 0.004 clearance = 0.036,
-    // so the front face sits at z = 0.018 — behind the skin inner face
-    // (z = 0.02), never proud of the intact outer skin.
-    expect(exposed!.distance).toBeCloseTo(4.982, 2)
-    expect(exposed!.distance).toBeGreaterThan(5 - 0.02)
+    // Stud line 3 splits into sticks 9/10/11 — y = 1.35 is the middle one.
+    expect(exposed!.studId).toBe(10)
+    expect(exposed!.segmentId).toBe(10)
+    // Real lumber cross-section: depth 0.089 on the 0.12 m wall → the stick
+    // face sits at z = 0.0445, inside the wall (never proud of the 0.06
+    // outer face) but deeper than the old cavity-only studs.
+    expect(exposed!.distance).toBeCloseTo(4.9555, 2)
+    expect(exposed!.distance).toBeGreaterThan(5 - 0.06)
 
-    // Knife whittles: 3 hp → 2.
+    // Knife whittles: 2 hp → 1 (sticks snap fast).
     expect(fire(world, KNIFE)).toBe('wall')
     const target = useDestruction.getState().targets.get('wall-1')!
-    const stud = target.studs.find((s) => s.id === 3)!
-    expect(stud.hp).toBe(2)
+    const stud = target.segments.find((s) => s.id === 10)!
+    expect(stud.hp).toBe(1)
     expect(stud.broken).toBe(false)
 
-    // Gun finishes it: 24 damage ≥ 2 hp → snapped.
+    // Gun finishes it: 24 damage ≥ 1 hp → snapped.
     expect(fire(world, GUN)).toBe('wall')
     expect(stud.broken).toBe(true)
-    expect(studsSnapshot().find((s) => s.studId === 3)!.broken).toBe(true)
+    expect(studsSnapshot().find((s) => s.studId === 10)!.broken).toBe(true)
 
-    // Broken studs are transparent to rays — and this lane is fully open now.
+    // Broken studs are transparent to rays.
     expect(raycastStuds(playerRig.position, new Vector3(0, 0, -1), 90)).toBeNull()
+    // The far skin survived the near-face carves (pierce fix) — open it
+    // from its own face and the lane is fully clear.
+    damageTarget(world, 'wall-1', new Vector3(studX, 1.35, -0.06), 0.45)
     expect(fire(world, GUN)).toBe('none')
   })
 })
@@ -296,9 +305,11 @@ describe('unsupported islands crumble after the settle delay', () => {
       root: wall.root,
       meshes: [wall.mesh],
     })
-    // A horizontal cut across the full 6m length at y = 2.0.
+    // A horizontal cut across the full 6m length at y = 2.0 — one grazing
+    // pass per FACE, since sub-pierce carves respect the entered skin now.
     for (let x = -3; x <= 3.001; x += 0.35) {
-      damageTarget(world, 'wall-long', new Vector3(x, 2.0, 0), 0.2)
+      damageTarget(world, 'wall-long', new Vector3(x, 2.0, -0.06), 0.2)
+      damageTarget(world, 'wall-long', new Vector3(x, 2.0, 0.06), 0.2)
     }
     // The grazing cut must not have shed whole sheets — that would empty
     // the top rows before the island pass gets to prove itself.

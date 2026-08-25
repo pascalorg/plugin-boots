@@ -478,3 +478,52 @@ voxel-walls.tsx + game-root.tsx doc blocks):
   banding at the dome pole.
 
 Checks: `bun run check-types` clean, `bun test` 113 pass / 4139 expects.
+
+## Phase 3, Round 3 — 2026-08-25 (sandwich finish + manager-built trees + remount healing)
+
+Round outcome: wall-sandwich delivered the full round-3 slate; trees-fire
+failed a THIRD time so the manager built trees-destruct directly. Wiring
+closed every other seam. All in: `bun run check-types` clean, `bun test`
+139 pass / 6351 expects.
+
+- **Sandwich (destruction.ts / voxel.ts)**: skin-aware pierce —
+  `removeSphere` takes an optional `SkinLimit`, wall carves under
+  `WALL_PIERCE_RADIUS = 0.6` only open the ENTERED face (the far skin
+  falls to the follow-up shot through the hole; a future heavy weapon
+  gets both with `tearRadius ≥ 0.6`). Sheet fly-off sheds ≤ 12 torn-edge
+  plates + crumbs; carves shed rim shards. `SegmentMember` charcoal
+  sticks at real lumber cross-section (0.038 × 0.089 m; verticals split
+  2-3 sticks, plates ~1.2 m runs, hp 2) with `raycastSegments` /
+  `damageSegment` (+ legacy stud aliases).
+- **Island wraparound root cause (voxel.ts)**: `findUnsupportedIslands`
+  read neighbors without bounds checks — `gridKey`'s flat linearization
+  aliased out-of-range coords onto real cells (−y under the base row =
+  top row of the previous z-slab), teleporting the support flood into
+  floating islands. Bounds-checked both floods; the QA floating-tabletop
+  and the owner's cut-shower now crumble. Regression tests pinned.
+- **Trees (trees-destruct.tsx, NEW — manager-built)**: nature's grove
+  (same scatter seed, nature.tsx no longer renders trees) is a target
+  class. State machine per tree: trunk fire fells (hp 70) into a voxel
+  burst in the tree's colors down to a stump; canopy damage ≥ 48 ignites
+  — crackle loop + smoke puffs + embers while the crown chars over 4.5 s,
+  then it collapses into charcoal voxels leaving a black trunk + 3 bare
+  branch sticks; each further hit snaps one (charSnap), the last bursts
+  the trunk to a stump. Four InstancedMeshes for the whole grove; analytic
+  trunk-cylinder/canopy-sphere raycasts; routes registered via
+  shooting.ts's `registerTreeRoutes`; `__boots.trees()` dumps live state.
+  11 headless tests on the pure helpers.
+- **Remount healing (game-root.tsx)**: a mid-session ActiveGame remount
+  (Fast Refresh during fleet syncs) used to snapshot a world whose walls
+  were still session-hidden — "the building vanished" QA burn. Now: on
+  unmount-while-live the hidden-object ledger restores early, and a mount
+  effect re-collects once if the render-time snapshot saw zero walls.
+- **Wiring**: `prevoxelizeTick`/`dustDebug` direct imports; `boards()`
+  documented as a sheets alias (sheets ARE the drywall plates);
+  `overlayRoots` flipped to required on GameWorld (all fixtures updated);
+  sky pole cap kills the zenith banding and doubles as the overhead
+  light break (warm gray, never blue).
+
+Open for QA (round 4 gate): re-verify (g) volume islands (fixed at the
+root, needs the in-browser repro), (d) trees full loop in-browser, and
+the in-game-vs-editor fps ratio watch item now that grass + prevoxelized
+walls + the grove render from session start.

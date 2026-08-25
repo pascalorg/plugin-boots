@@ -407,6 +407,7 @@ function worldWithPlacedWall(): GameWorld {
     walls: new Map(),
     glass: [],
     doors: [],
+    overlayRoots: [],
     buildingAabb: entry.worldBox.clone(),
     spawn: new Vector3(0, 0, 6),
     spawnYaw: 0,

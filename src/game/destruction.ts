@@ -1,7 +1,7 @@
 import { Box3, Color, Matrix4, type Mesh, Vector3 } from 'three'
 import { create } from 'zustand'
 import { sfx } from './audio'
-import { spawnDebris } from './debris'
+import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { hideForGame } from './session'
 import {
@@ -11,6 +11,7 @@ import {
   raycastVoxels,
   raycastYawObb,
   removeSphere,
+  type SkinLimit,
   type VoxelGridData,
   type VoxelSource,
 } from './voxel'
@@ -41,11 +42,17 @@ import { bvhFor, type GameWorld } from './world'
  *                             nodeId → VoxelTarget. `version` bumps on any
  *                             change; re-read the map when it does.
  *   VoxelTarget               { nodeId, kind: 'wall' | 'volume', grid,
- *                             baseColor, studs: StudMember[],
+ *                             baseColor, segments: SegmentMember[],
+ *                             studs (legacy — SAME array as segments),
  *                             sheets: SheetMember[], sheetByCell,
  *                             removedQueue, revision }
- *   StudMember                { id, center, size, yaw, hp, broken } —
- *                             renderers should skip `broken` studs.
+ *   SegmentMember             { id, center, size, yaw, hp, broken } — one
+ *                             charcoal-stick length of framing lumber at
+ *                             the real ~0.038 × 0.089 m cross-section;
+ *                             stud lines split into 2-3 sticks, plates
+ *                             into ~1.2 m runs. Renderers skip `broken`
+ *                             members (fixed-length array, never spliced).
+ *                             StudMember is a legacy alias of this type.
  *   SheetMember               LOGICAL drywall sheet — a ~1.2 × 2.4 m group
  *                             of EXISTING skin voxels on one wall face (no
  *                             rendered board plane of its own, so nothing
@@ -66,22 +73,29 @@ import { bvhFor, type GameWorld } from './world'
  *                             it from a useFrame until then.
  *   damageTarget(world, nodeId, point, radius, direction?)   carve a sphere
  *                             at a world point (voxelizes on first hit);
- *                             direction aims the tear dust plume. Returns
- *                             the number of voxels removed. `damageWall`
- *                             is a legacy alias.
- *   damageStud(world, nodeId, studId, damage, point)   chip a stud (wood
- *                             splinters); at hp ≤ 0 it breaks — two large
- *                             falling pieces + snap sfx. Returns true if
- *                             damage applied.
+ *                             direction aims the tear dust plume. Wall
+ *                             carves under WALL_PIERCE_RADIUS respect the
+ *                             SKIN the shot entered (resolved from the hit
+ *                             point) — the far face falls to the next shot
+ *                             through the hole, or to a heavy weapon past
+ *                             the gate. Returns the number of voxels
+ *                             removed. `damageWall` is a legacy alias.
+ *   damageSegment(world, nodeId, segmentId, damage, point)   chip a framing
+ *                             stick (wood splinters); at hp ≤ 0 it snaps
+ *                             like charcoal — 2-3 tumbling pieces along its
+ *                             long axis + snap sfx. Returns true if damage
+ *                             applied. `damageStud` is a legacy alias.
  * Queries
  *   raycastVoxelTargets(origin, direction, maxDist)   first live voxel of
  *                             any target along the ray → { nodeId,
  *                             distance, point } | null.
  *                             `raycastVoxelWalls` is a legacy alias.
- *   raycastStuds(origin, direction, maxDist)   analytic ray-vs-OBB over
- *                             all live studs → { nodeId, studId, distance,
- *                             point } | null. Shooting should test this
- *                             alongside voxels and keep the nearest.
+ *   raycastSegments(origin, direction, maxDist)   analytic ray-vs-OBB over
+ *                             all live segments → { nodeId, segmentId,
+ *                             studId (alias), distance, point } | null.
+ *                             Shooting should test this alongside voxels
+ *                             and keep the nearest. `raycastStuds` is a
+ *                             legacy alias.
  *   collideVoxelTargets(pos, vel, radius, height)   capsule push-out
  *                             against live voxels; returns grounded.
  *                             `collideVoxelWalls` is a legacy alias.
@@ -91,7 +105,15 @@ import { bvhFor, type GameWorld } from './world'
  * ──────────────────────────────────────────────────────────────────────
  */
 
-export type StudMember = {
+/**
+ * One breakable framing SEGMENT — a charcoal-stick length of lumber at the
+ * REAL cross-section (~0.038 × 0.089 m, far skinnier than a voxel cell).
+ * Vertical stud lines split into 2-3 stacked sticks, plates into ~1.2 m
+ * runs, so a wall's framing snaps piece by piece instead of whole studs
+ * vanishing. Matches voxel-walls.tsx's SandwichMember contract: the array
+ * is fixed-length after voxelize, breaking only flips `broken`.
+ */
+export type SegmentMember = {
   id: number
   center: [number, number, number]
   size: [number, number, number]
@@ -99,6 +121,10 @@ export type StudMember = {
   hp: number
   broken: boolean
 }
+
+/** Legacy alias — `target.studs` IS the segments array now (same objects);
+ * the old whole-stud members were replaced by the stick segments. */
+export type StudMember = SegmentMember
 
 /** Legacy alias — studs now carry id/hp/broken on top of the old shape. */
 export type StudBox = StudMember
@@ -136,10 +162,15 @@ export type SheetMember = {
 
 export type VoxelTarget = {
   nodeId: string
-  /** 'wall' targets carry the skins + studs anatomy; 'volume' is plain. */
+  /** 'wall' targets carry the skins + framing anatomy; 'volume' is plain. */
   kind: 'wall' | 'volume'
   grid: VoxelGridData
   baseColor: Color
+  /** Breakable framing sticks (walls only). voxel-walls.tsx renders these
+   * as the SEGMENTS layer; shooting.ts routes raycastSegments/damageSegment
+   * over them. */
+  segments: SegmentMember[]
+  /** Legacy alias — the SAME array instance as `segments`. */
   studs: StudMember[]
   /** Logical drywall sheets (walls only; empty for plain volumes). */
   sheets: SheetMember[]
@@ -322,6 +353,66 @@ function buildStuds(
   return studs
 }
 
+/** Real 2×4 lumber cross-section: 1.5" face along the run, 3.5" across the
+ * cavity — the "skinnier than a voxel" read. Depth clamps just inside the
+ * wall so lumber never pokes proud of the outer faces. */
+const SEGMENT_W = 0.038
+const SEGMENT_D = 0.089
+/** Sticks snap FAST — knife whittles twice, any gun snaps in one. */
+const SEGMENT_HP = 2
+/** Plates split into runs about this long. */
+const SEGMENT_RUN = 1.2
+
+/**
+ * Split the stud-line layout into charcoal-stick SEGMENTS: vertical lines
+ * become 2-3 stacked sticks, plates become ~1.2 m runs, all at the real
+ * lumber cross-section. The result is BOTH `target.segments` and (same
+ * array) the legacy `target.studs` — one fixed-length member layer that
+ * voxel-walls.tsx draws and shooting.ts snipes at, stick by stick.
+ */
+function buildSegments(wall: WallEntry, layout: StudMember[]): SegmentMember[] {
+  const thickness = wall.node.thickness ?? 0.15
+  const depth = Math.min(SEGMENT_D, Math.max(0.04, thickness - 0.02))
+  const segments: SegmentMember[] = []
+  for (const stud of layout) {
+    const [sx, sy] = stud.size
+    if (sy >= sx) {
+      // Vertical stud line → stacked sticks.
+      const pieces = sy > 1.6 ? 3 : sy > 0.8 ? 2 : 1
+      const len = sy / pieces
+      const bottom = stud.center[1] - sy / 2
+      for (let i = 0; i < pieces; i++) {
+        segments.push({
+          id: segments.length,
+          center: [stud.center[0], bottom + len * (i + 0.5), stud.center[2]],
+          size: [SEGMENT_W, len - 0.012, depth],
+          yaw: stud.yaw,
+          hp: SEGMENT_HP,
+          broken: false,
+        })
+      }
+    } else {
+      // Plate → flat sticks laid along the run (local +x is (cos yaw, sin yaw)).
+      const pieces = Math.max(1, Math.round(sx / SEGMENT_RUN))
+      const len = sx / pieces
+      const cos = Math.cos(stud.yaw)
+      const sin = Math.sin(stud.yaw)
+      for (let i = 0; i < pieces; i++) {
+        const t = (i + 0.5) * len - sx / 2
+        segments.push({
+          id: segments.length,
+          center: [stud.center[0] + cos * t, stud.center[1], stud.center[2] + sin * t],
+          size: [len - 0.012, SEGMENT_W, depth],
+          yaw: stud.yaw,
+          hp: SEGMENT_HP,
+          broken: false,
+        })
+      }
+    }
+  }
+  return segments
+}
+
 /** Real-world drywall board footprint the logical sheets tile at. */
 const SHEET_W = 1.2
 const SHEET_H = 2.4
@@ -339,6 +430,21 @@ const SHEET_FLY_MIN_TORN = 0.15
 
 const EMPTY_SHEET_MAP = new Int32Array(0)
 
+/** Thickness axis of a layered grid: the axis with the smallest PHYSICAL
+ * extent (span × cell) — the same rule dropInteriorCells skins by, shared
+ * by the sheet builder and the entry-skin resolver so they can never
+ * disagree about which way a wall is thin. */
+function thicknessAxisOf(grid: VoxelGridData): 0 | 1 | 2 {
+  let t: 0 | 1 | 2 = 0
+  let extent = grid.nx * grid.cellX
+  if (grid.ny * grid.cellY < extent) {
+    t = 1
+    extent = grid.ny * grid.cellY
+  }
+  if (grid.nz * grid.cellZ < extent) t = 2
+  return t
+}
+
 /**
  * Group a wall grid's skin voxels into logical drywall sheets: split by
  * face (side of the thickness axis — the axis with the smallest physical
@@ -355,9 +461,7 @@ function buildSheets(grid: VoxelGridData): { sheets: SheetMember[]; sheetByCell:
   const cells = [grid.cellX, grid.cellY, grid.cellZ]
   // Thickness axis: smallest physical extent. Run axis: the other plan
   // axis; vertical axis: y (unless the target lies flat — then z stands in).
-  let t = 0
-  if (spans[1]! * cells[1]! < spans[t]! * cells[t]!) t = 1
-  if (spans[2]! * cells[2]! < spans[t]! * cells[t]!) t = 2
+  const t = thicknessAxisOf(grid)
   const u = t === 0 ? 2 : 0
   const v = t === 1 ? 2 : 1
   const tileU = Math.max(1, Math.round(SHEET_W / cells[u]!))
@@ -513,12 +617,16 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   if (grid.count === 0) return null
 
   const sheetInfo = wall ? buildSheets(grid) : null
+  // The stud-line layout is scaffolding only — the real members are the
+  // stick segments split from it. `studs` aliases the SAME array.
+  const segments = wall ? buildSegments(wall, buildStuds(wall, grid)) : []
   const target: VoxelTarget = {
     nodeId,
     kind: wall ? 'wall' : 'volume',
     grid,
     baseColor: targetBaseColor(meshes),
-    studs: wall ? buildStuds(wall, grid) : [],
+    segments,
+    studs: segments,
     sheets: sheetInfo?.sheets ?? [],
     sheetByCell: sheetInfo?.sheetByCell ?? EMPTY_SHEET_MAP,
     removedQueue: [],
@@ -639,16 +747,29 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
   }
   target.revision++
   useDestruction.getState().bump()
-  // Shreds — flat-ish chunks sampled across the sheet's own cells.
+  // Shreds — torn-edge PLATES (debris.tsx's flat flutter path) sampled
+  // across the sheet's own cells: the board leaves as ragged paper, not
+  // cubes. A couple of cube crumbs keep some weight in the fall.
   if (sheet.cells.length > 0) {
-    const shards = Math.min(14, 6 + Math.round(freed / 8))
-    for (let n = 0; n < shards; n++) {
+    const plates = Math.min(12, 5 + Math.round(freed / 10))
+    for (let n = 0; n < plates; n++) {
+      const idx = sheet.cells[Math.floor(Math.random() * sheet.cells.length)]!
+      spawnFlatDebris(
+        target.grid.centers[idx * 3]!,
+        target.grid.centers[idx * 3 + 1]!,
+        target.grid.centers[idx * 3 + 2]!,
+        0.18 + Math.random() * 0.3,
+        0.22 + Math.random() * 0.34,
+        target.baseColor,
+      )
+    }
+    for (let n = 0; n < 3; n++) {
       const idx = sheet.cells[Math.floor(Math.random() * sheet.cells.length)]!
       spawnDebris(
         target.grid.centers[idx * 3]!,
         target.grid.centers[idx * 3 + 1]!,
         target.grid.centers[idx * 3 + 2]!,
-        target.grid.cell * (0.9 + Math.random() * 0.9),
+        target.grid.cell * (0.7 + Math.random() * 0.6),
         target.baseColor,
         2.2,
         3.2,
@@ -696,10 +817,55 @@ function noteSheetCarve(target: VoxelTarget, removed: number[], direction?: Vect
   }
 }
 
+/** Heavy-weapon gate for the skin-respecting carve: tears at least this
+ * wide punch BOTH drywall skins in one hit. Every current weapon's wall
+ * tearRadius (weapons.ts, ≤ 0.55) stays under it, so the far skin always
+ * survives the first shot and only falls to a follow-up through the hole —
+ * a future heavy (tearRadius ≥ 0.6) blows straight through. */
+const WALL_PIERCE_RADIUS = 0.6
+
+/**
+ * Which drywall skin a carve entered — the pierce-through fix. The hit
+ * point sits ON the face the shot struck (mesh surface on first blood, DDA
+ * voxel face afterwards), so its continuous coordinate along the thickness
+ * axis lands in that skin's half of the grid. Only layered anatomy grids
+ * (anisotropic — cellX ≠ cellZ) have skins; isotropic fallbacks return null
+ * and carve the full volume as before.
+ */
+const _skin: SkinLimit = { axis: 0, side: 0 }
+
+function entrySkin(grid: VoxelGridData, x: number, y: number, z: number): SkinLimit | null {
+  if (grid.cellX === grid.cellZ) return null
+  const axis = thicknessAxisOf(grid)
+  // Yaw grids index in their local frame — rotate the query point in.
+  let px = x
+  let pz = z
+  if (grid.yaw !== 0) {
+    const cos = Math.cos(grid.yaw)
+    const sin = Math.sin(grid.yaw)
+    px = x * cos + z * sin
+    pz = -x * sin + z * cos
+  }
+  const p = axis === 0 ? px : axis === 1 ? y : pz
+  const origin = axis === 0 ? grid.origin.x : axis === 1 ? grid.origin.y : grid.origin.z
+  const cell = axis === 0 ? grid.cellX : axis === 1 ? grid.cellY : grid.cellZ
+  const span = axis === 0 ? grid.nx : axis === 1 ? grid.ny : grid.nz
+  const c = (p - origin) / cell
+  _skin.axis = axis
+  _skin.side = c * 2 < span ? 0 : 1
+  return _skin
+}
+
 /** Carve a sphere out of any target at a world point (voxelizes on first
  * hit); spawns debris, queues the island check. Returns how many voxels
  * were removed. `direction` (optional, phase 3) is the shot direction —
- * it aims the wall-tear dust plume through the hole. */
+ * it aims the wall-tear dust plume through the hole.
+ *
+ * Walls carve SKIN-RESPECTING: below WALL_PIERCE_RADIUS the sphere only
+ * removes cells of the drywall face the shot entered (resolved from the
+ * hit point), so a 0.12 m wall never loses both skins to one rifle round —
+ * the far face falls to the next shot through the hole, or to a heavy
+ * weapon whose tearRadius clears the pierce gate. */
 export function damageTarget(
   world: GameWorld,
   nodeId: string,
@@ -709,7 +875,18 @@ export function damageTarget(
 ): number {
   const target = ensureVoxelTarget(world, nodeId)
   if (!target) return 0
-  const removed = removeSphere(target.grid, point.x, point.y, point.z, radius)
+  const skin =
+    target.kind === 'wall' && radius < WALL_PIERCE_RADIUS
+      ? entrySkin(target.grid, point.x, point.y, point.z)
+      : null
+  const removed = removeSphere(
+    target.grid,
+    point.x,
+    point.y,
+    point.z,
+    radius,
+    skin ?? undefined,
+  )
   if (removed.length === 0) return 0
   target.removedQueue.push(...removed)
   target.revision++
@@ -735,6 +912,20 @@ export function damageTarget(
       kind: 'plume',
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
+    // A few small torn-edge paper shards flutter off the hole's rim —
+    // drywall reads as tearing plates, not popping cubes.
+    const shards = Math.min(3, 1 + (removed.length >> 3))
+    for (let n = 0; n < shards; n++) {
+      const idx = removed[Math.floor(Math.random() * removed.length)]!
+      spawnFlatDebris(
+        target.grid.centers[idx * 3]!,
+        target.grid.centers[idx * 3 + 1]!,
+        target.grid.centers[idx * 3 + 2]!,
+        0.1 + Math.random() * 0.16,
+        0.12 + Math.random() * 0.2,
+        target.baseColor,
+      )
+    }
     // Sheet accounting (hits + torn cells) — may fly whole sheets off.
     noteSheetCarve(target, removed, direction)
   } else {
@@ -762,21 +953,30 @@ export function damageTarget(
 /** Legacy alias. */
 export const damageWall = damageTarget
 
-export type StudRayHit = { nodeId: string; studId: number; distance: number; point: Vector3 }
+export type SegmentRayHit = {
+  nodeId: string
+  segmentId: number
+  /** Legacy alias of segmentId — old stud-lane callers read this. */
+  studId: number
+  distance: number
+  point: Vector3
+}
+/** Legacy alias. */
+export type StudRayHit = SegmentRayHit
 
-/** Nearest live (unbroken) stud any voxelized wall exposes along the ray —
- * analytic ray-vs-OBB, no meshes involved. */
-export function raycastStuds(
+/** Nearest live (unbroken) framing segment any voxelized wall exposes along
+ * the ray — analytic ray-vs-OBB, no meshes involved. */
+export function raycastSegments(
   origin: Vector3,
   direction: Vector3,
   maxDist: number,
-): StudRayHit | null {
+): SegmentRayHit | null {
   let bestDist = maxDist
   let bestNode: string | null = null
-  let bestStud = -1
+  let bestSegment = -1
   for (const target of useDestruction.getState().targets.values()) {
-    for (const stud of target.studs) {
-      if (stud.broken) continue
+    for (const segment of target.segments) {
+      if (segment.broken) continue
       const t = raycastYawObb(
         origin.x,
         origin.y,
@@ -784,66 +984,96 @@ export function raycastStuds(
         direction.x,
         direction.y,
         direction.z,
-        stud.center[0],
-        stud.center[1],
-        stud.center[2],
-        stud.size[0] / 2,
-        stud.size[1] / 2,
-        stud.size[2] / 2,
-        stud.yaw,
+        segment.center[0],
+        segment.center[1],
+        segment.center[2],
+        segment.size[0] / 2,
+        segment.size[1] / 2,
+        segment.size[2] / 2,
+        segment.yaw,
         bestDist,
       )
       if (t === null || t >= bestDist) continue
       bestDist = t
       bestNode = target.nodeId
-      bestStud = stud.id
+      bestSegment = segment.id
     }
   }
   if (bestNode === null) return null
   return {
     nodeId: bestNode,
-    studId: bestStud,
+    segmentId: bestSegment,
+    studId: bestSegment,
     distance: bestDist,
     point: origin.clone().addScaledVector(direction, bestDist),
   }
 }
 
-/** Chip a stud. Splinters fly at the hit point; at hp ≤ 0 the stud breaks:
- * two large falling wood pieces (upper + lower halves), more splinters, a
- * snap. Returns true when damage applied (false: unknown/already broken). */
-export function damageStud(
+/** Legacy alias — the stud lane and the segment lane are one layer now. */
+export const raycastStuds = raycastSegments
+
+/** Chip a framing segment. Splinters fly at the hit point; at hp ≤ 0 the
+ * stick SNAPS like charcoal — it breaks into 2-3 tumbling pieces spread
+ * along its long axis, more splinters, a snap voice. Returns true when
+ * damage applied (false: unknown/already broken). */
+export function damageSegment(
   world: GameWorld,
   nodeId: string,
-  studId: number,
+  segmentId: number,
   damage: number,
   point: Vector3,
 ): boolean {
   void world // reserved (future: structural collapse of the wall above)
   const target = useDestruction.getState().targets.get(nodeId)
   if (!target) return false
-  const stud = target.studs.find((s) => s.id === studId)
-  if (!stud || stud.broken) return false
-  stud.hp -= damage
+  const segment = target.segments.find((s) => s.id === segmentId)
+  if (!segment || segment.broken) return false
+  segment.hp -= damage
   for (let i = 0; i < 4; i++) {
     spawnDebris(point.x, point.y, point.z, 0.02 + Math.random() * 0.02, WOOD, 2, 0.9)
   }
-  if (stud.hp > 0) {
+  if (segment.hp > 0) {
     sfx.studHit()
     return true
   }
-  stud.hp = 0 // clamp — debug snapshots read hp, don't show underflow
-  stud.broken = true
+  segment.hp = 0 // clamp — debug snapshots read hp, don't show underflow
+  segment.broken = true
   target.revision++
   useDestruction.getState().bump()
-  const quarter = stud.size[1] / 4
-  spawnDebris(stud.center[0], stud.center[1] + quarter, stud.center[2], 0.09 + Math.random() * 0.03, WOOD, 1.2, 3.5)
-  spawnDebris(stud.center[0], stud.center[1] - quarter, stud.center[2], 0.09 + Math.random() * 0.03, WOOD, 1.2, 3.5)
+  // Charcoal-stick snap: 2-3 stick pieces spread along the long axis
+  // (verticals fall as stacked thirds, plates as run pieces).
+  const [sx, sy, sz] = segment.size
+  const long = Math.max(sx, sy, sz)
+  let ax = 0
+  let ay = 1
+  let az = 0
+  if (sy < long) {
+    ax = Math.cos(segment.yaw)
+    ay = 0
+    az = Math.sin(segment.yaw)
+  }
+  const pieces = 2 + (Math.random() < 0.5 ? 1 : 0)
+  for (let i = 0; i < pieces; i++) {
+    const t = ((i + 0.5) / pieces - 0.5) * long
+    spawnDebris(
+      segment.center[0] + ax * t,
+      segment.center[1] + ay * t,
+      segment.center[2] + az * t,
+      0.06 + Math.random() * 0.04,
+      WOOD,
+      1.3,
+      3.4,
+    )
+  }
   for (let i = 0; i < 6; i++) {
     spawnDebris(point.x, point.y, point.z, 0.02 + Math.random() * 0.025, WOOD, 2.4, 1.2)
   }
   sfx.studSnap()
   return true
 }
+
+/** Legacy alias — identical signature, same member layer. */
+export const damageStud = damageSegment
 
 export type TargetRayHit = { nodeId: string; distance: number; point: Vector3 }
 /** Legacy alias. */

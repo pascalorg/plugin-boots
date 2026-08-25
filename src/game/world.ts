@@ -55,13 +55,9 @@ export type GameWorld = {
   /** Roots of engineering-overlay renderers (Bones X-ray members). Never
    * solid or destructible — game-root hides them for the session via the
    * restore ledger so no unbreakable ghost layer haunts voxelized walls.
-   * Optional only so hand-built test worlds don't have to carry it;
-   * collectWorld always returns it (possibly empty).
-   * TODO(quiet round): flip to required + add `overlayRoots: []` to every
-   * test fixture. Deliberately left optional through phase-3 round 2: the
-   * sandwich/trees agents were still landing new GameWorld fixtures written
-   * against this optional shape, and their test files have other owners. */
-  overlayRoots?: Object3D[]
+   * collectWorld always returns it (possibly empty); hand-built test
+   * worlds carry `overlayRoots: []`. */
+  overlayRoots: Object3D[]
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number

@@ -88,6 +88,19 @@ function getSkyTexture(): CanvasTexture | null {
     g.fill()
   }
 
+  // Pole cap: every u-column of canvas row y=0 collapses onto the dome's
+  // single zenith point, so ANY x-variation near the top (smudge/break
+  // tails) smears into concentric rings around the pole. Painting the top
+  // rows back to one uniform color removes the banding — and making that
+  // color a touch BRIGHTER than the zenith gray doubles as the subtle
+  // light-through-clouds lift straight overhead (warm gray, never blue).
+  const cap = g.createLinearGradient(0, 0, 0, h * 0.14)
+  cap.addColorStop(0, 'rgba(185,182,176,1)') // uniform, slightly lifted zenith
+  cap.addColorStop(0.55, 'rgba(185,182,176,0.55)')
+  cap.addColorStop(1, 'rgba(185,182,176,0)')
+  g.fillStyle = cap
+  g.fillRect(0, 0, w, Math.ceil(h * 0.14))
+
   skyTexture = new CanvasTexture(canvas)
   skyTexture.colorSpace = SRGBColorSpace
   return skyTexture
