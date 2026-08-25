@@ -326,13 +326,16 @@ function buildStuds(
 /** Real-world drywall board footprint the logical sheets tile at. */
 const SHEET_W = 1.2
 const SHEET_H = 2.4
-/** A sheet flies off once this fraction of its cells is torn out… */
-const SHEET_FLY_TORN = 0.35
+/** A sheet flies off once this fraction of its cells is torn out — one
+ * pistol tear is ~17% of a board, so the SECOND concentrated hit sheds it
+ * (drywall dies fast; play-tested against the headless battery, where
+ * spread shots straddle sheet seams and slip through existing holes). */
+const SHEET_FLY_TORN = 0.25
 /** …or after this many carves — but only once the board is genuinely
  * opened (SHEET_FLY_MIN_TORN), so a long shallow line cut across many
- * sheets (grazing hits) doesn't shed every board it nicked. */
+ * sheets (grazing hits, ~14% each) doesn't shed every board it nicked. */
 const SHEET_FLY_HITS = 3
-const SHEET_FLY_MIN_TORN = 0.2
+const SHEET_FLY_MIN_TORN = 0.18
 
 const EMPTY_SHEET_MAP = new Int32Array(0)
 
