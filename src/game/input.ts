@@ -129,7 +129,14 @@ export class GameInput {
   }
 
   requestLock(): void {
-    void this.canvas?.requestPointerLock?.()
+    // Some browsers return a promise that rejects (e.g. WrongDocumentError
+    // right after fullscreen churn), others return undefined — swallow both.
+    try {
+      const result = this.canvas?.requestPointerLock?.() as unknown
+      if (result instanceof Promise) result.catch(() => {})
+    } catch {
+      // ignore — relock-on-click will retry
+    }
   }
 
   /** Read-and-clear the accumulated look delta. */

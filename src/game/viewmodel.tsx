@@ -22,11 +22,18 @@ import type { GameWorld } from './world'
  * animation stack: draw-in, breathing, look-lag, run bob, landing dip.
  */
 
-/** Classic FPS anchor: low-right of screen, barrel converging on the crosshair. */
+/**
+ * Classic FPS anchor: low-right of screen, barrel converging on the crosshair.
+ * Tuned to the weapon-models extents at the game FOV (90-ish vertical): the
+ * pistol/knife sit closer so the small models read; the rifle stays at arm's
+ * length so its muzzle (model z ~ -0.6) lands right of the crosshair, with the
+ * stock running off the bottom-right corner. Every part stays > 0.11 in front
+ * of the camera through recoil (+0.07 z) and draw-in, clear of the near plane.
+ */
 const POSES: Record<WeaponId, { pos: [number, number, number]; rot: [number, number, number] }> = {
   knife: { pos: [0.3, -0.3, -0.42], rot: [0.05, -0.24, 0.12] },
-  pistol: { pos: [0.34, -0.32, -0.52], rot: [0, -0.08, 0.03] },
-  rifle: { pos: [0.34, -0.32, -0.52], rot: [0, -0.1, 0.04] },
+  pistol: { pos: [0.3, -0.28, -0.45], rot: [0, -0.07, 0.03] },
+  rifle: { pos: [0.33, -0.3, -0.5], rot: [0.01, -0.09, 0.04] },
   builder: { pos: [0.32, -0.33, -0.46], rot: [0.07, -0.28, 0.14] },
 }
 
@@ -54,8 +61,6 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const breathT = useRef(0)
   const bobPhase = useRef(0)
   const bobAmp = useRef(0)
-  const prevYaw = useRef(playerRig.yaw)
-  const prevPitch = useRef(playerRig.pitch)
   const lagYaw = useRef(0)
   const lagPitch = useRef(0)
   const prevGrounded = useRef(true)
@@ -156,14 +161,15 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const bobX = Math.sin(bobPhase.current) * 0.012 * bobAmp.current
     const bobRoll = Math.sin(bobPhase.current) * 0.01 * bobAmp.current
 
-    // Look-lag: the weapon trails mouse deltas through a spring.
-    const yawVel = (playerRig.yaw - prevYaw.current) * invDt
-    const pitchVel = (playerRig.pitch - prevPitch.current) * invDt
-    prevYaw.current = playerRig.yaw
-    prevPitch.current = playerRig.pitch
-    const lagK = Math.min(1, dt * 12)
-    lagYaw.current += (clamp(-yawVel * 0.014, -0.05, 0.05) - lagYaw.current) * lagK
-    lagPitch.current += (clamp(-pitchVel * 0.014, -0.05, 0.05) - lagPitch.current) * lagK
+    // Look-lag: the weapon trails mouse motion through a spring. Reads the
+    // rig's look velocities (rad/s, mouse-driven so teleports don't spike,
+    // pre-smoothed ~10 Hz in player.tsx) — gain and spring rate are hotter
+    // than the old raw-delta tune to offset that upstream smoothing.
+    const lagK = Math.min(1, dt * 18)
+    lagYaw.current +=
+      (clamp(-playerRig.yawVelocity * 0.018, -0.055, 0.055) - lagYaw.current) * lagK
+    lagPitch.current +=
+      (clamp(-playerRig.pitchVelocity * 0.018, -0.055, 0.055) - lagPitch.current) * lagK
 
     // Landing dip: track fall speed from camera height, dip on touchdown.
     const velY = (camera.position.y - prevCamY.current) * invDt
@@ -206,7 +212,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
   return (
     <group ref={rigRef} userData={{ __boots: true }}>
-      <group ref={poseRef} position={[0.34, -0.32, -0.52]}>
+      {/* Initial position matches the knife pose (spawn weapon); the frame loop owns it after. */}
+      <group ref={poseRef} position={[0.3, -0.3, -0.42]}>
         <group visible={showKnife}>
           <KnifeModel />
         </group>

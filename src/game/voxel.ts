@@ -19,7 +19,13 @@ export type VoxelSource = {
 }
 
 export type VoxelGridData = {
+  /** Legacy/render size — the LARGEST per-axis cell (length/height cell on
+   * anisotropic wall grids). Debris sizing and gap-free collision spheres
+   * key off this. Grid math must use cellX/cellY/cellZ. */
   cell: number
+  cellX: number
+  cellY: number
+  cellZ: number
   nx: number
   ny: number
   nz: number
@@ -47,6 +53,14 @@ const gridKey = (ix: number, iy: number, iz: number, nx: number, ny: number) =>
 /** Cap on voxels per wall — beyond this the cell size grows to compensate. */
 const MAX_VOXELS = 1600
 
+/** Per-axis cell override — wall anatomy pins the THICKNESS axis to a thin
+ * cell (thickness/3 → 0.03–0.05 m skins) so even a 0.10 m wall gets three
+ * layers. Overridden axes keep their cell fixed; the rest stay adaptive. */
+export type VoxelCellOverride = { x?: number; y?: number; z?: number }
+
+const spanOf = (extent: number, cell: number) =>
+  Math.max(1, Math.ceil(extent / cell - 1e-6))
+
 export function buildVoxelGrid(
   sources: VoxelSource[],
   worldBounds: Box3,
@@ -55,24 +69,30 @@ export function buildVoxelGrid(
    * even a 100%-occupied grid stays ≤ MAX_VOXELS instead of relying on the
    * thin-wall occupancy discount. */
   solid = false,
+  cellSizes?: VoxelCellOverride,
 ): VoxelGridData {
   const size = new Vector3()
   worldBounds.getSize(size)
-  // Grow the cell until the raw grid is small enough that even a solid fill
-  // stays under budget (walls are mostly thin, so real counts land far lower).
+  // Grow the adaptive cell until the raw grid is small enough that even a
+  // solid fill stays under budget (plain walls are mostly thin, so real
+  // counts land far lower). Anisotropic wall grids fill their thickness
+  // axis ~100%, so an override forfeits the occupancy discount.
   let cell = preferredCell
-  const budget = solid ? MAX_VOXELS : MAX_VOXELS * 24
+  const budget = solid || cellSizes ? MAX_VOXELS : MAX_VOXELS * 24
   for (let guard = 0; guard < 12; guard++) {
     const rawCount =
-      Math.max(1, Math.ceil(size.x / cell)) *
-      Math.max(1, Math.ceil(size.y / cell)) *
-      Math.max(1, Math.ceil(size.z / cell))
+      spanOf(size.x, cellSizes?.x ?? cell) *
+      spanOf(size.y, cellSizes?.y ?? cell) *
+      spanOf(size.z, cellSizes?.z ?? cell)
     if (rawCount <= budget) break
     cell *= 1.35
   }
-  const nx = Math.max(1, Math.ceil(size.x / cell))
-  const ny = Math.max(1, Math.ceil(size.y / cell))
-  const nz = Math.max(1, Math.ceil(size.z / cell))
+  const cellX = cellSizes?.x ?? cell
+  const cellY = cellSizes?.y ?? cell
+  const cellZ = cellSizes?.z ?? cell
+  const nx = spanOf(size.x, cellX)
+  const ny = spanOf(size.y, cellY)
+  const nz = spanOf(size.z, cellZ)
   const origin = worldBounds.min
 
   const inverses = sources.map((s) => _mat.clone().copy(s.matrixWorld).invert())
@@ -81,21 +101,23 @@ export function buildVoxelGrid(
   const centers: number[] = []
   const index = new Map<number, number>()
 
-  const half = cell / 2
+  const halfX = cellX / 2
+  const halfY = cellY / 2
+  const halfZ = cellZ / 2
   for (let iz = 0; iz < nz; iz++) {
     for (let iy = 0; iy < ny; iy++) {
       for (let ix = 0; ix < nx; ix++) {
-        const cx = origin.x + ix * cell + half
-        const cy = origin.y + iy * cell + half
-        const cz = origin.z + iz * cell + half
+        const cx = origin.x + ix * cellX + halfX
+        const cy = origin.y + iy * cellY + halfY
+        const cz = origin.z + iz * cellZ + halfZ
         let inside = false
         for (let m = 0; m < sources.length && !inside; m++) {
           const bvh = sources[m]?.bvh
           const inv = inverses[m]
           if (!bvh || !inv) continue
           // Shell test: world-aligned voxel box as an OBB in mesh space.
-          _box.min.set(cx - half, cy - half, cz - half)
-          _box.max.set(cx + half, cy + half, cz + half)
+          _box.min.set(cx - halfX, cy - halfY, cz - halfZ)
+          _box.max.set(cx + halfX, cy + halfY, cz + halfZ)
           if (bvh.intersectsBox(_box, inv)) {
             inside = true
             break
@@ -119,7 +141,10 @@ export function buildVoxelGrid(
 
   const count = coords.length / 3
   return {
-    cell,
+    cell: Math.max(cellX, cellY, cellZ),
+    cellX,
+    cellY,
+    cellZ,
     nx,
     ny,
     nz,
@@ -136,19 +161,23 @@ export function buildVoxelGrid(
 /**
  * Drywall-skin post-pass: rebuilds the grid keeping only the two one-cell
  * layers on the min and max faces of the THICKNESS axis (the grid axis with
- * the smallest cell span) — the stud cavity between them becomes empty
- * space. A cell is interior when, along that axis, it is neither within one
- * cell of the min face nor of the max face. Grids ≤ 2 cells thick have no
- * interior and are returned unchanged (same object).
+ * the smallest PHYSICAL extent — anisotropic wall grids give the thinnest
+ * axis as many cells as the others, so raw spans can't be trusted) — the
+ * stud cavity between them becomes empty space. A cell is interior when,
+ * along that axis, it is neither within one cell of the min face nor of the
+ * max face. Grids ≤ 2 cells thick have no interior and are returned
+ * unchanged (same object).
  */
 export function dropInteriorCells(grid: VoxelGridData): VoxelGridData {
   let axis = 0
   let span = grid.nx
-  if (grid.ny < span) {
+  let extent = grid.nx * grid.cellX
+  if (grid.ny * grid.cellY < extent) {
     axis = 1
     span = grid.ny
+    extent = grid.ny * grid.cellY
   }
-  if (grid.nz < span) {
+  if (grid.nz * grid.cellZ < extent) {
     axis = 2
     span = grid.nz
   }
@@ -173,6 +202,9 @@ export function dropInteriorCells(grid: VoxelGridData): VoxelGridData {
   }
   return {
     cell: grid.cell,
+    cellX: grid.cellX,
+    cellY: grid.cellY,
+    cellZ: grid.cellZ,
     nx: grid.nx,
     ny: grid.ny,
     nz: grid.nz,
@@ -280,13 +312,13 @@ export function removeSphere(
   radius: number,
 ): number[] {
   const removed: number[] = []
-  const { cell, origin, nx, ny, nz } = grid
-  const minX = Math.max(0, Math.floor((x - radius - origin.x) / cell))
-  const maxX = Math.min(nx - 1, Math.floor((x + radius - origin.x) / cell))
-  const minY = Math.max(0, Math.floor((y - radius - origin.y) / cell))
-  const maxY = Math.min(ny - 1, Math.floor((y + radius - origin.y) / cell))
-  const minZ = Math.max(0, Math.floor((z - radius - origin.z) / cell))
-  const maxZ = Math.min(nz - 1, Math.floor((z + radius - origin.z) / cell))
+  const { cellX, cellY, cellZ, origin, nx, ny, nz } = grid
+  const minX = Math.max(0, Math.floor((x - radius - origin.x) / cellX))
+  const maxX = Math.min(nx - 1, Math.floor((x + radius - origin.x) / cellX))
+  const minY = Math.max(0, Math.floor((y - radius - origin.y) / cellY))
+  const maxY = Math.min(ny - 1, Math.floor((y + radius - origin.y) / cellY))
+  const minZ = Math.max(0, Math.floor((z - radius - origin.z) / cellZ))
+  const maxZ = Math.min(nz - 1, Math.floor((z + radius - origin.z) / cellZ))
   const r2 = radius * radius
   for (let iz = minZ; iz <= maxZ; iz++) {
     for (let iy = minY; iy <= maxY; iy++) {
@@ -323,11 +355,11 @@ export function raycastVoxels(
   dz: number,
   maxDist: number,
 ): VoxelRayHit | null {
-  const { cell, origin, nx, ny, nz } = grid
+  const { cellX, cellY, cellZ, origin, nx, ny, nz } = grid
   // Clip the ray to the grid AABB first.
-  const boundsMaxX = origin.x + nx * cell
-  const boundsMaxY = origin.y + ny * cell
-  const boundsMaxZ = origin.z + nz * cell
+  const boundsMaxX = origin.x + nx * cellX
+  const boundsMaxY = origin.y + ny * cellY
+  const boundsMaxZ = origin.z + nz * cellZ
   let tMin = 0
   let tMax = maxDist
   const axes: Array<[number, number, number, number]> = [
@@ -352,23 +384,23 @@ export function raycastVoxels(
   let px = ox + dx * startT
   let py = oy + dy * startT
   let pz = oz + dz * startT
-  let ix = Math.min(nx - 1, Math.max(0, Math.floor((px - origin.x) / cell)))
-  let iy = Math.min(ny - 1, Math.max(0, Math.floor((py - origin.y) / cell)))
-  let iz = Math.min(nz - 1, Math.max(0, Math.floor((pz - origin.z) / cell)))
+  let ix = Math.min(nx - 1, Math.max(0, Math.floor((px - origin.x) / cellX)))
+  let iy = Math.min(ny - 1, Math.max(0, Math.floor((py - origin.y) / cellY)))
+  let iz = Math.min(nz - 1, Math.max(0, Math.floor((pz - origin.z) / cellZ)))
 
   const stepX = dx > 0 ? 1 : -1
   const stepY = dy > 0 ? 1 : -1
   const stepZ = dz > 0 ? 1 : -1
-  const nextBound = (i: number, o: number, d: number, gridO: number) => {
-    const edge = gridO + (d > 0 ? (i + 1) * cell : i * cell)
+  const nextBound = (i: number, o: number, d: number, gridO: number, c: number) => {
+    const edge = gridO + (d > 0 ? (i + 1) * c : i * c)
     return Math.abs(d) < 1e-9 ? Infinity : (edge - o) / d
   }
-  let tX = startT + nextBound(ix, px, dx, origin.x)
-  let tY = startT + nextBound(iy, py, dy, origin.y)
-  let tZ = startT + nextBound(iz, pz, dz, origin.z)
-  const tDeltaX = Math.abs(dx) < 1e-9 ? Infinity : cell / Math.abs(dx)
-  const tDeltaY = Math.abs(dy) < 1e-9 ? Infinity : cell / Math.abs(dy)
-  const tDeltaZ = Math.abs(dz) < 1e-9 ? Infinity : cell / Math.abs(dz)
+  let tX = startT + nextBound(ix, px, dx, origin.x, cellX)
+  let tY = startT + nextBound(iy, py, dy, origin.y, cellY)
+  let tZ = startT + nextBound(iz, pz, dz, origin.z, cellZ)
+  const tDeltaX = Math.abs(dx) < 1e-9 ? Infinity : cellX / Math.abs(dx)
+  const tDeltaY = Math.abs(dy) < 1e-9 ? Infinity : cellY / Math.abs(dy)
+  const tDeltaZ = Math.abs(dz) < 1e-9 ? Infinity : cellZ / Math.abs(dz)
 
   let t = startT
   for (let guard = 0; guard < nx + ny + nz + 3; guard++) {

@@ -22,8 +22,10 @@ import { bvhFor, type GameWorld } from './world'
  * and a voxel replica takes over rendering, collision, and bullet
  * interception.
  *
- * WALL ANATOMY: walls voxelize as TWO drywall skins (interior cells along
- * the thickness axis are dropped — `dropInteriorCells`) with the stud
+ * WALL ANATOMY: walls voxelize ANISOTROPICALLY — the thickness axis is
+ * pinned to thickness/3 cells (≥ 3 layers even on a 0.10 m wall) while
+ * length/height keep ~0.15 m cells — then interior layers are dropped
+ * (`dropInteriorCells`), leaving TWO thin drywall skins with the stud
  * cavity between them, and the studs are first-class breakable members
  * with their own hp.
  *
@@ -124,6 +126,10 @@ export const useDestruction = create<DestructionState>((set) => {
 
 const _bounds = new Box3()
 const _size = new Vector3()
+
+/** Above this world-axis thickness the node is not a thin axis-aligned wall
+ * (diagonal walls, piers) — no skin/cavity layering, legacy grid instead. */
+const MAX_ANATOMY_THICKNESS = 0.35
 
 const STUD_SPACING = 0.4064 // 16" o.c.
 const STUD_WIDTH = 0.038
@@ -238,8 +244,34 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   })
   if (_bounds.isEmpty()) return null
 
-  let grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, !wall)
-  if (wall) grid = dropInteriorCells(grid)
+  let grid: ReturnType<typeof buildVoxelGrid>
+  if (wall) {
+    // Wall anatomy needs ≥ 3 layers across the thickness so the two drywall
+    // skins survive dropInteriorCells with a real cavity between them —
+    // typical walls (0.10–0.15 m) are ONE 0.15 m cell thick otherwise. Pin
+    // the thickness axis (the thin horizontal world extent) to thickness/3
+    // cells: 0.03–0.05 m skins, ~0.15 m cells along length/height. Diagonal
+    // walls have no thin world axis and keep the legacy isotropic grid.
+    _bounds.getSize(_size)
+    const thicknessAxis = _size.x <= _size.z ? 'x' : 'z'
+    const extent = thicknessAxis === 'x' ? _size.x : _size.z
+    if (extent > 0.001 && extent <= MAX_ANATOMY_THICKNESS) {
+      const layers = Math.max(3, Math.ceil(extent / 0.15 - 1e-6))
+      const thicknessCell = extent / layers
+      grid = buildVoxelGrid(
+        sources,
+        _bounds.clone(),
+        0.15,
+        false,
+        thicknessAxis === 'x' ? { x: thicknessCell } : { z: thicknessCell },
+      )
+    } else {
+      grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, false)
+    }
+    grid = dropInteriorCells(grid)
+  } else {
+    grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
+  }
   if (grid.count === 0) return null
 
   const target: VoxelTarget = {
@@ -290,7 +322,16 @@ function crumbleIslands(target: VoxelTarget): void {
   }
   target.revision++
   useDestruction.getState().bump()
-  sfx.crumble(total)
+  // Broken framing in the collapse → wood-laced rubble; pure drywall otherwise.
+  let framingGone = false
+  for (const stud of target.studs) {
+    if (stud.broken) {
+      framingGone = true
+      break
+    }
+  }
+  if (framingGone) sfx.woodCrumble(total)
+  else sfx.crumble(total)
 }
 
 /** Carve a sphere out of any target at a world point (voxelizes on first
@@ -409,6 +450,7 @@ export function damageStud(
     sfx.studHit()
     return true
   }
+  stud.hp = 0 // clamp — debug snapshots read hp, don't show underflow
   stud.broken = true
   target.revision++
   useDestruction.getState().bump()
@@ -468,13 +510,15 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
   let grounded = false
   for (const target of useDestruction.getState().targets.values()) {
     const { grid } = target
+    // Sphere radius keys off the LARGEST cell — any smaller and the capsule
+    // could slip between skin voxels spaced a full length-cell apart.
     const r = grid.cell * 0.55
-    const minX = Math.floor((pos.x - radius - r - grid.origin.x) / grid.cell)
-    const maxX = Math.floor((pos.x + radius + r - grid.origin.x) / grid.cell)
-    const minY = Math.floor((pos.y - r - grid.origin.y) / grid.cell)
-    const maxY = Math.floor((pos.y + height + r - grid.origin.y) / grid.cell)
-    const minZ = Math.floor((pos.z - radius - r - grid.origin.z) / grid.cell)
-    const maxZ = Math.floor((pos.z + radius + r - grid.origin.z) / grid.cell)
+    const minX = Math.floor((pos.x - radius - r - grid.origin.x) / grid.cellX)
+    const maxX = Math.floor((pos.x + radius + r - grid.origin.x) / grid.cellX)
+    const minY = Math.floor((pos.y - r - grid.origin.y) / grid.cellY)
+    const maxY = Math.floor((pos.y + height + r - grid.origin.y) / grid.cellY)
+    const minZ = Math.floor((pos.z - radius - r - grid.origin.z) / grid.cellZ)
+    const maxZ = Math.floor((pos.z + radius + r - grid.origin.z) / grid.cellZ)
     if (maxX < 0 || maxY < 0 || maxZ < 0) continue
     for (let iz = Math.max(0, minZ); iz <= Math.min(grid.nz - 1, maxZ); iz++) {
       for (let iy = Math.max(0, minY); iy <= Math.min(grid.ny - 1, maxY); iy++) {

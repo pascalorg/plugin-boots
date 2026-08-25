@@ -5,6 +5,7 @@ import { useEffect, useRef } from 'react'
 import { Box3, Matrix4, type Object3D, Quaternion, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { useDestruction } from './destruction'
 import { tablePosition } from './guntable'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -56,6 +57,13 @@ const tmpVec = new Vector3()
 const tmpQuat = new Quaternion()
 const tmpMat = new Matrix4()
 const tmpBox = new Box3()
+
+/** Once gunfire voxelizes a door, destruction owns its colliders and its
+ * mesh is hidden — the door system must stand down (no prompt, no swing,
+ * and NEVER re-enable colliders over the carved voxel grid). */
+function isVoxelized(nodeId: string): boolean {
+  return useDestruction.getState().targets.has(nodeId)
+}
 
 function easeOutCubic(k: number): number {
   const inv = 1 - k
@@ -192,7 +200,7 @@ export function Doors({ world }: { world: GameWorld }) {
       if (door.animT >= SWING_SECONDS) {
         door.angle = door.toAngle
         applyDoorPose(door)
-        if (!door.open) {
+        if (!door.open && !isVoxelized(door.entry.nodeId)) {
           // Fully shut: solid again, latch catches.
           for (const collider of door.colliders) collider.disabled = false
           sfx.doorLatch()
@@ -204,6 +212,7 @@ export function Doors({ world }: { world: GameWorld }) {
     let nearest: DoorState | null = null
     let bestSq = INTERACT_RANGE * INTERACT_RANGE
     for (const door of doors.values()) {
+      if (isVoxelized(door.entry.nodeId)) continue // shot to bits — no longer a door
       const dSq = door.center.distanceToSquared(playerRig.position)
       if (dSq < bestSq) {
         bestSq = dSq
@@ -242,6 +251,6 @@ export const doorsDebug = {
       : [],
   toggle: (nodeId: string): void => {
     const door = activeDoors?.get(nodeId)
-    if (door) toggleDoor(door)
+    if (door && !isVoxelized(nodeId)) toggleDoor(door)
   },
 }

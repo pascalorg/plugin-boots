@@ -45,3 +45,38 @@ Rough / next:
   in real plans, stud hit-feel) — round 2 starts with a play-test pass.
 
 Checks: `bun run check-types` clean, `bun test` 28 pass / 387 expects.
+
+## Round 2 — 2026-08-25 (overnight)
+
+- **Wall anatomy v2** — `voxel.ts` grids are now anisotropic
+  (`cellX/cellY/cellZ`, optional `VoxelCellOverride` on `buildVoxelGrid`);
+  `destruction.ts` pins the wall thickness axis to thickness/max(3,…) cells,
+  so 0.10–0.15 m walls really get outer skin / stud cavity / inner skin.
+  `dropInteriorCells` picks the thickness axis by physical extent; DDA,
+  removeSphere, and capsule push-out honor per-axis cells. 5 new grid tests.
+- **Weapon models v2** — pistol (slide ribs, ejection port, hammer, closed
+  trigger guard), rifle (charging handle, gas tube, front sight, 2-segment
+  mag, stock wedge + butt pad), knife (fuller + bright edge), hammer (real
+  two-prong claw). MUZZLE_OFFSETS retuned.
+- **Viewmodel v2** — look-lag now reads `playerRig.yawVelocity/pitchVelocity`
+  (teleport-safe, pre-smoothed); POSES retuned to the new model extents,
+  everything clears the near plane through recoil.
+- **Wiring** — `smoke.test.ts`: 11 headless tests over the full
+  fire→voxelize→stud pipeline (skins+cavity, stud snap, slab volume, prop
+  refusal).
+- **Integration (manager)** — voxel-walls.tsx renders per-axis voxel scale
+  (skins no longer draw as full cubes); input.ts pointer-lock promise
+  rejection swallowed (console now clean on enter); doors stand down once a
+  door is voxelized (no prompt/swing, colliders stay owned by destruction —
+  fixes the invisible-collider resurrection); stud hp clamps to 0 on break.
+
+Rough / next:
+- Doors still never toggled in a LIVE browser (QA scene had no door) — seed
+  one and verify open/close + walk-through.
+- Two-skin read needs a close-up visual confirmation shot post per-axis
+  scale fix.
+- '1 Issue' editor badge after exit (likely host validation, pre-existing) —
+  confirm not Boots-related.
+- Headless fps floor ~3.5 (software GL) — validate smoothness on real HW.
+
+Checks: `bun run check-types` clean, `bun test` 44 pass / 1828 expects.

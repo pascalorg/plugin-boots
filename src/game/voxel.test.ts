@@ -121,6 +121,94 @@ describe('dropInteriorCells', () => {
   })
 })
 
+describe('anisotropic wall grids', () => {
+  /** 2m long × 1m tall × 0.12m thick — a real interior wall. Thickness axis
+   * pinned to thickness/3 the way ensureVoxelTarget does. */
+  function thinWallGrid() {
+    const geometry = new BoxGeometry(2, 1, 0.12)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.06), new Vector3(1, 0.5, 0.06))
+    return buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.15, false, {
+      z: 0.12 / 3,
+    })
+  }
+
+  test('a 0.12m wall gets exactly 3 thickness layers', () => {
+    const grid = thinWallGrid()
+    expect(grid.nz).toBe(3)
+    expect(grid.cellZ).toBeCloseTo(0.04, 6)
+    expect(grid.cellX).toBeCloseTo(0.15, 6)
+    expect(grid.cellY).toBeCloseTo(0.15, 6)
+    // Scalar cell stays the length/height cell — render/debris size.
+    expect(grid.cell).toBeCloseTo(0.15, 6)
+    // 14 × 7 × 3, fully occupied.
+    expect(grid.nx).toBe(14)
+    expect(grid.ny).toBe(7)
+    expect(grid.count).toBe(14 * 7 * 3)
+    // Centers honor the per-axis cells: z layers at −0.04, 0, 0.04.
+    for (let i = 0; i < grid.count; i++) {
+      const iz = grid.coords[i * 3 + 2]!
+      expect(grid.centers[i * 3 + 2]!).toBeCloseTo(-0.04 + iz * 0.04, 6)
+    }
+  })
+
+  test('legacy isotropic grids expose equal per-axis cells', () => {
+    const grid = wallGrid()
+    expect(grid.cellX).toBe(grid.cell)
+    expect(grid.cellY).toBe(grid.cell)
+    expect(grid.cellZ).toBe(grid.cell)
+  })
+
+  test('dropInteriorCells keeps 2 of the 3 thin layers', () => {
+    const skinned = dropInteriorCells(thinWallGrid())
+    expect(skinned.count).toBe(14 * 7 * 2)
+    expect(skinned.aliveCount).toBe(skinned.count)
+    expect(skinned.cellZ).toBeCloseTo(0.04, 6)
+    for (let i = 0; i < skinned.count; i++) {
+      const iz = skinned.coords[i * 3 + 2]!
+      expect(iz === 0 || iz === 2).toBe(true)
+    }
+  })
+
+  test('DDA hits the outer skin, then the inner skin through a carved hole', () => {
+    const skinned = dropInteriorCells(thinWallGrid())
+    // Outer skin face is at z = 0.06.
+    const first = raycastVoxels(skinned, 0, 0, 5, 0, 0, -1, 20)
+    expect(first).not.toBeNull()
+    expect(first!.distance).toBeCloseTo(4.94, 3)
+    // Carve the outer-skin voxel on the ray's path; the ray now crosses the
+    // cavity and stops at the inner skin (z = -0.02 → distance 5.02).
+    const removed = removeSphere(skinned, 0, 0, 0.04, 0.05)
+    expect(removed).toHaveLength(1)
+    const second = raycastVoxels(skinned, 0, 0, 5, 0, 0, -1, 20)
+    expect(second).not.toBeNull()
+    expect(second!.distance).toBeCloseTo(5.02, 3)
+  })
+
+  test('occupancy respects a doorway cutout', () => {
+    // Two 0.8m wall piers flanking a 0.4m opening (|x| < 0.2).
+    const geometry = new BoxGeometry(0.8, 1, 0.12)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.06), new Vector3(1, 0.5, 0.06))
+    const grid = buildVoxelGrid(
+      [
+        { bvh, matrixWorld: new Matrix4().makeTranslation(-0.6, 0, 0) },
+        { bvh, matrixWorld: new Matrix4().makeTranslation(0.6, 0, 0) },
+      ],
+      bounds,
+      0.15,
+      false,
+      { z: 0.12 / 3 },
+    )
+    // Column ix=6 spans x −0.10..0.05 — fully inside the opening.
+    for (let i = 0; i < grid.count; i++) {
+      expect(grid.coords[i * 3]!).not.toBe(6)
+    }
+    // A ray through the doorway passes clean.
+    expect(raycastVoxels(grid, -0.025, 0, 5, 0, 0, -1, 20)).toBeNull()
+  })
+})
+
 describe('raycastYawObb', () => {
   test('hits an axis-aligned box straight on', () => {
     const t = raycastYawObb(0, 0, 5, 0, 0, -1, 0, 0, 0, 0.5, 0.5, 0.5, 0, 20)

@@ -73,8 +73,9 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
     const mesh = meshRef.current
     const { grid } = wall
     mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    const size = grid.cell * 0.99
-    _scale.setScalar(size)
+    // Per-axis scale: anisotropic wall grids have thin skin cells along the
+    // thickness axis — a uniform grid.cell cube would visually fill the cavity.
+    _scale.set(grid.cellX * 0.99, grid.cellY * 0.99, grid.cellZ * 0.99)
     _quat.identity()
     for (let i = 0; i < grid.count; i++) {
       if (grid.alive[i]) {
