@@ -425,3 +425,56 @@ Rough / next (round 2):
   could expose isEditing).
 
 Checks: `bun run check-types` clean, `bun test` 98 pass / 2489 expects.
+
+## Phase 3, Round 2 — 2026-08-25 (dust rework + wiring; sandwich/trees workers failed again)
+
+Round outcome: the two core workers (wall-sandwich, trees-fire) failed to
+land for a second round — destruction.ts still has the phase-2 anatomy
+(no `prevoxelizeTick`, no boards/segments/sheets) and no trees-destruct
+module exists. Everything around them landed and is green.
+
+- **Dust rework** (dust.tsx + dust.test.ts): glowing balls gone —
+  NormalBlending gypsum quads with ragged CanvasTexture atlas silhouettes,
+  per-instance alpha fade, coned ejection around the surface normal; kinds
+  chip/puff/plume + haze; pool-pressure guard. destruction.ts owns ALL wall
+  dust (shooting.ts is wall-silent); carves throw a 'plume' aimed through
+  the hole via damageTarget's optional direction arg.
+- **Tear feel prep** (weapons.ts / shooting.ts / debris.tsx): per-weapon
+  `tearRadius` for wall targets (pistol ~0.9 m holes); board lane removed
+  from routing (sheets become logical voxel groups when sandwich lands);
+  torn-edge plate debris proportions + ground-slap chip + flat-shard cap.
+- **Spin drag** (player.tsx / viewmodel.tsx): `playerRig.speedScale` API
+  (move-loop multiplier, writers restore to exactly 1); rotary spin lerps
+  it 1→0.55 so the heavy gun slows the carrier; restored with the
+  spin-down whine and on unmount.
+- **Overlay ghosts** (game-root.tsx / world.ts): ForeignOverlayHide +
+  OverlaySweep re-hide late-registering Bones overlay roots (frames
+  0–120, idempotent, every flip in the restore ledger) with a layer-mask
+  backstop restored on exit.
+- **Z-fighting** (nature.tsx / builder.tsx): lawn disc raised + building
+  footprint cut from the ground geometry; builder ghost inflated 1.03.
+- **Manager close**: `__boots.targets()` census dump added (nodeId, kind,
+  aliveCount/totalCount, revision, brokenStuds) — QA can now measure voxel
+  removal and island collapse numerically; commercial-name grep clean;
+  panel copy tweak (construction boots / not-OSHA joke) folded in.
+
+QA round 1 verdict recap (still open): (a) pre-voxelized look FAIL,
+(b) sandwich FAIL (one rifle hit pierces the whole 0.12 m wall — tear vs
+skin layering needs the real anatomy), (d) trees ABSENT, (g) island
+collapse FAIL on the wall cut / untested on item volumes. PASS: minigun
+rear table + sweep-leveling, 3x3 pocket→window Keep mapping, sky, exit
+restore, 120 fps.
+
+Round 3 MUST-land (same contracts, pinned in shooting.ts +
+voxel-walls.tsx + game-root.tsx doc blocks):
+- wall-sandwich: `prevoxelizeTick(world, budgetMs?) => boolean` (driver
+  passes a ~4 ms TIME budget), sheets/segments members + damage/raycast,
+  paper-tear + charcoal-stick feel, thickness-aware tear so one hit ≠
+  through-hole, island collapse incl. studless item volumes.
+- trees-fire: trees-destruct module, `registerTreeRoutes()` at init,
+  ignite→charcoal→stump, `<TreesDestruct/>` mount + trees() debug swap
+  (exact patch recipe in wiring's round-2 report / game-root comments).
+- sky nit: brighter breaks barely visible at zenith + faint concentric
+  banding at the dome pole.
+
+Checks: `bun run check-types` clean, `bun test` 113 pass / 4139 expects.

@@ -38,7 +38,7 @@ export const bootsHostPanel: PluginHostPanel = {
   component: () => import('./panel'),
   pluginId: bootsPlugin.id,
   description:
-    "It's a game — jump in and the editor becomes a first-person shooter set in the building you're editing. Esc, and nothing happened.",
+    "It's a game — jump in and the editor becomes a first-person shooter set in the building you're editing. Bring your construction boots. ⚠ Not OSHA compliant. Esc, and nothing happened.",
   creator: {
     name: 'Pascal',
     url: 'https://github.com/pascalorg',

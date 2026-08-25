@@ -235,6 +235,17 @@ function ActiveGame() {
       setBotsFrozen: (v: boolean) => {
         debugFlags.botsFrozen = v
       },
+      // Per-target voxel census (QA asked for this to measure removal /
+      // island collapse numerically): plain copies, never live refs.
+      targets: () =>
+        Array.from(useDestruction.getState().targets.values()).map((target) => ({
+          nodeId: target.nodeId,
+          kind: target.kind,
+          aliveCount: target.grid.aliveCount,
+          totalCount: target.grid.alive.length,
+          revision: target.revision,
+          brokenStuds: target.studs.reduce((n, s) => n + (s.broken ? 1 : 0), 0),
+        })),
       studs: () =>
         Array.from(useDestruction.getState().targets.values()).flatMap((target) =>
           target.studs.map((stud) => ({
