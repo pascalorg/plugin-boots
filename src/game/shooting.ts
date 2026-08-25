@@ -18,29 +18,32 @@ import type { GameWorld } from './world'
 
 /**
  * Hitscan resolution across every target class, phase-3 edition:
- * solid host meshes (BVH), voxelized skins (grid DDA), drywall BOARDS
- * (flat tearable plates), framing SEGMENTS (charcoal-stick studs), trees,
- * glass panes, bots. Nearest hit wins; on a near-tie (within 1 cm) the
- * higher class wins:
+ * solid host meshes (BVH), voxelized skins (grid DDA), framing SEGMENTS
+ * (charcoal-stick studs), trees, glass panes, bots. Nearest hit wins; on a
+ * near-tie (within 1 cm) the higher class wins:
  *
- *   bot > glass > tree > segment > board > voxel skin > solid collider
+ *   bot > glass > tree > segment > voxel skin > solid collider
  *
  * First bullet into a pristine destructible node converts it to voxels and
  * carves in the same shot — walls get the skins + framing anatomy
- * automatically.
+ * automatically. Kind-'wall' targets carve at weapon.tearRadius (drywall
+ * tears MASSIVE holes fast); everything else carves at weapon.holeRadius.
  *
  * ── Sound ownership (no double-voicing) ───────────────────────────────
  *   voxel skins   drywallCrunch here (carve); plain volumes self-voice in
  *                 damageTarget.
- *   boards        damageBoard voices the paper tear — silent here.
  *   segments      damageSegment / damageStud voice chip + snap — silent
  *                 here (tiny voxelCrunch only when the hit went stale).
  *   trees/glass/bots  their modules voice themselves.
  *
- * ── Dust ───────────────────────────────────────────────────────────────
- *   Every hit class puffs spawnDust at the impact (guarded — the fleet
- *   rewrites dust.tsx too); heavy carves (removed > 6) add a second puff
- *   pushed along the shot so carve-through reads inside the hole.
+ * ── Dust (single-emission policy) ──────────────────────────────────────
+ *   destruction.ts owns ALL dust/debris emission for wall damage — carve,
+ *   sheet fly-off, crumble. This file MUST NOT also emit for wall carves.
+ *   Non-wall hits emit only a small kind-'chip' spawnDust (surface normal
+ *   when the hit exposes one, shot direction as the fallback) or nothing:
+ *   bots and non-destructible solids are sparks-only. Heavy NON-WALL
+ *   carves (removed > 6) add one kind-'puff' pushed along the shot so
+ *   carve-through reads inside the hole.
  *
  * ── Phase-3 destruction contract (feature-detected) ────────────────────
  * destruction.ts is being extended by a parallel agent. This file routes
@@ -50,10 +53,6 @@ import type { GameWorld } from './world'
  *   raycastSegments(origin, direction, maxDist)
  *       → { nodeId, segmentId, distance, point } | null
  *   damageSegment(world, nodeId, segmentId, damage, point) → boolean
- *   raycastBoards(origin, direction, maxDist)
- *       → { nodeId, boardId, distance, point } | null
- *   damageBoard(world, nodeId, boardId, damage, point, direction) → number
- *       (voxels/shreds removed; owns the tear sfx)
  *   damageTarget(world, nodeId, point, radius, direction?) — direction is
  *       the new optional carve-through param; legacy 4-arg calls still work.
  *
@@ -71,7 +70,7 @@ import type { GameWorld } from './world'
 
 export type FireOutcome = 'bot' | 'wall' | 'glass' | 'tree' | 'solid' | 'none'
 
-type HitClass = 'none' | 'solid' | 'voxel' | 'board' | 'segment' | 'tree' | 'glass' | 'bot'
+type HitClass = 'none' | 'solid' | 'voxel' | 'segment' | 'tree' | 'glass' | 'bot'
 
 /** Near-tie window: hits this close resolve by class priority, not range. */
 const TIE = 0.01
@@ -109,13 +108,6 @@ type SegmentRayHit = {
   point: Vector3
 }
 
-type BoardRayHit = {
-  nodeId: string
-  boardId: number
-  distance: number
-  point: Vector3
-}
-
 type Phase3Destruction = {
   raycastSegments?: (origin: Vector3, direction: Vector3, maxDist: number) => SegmentRayHit | null
   damageSegment?: (
@@ -125,15 +117,6 @@ type Phase3Destruction = {
     damage: number,
     point: Vector3,
   ) => boolean
-  raycastBoards?: (origin: Vector3, direction: Vector3, maxDist: number) => BoardRayHit | null
-  damageBoard?: (
-    world: GameWorld,
-    nodeId: string,
-    boardId: number,
-    damage: number,
-    point: Vector3,
-    direction: Vector3,
-  ) => number | void
 }
 
 /** Guarded view of the parallel agent's new exports — every use checks
@@ -200,39 +183,75 @@ export function aimDirection(target: Vector3, spread: number): Vector3 {
   return target
 }
 
-/** Impact dust, existence-guarded (the fleet rewrites dust.tsx too). */
-function puff(x: number, y: number, z: number, intensity: number): void {
-  if (typeof spawnDust === 'function') spawnDust(x, y, z, intensity)
-}
+// --- Dust façade (dust.tsx is owned by a parallel agent) -----------------
 
-/** Extra puff for heavy carves, pushed along the shot so the dissolve
- * reads INSIDE the hole — the slow-lobby shootout air. */
-function heavyPuff(point: Vector3, direction: Vector3, removed: number): void {
-  if (removed <= 6) return
-  puff(
-    point.x + direction.x * 0.25,
-    point.y + direction.y * 0.25,
-    point.z + direction.z * 0.25,
-    Math.min(1, 0.5 + removed / 30),
+/** Frozen phase-3 dust contract: position-first with an opts bag. The cast
+ * bridges the rewrite window (dust.tsx still ships the legacy scalar
+ * signature in some checkouts); existence stays guarded at every call. */
+type DustOpts = {
+  normal?: Vector3
+  direction?: Vector3
+  kind?: 'chip' | 'puff' | 'plume'
+}
+const dust = spawnDust as unknown as (
+  position: Vector3,
+  intensity: number,
+  opts?: DustOpts,
+) => void
+
+/** Small impact chip — the ONLY dust a non-wall hit emits. Opts vectors
+ * are cloned so the emitter may retain them past this shot's scratch
+ * reuse; position is read synchronously at spawn (contract). */
+function chip(point: Vector3, intensity: number, normal?: Vector3): void {
+  if (typeof spawnDust !== 'function') return
+  dust(
+    point,
+    intensity,
+    normal ? { kind: 'chip', normal: normal.clone() } : { kind: 'chip', direction: _direction.clone() },
   )
 }
 
-/** Carve into a destructible node; drywall skins get the papery crunch on
- * top (damageTarget's own crunch covers plain volumes). Returns voxels
- * removed. */
+const _puffPoint = new Vector3()
+
+/** One extra puff for heavy NON-WALL carves, pushed along the shot so the
+ * dissolve reads INSIDE the hole. Never for walls — destruction.ts owns
+ * every gram of drywall dust (contract 4). */
+function heavyPuff(point: Vector3, direction: Vector3, removed: number): void {
+  if (removed <= 6) return
+  if (typeof spawnDust !== 'function') return
+  _puffPoint.copy(point).addScaledVector(direction, 0.25)
+  dust(_puffPoint, Math.min(1, 0.5 + removed / 30), { kind: 'puff', direction: direction.clone() })
+}
+
+/** Kind-'wall' predictor that works BEFORE first-blood voxelization too:
+ * ensureVoxelTarget assigns kind 'wall' exactly when world.walls has the
+ * node, so radius choice and emission policy agree with destruction.ts. */
+function isWallTarget(world: GameWorld, nodeId: string): boolean {
+  return useDestruction.getState().targets.get(nodeId)?.kind === 'wall' || world.walls.has(nodeId)
+}
+
+/** Carve into a destructible node. Walls tear at weapon.tearRadius (falls
+ * back to holeRadius) and get the papery crunch on top — but emit NO dust
+ * here; destruction.ts owns all wall emission. Non-wall volumes carve at
+ * holeRadius with a small chip (+ carve-through puff when heavy). Returns
+ * voxels removed. */
 function carve(
   world: GameWorld,
   nodeId: string,
   point: Vector3,
-  radius: number,
+  weapon: WeaponDef,
   direction: Vector3,
 ): number {
+  const wall = isWallTarget(world, nodeId)
+  const radius = wall ? (weapon.tearRadius ?? weapon.holeRadius) : weapon.holeRadius
   const removed = carveTarget(world, nodeId, point, radius, direction)
-  if (removed > 0 && useDestruction.getState().targets.get(nodeId)?.kind === 'wall') {
+  if (removed === 0) return 0
+  if (wall) {
     sfx.drywallCrunch(Math.min(1, removed / 10))
+  } else {
+    chip(point, Math.min(0.5, 0.2 + removed / 60))
+    heavyPuff(point, direction, removed)
   }
-  puff(point.x, point.y, point.z, Math.min(1, 0.3 + removed / 40))
-  heavyPuff(point, direction, removed)
   return removed
 }
 
@@ -277,16 +296,6 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
     _point.copy(voxelHit.point)
   }
 
-  // Drywall boards behind the cladding (phase-3 lane; absent = skip).
-  const boardHit =
-    d3.raycastBoards && d3.damageBoard
-      ? d3.raycastBoards(_origin, _direction, bestDist + TIE)
-      : null
-  if (boardHit) {
-    bestDist = boardHit.distance
-    winner = 'board'
-  }
-
   // Framing segments in opened cavities (falls back to the legacy whole-stud
   // lane until the segment API lands).
   const segmentHit: SegmentRayHit | null =
@@ -318,18 +327,21 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
 
   if (winner === 'bot' && botHit) {
     damageBot(botHit.bot, weapon.damage)
-    puff(botHit.point.x, botHit.point.y, botHit.point.z, 0.3)
+    // Metal chassis: sparks only, no dust.
+    for (let i = 0; i < 2; i++) {
+      spawnDebris(botHit.point.x, botHit.point.y, botHit.point.z, 0.03, SPARK, 1.6, 0.5)
+    }
     return 'bot'
   }
   if (winner === 'glass' && glassHit) {
     hitGlass(glassHit)
-    puff(glassHit.point.x, glassHit.point.y, glassHit.point.z, 0.25)
+    chip(glassHit.point, 0.2, glassHit.normal)
     return 'glass'
   }
   if (winner === 'tree' && treeHit && treeRoutes) {
     // Tree module owns its own voxel-burst/char sfx.
     treeRoutes.damage(world, treeHit, weapon.damage, weapon.holeRadius, _direction)
-    puff(treeHit.point.x, treeHit.point.y, treeHit.point.z, 0.35)
+    chip(treeHit.point, 0.3)
     return 'tree'
   }
   if (winner === 'segment' && segmentHit) {
@@ -341,39 +353,24 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
       ? d3.damageSegment(world, segmentHit.nodeId, memberId, dmg, segmentHit.point)
       : damageStud(world, segmentHit.nodeId, memberId, dmg, segmentHit.point)
     if (!applied) sfx.voxelCrunch(0.25)
-    puff(segmentHit.point.x, segmentHit.point.y, segmentHit.point.z, 0.3)
-    return 'wall'
-  }
-  if (winner === 'board' && boardHit && d3.damageBoard) {
-    // damageBoard voices the paper tear itself — silent here.
-    const torn = d3.damageBoard(
-      world,
-      boardHit.nodeId,
-      boardHit.boardId,
-      weapon.damage,
-      boardHit.point,
-      _direction,
-    )
-    puff(boardHit.point.x, boardHit.point.y, boardHit.point.z, 0.4)
-    if (typeof torn === 'number') heavyPuff(boardHit.point, _direction, torn)
+    chip(segmentHit.point, 0.3)
     return 'wall'
   }
   if (winner === 'voxel' && voxelHit) {
-    carve(world, voxelHit.nodeId, _point, weapon.holeRadius, _direction)
+    carve(world, voxelHit.nodeId, _point, weapon, _direction)
     return 'wall'
   }
   if (winner === 'solid' && solidNodeId) {
     if (solidNodeType && DESTRUCTIBLE.has(solidNodeType)) {
       // First blood: voxelize + carve in one go (walls keep their skins +
       // framing anatomy via the destruction manager).
-      if (carve(world, solidNodeId, _point, weapon.holeRadius, _direction) > 0) return 'wall'
+      if (carve(world, solidNodeId, _point, weapon, _direction) > 0) return 'wall'
     }
     // Non-destructible surface (or one that refused to voxelize): sparks
-    // and a thunk.
+    // and a thunk — no dust.
     for (let i = 0; i < 3; i++) {
       spawnDebris(_point.x, _point.y, _point.z, 0.035, SPARK, 1.4, 0.6)
     }
-    puff(_point.x, _point.y, _point.z, 0.25)
     if (weapon.melee) sfx.knifeHit()
     else sfx.voxelCrunch(0.25)
     return 'solid'

@@ -7,8 +7,15 @@ export type WeaponDef = {
   /** Hold-to-fire. Semi-auto requires a trigger release between shots. */
   auto: boolean
   damage: number
-  /** Radius of the voxel sphere a hit carves out of a wall. */
+  /** Radius of the voxel sphere a hit carves out of a non-wall volume. */
   holeRadius: number
+  /**
+   * Carve radius for kind-'wall' targets only (drywall tears in big sheets,
+   * so per-hit holes must read MASSIVE fast — pistol ≈ 0.9 m across).
+   * shooting.ts resolves `tearRadius ?? holeRadius`; non-wall destructibles
+   * always use holeRadius.
+   */
+  tearRadius?: number
   /** Radians of cone jitter. */
   spread: number
   range: number
@@ -30,6 +37,7 @@ export const WEAPONS: Record<WeaponDef['id'], WeaponDef> = {
     auto: true,
     damage: 45,
     holeRadius: 0.11,
+    tearRadius: 0.3,
     spread: 0,
     range: 2.1,
     melee: true,
@@ -41,6 +49,7 @@ export const WEAPONS: Record<WeaponDef['id'], WeaponDef> = {
     auto: false,
     damage: 34,
     holeRadius: 0.16,
+    tearRadius: 0.45,
     spread: 0.011,
     range: 90,
     melee: false,
@@ -52,20 +61,23 @@ export const WEAPONS: Record<WeaponDef['id'], WeaponDef> = {
     auto: true,
     damage: 24,
     holeRadius: 0.19,
+    tearRadius: 0.55,
     spread: 0.028,
     range: 90,
     melee: false,
     kick: 0.011,
   },
   // The big one: near-continuous stream that levels a building by sweeping
-  // it. Low per-bullet damage, but 24/s of 0.15 m holes chews through
-  // anything; wide spread + tiny constant kick sell the hose feel.
+  // it. Low per-bullet damage and a smaller per-bullet tear than the rifle,
+  // but 24/s of them chews through anything; wide spread + tiny constant
+  // kick sell the hose feel.
   minigun: {
     id: 'minigun',
     rate: 24,
     auto: true,
     damage: 10,
     holeRadius: 0.15,
+    tearRadius: 0.34,
     spread: 0.045,
     range: 90,
     melee: false,

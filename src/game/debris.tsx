@@ -3,6 +3,7 @@
 import { useFrame } from '@react-three/fiber'
 import { useLayoutEffect, useRef } from 'react'
 import { Color, DynamicDrawUsage, Euler, type InstancedMesh, Matrix4, Quaternion, Vector3 } from 'three'
+import { spawnDust } from './dust'
 
 /**
  * One global ring buffer of tumbling debris — voxel chunks, sparks, glass
@@ -16,7 +17,9 @@ import { Color, DynamicDrawUsage, Euler, type InstancedMesh, Matrix4, Quaternion
  * API (callers may feature-check the named exports):
  *   spawnDebris(x, y, z, size, color, speed, ttl?)  — classic cube chunk.
  *   spawnFlatDebris(x, y, z, w, h, color)           — drywall/paper plate,
- *     w×h meters, slow flutter, ~3s life.
+ *     w×h meters (torn-edge xy jitter), slow flutter, ~3s life, one tiny
+ *     chip puff on its first ground slap. Live plates cap at 120 — the
+ *     plate closest to expiry gets reused first.
  *   clearDebris()                                   — session teardown.
  */
 
@@ -116,16 +119,39 @@ export function spawnDebris(
 
 /** How thin a plate shard draws (meters) — a drywall sliver, not a voxel. */
 const PLATE_THICKNESS = 0.016
+/** Max plate shards alive at once — beyond this the oldest gets recycled. */
+const FLAT_CAP = 120
 
 /**
  * Flat plate shard — torn drywall paper/board. Gentle outward pop, then a
- * slow fluttery fall (air drag + tilt side-slip in the frame loop).
+ * slow fluttery fall (air drag + tilt side-slip in the frame loop). Edges
+ * read torn via independent non-uniform xy scale jitter.
  */
 export function spawnFlatDebris(x: number, y: number, z: number, w: number, h: number, color: Color): void {
-  const slot = slots[cursor]!
-  colors[cursor]!.copy(color).offsetHSL(0, 0, (Math.random() - 0.5) * 0.06)
-  cursor = (cursor + 1) % CAPACITY
-  if (!slot.alive) liveCount++
+  // Count live plates; under cap pressure, recycle the one closest to
+  // expiry instead of burning a fresh ring slot.
+  let flats = 0
+  let oldest = -1
+  let oldestTtl = Number.POSITIVE_INFINITY
+  for (let i = 0; i < CAPACITY; i++) {
+    const s = slots[i]!
+    if (!s.alive || !s.flat) continue
+    flats++
+    if (s.ttl < oldestTtl) {
+      oldestTtl = s.ttl
+      oldest = i
+    }
+  }
+  let index: number
+  if (flats >= FLAT_CAP && oldest >= 0) {
+    index = oldest // still alive — liveCount unchanged
+  } else {
+    index = cursor
+    cursor = (cursor + 1) % CAPACITY
+    if (!slots[index]!.alive) liveCount++
+  }
+  const slot = slots[index]!
+  colors[index]!.copy(color).offsetHSL(0, 0, (Math.random() - 0.5) * 0.06)
   slot.alive = true
   slot.flat = true
   slot.px = x
@@ -143,8 +169,10 @@ export function spawnFlatDebris(x: number, y: number, z: number, w: number, h: n
   slot.wx = (Math.random() - 0.5) * 4.4
   slot.wy = (Math.random() - 0.5) * 1.8
   slot.wz = (Math.random() - 0.5) * 4.4
-  slot.sx = Math.max(0.05, w)
-  slot.sy = Math.max(0.05, h)
+  // Torn edges: each axis shrinks independently (1.0 vs 0.7 style), so no
+  // two plates keep the pristine rectangle proportions.
+  slot.sx = Math.max(0.05, w) * (0.7 + Math.random() * 0.3)
+  slot.sy = Math.max(0.05, h) * (0.7 + Math.random() * 0.3)
   slot.sz = PLATE_THICKNESS
   slot.ground = 0.045
   slot.ttl = 2.6 + Math.random() * 1.5
@@ -168,6 +196,8 @@ const _quat = new Quaternion()
 const _euler = new Euler()
 const _pos = new Vector3()
 const _scale = new Vector3()
+const _dustPos = new Vector3()
+const SLAP_CHIP = { kind: 'chip' } as const
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 
 export function Debris() {
@@ -217,7 +247,12 @@ export function Debris() {
       if (s.py < half && s.vy < 0) {
         s.py = half
         if (s.flat) {
-          // Plates don't bounce — they slap down and settle.
+          // Plates don't bounce — they slap down and settle; the first
+          // slap kicks up one tiny dust chip right where they land.
+          if (!s.bounced) {
+            _dustPos.set(s.px, half + 0.02, s.pz)
+            spawnDust(_dustPos, 0.18, SLAP_CHIP)
+          }
           s.vy = 0
           const settle = 1 / (1 + 9 * dt)
           s.vx *= settle

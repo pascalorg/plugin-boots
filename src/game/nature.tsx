@@ -11,8 +11,11 @@ import {
   CylinderGeometry,
   type InstancedMesh,
   Matrix4,
+  Path,
   Quaternion,
   RepeatWrapping,
+  Shape,
+  ShapeGeometry,
   Vector3,
 } from 'three'
 import type { GameWorld } from './world'
@@ -121,6 +124,50 @@ function grassClusterGeometry(): BufferGeometry {
   return geometry
 }
 
+const GROUND_RADIUS = 95
+
+/**
+ * The lawn disc with the building footprint CUT OUT of it (AABB + 1 m
+ * margin): host slabs sit on the same ground plane, and any lawn surface
+ * running under them z-fights their bottom faces from grazing angles. A
+ * hole in the geometry kills that coplanar pair by construction — no
+ * offset tuning, nothing rendered where the building stands.
+ */
+function groundGeometry(world: GameWorld): BufferGeometry {
+  const shape = new Shape()
+  shape.absarc(0, 0, GROUND_RADIUS, 0, Math.PI * 2, false)
+  const aabb = world.buildingAabb
+  if (!aabb.isEmpty()) {
+    const center = aabb.getCenter(new Vector3())
+    const pad = 1
+    // Shape space is the disc's local XY; the mesh rotates -PI/2 about X,
+    // so local (x, y) lands at world (x, -z) around the building center.
+    const x0 = aabb.min.x - pad - center.x
+    const x1 = aabb.max.x + pad - center.x
+    const y0 = center.z - (aabb.max.z + pad)
+    const y1 = center.z - (aabb.min.z - pad)
+    // Only cut when the rectangle sits fully inside the disc — a hole
+    // crossing the outer contour would break triangulation.
+    if (Math.max(Math.abs(x0), Math.abs(x1), Math.abs(y0), Math.abs(y1)) < GROUND_RADIUS * 0.95) {
+      const hole = new Path()
+      hole.moveTo(x0, y0)
+      hole.lineTo(x1, y0)
+      hole.lineTo(x1, y1)
+      hole.lineTo(x0, y1)
+      hole.closePath()
+      shape.holes.push(hole)
+    }
+  }
+  const geometry = new ShapeGeometry(shape, 48)
+  // ShapeGeometry UVs are raw meters — normalize to [0, 1] across the disc
+  // so the shared grass texture keeps its CircleGeometry-era repeat grain.
+  const uv = geometry.getAttribute('uv')
+  for (let i = 0; i < uv.count; i++) {
+    uv.setXY(i, uv.getX(i) / (GROUND_RADIUS * 2) + 0.5, uv.getY(i) / (GROUND_RADIUS * 2) + 0.5)
+  }
+  return geometry
+}
+
 type Scatter = { matrices: Matrix4[]; colors: Color[] }
 
 function scatter(
@@ -185,6 +232,8 @@ const _yAxis = new Vector3(0, 1, 0)
 
 export function Nature({ world }: { world: GameWorld }) {
   const texture = useMemo(groundTexture, [])
+
+  const groundGeo = useMemo(() => groundGeometry(world), [world])
 
   const grassGeometry = useMemo(grassClusterGeometry, [])
 
@@ -273,8 +322,9 @@ export function Nature({ world }: { world: GameWorld }) {
 
   return (
     <group userData={{ __boots: true }}>
-      <mesh position={[center.x, 0.02, center.z]} rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[95, 48]} />
+      {/* y 0.05 clears host slab tops; the footprint hole (groundGeometry)
+          keeps the lawn from ever running under the building. */}
+      <mesh geometry={groundGeo} position={[center.x, 0.05, center.z]} rotation={[-Math.PI / 2, 0, 0]}>
         {texture ? (
           <meshStandardMaterial map={texture} roughness={1} />
         ) : (

@@ -6,6 +6,7 @@ import type { Group, Mesh, Object3D } from 'three'
 import type { WeaponId } from '../store'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { builderDebug } from './builder'
 import { MOVE } from './movement'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -60,6 +61,9 @@ const DIP_TIME = 0.3
 /** Barrel cluster speed at full spin (rad/s) and spin-down time (s). */
 const BARREL_SPIN_RATE = 28
 const SPIN_DOWN_TIME = 0.9
+/** Spin drag: hauling live barrels slows you — playerRig.speedScale lerps
+ * 1 → (1 - SPIN_DRAG) with spin level, recovering over the spin-down. */
+const SPIN_DRAG = 0.45
 const TWO_PI = Math.PI * 2
 
 /** audio.ts gains sfx.minigun() this round (audio agent) — feature-detect so
@@ -108,12 +112,20 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const spinAngle = useRef(0)
   const barrelsRef = useRef<Object3D | null>(null)
   const spinSfx = useRef<MinigunSfxHandle | null>(null)
+  /** True while WE own playerRig.speedScale (spin drag active) — lets the
+   * restore-to-1 write happen exactly once when the barrels rest. */
+  const spinDragging = useRef(false)
 
-  // Kill the whine if the session unmounts mid-spin.
+  // Kill the whine if the session unmounts mid-spin, and hand the player
+  // their legs back (speedScale contract: writers restore exactly 1).
   useEffect(
     () => () => {
       spinSfx.current?.stop()
       spinSfx.current = null
+      if (spinDragging.current) {
+        playerRig.speedScale = 1
+        spinDragging.current = false
+      }
     },
     [],
   )
@@ -141,8 +153,15 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         const next = list[(at + (action === 'WheelDown' ? 1 : list.length - 1)) % list.length]!
         switchWeapon(next)
       } else if (action === 'KeyQ' && state.weapon === 'builder') {
-        const order = ['wall', 'floor', 'roof'] as const
-        state.setBuildPiece(order[(order.indexOf(state.buildPiece) + 1) % order.length]!)
+        // 3x3 edit mode owns Q while editing a placed wall (pocket cycling) —
+        // feature-detected so this compiles before builder's edit mode lands.
+        // Supports isEditing as a getter fn or plain flag; absent = never editing.
+        const editFlag = (builderDebug as { isEditing?: boolean | (() => boolean) }).isEditing
+        const editing = typeof editFlag === 'function' ? editFlag() : editFlag === true
+        if (!editing) {
+          const order = ['wall', 'floor', 'roof'] as const
+          state.setBuildPiece(order[(order.indexOf(state.buildPiece) + 1) % order.length]!)
+        }
       }
     }
 
@@ -188,6 +207,16 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     } else if (spinSfx.current) {
       spinSfx.current.stop()
       spinSfx.current = null
+    }
+    // Spin drag on the legs: written every frame while spin > 0 (release or
+    // weapon switch just lets spinT decay, so speed recovers with the whine),
+    // then restored to exactly 1 once — never fighting other writers at rest.
+    if (spinT.current > 0) {
+      playerRig.speedScale = 1 - SPIN_DRAG * spinT.current
+      spinDragging.current = true
+    } else if (spinDragging.current) {
+      playerRig.speedScale = 1
+      spinDragging.current = false
     }
 
     if (current !== 'builder' && !staggered) {

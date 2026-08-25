@@ -891,13 +891,17 @@ export function Builder() {
 
   if (!ghost) return null
   const pose = piecePose(ghost.piece, ghost.y)
+  // Inflated 1.03 like the edit overlay above: a ghost hovering over an
+  // already-placed piece would otherwise sit exactly coplanar with its
+  // faces and z-fight (transparent + no depthWrite still depth-TESTS).
+  const ghostDims = PIECE_DIMS[ghost.piece]
   return (
     <group ref={ghostRef} userData={{ __boots: true }}>
       <mesh
         position={[ghost.x, pose.y, ghost.z]}
         rotation={[ghost.piece === 'roof' ? pose.tilt : 0, ghost.yaw, 0, 'YXZ']}
       >
-        <boxGeometry args={PIECE_DIMS[ghost.piece]} />
+        <boxGeometry args={[ghostDims[0] * 1.03, ghostDims[1] * 1.03, ghostDims[2] * 1.03]} />
         <meshBasicMaterial
           color={ghost.occupied ? '#ff5a4d' : '#59a7ff'}
           depthWrite={false}

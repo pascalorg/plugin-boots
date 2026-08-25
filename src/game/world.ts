@@ -56,7 +56,11 @@ export type GameWorld = {
    * solid or destructible — game-root hides them for the session via the
    * restore ledger so no unbreakable ghost layer haunts voxelized walls.
    * Optional only so hand-built test worlds don't have to carry it;
-   * collectWorld always returns it (possibly empty). */
+   * collectWorld always returns it (possibly empty).
+   * TODO(quiet round): flip to required + add `overlayRoots: []` to every
+   * test fixture. Deliberately left optional through phase-3 round 2: the
+   * sandwich/trees agents were still landing new GameWorld fixtures written
+   * against this optional shape, and their test files have other owners. */
   overlayRoots?: Object3D[]
   buildingAabb: Box3
   spawn: Vector3
@@ -126,6 +130,27 @@ function collectMeshes(root: Object3D): Mesh[] {
     meshes.push(mesh)
   })
   return meshes
+}
+
+/**
+ * Bones overlay roots — installations may predate any of these kinds, so
+ * guard every byType lookup (the map only has keys something registered).
+ * Exported separately from collectWorld so the session can re-sweep a few
+ * frames in: overlay renderers register their nodes asynchronously and a
+ * root that lands AFTER the world snapshot would otherwise stay visible
+ * (and unbreakable) for the whole session.
+ */
+export function collectOverlayRoots(): Object3D[] {
+  const overlayRoots: Object3D[] = []
+  for (const kind of OVERLAY_KINDS) {
+    const ids = sceneRegistry.byType[kind]
+    if (!ids) continue
+    for (const id of ids) {
+      const root = sceneRegistry.nodes.get(id)
+      if (root) overlayRoots.push(root)
+    }
+  }
+  return overlayRoots
 }
 
 export function collectWorld(): GameWorld {
@@ -211,17 +236,7 @@ export function collectWorld(): GameWorld {
     }
   }
 
-  // Bones overlay roots — installations may predate any of these kinds, so
-  // guard every byType lookup (the map only has keys something registered).
-  const overlayRoots: Object3D[] = []
-  for (const kind of OVERLAY_KINDS) {
-    const ids = sceneRegistry.byType[kind]
-    if (!ids) continue
-    for (const id of ids) {
-      const root = sceneRegistry.nodes.get(id)
-      if (root) overlayRoots.push(root)
-    }
-  }
+  const overlayRoots = collectOverlayRoots()
 
   // Spawn: outside the building along +X of its center, eye toward it.
   const spawn = new Vector3(6, 0, 6)

@@ -2,12 +2,14 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useMemo, useRef } from 'react'
+import type { Object3D } from 'three'
 import { useBoots } from '../store'
 import { Builder, PlacedPieces } from './builder'
 import { clearDebris, Debris } from './debris'
 import * as destructionApi from './destruction'
 import { resetDestruction, useDestruction, type VoxelTarget } from './destruction'
 import { Doors, doorsDebug } from './doors'
+import * as dustApi from './dust'
 import { clearDust, DustSystem } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
@@ -21,7 +23,7 @@ import { GameSky } from './sky'
 import { Viewmodel } from './viewmodel'
 import { VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
-import { collectWorld, type GameWorld } from './world'
+import { collectOverlayRoots, collectWorld, type GameWorld } from './world'
 
 /**
  * In-canvas game orchestrator, mounted through the plugin's `def.system`
@@ -44,20 +46,112 @@ export function GameRoot() {
  */
 const prevoxelizeTick = (
   destructionApi as {
-    prevoxelizeTick?: (world: GameWorld, budget: number) => boolean
+    prevoxelizeTick?: (world: GameWorld, budgetMs?: number) => boolean
   }
 ).prevoxelizeTick
 
 /**
- * Spreads prevoxelization across frames (budget: 2 walls/frame — a full
- * house clads in well under a second without a first-frame hitch), then
- * goes inert once destruction reports every wall done.
+ * Spreads prevoxelization across frames (~4 ms budget per tick — a full
+ * house clads in well under a second without a hitch), then goes inert
+ * once destruction reports every wall done. The very first frame is
+ * skipped so first paint never carries the voxelization cost on top of
+ * session-start work (fullscreen, HUD, snapshot).
  */
 function Prevoxelize({ world }: { world: GameWorld }) {
   const done = useRef(false)
+  const frame = useRef(0)
   useFrame(() => {
     if (done.current) return
-    done.current = prevoxelizeTick ? prevoxelizeTick(world, 2) : true
+    if (frame.current++ === 0) return
+    done.current = prevoxelizeTick ? prevoxelizeTick(world, 4) : true
+  })
+  return null
+}
+
+/**
+ * Bones' framing renderer re-parents cross-level "foreign" groups (gable
+ * gypsum/sheathing/cladding, roof framing mounted on other storeys) onto
+ * LEVEL Object3Ds and re-asserts `group.visible` from its own store EVERY
+ * FRAME — so the one-shot overlay-root hide in ActiveGame never reaches
+ * them, and they read as z-fighting, unbreakable drywall over voxelized
+ * walls. Hidden here two ways, both cheap:
+ *
+ *  - `visible = false` per frame, AFTER bones' re-assert: this subscriber
+ *    mounts at session start, long after bones' — R3F sorts equal-priority
+ *    subscribers stably, so subscription order IS execution order and ours
+ *    runs later within every frame. Deliberately priority 0: any priority
+ *    > 0 flips the whole canvas into manual-render mode (R3F only
+ *    auto-renders when internal.priority === 0), which would silently hand
+ *    rendering to the host's post pipeline — or a black screen when that
+ *    pipeline is errored/rebuilding.
+ *  - `layers.disableAll()` once per descendant as the ordering-proof
+ *    backstop: bones re-writes `visible` but never touches layers after
+ *    build, so even a bones remount that resubscribes AFTER us (new stable
+ *    sort position) cannot bring the meshes back mid-session.
+ *
+ * Exit-restore guarantees: `visible` restores ITSELF — bones' frame loop
+ * re-asserts it from its store on the first frame after this component
+ * unmounts, so no ledger entry is needed (or wanted: a ledger restore
+ * would just be overwritten by the same loop). Layer masks are ours to
+ * restore: the unmount cleanup writes every recorded mask back. Groups
+ * bones disposed mid-session leave stale-but-inert entries; groups built
+ * mid-session are caught by the ~1 Hz rescan below.
+ */
+function ForeignOverlayHide() {
+  const groups = useRef<Object3D[]>([])
+  const masks = useRef(new Map<Object3D, number>())
+  const frame = useRef(0)
+  useEffect(() => {
+    const recorded = masks.current
+    return () => {
+      for (const [object, mask] of recorded) object.layers.mask = mask
+      recorded.clear()
+      groups.current = []
+    }
+  }, [])
+  useFrame(({ scene }) => {
+    frame.current++
+    // (Late-registering overlay ROOTS are OverlaySweep's job below — this
+    // component only handles the re-parented foreign groups that no root
+    // hide can ever reach.)
+    // Collect refs lazily (first frame, then ~1 Hz) — bones only rebuilds
+    // these groups on compute changes, so a full scene traverse per frame
+    // would be pure waste.
+    if (frame.current === 1 || frame.current % 60 === 0) {
+      groups.current = []
+      scene.traverse((object) => {
+        if (!object.name.startsWith('bones-foreign-')) return
+        groups.current.push(object)
+        object.traverse((child) => {
+          if (masks.current.has(child)) return
+          masks.current.set(child, child.layers.mask)
+          child.layers.disableAll()
+        })
+      })
+    }
+    for (const group of groups.current) group.visible = false
+  })
+  return null
+}
+
+/**
+ * Overlay ghost-buster for late-registering ROOTS: Bones' X-ray renderers
+ * register their nodes asynchronously, so a root that lands after
+ * collectWorld's snapshot escapes ActiveGame's mount-time hide and would
+ * survive wall voxelization as an unbreakable ghost layer. Re-collects
+ * every 15th frame for the first ~2s of the session; hideForGame skips
+ * anything already invisible, so repeat sweeps cost nothing and every flip
+ * still lands in the session's restore ledger. (Re-parented foreign groups
+ * that no root hide can reach are ForeignOverlayHide's job above.)
+ */
+function OverlaySweep() {
+  const frame = useRef(0)
+  useFrame(() => {
+    const f = frame.current
+    if (f > 120) return
+    frame.current = f + 1
+    if (f % 15 !== 0) return
+    for (const root of collectOverlayRoots()) hideForGame(root)
   })
   return null
 }
@@ -151,9 +245,18 @@ function ActiveGame() {
           })),
         ),
       // Phase-3 anatomy dumps — empty arrays until destruction.ts's
-      // boards/segments land (see dumpDestructionMembers).
+      // boards/segments/sheets land (see dumpDestructionMembers; sheets are
+      // the logical drywall tear groups of the tear-out rework).
       boards: () => dumpDestructionMembers('boards'),
       segments: () => dumpDestructionMembers('segments'),
+      sheets: () => dumpDestructionMembers('sheets'),
+      // Dust debug — feature-detected like prevoxelizeTick: dust.tsx's
+      // rework may export a `dustDebug` dump; a stable key + empty object
+      // until then, never a live ref either way.
+      dust: () => {
+        const dump = (dustApi as { dustDebug?: () => Record<string, unknown> }).dustDebug
+        return dump ? dump() : {}
+      },
       // Trees list — swaps to trees-destruct's debug dump when that module
       // lands; a stable key with an empty list until then.
       trees: () => [] as Array<Record<string, unknown>>,
@@ -178,6 +281,8 @@ function ActiveGame() {
       <Player world={world} />
       <Viewmodel world={world} />
       <Prevoxelize world={world} />
+      <ForeignOverlayHide />
+      <OverlaySweep />
       <VoxelWalls />
       <GlassCracks />
       <Debris />

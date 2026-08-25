@@ -51,10 +51,11 @@ import { bvhFor, type GameWorld } from './world'
  *                             skins + studs anatomy; everything else is a
  *                             plain adaptive volume (≤ 1600 voxels).
  *                             `ensureVoxelWall` is a legacy alias.
- *   damageTarget(world, nodeId, point, radius)   carve a sphere at a world
- *                             point (voxelizes on first hit). Returns the
- *                             number of voxels removed. `damageWall` is a
- *                             legacy alias.
+ *   damageTarget(world, nodeId, point, radius, direction?)   carve a sphere
+ *                             at a world point (voxelizes on first hit);
+ *                             direction aims the tear dust plume. Returns
+ *                             the number of voxels removed. `damageWall`
+ *                             is a legacy alias.
  *   damageStud(world, nodeId, studId, damage, point)   chip a stud (wood
  *                             splinters); at hp ≤ 0 it breaks — two large
  *                             falling pieces + snap sfx. Returns true if
@@ -130,6 +131,8 @@ export const useDestruction = create<DestructionState>((set) => {
 })
 
 const _bounds = new Box3()
+/** Scratch for damageTarget's dust direction (dust.tsx reads it at spawn). */
+const _plumeDir = new Vector3()
 const _size = new Vector3()
 const _localBounds = new Box3()
 const _meshBox = new Box3()
@@ -421,12 +424,14 @@ function crumbleIslands(target: VoxelTarget): void {
 
 /** Carve a sphere out of any target at a world point (voxelizes on first
  * hit); spawns debris, queues the island check. Returns how many voxels
- * were removed. */
+ * were removed. `direction` (optional, phase 3) is the shot direction —
+ * it aims the wall-tear dust plume through the hole. */
 export function damageTarget(
   world: GameWorld,
   nodeId: string,
   point: Vector3,
   radius: number,
+  direction?: Vector3,
 ): number {
   const target = ensureVoxelTarget(world, nodeId)
   if (!target) return 0
@@ -447,8 +452,21 @@ export function damageTarget(
       2.6,
     )
   }
-  // Impact dust puff scaled by how much material the carve took out.
-  spawnDust(point.x, point.y, point.z, Math.min(1, 0.25 + removed.length / 30))
+  // Dust (single-emission policy: this module owns ALL wall carve dust —
+  // shooting.ts is deliberately silent for walls). Drywall tears throw a
+  // MASSIVE billowing plume coned through the hole; plain volumes keep a
+  // modest puff scaled by how much material the carve took out.
+  if (target.kind === 'wall') {
+    spawnDust(point, Math.min(1, 0.45 + removed.length / 18), {
+      kind: 'plume',
+      direction: direction ? _plumeDir.copy(direction) : undefined,
+    })
+  } else {
+    spawnDust(point, Math.min(1, 0.25 + removed.length / 30), {
+      kind: 'puff',
+      direction: direction ? _plumeDir.copy(direction) : undefined,
+    })
+  }
   // Walls get the papery drywallCrunch from shooting.ts; only plain volumes
   // voice their own crunch here (avoids the two sounds layering).
   if (target.kind !== 'wall') sfx.voxelCrunch(Math.min(1, removed.length / 12))

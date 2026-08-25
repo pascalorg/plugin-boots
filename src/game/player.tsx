@@ -7,7 +7,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { collideCapsule, EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
 import { collideVoxelWalls } from './destruction'
-import { MOVE, stepVelocity } from './movement'
+import { MOVE, type MoveConfig, stepVelocity } from './movement'
 import { getSession } from './session'
 import type { GameWorld } from './world'
 
@@ -35,6 +35,14 @@ import type { GameWorld } from './world'
  *   plane; direction is normalized, impulses accumulate and are consumed
  *   into the player velocity on the next frame. Safe to call from anywhere
  *   (enemies, explosions) — it never touches the camera directly.
+ *
+ * `playerRig.speedScale` — move-speed multiplier (default 1), consumed by the
+ *   move loop every frame: it scales the run/walk TARGET speeds only, leaving
+ *   gravity, jump and friction stock so acceleration keeps its snap. External
+ *   systems own it (the rotary gun's spin-up drag in viewmodel.tsx lerps it
+ *   1→0.55 with barrel spin); writers MUST hand back exactly 1 when done.
+ *   Reset to 1 on session start. Keep values in (0, 1.5] — 0 would pin the
+ *   player in place.
  *
  * REGEN: 4s after the last damage, health climbs +12/s to 100. Store writes
  * are throttled to ~4/s (fractional hp pools locally) to avoid re-render
@@ -105,6 +113,9 @@ export const playerRig = {
   /** Look velocity (rad/s), ~10 Hz smoothed — viewmodel sway reads these. */
   yawVelocity: 0,
   pitchVelocity: 0,
+  /** Move-speed multiplier (see the API block): scales run/walk target
+   * speeds in the move loop. Writers restore 1; reset on session start. */
+  speedScale: 1,
   /** Knockback: queue an XZ impulse (m/s); consumed into velocity next frame. */
   shove(dirX: number, dirZ: number, power: number): void {
     const len = Math.hypot(dirX, dirZ)
@@ -116,6 +127,9 @@ export const playerRig = {
 
 // --- Module-level combat state (reset when the Player mounts) --------------
 const shoveAccum = { x: 0, z: 0 }
+/** Reused MoveConfig for playerRig.speedScale ≠ 1 — module temp, only the
+ * two target speeds are rewritten per frame, never a fresh object. */
+const scaledMove: MoveConfig = { ...MOVE }
 /** Summed-dt session clock — never Date.now() in render paths. */
 let clock = 0
 let lastDamageAt = -Infinity
@@ -236,6 +250,7 @@ export function Player({ world }: { world: GameWorld }) {
     playerRig.pitch = 0
     playerRig.yawVelocity = 0
     playerRig.pitchVelocity = 0
+    playerRig.speedScale = 1
     // Fresh combat clock per session.
     shoveAccum.x = 0
     shoveAccum.z = 0
@@ -325,6 +340,15 @@ export function Player({ world }: { world: GameWorld }) {
     const wishX = -sinY * fwd + cosY * side
     const wishZ = -cosY * fwd - sinY * side
 
+    // speedScale (rotary spin-up drag, etc.): scale the run/walk targets
+    // only — gravity/jump/friction stay stock so the feel keeps its snap.
+    let moveCfg = MOVE
+    if (playerRig.speedScale !== 1) {
+      scaledMove.runSpeed = MOVE.runSpeed * playerRig.speedScale
+      scaledMove.walkSpeed = MOVE.walkSpeed * playerRig.speedScale
+      moveCfg = scaledMove
+    }
+
     const jumped = stepVelocity(
       vel.current,
       {
@@ -336,7 +360,7 @@ export function Player({ world }: { world: GameWorld }) {
       },
       playerRig.grounded,
       dt,
-      MOVE,
+      moveCfg,
     )
     if (jumped) sfx.jump()
 
