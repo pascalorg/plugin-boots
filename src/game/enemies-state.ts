@@ -8,6 +8,15 @@ import { spawnDebris } from './debris'
  * horde grammar: they come straight at you, in numbers, and you kite them.
  * The React component integrates; this module owns state + damage so the
  * shooting path needs no React.
+ *
+ * PACING (owned here + enemies.tsx):
+ * - GRACE: while `waveState.alerted` is false the lot is peaceful — no
+ *   spawns, no wave text. Walking, building, breaking walls never wake the
+ *   horde; only picking up a gun (pistol/rifle in useBoots.owned) does.
+ * - ALERT: the first gun pickup starts a one-shot ALERT_SECONDS countdown
+ *   ("They heard you — 5"); at 0 the wave director takes over (WAVE 1).
+ * - MERCY: while the player is staggered bots never attack — ground bots
+ *   hold a 4–6 m ring, drones climb +1 m and hover (see enemies.tsx).
  */
 
 export type BotKind = 'droid' | 'dog' | 'drone'
@@ -40,16 +49,25 @@ export const BOT_STATS: Record<
 export const bots: Bot[] = []
 let botId = 1
 
+/** Length of the "they heard you" countdown after the first gun pickup. */
+export const ALERT_SECONDS = 5
+
 export const waveState = {
   wave: 0,
   /** Countdown to next wave while no bots are alive. */
   intermission: 4,
+  /** Flips true on the first gun pickup — the lot stays peaceful before. */
+  alerted: false,
+  /** Seconds left on the one-shot "they heard you" countdown once alerted. */
+  countdown: ALERT_SECONDS,
 }
 
 export function resetBots(): void {
   bots.length = 0
   waveState.wave = 0
   waveState.intermission = 4
+  waveState.alerted = false
+  waveState.countdown = ALERT_SECONDS
 }
 
 export function spawnBot(kind: BotKind, x: number, z: number): void {

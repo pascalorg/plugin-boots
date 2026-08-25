@@ -7,10 +7,20 @@
  *
  * One shared AudioContext behind a soft limiter; every voice is fire-and-
  * forget with envelope-driven gain so nothing needs manual cleanup.
+ *
+ * Master chain: compressor → lowpass ("muffle", 19kHz open) → gain → out.
+ * Damage-feel hooks (driven from enemies.tsx off health/stagger):
+ * - sfx.setMuffle(0..1) — concussion: sweeps the master lowpass 19kHz→700Hz.
+ * - sfx.heartbeat() — looping lub-dub, returns { setRate, setLevel, stop }.
  */
+
+/** Muffle sweep endpoints — fully open vs. concussed. */
+const MUFFLE_OPEN_HZ = 19000
+const MUFFLE_CLOSED_HZ = 700
 
 let ctx: AudioContext | null = null
 let master: DynamicsCompressorNode | null = null
+let muffleFilter: BiquadFilterNode | null = null
 let noiseBuffer: AudioBuffer | null = null
 
 function ensureContext(): AudioContext | null {
@@ -24,9 +34,14 @@ function ensureContext(): AudioContext | null {
     master.ratio.value = 12
     master.attack.value = 0.002
     master.release.value = 0.12
+    muffleFilter = ctx.createBiquadFilter()
+    muffleFilter.type = 'lowpass'
+    muffleFilter.frequency.value = MUFFLE_OPEN_HZ
+    muffleFilter.Q.value = 0.7
     const gain = ctx.createGain()
     gain.gain.value = 0.5
-    master.connect(gain)
+    master.connect(muffleFilter)
+    muffleFilter.connect(gain)
     gain.connect(ctx.destination)
   }
   if (ctx.state === 'suspended') void ctx.resume()
@@ -105,9 +120,73 @@ function thump(freq: number, duration: number, gainValue: number, when = 0, type
   osc.stop(t + duration + 0.05)
 }
 
+/** Handle returned by sfx.heartbeat(). */
+export type HeartbeatHandle = {
+  setRate: (bpm: number) => void
+  setLevel: (v: number) => void
+  stop: () => void
+}
+
 export const sfx = {
   resume(): void {
     ensureContext()
+  },
+
+  /**
+   * Concussion muffle, 0 (clear) → 1 (fully concussed). Sweeps the master
+   * lowpass from 19kHz down to 700Hz on an exponential curve, smoothed over
+   * ~80ms. Driven from enemies.tsx on stagger edges — this module only
+   * exposes the knob.
+   */
+  setMuffle(v: number): void {
+    const c = ensureContext()
+    if (!c || !muffleFilter) return
+    const x = Math.min(1, Math.max(0, v))
+    const freq = MUFFLE_OPEN_HZ * (MUFFLE_CLOSED_HZ / MUFFLE_OPEN_HZ) ** x
+    muffleFilter.frequency.setTargetAtTime(freq, c.currentTime, 0.08)
+  },
+
+  /**
+   * Looping heartbeat — a lub-dub pair (90Hz then 70Hz thumps, 120ms apart)
+   * scheduled sample-accurately via a 100ms lookahead interval, so the pulse
+   * stays steady even when the tab hiccups. setRate/setLevel take effect on
+   * the next unscheduled beat. Starts silent-safe: with level 0 the timer
+   * runs but schedules nothing. Driven from enemies.tsx off health (rate and
+   * level climb as health falls below 45). Always returns a handle (no-op
+   * without WebAudio).
+   */
+  heartbeat(): HeartbeatHandle {
+    const c = ensureContext()
+    let bpm = 60
+    let level = 0.5
+    const LOOKAHEAD = 0.3
+    let nextBeat = c ? c.currentTime + 0.05 : 0
+    const schedule = () => {
+      if (!c || !master) return
+      const now = c.currentTime
+      if (nextBeat < now) nextBeat = now + 0.02 // resync after throttling
+      while (nextBeat < now + LOOKAHEAD) {
+        if (level > 0.001) {
+          const when = nextBeat - now
+          thump(90, 0.14, 0.5 * level, when) // lub
+          thump(70, 0.16, 0.4 * level, when + 0.12) // dub
+        }
+        nextBeat += 60 / bpm
+      }
+    }
+    const timer = c ? setInterval(schedule, 100) : null
+    if (c) schedule()
+    return {
+      setRate: (v: number) => {
+        bpm = Math.min(220, Math.max(20, v))
+      },
+      setLevel: (v: number) => {
+        level = Math.min(1, Math.max(0, v))
+      },
+      stop: () => {
+        if (timer) clearInterval(timer)
+      },
+    }
   },
 
   pistolShot(): void {

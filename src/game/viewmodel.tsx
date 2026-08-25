@@ -68,6 +68,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const fallVel = useRef(0)
   const dipT = useRef(1)
   const dipDepth = useRef(0)
+  /** 0→1 while staggered: weapon droops (down + muzzle-down), firing blocked. */
+  const droop = useRef(0)
 
   useFrame((_, rawDt) => {
     const session = getSession()
@@ -104,6 +106,10 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
     const firing = session.input.state.firing
     const current = useBoots.getState().weapon
+    const staggered = useBoots.getState().staggered
+    // Weapon droop while staggered — slow lerp both ways so the arm sags
+    // and recovers smoothly instead of snapping.
+    droop.current += ((staggered ? 1 : 0) - droop.current) * Math.min(1, dt * 6)
 
     // Any switch (slots, wheel, gear-table pickup) restarts the draw-in.
     if (current !== prevWeapon.current) {
@@ -112,7 +118,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     }
     drawT.current = Math.min(1, drawT.current + dt / DRAW_TIME)
 
-    if (current !== 'builder') {
+    if (current !== 'builder' && !staggered) {
       const def = WEAPONS[current]
       const wantsShot = def.auto ? firing : firing && !prevFiring.current
       if (wantsShot && cooldown.current <= 0) {
@@ -192,15 +198,16 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
     const p = poseRef.current
     if (p) {
+      const sag = droop.current
       p.position.set(
         pose.pos[0] + bobX + breatheX + lagYaw.current * 0.35,
-        pose.pos[1] + bobY + breatheY - dip - draw * 0.24 - swing * 0.1 + lagPitch.current * 0.3,
+        pose.pos[1] + bobY + breatheY - dip - draw * 0.24 - swing * 0.1 + lagPitch.current * 0.3 - sag * 0.06,
         pose.pos[2] + recoil * 0.07,
       )
       p.rotation.set(
-        pose.rot[0] - draw * 0.55 - dip * 1.4 - swing * 1.7 + recoil * 0.14 + lagPitch.current,
+        pose.rot[0] - draw * 0.55 - dip * 1.4 - swing * 1.7 + recoil * 0.14 + lagPitch.current - sag * 0.12,
         pose.rot[1] + lagYaw.current + swing * 0.5,
-        pose.rot[2] + bobRoll + swing * 0.3,
+        pose.rot[2] + bobRoll + swing * 0.3 + sag * 0.07,
       )
     }
   })

@@ -4,9 +4,9 @@ import { useFrame } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import { type Group, Vector3 } from 'three'
 import { useBoots } from '../store'
-import { sfx } from './audio'
-import { BOT_STATS, type Bot, bots, resetBots, spawnBot, waveState } from './enemies-state'
-import { playerRig } from './player'
+import { type HeartbeatHandle, sfx } from './audio'
+import { ALERT_SECONDS, BOT_STATS, type Bot, bots, resetBots, spawnBot, waveState } from './enemies-state'
+import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
 import type { GameWorld } from './world'
 
@@ -14,23 +14,65 @@ import type { GameWorld } from './world'
  * Wave-based horde: humanoid droids, robot dogs, FPV drones — they beeline
  * for you and you mow them down. Ground bots probe ahead with a cheap
  * whisker so they hug obstacles instead of phasing through the table.
+ *
+ * Pacing (see enemies-state.ts for the state shape):
+ * - Peaceful until the first gun pickup, then a 5s "They heard you"
+ *   countdown on the wave line, then WAVE 1 and the normal director.
+ * - Melee routes through player.tsx `damagePlayer` (knockback + directional
+ *   flash + stagger come for free — no local sfx/flash here).
+ * - Stagger mercy: bots never attack a staggered player; ground bots hold a
+ *   4–6 m ring, drones climb +1 m and hover in place.
+ * - Concussion audio: sfx.setMuffle(1) while staggered, and a heartbeat
+ *   whose rate climbs 70→150 bpm as health falls below 45.
  */
 
 const KIND_CYCLE = ['droid', 'dog', 'droid', 'drone', 'dog', 'drone'] as const
 
+/** Stagger-mercy standoff ring for ground bots (m). */
+const MERCY_MIN = 4
+const MERCY_MAX = 6
+/** Heartbeat kicks in below this hp; rate ramps 70→150 bpm toward 0 hp. */
+const HEARTBEAT_HP = 45
+
 const _toPlayer = new Vector3()
+const _center = new Vector3()
+
+/** Spawn the next wave in a ring around the building. */
+function spawnWave(world: GameWorld): void {
+  waveState.wave++
+  waveState.intermission = 5
+  const count = 3 + waveState.wave * 2
+  const center = world.buildingAabb.isEmpty()
+    ? _center.set(0, 0, 0)
+    : world.buildingAabb.getCenter(_center)
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2
+    const radius = 22 + Math.random() * 12
+    spawnBot(
+      KIND_CYCLE[i % KIND_CYCLE.length]!,
+      center.x + Math.cos(angle) * radius,
+      center.z + Math.sin(angle) * radius,
+    )
+  }
+}
 
 export function Enemies({ world }: { world: GameWorld }) {
   const [tick, setTick] = useState(0)
   const signature = useRef('')
   const buzz = useRef<ReturnType<typeof sfx.droneBuzz>>(null)
   const waveLabelT = useRef(0)
+  const waveText = useRef<string | null>(null)
+  const staggerWas = useRef(false)
+  const heart = useRef<HeartbeatHandle | null>(null)
 
   useEffect(() => {
     resetBots()
     buzz.current = sfx.droneBuzz()
     return () => {
       buzz.current?.stop()
+      heart.current?.stop()
+      heart.current = null
+      sfx.setMuffle?.(0)
       resetBots()
     }
   }, [])
@@ -39,34 +81,62 @@ export function Enemies({ world }: { world: GameWorld }) {
     const session = getSession()
     if (!session) return
     const dt = Math.min(rawDt, 1 / 30)
+    const boots = useBoots.getState()
+    const staggered = boots.staggered
 
-    // Wave director.
-    const alive = bots.filter((b) => b.state === 'alive')
-    if (alive.length === 0 && bots.length === 0) {
-      waveState.intermission -= dt
-      session.hud.wave(`WAVE ${waveState.wave + 1} incoming — ${Math.max(1, Math.ceil(waveState.intermission))}`)
-      if (waveState.intermission <= 0) {
-        waveState.wave++
-        waveState.intermission = 5
-        const count = 3 + waveState.wave * 2
-        const center = world.buildingAabb.isEmpty()
-          ? new Vector3()
-          : world.buildingAabb.getCenter(new Vector3())
-        for (let i = 0; i < count; i++) {
-          const angle = Math.random() * Math.PI * 2
-          const radius = 22 + Math.random() * 12
-          spawnBot(
-            KIND_CYCLE[i % KIND_CYCLE.length]!,
-            center.x + Math.cos(angle) * radius,
-            center.z + Math.sin(angle) * radius,
-          )
-        }
+    // Concussion audio — guarded so integration order can't crash.
+    if (staggered !== staggerWas.current) {
+      staggerWas.current = staggered
+      sfx.setMuffle?.(staggered ? 1 : 0)
+    }
+    if (boots.health < HEARTBEAT_HP) {
+      if (!heart.current && typeof sfx.heartbeat === 'function') {
+        heart.current = sfx.heartbeat()
+      }
+      const severity = (HEARTBEAT_HP - Math.max(0, boots.health)) / HEARTBEAT_HP
+      heart.current?.setRate(70 + 80 * severity)
+      heart.current?.setLevel(0.35 + 0.4 * severity)
+    } else if (heart.current) {
+      heart.current.stop()
+      heart.current = null
+    }
+
+    // Wave director: peaceful grace → one-shot alert countdown → waves.
+    if (!waveState.alerted) {
+      if (boots.owned.includes('pistol') || boots.owned.includes('rifle')) {
+        waveState.alerted = true
+        waveState.countdown = ALERT_SECONDS
+      }
+    } else if (waveState.countdown > 0) {
+      waveState.countdown -= dt
+      if (waveState.countdown <= 0) {
+        spawnWave(world) // WAVE 1
         waveLabelT.current = 3
-        session.hud.wave(`WAVE ${waveState.wave}`)
+      }
+    } else if (bots.length === 0) {
+      waveState.intermission -= dt
+      if (waveState.intermission <= 0) {
+        spawnWave(world)
+        waveLabelT.current = 3
       }
     } else if (waveLabelT.current > 0) {
       waveLabelT.current -= dt
-      if (waveLabelT.current <= 0) session.hud.wave(null)
+    }
+
+    // Wave line — write only on change.
+    let label: string | null = null
+    if (waveState.alerted) {
+      if (waveState.countdown > 0) {
+        label = `They heard you — ${Math.ceil(waveState.countdown)}`
+      } else if (bots.length === 0) {
+        label = `next wave — ${Math.max(1, Math.ceil(waveState.intermission))}`
+      } else if (waveLabelT.current > 0) {
+        label = `WAVE ${waveState.wave}`
+      }
+    }
+    if (label !== waveText.current) {
+      waveText.current = label
+      session.hud.wave(label)
     }
 
     // Integrate bots.
@@ -91,12 +161,26 @@ export function Enemies({ world }: { world: GameWorld }) {
       bot.yaw = Math.atan2(_toPlayer.x, _toPlayer.z)
 
       if (bot.kind === 'drone') {
-        const targetY = playerRig.position.y + 0.9 + Math.sin(bot.phase * 0.7 + bot.seed) * 0.5
+        // Mercy: drones climb an extra meter and hold while you're staggered.
+        const targetY =
+          playerRig.position.y +
+          0.9 +
+          (staggered ? 1 : 0) +
+          Math.sin(bot.phase * 0.7 + bot.seed) * 0.5
         bot.position.y += (targetY - bot.position.y) * Math.min(1, dt * 2.2)
         nearestDrone = Math.min(nearestDrone, bot.position.distanceTo(playerRig.position))
       }
 
-      if (dist > stats.reach) {
+      if (staggered) {
+        // Mercy window: nobody attacks a downed player. Ground bots steer to
+        // hold a 4–6 m standoff ring; drones freeze in place (climb above).
+        if (bot.kind !== 'drone' && dist > 0.001 && (dist < MERCY_MIN || dist > MERCY_MAX)) {
+          _toPlayer.normalize()
+          const sign = dist < MERCY_MIN ? -1 : 1
+          bot.position.x += _toPlayer.x * stats.speed * sign * dt
+          bot.position.z += _toPlayer.z * stats.speed * sign * dt
+        }
+      } else if (dist > stats.reach) {
         _toPlayer.normalize()
         // Dogs weave as they close in.
         if (bot.kind === 'dog') {
@@ -111,10 +195,9 @@ export function Enemies({ world }: { world: GameWorld }) {
         bot.position.z += _toPlayer.z * stats.speed * dt
       } else if (bot.attackCooldown <= 0) {
         bot.attackCooldown = 1.1
-        const s = useBoots.getState()
-        s.setHealth(s.health - stats.damage)
-        sfx.damage()
-        session.hud.damageFlash()
+        // bot→player XZ direction; damagePlayer normalizes and handles
+        // knockback, directional flash, sfx and the stagger routing.
+        damagePlayer(stats.damage, { x: _toPlayer.x, z: _toPlayer.z })
       }
     }
 

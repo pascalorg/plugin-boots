@@ -25,6 +25,10 @@ type BootsState = {
   clip: Record<string, number>
   reloading: boolean
   health: number
+  /** True while the player is in the 2.5s "downed but not dead" stagger
+   * (health hit 0). Player movement halves, viewmodel droops, firing is
+   * blocked. Set/cleared by player.tsx's stagger loop. */
+  staggered: boolean
   buildPiece: BuildPiece
   /** Pieces placed in build mode this session (or awaiting Keep/Discard). */
   placed: PlacedPiece[]
@@ -37,6 +41,7 @@ type BootsState = {
   setClip: (weapon: WeaponId, rounds: number) => void
   setReloading: (reloading: boolean) => void
   setHealth: (health: number) => void
+  setStaggered: (staggered: boolean) => void
   setBuildPiece: (piece: BuildPiece) => void
   addPlaced: (piece: Omit<PlacedPiece, 'id'>) => void
   removeLastPlaced: () => PlacedPiece | undefined
@@ -54,6 +59,7 @@ export const useBoots = create<BootsState>((set, get) => ({
   clip: {},
   reloading: false,
   health: 100,
+  staggered: false,
   buildPiece: 'wall',
   placed: [],
   pendingDecision: false,
@@ -65,6 +71,7 @@ export const useBoots = create<BootsState>((set, get) => ({
   setClip: (weapon, rounds) => set((s) => ({ clip: { ...s.clip, [weapon]: rounds } })),
   setReloading: (reloading) => set({ reloading }),
   setHealth: (health) => set({ health }),
+  setStaggered: (staggered) => set({ staggered }),
   setBuildPiece: (buildPiece) => set({ buildPiece }),
   addPlaced: (piece) => set((s) => ({ placed: [...s.placed, { ...piece, id: placedId++ }] })),
   removeLastPlaced: () => {
@@ -82,6 +89,7 @@ export const useBoots = create<BootsState>((set, get) => ({
       clip: {},
       reloading: false,
       health: 100,
+      staggered: false,
       buildPiece: 'wall',
     }),
 }))

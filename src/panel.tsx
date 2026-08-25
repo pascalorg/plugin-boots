@@ -28,9 +28,10 @@ export default function BootsPanel() {
           </span>
         </div>
         <p className="text-sidebar-foreground/50 text-xs leading-relaxed">
-          It's a game. Jump in and the editor becomes a first-person shooter set in the building
-          you're editing — break the walls, shatter the glass, build new ones, hold off the
-          machines. Press Esc and it's as if nothing happened.
+          It's a game — and a way to build. Jump in and the editor becomes a first-person world
+          set in the building you're editing: shoot, break, then switch to build mode and make
+          something new. When you're done playing, keep what you built — or press Esc and it's
+          as if nothing happened.
         </p>
       </header>
 
@@ -94,8 +95,10 @@ export default function BootsPanel() {
         </p>
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the table</p>
+        <p>Peaceful until you grab a gun — then the machines count down.</p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build</p>
-        <p>Q cycle piece · G undo · Esc exit</p>
+        <p>Q cycle piece · hold click to place a run · G undo · Esc exit</p>
+        <p>You can't die — you get staggered. Catch your breath and keep going.</p>
       </section>
     </div>
   )

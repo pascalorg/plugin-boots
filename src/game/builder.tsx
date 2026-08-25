@@ -13,20 +13,58 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
  * Build mode, battle-builder grammar: wall / floor / ramp (Q cycles), ghost
- * snapped to a 1.5 m grid + 90° yaw in front of you, LMB stamps it in.
- * Placements are game-only state — the panel's Keep converts walls into
- * real scene nodes afterwards, Discard forgets everything. G undoes.
+ * in front of you, LMB stamps it in. Placements are game-only state — the
+ * panel's Keep converts walls into real scene nodes afterwards, Discard
+ * forgets everything. G undoes (piece + collider + any voxel replica).
+ *
+ * ── PLACEMENT GRAMMAR (phase 2) ───────────────────────────────────────────
+ * ADJACENCY SNAP: the raw ghost (1.5 m grid + 90° yaw, reach shortens with
+ * pitch so it tracks your aim) snaps to the nearest candidate generated from
+ * placed pieces within reach when that candidate is ≤ SNAP_RANGE (1.1 m,
+ * XZ) of the raw ghost; otherwise the plain grid pose is used.
+ *   walls  — chain end-to-end along the neighbor's axis (only when your
+ *            snapped yaw is parallel to it), and stack on top when your aim
+ *            ray passes above the neighbor's mid-height.
+ *   floors — tile edge-to-edge on the neighbor's plane (4 sides).
+ *   ramps  — low edge snaps to a floor edge (rising away from the floor) or
+ *            to a wall base (high edge kisses the wall top: WALL_H rise).
+ * HOLD-TO-PLACE: holding LMB stamps a piece whenever the (possibly snapped)
+ * ghost pose changes, min PLACE_INTERVAL between stamps — sweep a wall run.
+ * VALIDITY: an identical pose (piece + position + yaw up to the piece's own
+ * symmetry) is never placed twice — the ghost tints red over an occupied
+ * pose, blue when free; occupied stamps are skipped silently.
+ *
+ * ── API (exported for tests / other systems) ──────────────────────────────
+ *   PIECE_DIMS / piecePose      piece geometry + pose from base elevation.
+ *   resolveSnap(piece, placed, raw, aimYAt)   pure snap resolver → snapped
+ *       pose or null. `aimYAt(x, z)` = aim-ray height over that XZ point
+ *       (gates wall stacking). RETURNS A REUSED MODULE OBJECT — copy fields
+ *       before the next call if you keep them.
+ *   isOccupied(placed, piece, x, y, z, yaw)   identical-pose test, yaw
+ *       compared modulo the piece's symmetry (wall π, floor π/2, ramp 2π).
+ * ──────────────────────────────────────────────────────────────────────────
  */
 
 const GRID = 1.5
 const WALL_H = 2.8
 const LEVEL_STEP = 1.4
+/** Raw-ghost distance from the eye when looking level (shortens with pitch). */
+const REACH = 3.2
+/** Raw ghost must land this close (XZ) to a candidate for the snap to win. */
+const SNAP_RANGE = 1.1
+/** Min seconds between hold-to-place stamps. */
+const PLACE_INTERVAL = 0.18
 
 export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   wall: [3, WALL_H, 0.12],
   floor: [3, 0.12, 3],
   ramp: [3, 0.12, 4.1],
 }
+
+/** Horizontal footprint of a piece along its snap axis. The ramp's 4.1 m
+ * plank covers a 3 m run + WALL_H rise, so every piece tiles on 3 m. */
+const SPAN = 3
+const RAMP_HALF_RUN = SPAN / 2
 
 const RAMP_TILT = -Math.atan2(WALL_H, 3)
 
@@ -46,28 +84,195 @@ function geometryFor(piece: BuildPiece): BoxGeometry {
   return geometry
 }
 
-type GhostState = { x: number; y: number; z: number; yaw: number; piece: BuildPiece }
+// --- Pose equality --------------------------------------------------------
 
-function snapGhost(piece: BuildPiece): GhostState {
-  const fwdX = -Math.sin(playerRig.yaw)
-  const fwdZ = -Math.cos(playerRig.yaw)
-  const tx = playerRig.position.x + fwdX * 3.2
-  const tz = playerRig.position.z + fwdZ * 3.2
-  const feetY = playerRig.position.y - EYE_HEIGHT
-  const baseY = Math.max(0, Math.round(feetY / LEVEL_STEP) * LEVEL_STEP)
-  return {
-    x: Math.round(tx / GRID) * GRID,
-    y: baseY,
-    z: Math.round(tz / GRID) * GRID,
-    yaw: (Math.round(playerRig.yaw / (Math.PI / 2)) * Math.PI) / 2,
-    piece,
+const TWO_PI = Math.PI * 2
+/** Yaw period under which the piece's box is self-identical. */
+const YAW_SYMMETRY: Record<BuildPiece, number> = {
+  wall: Math.PI,
+  floor: Math.PI / 2,
+  ramp: TWO_PI,
+}
+
+function sameYaw(a: number, b: number, period: number): boolean {
+  const d = (((a - b) % period) + period) % period
+  return d < 0.01 || period - d < 0.01
+}
+
+/** True when an identical pose (up to yaw symmetry) is already placed. */
+export function isOccupied(
+  placed: readonly PlacedPiece[],
+  piece: BuildPiece,
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+): boolean {
+  for (const p of placed) {
+    if (p.piece !== piece) continue
+    if (
+      Math.abs(p.position[0] - x) > 0.02 ||
+      Math.abs(p.position[1] - y) > 0.02 ||
+      Math.abs(p.position[2] - z) > 0.02
+    ) {
+      continue
+    }
+    if (sameYaw(p.yaw, yaw, YAW_SYMMETRY[piece])) return true
   }
+  return false
+}
+
+// --- Adjacency snap -------------------------------------------------------
+
+export type RawGhost = { x: number; y: number; z: number; yaw: number }
+type SnapPose = { x: number; y: number; z: number; yaw: number }
+
+// Module temps — the snap resolver runs every frame (rule: no per-frame
+// allocations). _best is the object resolveSnap returns; copy to keep.
+const _best: SnapPose & { d2: number; found: boolean } = {
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  d2: Infinity,
+  found: false,
+}
+let _rawX = 0
+let _rawY = 0
+let _rawZ = 0
+
+function consider(x: number, y: number, z: number, yaw: number): void {
+  const dx = x - _rawX
+  const dz = z - _rawZ
+  const dxz2 = dx * dx + dz * dz
+  if (dxz2 > SNAP_RANGE * SNAP_RANGE) return
+  // Mild Y weight: same-level candidates win ties against stacked ones.
+  const dy = y - _rawY
+  const d2 = dxz2 + dy * dy * 0.1
+  if (d2 >= _best.d2) return
+  _best.x = x
+  _best.y = y
+  _best.z = z
+  _best.yaw = yaw
+  _best.d2 = d2
+  _best.found = true
+}
+
+/**
+ * Candidate poses from nearby placed pieces; nearest one within SNAP_RANGE
+ * of the raw ghost wins, null means "use the plain grid". Pure — pass
+ * `aimYAt(x, z)` = height of the aim ray above that XZ point (gates wall
+ * stacking at the neighbor's mid-height). Returned object is REUSED.
+ */
+export function resolveSnap(
+  piece: BuildPiece,
+  placed: readonly PlacedPiece[],
+  raw: RawGhost,
+  aimYAt: (x: number, z: number) => number,
+): SnapPose | null {
+  _rawX = raw.x
+  _rawY = raw.y
+  _rawZ = raw.z
+  _best.d2 = Infinity
+  _best.found = false
+
+  for (const p of placed) {
+    const px = p.position[0]
+    const py = p.position[1]
+    const pz = p.position[2]
+    // Cheap cull: candidates sit ≤ SPAN from the neighbor center, plus the
+    // snap window.
+    if (Math.abs(px - _rawX) > SPAN + SNAP_RANGE || Math.abs(pz - _rawZ) > SPAN + SNAP_RANGE) {
+      continue
+    }
+
+    if (piece === 'wall' && p.piece === 'wall') {
+      // Chain end-to-end along the neighbor's axis — only when the player's
+      // snapped yaw is parallel, so corner walls stay on the plain grid.
+      const ax = Math.cos(p.yaw)
+      const az = -Math.sin(p.yaw)
+      if (sameYaw(raw.yaw, p.yaw, Math.PI)) {
+        consider(px + ax * SPAN, py, pz + az * SPAN, p.yaw)
+        consider(px - ax * SPAN, py, pz - az * SPAN, p.yaw)
+      }
+      // Stack on top when the aim ray passes above the neighbor's mid-height.
+      if (aimYAt(px, pz) > py + WALL_H * 0.5) consider(px, py + WALL_H, pz, p.yaw)
+    } else if (piece === 'floor' && p.piece === 'floor') {
+      // Tile edge-to-edge on the same plane, 4 sides, neighbor's yaw.
+      const ax = Math.cos(p.yaw)
+      const az = -Math.sin(p.yaw)
+      consider(px + ax * SPAN, py, pz + az * SPAN, p.yaw)
+      consider(px - ax * SPAN, py, pz - az * SPAN, p.yaw)
+      const nx = Math.sin(p.yaw)
+      const nz = Math.cos(p.yaw)
+      consider(px + nx * SPAN, py, pz + nz * SPAN, p.yaw)
+      consider(px - nx * SPAN, py, pz - nz * SPAN, p.yaw)
+    } else if (piece === 'ramp' && p.piece === 'floor') {
+      // Low edge on a floor edge, rising away from the floor. With the ramp's
+      // low-edge direction L = (-sin yaw, -cos yaw), edge direction d needs
+      // L = -d and center = floor + 3d → yaw = atan2(d.x, d.z).
+      const ax = Math.cos(p.yaw)
+      const az = -Math.sin(p.yaw)
+      const nx = Math.sin(p.yaw)
+      const nz = Math.cos(p.yaw)
+      consider(px + ax * SPAN, py, pz + az * SPAN, Math.atan2(ax, az))
+      consider(px - ax * SPAN, py, pz - az * SPAN, Math.atan2(-ax, -az))
+      consider(px + nx * SPAN, py, pz + nz * SPAN, Math.atan2(nx, nz))
+      consider(px - nx * SPAN, py, pz - nz * SPAN, Math.atan2(-nx, -nz))
+    } else if (piece === 'ramp' && p.piece === 'wall') {
+      // Low edge at the wall base, high edge kissing the wall (the ramp
+      // rises exactly WALL_H, so it tops out at the wall top). For face
+      // normal n: center = wall + 1.5n, low-edge dir L = n →
+      // yaw = atan2(-n.x, -n.z).
+      const nx = Math.sin(p.yaw)
+      const nz = Math.cos(p.yaw)
+      consider(px + nx * RAMP_HALF_RUN, py, pz + nz * RAMP_HALF_RUN, Math.atan2(-nx, -nz))
+      consider(px - nx * RAMP_HALF_RUN, py, pz - nz * RAMP_HALF_RUN, Math.atan2(nx, nz))
+    }
+  }
+
+  return _best.found ? _best : null
+}
+
+// --- Ghost ----------------------------------------------------------------
+
+type GhostState = {
+  x: number
+  y: number
+  z: number
+  yaw: number
+  piece: BuildPiece
+  occupied: boolean
+}
+
+const _raw: RawGhost = { x: 0, y: 0, z: 0, yaw: 0 }
+
+/** Raw grid ghost: reach shortens as you pitch away from level so the ghost
+ * tracks your aim (stacking a wall means looking UP at it). */
+function rawGhost(): RawGhost {
+  const reach = REACH * Math.max(0.35, Math.cos(playerRig.pitch))
+  const tx = playerRig.position.x - Math.sin(playerRig.yaw) * reach
+  const tz = playerRig.position.z - Math.cos(playerRig.yaw) * reach
+  const feetY = playerRig.position.y - EYE_HEIGHT
+  _raw.x = Math.round(tx / GRID) * GRID
+  _raw.y = Math.max(0, Math.round(feetY / LEVEL_STEP) * LEVEL_STEP)
+  _raw.z = Math.round(tz / GRID) * GRID
+  _raw.yaw = (Math.round(playerRig.yaw / (Math.PI / 2)) * Math.PI) / 2
+  return _raw
+}
+
+/** Height of the aim ray above (x, z) — flat-distance projection. */
+function aimHeightAt(x: number, z: number): number {
+  const hd = Math.hypot(x - playerRig.position.x, z - playerRig.position.z)
+  return playerRig.position.y + Math.tan(playerRig.pitch) * hd
 }
 
 /** One placed piece: the RENDERED mesh doubles as its collider, so when the
  * piece voxelizes the destruction manager ledger-hides the mesh the player
  * sees and the voxel replica takes over. Pieces are immutable once placed —
- * register on mount, disable on unmount (undo). */
+ * register on mount, remove on unmount (undo). Placed entries are always
+ * APPENDED after the world's build-time colliders, so splicing them out
+ * never shifts the door colliderIndices. */
 function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorld }) {
   const meshRef = useRef<Mesh>(null)
 
@@ -88,6 +293,8 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
     world.colliders.push(entry)
     return () => {
       entry.disabled = true
+      const index = world.colliders.indexOf(entry)
+      if (index !== -1) world.colliders.splice(index, 1)
       // If the piece had voxelized, drop the replica too (G-undo would
       // otherwise leave carved voxels floating until exit).
       dropTarget(entry.nodeId)
@@ -126,6 +333,8 @@ export function Builder() {
   const prevFire = useRef(false)
   const prevUndo = useRef(false)
   const placeCooldown = useRef(0)
+  /** Pose of the last stamp — hold-to-place fires again once it changes. */
+  const lastPlaced = useRef({ has: false, piece: 'wall' as BuildPiece, x: 0, y: 0, z: 0, yaw: 0 })
 
   const weapon = useBoots((s) => s.weapon)
   const buildPiece = useBoots((s) => s.buildPiece)
@@ -138,31 +347,58 @@ export function Builder() {
 
     if (!active) {
       if (ghost) setGhost(null)
+      lastPlaced.current.has = false
       prevFire.current = session.input.state.firing
       return
     }
 
-    const next = snapGhost(buildPiece)
+    // Resolve this frame's ghost: raw grid pose, then adjacency snap.
+    const placed = useBoots.getState().placed
+    const raw = rawGhost()
+    const snap = resolveSnap(buildPiece, placed, raw, aimHeightAt)
+    const gx = snap ? snap.x : raw.x
+    const gy = snap ? snap.y : raw.y
+    const gz = snap ? snap.z : raw.z
+    const gyaw = snap ? snap.yaw : raw.yaw
+    const occupied = isOccupied(placed, buildPiece, gx, gy, gz, gyaw)
+
     if (
       !ghost ||
-      ghost.x !== next.x ||
-      ghost.y !== next.y ||
-      ghost.z !== next.z ||
-      ghost.yaw !== next.yaw ||
-      ghost.piece !== next.piece
+      ghost.x !== gx ||
+      ghost.y !== gy ||
+      ghost.z !== gz ||
+      ghost.yaw !== gyaw ||
+      ghost.piece !== buildPiece ||
+      ghost.occupied !== occupied
     ) {
-      setGhost(next)
+      setGhost({ x: gx, y: gy, z: gz, yaw: gyaw, piece: buildPiece, occupied })
     }
 
+    // Place: on press, and while held whenever the ghost pose changes
+    // (min PLACE_INTERVAL apart). Occupied poses are skipped, no sound.
+    // Staggered hands can't stamp (matches the viewmodel's fire block);
+    // prevFire still tracks the raw button so recovery doesn't edge-place.
     const firing = session.input.state.firing
-    if (firing && !prevFire.current && placeCooldown.current <= 0 && ghost) {
-      placeCooldown.current = 0.22
-      useBoots.getState().addPlaced({
-        piece: ghost.piece,
-        position: [ghost.x, ghost.y, ghost.z],
-        yaw: ghost.yaw,
-      })
-      sfx.place()
+    if (firing && !useBoots.getState().staggered && placeCooldown.current <= 0) {
+      const last = lastPlaced.current
+      const moved =
+        !last.has ||
+        last.piece !== buildPiece ||
+        last.x !== gx ||
+        last.y !== gy ||
+        last.z !== gz ||
+        last.yaw !== gyaw
+      if ((!prevFire.current || moved) && !occupied) {
+        placeCooldown.current = PLACE_INTERVAL
+        useBoots.getState().addPlaced({ piece: buildPiece, position: [gx, gy, gz], yaw: gyaw })
+        sfx.place()
+        last.has = true
+        last.piece = buildPiece
+        last.x = gx
+        last.y = gy
+        last.z = gz
+        last.yaw = gyaw
+      }
     }
     prevFire.current = firing
 
@@ -183,7 +419,12 @@ export function Builder() {
         rotation={[ghost.piece === 'ramp' ? pose.tilt : 0, ghost.yaw, 0, 'YXZ']}
       >
         <boxGeometry args={PIECE_DIMS[ghost.piece]} />
-        <meshBasicMaterial color="#59a7ff" depthWrite={false} opacity={0.38} transparent />
+        <meshBasicMaterial
+          color={ghost.occupied ? '#ff5a4d' : '#59a7ff'}
+          depthWrite={false}
+          opacity={0.38}
+          transparent
+        />
       </mesh>
     </group>
   )

@@ -4,10 +4,13 @@
 
 Bones shows you what the house is made of. Boots puts you *in* it — eye height, WASD, pointer lock — the way you'd actually walk a jobsite: clipboard in hand, cones on the floor.
 
-## Today (v0)
+## Today
 
-- **Jump in** — one button. Full screen, pointer lock, first person, standing in the building you were just editing. `Esc` to exit.
-- `boots:job` — a punch-list cone node kind (fix / paint / install / clean / inspect, open/done), groundwork for the game loop below.
+- **Jump in** — one button. Full screen, pointer lock, first person, standing in the building you were just editing. It's a game — and a way to build.
+- **Play** — break the walls, shatter the glass. Peaceful until you gear up at the table: grab a gun and the machines arrive on a short countdown. You can't die — you get staggered; catch your breath and keep going.
+- **Build** — slot `4`/`B`: cycle pieces with `Q`, hold click to place a run, `G` to undo. When you're done playing, keep what you built — walls become real editor walls — or discard it all.
+- `Esc` exits, and the editor is exactly as you left it.
+- `boots:job` — a punch-list cone node kind (fix / paint / install / clean / inspect, open/done), groundwork for the loop below.
 
 ## Where it's going
 

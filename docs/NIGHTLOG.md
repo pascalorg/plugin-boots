@@ -160,3 +160,58 @@ Rough / next:
   pattern available if tap-robustness is wanted — one stripper per key).
 
 Checks: `bun run check-types` clean, `bun test` 50 pass / 2337 expects.
+
+## Phase 2, Round 1 — 2026-08-25 (can't die, grace countdown, builder feel)
+
+Owner feedback round: no respawn-teleport on death, builder-generation build
+mode, and a peaceful start with a ~5s countdown once you grab a gun.
+
+Landed (5 agents + manager integration):
+- **You can't die** (player.tsx / store.ts): respawn-teleport removed.
+  `damagePlayer(amount, fromDir?)` is the one damage entry point — knockback
+  shove (playerRig.shove, impulse accumulator), regen (+12 hp/s after 4s,
+  writes chunked), and a 2.5s STAGGER instead of death: health pins at 1,
+  `store.staggered` flips, walk-speed legs, no jump, camera sway, weapon
+  droop + fire block (viewmodel.tsx), mercy window (no hp loss while
+  staggered). Recovery at 40 hp. Safety net converts any raw health<=0
+  store write into the stagger path.
+- **Damage feel** (hud.ts / audio.ts): `damageFlash(angle?)` now directional
+  — four edge-glow strips with cosine falloff (angle computed screen-relative
+  in damagePlayer). Persistent low-HP vignette pulses on a severity-scaled
+  heartbeat below 45 hp. Full-screen stagger overlay ("shake it off") keyed
+  off `store.staggered`. Audio master chain grew a concussion lowpass
+  (`sfx.setMuffle`) and a lookahead-scheduled `sfx.heartbeat()` handle.
+- **Pacing** (enemies-state.ts / enemies.tsx): peaceful GRACE until the first
+  gun pickup (pistol/rifle in owned) — building/breaking never wakes the
+  machines. Then a one-shot 5s "They heard you — N" countdown top-center,
+  WAVE 1 at zero; later intermissions show a subtle lowercase line. Melee
+  routes through damagePlayer (knockback + directional flash for free).
+  MERCY while staggered: ground bots hold a 4–6 m standoff ring, drones
+  climb +1 m and hover. enemies.tsx also drives setMuffle on stagger edges
+  and the heartbeat rate/level from health.
+- **Builder feel** (builder.tsx): adjacency snap — walls chain end-to-end +
+  stack (aim-gated), floors tile 4 ways, ramps dock low-edge to floor edges
+  and wall bases (rise = WALL_H by construction). Hold-to-place sweeps runs
+  (0.18s min interval, re-stamps on pose change). Occupancy check (pose
+  modulo piece symmetry) tints the ghost red and skips silently. Pitch-
+  shortened reach so the ghost tracks your aim. G-undo now splices the
+  collider out and drops any voxel replica. 10 new tests.
+- **Copy** (panel.tsx / README.md): builder-first story — "It's a game — and
+  a way to build", grace/countdown and staggered-not-dead called out,
+  hold-click runs documented.
+- Manager integration: damageFlash cast in player.tsx made a direct typed
+  call; redundant 0.5s stagger red-pulse/sfx removed from player.tsx (HUD
+  overlay + enemies-driven heartbeat own it now); hud.ts staggered read made
+  direct; audio.ts "exposed, not wired" comments updated (wired from
+  enemies.tsx); builder placement gated while staggered to match the
+  viewmodel fire block (prevFire still tracks the raw button).
+
+Rough / next:
+- Live QA pass pending (this round was headless-only): stagger feel timing,
+  countdown legibility over the wave line, snap ergonomics at corners,
+  drone hover during mercy.
+- Stagger sway + weapon droop numbers are first-pass — tune after a live run.
+- Ramp-on-ramp and wall-on-floor snaps intentionally absent (grammar keeps
+  corners on the grid).
+
+Checks: `bun run check-types` clean, `bun test` 65 pass / 2385 expects.
