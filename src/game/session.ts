@@ -87,6 +87,9 @@ export function enterGame(): boolean {
   sfx.resume()
   void container.requestFullscreen?.().catch(() => {})
   input.attach(canvas)
+  input.onEscape = () => {
+    if (current === session) exitGame()
+  }
   hud.mount(container)
 
   // Esc unwinds pointer lock and/or fullscreen — treat either as "exit",

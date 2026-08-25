@@ -28,6 +28,9 @@ export const playerRig = {
   recoil: 0,
 }
 
+/** Dev-only handle (used by headless E2E): teleport the player rig. */
+export const playerDebug: { teleport?: (x: number, z: number, yaw: number, pitch?: number) => void } = {}
+
 export function Player({ world }: { world: GameWorld }) {
   const camera = useThree((s) => s.camera) as PerspectiveCamera
   const feet = useRef(new Vector3())
@@ -58,7 +61,16 @@ export function Player({ world }: { world: GameWorld }) {
     playerRig.pitch = 0
     camera.fov = GAME_FOV
     camera.updateProjectionMatrix()
+    playerDebug.teleport = (x, z, yaw, pitch = 0) => {
+      feet.current.set(x, 0, z)
+      vel.current.set(0, 0, 0)
+      playerRig.yaw = yaw
+      playerRig.pitch = pitch
+    }
     // Restore handled by session.exitGame (it owns savedCamera).
+    return () => {
+      playerDebug.teleport = undefined
+    }
   }, [camera, world])
 
   useFrame((_, rawDt) => {

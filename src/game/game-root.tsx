@@ -9,9 +9,11 @@ import { Enemies } from './enemies'
 import { GlassCracks, resetGlass } from './glass'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
-import { Player } from './player'
+import { Player, playerDebug } from './player'
+import { fire } from './shooting'
 import { Viewmodel } from './viewmodel'
 import { VoxelWalls } from './voxel-walls'
+import { WEAPONS } from './weapons'
 import { collectWorld } from './world'
 
 /**
@@ -29,14 +31,23 @@ function ActiveGame() {
   // Snapshot once per session — walls don't move while you shoot them.
   const world = useMemo(() => collectWorld(), [])
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // Dev/E2E handle — lets headless tests aim and fire deterministically.
+    ;(globalThis as Record<string, unknown>).__boots = {
+      world,
+      fire: (weapon: 'pistol' | 'rifle' | 'knife' = 'rifle') => fire(world, WEAPONS[weapon]),
+      teleport: (x: number, z: number, yaw: number, pitch?: number) =>
+        playerDebug.teleport?.(x, z, yaw, pitch),
+      state: () => useBoots.getState(),
+      wallNodes: () => Array.from(world.walls.values()).map((w) => w.node),
+    }
+    return () => {
+      delete (globalThis as Record<string, unknown>).__boots
       resetDestruction()
       resetGlass()
       clearDebris()
-    },
-    [],
-  )
+    }
+  }, [world])
 
   return (
     <>

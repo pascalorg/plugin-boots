@@ -47,6 +47,11 @@ export class GameInput {
     actions: [],
   }
 
+  /** Fallback exit path: with an engaged pointer lock the browser eats Esc
+   * (releasing the lock, which the session watches); without one — lock
+   * denied or already released — this fires instead. */
+  onEscape: (() => void) | null = null
+
   private canvas: HTMLCanvasElement | null = null
   private detachFns: Array<() => void> = []
   private relockOnClick = false
@@ -67,6 +72,10 @@ export class GameInput {
     }
 
     on('keydown', (e) => {
+      if (e.code === 'Escape' && !this.pointerLocked) {
+        this.onEscape?.()
+        return
+      }
       if (!GAME_KEYS.has(e.code)) return
       e.preventDefault()
       e.stopImmediatePropagation()
