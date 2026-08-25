@@ -2,7 +2,7 @@
 
 **First-person mode for the [Pascal editor](https://github.com/pascalorg/editor). Put your boots on, walk the job, and work the punch list from the ground.**
 
-Bones shows you what the house is made of. Boots puts you *in* it — eye height, WASD, pointer lock — the way you'd actually walk a jobsite: clipboard in hand, cones on the floor, "good enough" is not on the inspection sheet.
+Bones shows you what the house is made of. Boots puts you *in* it — eye height, WASD, pointer lock — the way you'd actually walk a jobsite: clipboard in hand, cones on the floor.
 
 ## Today (v0)
 
