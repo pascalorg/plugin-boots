@@ -1,5 +1,5 @@
 import { sceneRegistry, useScene } from '@pascal-app/core'
-import { Box3, type BufferGeometry, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
+import { Box3, BufferAttribute, BufferGeometry, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
 
 /**
@@ -99,10 +99,52 @@ const OVERLAY_KINDS = ['bones:framing', 'bones:lumber', 'bones:service', 'bones:
 
 const bvhCache = new WeakMap<BufferGeometry, MeshBVH>()
 
+let emptyBvh: MeshBVH | null = null
+
+/** Never-throwing fallback: a degenerate BVH that no ray/shape ever hits. */
+function fallbackBvh(): MeshBVH {
+  if (!emptyBvh) {
+    const geometry = new BufferGeometry()
+    geometry.setAttribute(
+      'position',
+      new BufferAttribute(new Float32Array([0, -1e9, 0, 0, -1e9, 0, 0, -1e9, 0]), 3),
+    )
+    emptyBvh = new MeshBVH(geometry)
+  }
+  return emptyBvh
+}
+
+/**
+ * BVH per geometry, hardened for the wild (prod crash 2026-08-25: a scene
+ * mesh with interleaved GLB attributes made `new MeshBVH` read `.offset` of
+ * undefined INSIDE the game's mount useMemo — the viewer's error boundary
+ * then ate the whole canvas). Interleaved positions are de-interleaved into
+ * a BVH-only copy; anything that still throws degrades to a never-hit BVH
+ * instead of crashing the session.
+ */
 export function bvhFor(mesh: Mesh): MeshBVH {
   let bvh = bvhCache.get(mesh.geometry)
   if (!bvh) {
-    bvh = new MeshBVH(mesh.geometry)
+    try {
+      let geometry = mesh.geometry
+      const position = geometry.getAttribute('position')
+      if ((position as { isInterleavedBufferAttribute?: boolean }).isInterleavedBufferAttribute) {
+        const flat = new Float32Array(position.count * 3)
+        for (let i = 0; i < position.count; i++) {
+          flat[i * 3] = position.getX(i)
+          flat[i * 3 + 1] = position.getY(i)
+          flat[i * 3 + 2] = position.getZ(i)
+        }
+        const copy = new BufferGeometry()
+        copy.setAttribute('position', new BufferAttribute(flat, 3))
+        if (geometry.index) copy.setIndex(geometry.index.clone())
+        geometry = copy
+      }
+      bvh = new MeshBVH(geometry)
+    } catch (error) {
+      console.warn('[boots] BVH build failed — mesh will be non-solid', mesh.name, error)
+      bvh = fallbackBvh()
+    }
     bvhCache.set(mesh.geometry, bvh)
   }
   return bvh
@@ -199,9 +241,15 @@ export function collectWorld(): GameWorld {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
         meshBounds.copy(mesh.geometry.boundingBox!).applyMatrix4(mesh.matrixWorld)
         buildingAabb.union(meshBounds)
+        // BVH is LAZY: building hundreds of trees synchronously at snapshot
+        // time blocks the main thread for seconds on a real house (the
+        // "frozen frame on Jump in" class of bug). bvhFor caches per
+        // geometry, so the getter costs one WeakMap hit after first touch.
         colliders.push({
           mesh,
-          bvh: bvhFor(mesh),
+          get bvh() {
+            return bvhFor(this.mesh)
+          },
           inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
           worldBox: meshBounds.clone(),
           root,

@@ -1,3 +1,5 @@
+import { useEditor } from '@pascal-app/editor'
+import { useViewer } from '@pascal-app/viewer'
 import type { Object3D, PerspectiveCamera } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
@@ -31,6 +33,11 @@ export type GameSession = {
 }
 
 let current: GameSession | null = null
+let sessionSerial = 0
+
+/** Monotonic per-Jump-in counter — GameRoot keys its error boundary on it so
+ * a crashed session never poisons the next one. */
+export const getSessionSerial = (): number => sessionSerial
 
 export const getSession = (): GameSession | null => current
 
@@ -60,6 +67,38 @@ export function enterGame(): boolean {
   const container = canvas?.parentElement
   if (!canvas || !container) return false
   teardownList = []
+  sessionSerial++
+
+  // The game drives the 3D PERSPECTIVE camera. Jumping in from the 2D plan
+  // view (orthographic camera) leaves the controller writing to a camera the
+  // scene isn't rendered through — a frozen top-down frame with every input
+  // swallowed (the exact prod symptom). Force both switches; restore on exit.
+  const editorState = useEditor.getState() as unknown as {
+    viewMode?: string
+    setViewMode?: (mode: string) => void
+  }
+  const viewerState = useViewer.getState() as unknown as {
+    cameraMode?: string
+    setCameraMode?: (mode: string) => void
+  }
+  const prevViewMode = editorState.viewMode
+  const prevCameraMode = viewerState.cameraMode
+  if (editorState.setViewMode && prevViewMode && prevViewMode !== '3d') {
+    editorState.setViewMode('3d')
+    teardownList.push(() => {
+      ;(useEditor.getState() as unknown as { setViewMode?: (m: string) => void }).setViewMode?.(
+        prevViewMode,
+      )
+    })
+  }
+  if (viewerState.setCameraMode && prevCameraMode && prevCameraMode !== 'perspective') {
+    viewerState.setCameraMode('perspective')
+    teardownList.push(() => {
+      ;(
+        useViewer.getState() as unknown as { setCameraMode?: (m: string) => void }
+      ).setCameraMode?.(prevCameraMode)
+    })
+  }
 
   // Position context for the HUD overlay.
   if (getComputedStyle(container).position === 'static') {

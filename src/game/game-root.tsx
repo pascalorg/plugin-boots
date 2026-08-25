@@ -4,6 +4,7 @@ import { useFrame } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import type { Object3D } from 'three'
 import { useBoots } from '../store'
+import { GameBoundary } from './boundary'
 import { Builder, PlacedPieces } from './builder'
 import { clearDebris, Debris } from './debris'
 import {
@@ -20,7 +21,7 @@ import { GlassCracks, resetGlass } from './glass'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
 import { Player, playerDebug } from './player'
-import { getSession, hideForGame } from './session'
+import { getSession, hideForGame, getSessionSerial } from './session'
 import { fire } from './shooting'
 import { GameSky } from './sky'
 import { TreesDestruct, treesDebug } from './trees-destruct'
@@ -37,7 +38,13 @@ import { collectOverlayRoots, collectWorld, type GameWorld } from './world'
 export function GameRoot() {
   const phase = useBoots((s) => s.phase)
   if (phase !== 'game') return null
-  return <ActiveGame />
+  // Fresh boundary per session (key) — one crash exits cleanly and the next
+  // Jump in starts unpoisoned.
+  return (
+    <GameBoundary key={getSessionSerial()}>
+      <ActiveGame />
+    </GameBoundary>
+  )
 }
 
 /**

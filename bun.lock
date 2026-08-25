@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "@pascal-app/plugin-boots",
+      "dependencies": {
+        "three-mesh-bvh": "^0.9.10",
+      },
       "devDependencies": {
         "@pascal-app/core": "0.9.1",
         "@pascal-app/editor": "0.9.1",

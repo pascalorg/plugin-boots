@@ -36,8 +36,7 @@
     "react-dom": "^18 || ^19",
     "three": "^0.185",
     "zod": "^4",
-    "zustand": "^5",
-    "three-mesh-bvh": ">=0.8 <1"
+    "zustand": "^5"
   },
   "devDependencies": {
     "@pascal-app/core": "0.9.1",
@@ -65,5 +64,8 @@
     "plugin",
     "first-person"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "three-mesh-bvh": "^0.9.10"
+  }
 }
