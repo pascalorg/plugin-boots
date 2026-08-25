@@ -26,6 +26,9 @@ export const playerRig = {
   grounded: true,
   /** Camera recoil impulse (pitch radians), decays in the frame loop. */
   recoil: 0,
+  /** Look velocity (rad/s), ~10 Hz smoothed — viewmodel sway reads these. */
+  yawVelocity: 0,
+  pitchVelocity: 0,
 }
 
 /** Dev-only handle (used by headless E2E): teleport the player rig. */
@@ -59,6 +62,8 @@ export function Player({ world }: { world: GameWorld }) {
     vel.current.set(0, 0, 0)
     playerRig.yaw = world.spawnYaw
     playerRig.pitch = 0
+    playerRig.yawVelocity = 0
+    playerRig.pitchVelocity = 0
     camera.fov = GAME_FOV
     camera.updateProjectionMatrix()
     playerDebug.teleport = (x, z, yaw, pitch = 0) => {
@@ -81,11 +86,18 @@ export function Player({ world }: { world: GameWorld }) {
 
     // Look.
     const { dx, dy } = input.consumeLook()
+    const prevPitch = playerRig.pitch
     playerRig.yaw -= dx * SENSITIVITY
     playerRig.pitch = Math.max(
       -MAX_PITCH,
       Math.min(MAX_PITCH, playerRig.pitch - dy * SENSITIVITY),
     )
+    // Look velocity from the applied deltas (mouse-driven, so teleports
+    // don't spike it), smoothed at ~10 Hz for the viewmodel sway.
+    const invDt = 1 / Math.max(dt, 1e-4)
+    const smooth = Math.min(1, dt * 10)
+    playerRig.yawVelocity += (-dx * SENSITIVITY * invDt - playerRig.yawVelocity) * smooth
+    playerRig.pitchVelocity += ((playerRig.pitch - prevPitch) * invDt - playerRig.pitchVelocity) * smooth
     playerRig.recoil = Math.max(0, playerRig.recoil - dt * 6 * playerRig.recoil - dt * 0.02)
 
     // Wish direction (camera-relative on XZ).

@@ -11,7 +11,7 @@ import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
- * Build mode, Fortnite grammar: wall / floor / ramp (Q cycles), ghost
+ * Build mode, battle-builder grammar: wall / floor / ramp (Q cycles), ghost
  * snapped to a 1.5 m grid + 90° yaw in front of you, LMB stamps it in.
  * Placements are game-only state — the panel's Keep converts walls into
  * real scene nodes afterwards, Discard forgets everything. G undoes.

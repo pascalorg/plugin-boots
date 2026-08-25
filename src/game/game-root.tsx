@@ -4,7 +4,8 @@ import { useEffect, useMemo } from 'react'
 import { useBoots } from '../store'
 import { Builder, PlacedPieces } from './builder'
 import { clearDebris, Debris } from './debris'
-import { resetDestruction } from './destruction'
+import { resetDestruction, useDestruction } from './destruction'
+import { Doors, doorsDebug } from './doors'
 import { Enemies } from './enemies'
 import { GlassCracks, resetGlass } from './glass'
 import { GunTable } from './guntable'
@@ -40,6 +41,16 @@ function ActiveGame() {
         playerDebug.teleport?.(x, z, yaw, pitch),
       state: () => useBoots.getState(),
       wallNodes: () => Array.from(world.walls.values()).map((w) => w.node),
+      doors: doorsDebug,
+      studs: () =>
+        Array.from(useDestruction.getState().targets.values()).flatMap((target) =>
+          target.studs.map((stud) => ({
+            nodeId: target.nodeId,
+            studId: stud.id,
+            hp: stud.hp,
+            broken: stud.broken,
+          })),
+        ),
     }
     return () => {
       delete (globalThis as Record<string, unknown>).__boots
@@ -57,6 +68,7 @@ function ActiveGame() {
       <GlassCracks />
       <Debris />
       <GunTable world={world} />
+      <Doors world={world} />
       <PlacedPieces world={world} />
       <Builder />
       <Enemies world={world} />

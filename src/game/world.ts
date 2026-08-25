@@ -38,11 +38,20 @@ export type GlassPane = {
   nodeId: string
 }
 
+export type DoorEntry = {
+  nodeId: string
+  /** The registered node root — the object doors.tsx swings on its hinge. */
+  root: Object3D
+  /** Indices into GameWorld.colliders belonging to this door node. */
+  colliderIndices: number[]
+}
+
 export type GameWorld = {
   colliders: ColliderEntry[]
   /** wall nodeId → its colliders' indices + node data (for stud generation). */
   walls: Map<string, { node: WallNodeLike; root: Object3D; meshes: Mesh[] }>
   glass: GlassPane[]
+  doors: DoorEntry[]
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -116,6 +125,7 @@ export function collectWorld(): GameWorld {
   const colliders: ColliderEntry[] = []
   const walls = new Map<string, { node: WallNodeLike; root: Object3D; meshes: Mesh[] }>()
   const glass: GlassPane[] = []
+  const doors: DoorEntry[] = []
   const buildingAabb = new Box3()
   const meshBounds = new Box3()
 
@@ -151,6 +161,7 @@ export function collectWorld(): GameWorld {
         solidMeshes.push(mesh)
       }
 
+      const firstColliderIndex = colliders.length
       for (const mesh of solidMeshes) {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
         meshBounds.copy(mesh.geometry.boundingBox!).applyMatrix4(mesh.matrixWorld)
@@ -164,6 +175,12 @@ export function collectWorld(): GameWorld {
           nodeId: id,
           nodeType: kind,
         })
+      }
+
+      if (kind === 'door' && colliders.length > firstColliderIndex) {
+        const colliderIndices: number[] = []
+        for (let i = firstColliderIndex; i < colliders.length; i++) colliderIndices.push(i)
+        doors.push({ nodeId: id, root, colliderIndices })
       }
 
       if (kind === 'wall' && Array.isArray(node.start) && Array.isArray(node.end)) {
@@ -204,5 +221,5 @@ export function collectWorld(): GameWorld {
       }
     ).selectedLevelId ?? null
 
-  return { colliders, walls, glass, buildingAabb, spawn, spawnYaw, levelId }
+  return { colliders, walls, glass, doors, buildingAabb, spawn, spawnYaw, levelId }
 }

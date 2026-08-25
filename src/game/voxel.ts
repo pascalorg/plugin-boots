@@ -51,18 +51,23 @@ export function buildVoxelGrid(
   sources: VoxelSource[],
   worldBounds: Box3,
   preferredCell = 0.15,
+  /** True for chunky volumes (doors, slabs, furniture): sizes the cell so
+   * even a 100%-occupied grid stays ≤ MAX_VOXELS instead of relying on the
+   * thin-wall occupancy discount. */
+  solid = false,
 ): VoxelGridData {
   const size = new Vector3()
   worldBounds.getSize(size)
   // Grow the cell until the raw grid is small enough that even a solid fill
   // stays under budget (walls are mostly thin, so real counts land far lower).
   let cell = preferredCell
+  const budget = solid ? MAX_VOXELS : MAX_VOXELS * 24
   for (let guard = 0; guard < 12; guard++) {
     const rawCount =
       Math.max(1, Math.ceil(size.x / cell)) *
       Math.max(1, Math.ceil(size.y / cell)) *
       Math.max(1, Math.ceil(size.z / cell))
-    if (rawCount <= MAX_VOXELS * 24) break
+    if (rawCount <= budget) break
     cell *= 1.35
   }
   const nx = Math.max(1, Math.ceil(size.x / cell))
@@ -126,6 +131,144 @@ export function buildVoxelGrid(
     aliveCount: count,
     index,
   }
+}
+
+/**
+ * Drywall-skin post-pass: rebuilds the grid keeping only the two one-cell
+ * layers on the min and max faces of the THICKNESS axis (the grid axis with
+ * the smallest cell span) — the stud cavity between them becomes empty
+ * space. A cell is interior when, along that axis, it is neither within one
+ * cell of the min face nor of the max face. Grids ≤ 2 cells thick have no
+ * interior and are returned unchanged (same object).
+ */
+export function dropInteriorCells(grid: VoxelGridData): VoxelGridData {
+  let axis = 0
+  let span = grid.nx
+  if (grid.ny < span) {
+    axis = 1
+    span = grid.ny
+  }
+  if (grid.nz < span) {
+    axis = 2
+    span = grid.nz
+  }
+  if (span <= 2) return grid
+
+  const coords: number[] = []
+  const centers: number[] = []
+  const alive: number[] = []
+  const index = new Map<number, number>()
+  let aliveCount = 0
+  for (let i = 0; i < grid.count; i++) {
+    const c = grid.coords[i * 3 + axis]!
+    if (c !== 0 && c !== span - 1) continue
+    const ix = grid.coords[i * 3]!
+    const iy = grid.coords[i * 3 + 1]!
+    const iz = grid.coords[i * 3 + 2]!
+    index.set(gridKey(ix, iy, iz, grid.nx, grid.ny), coords.length / 3)
+    coords.push(ix, iy, iz)
+    centers.push(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
+    alive.push(grid.alive[i]!)
+    if (grid.alive[i]) aliveCount++
+  }
+  return {
+    cell: grid.cell,
+    nx: grid.nx,
+    ny: grid.ny,
+    nz: grid.nz,
+    origin: grid.origin,
+    count: coords.length / 3,
+    coords: Int16Array.from(coords),
+    centers: Float32Array.from(centers),
+    alive: Uint8Array.from(alive),
+    aliveCount,
+    index,
+  }
+}
+
+/**
+ * Analytic ray vs yaw-rotated OBB (slab test in the box's local frame).
+ * `yaw` follows the stud convention — the box renders with rotation
+ * [0, -yaw, 0], so world→local is a +yaw rotation about Y. Half-extents,
+ * not full sizes. Returns the entry distance along the (unit) ray within
+ * [0, maxDist], or null on a miss. Allocation-free.
+ */
+export function raycastYawObb(
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  cx: number,
+  cy: number,
+  cz: number,
+  halfX: number,
+  halfY: number,
+  halfZ: number,
+  yaw: number,
+  maxDist: number,
+): number | null {
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  const wx = ox - cx
+  const wy = oy - cy
+  const wz = oz - cz
+  const lox = wx * cos + wz * sin
+  const loy = wy
+  const loz = -wx * sin + wz * cos
+  const ldx = dx * cos + dz * sin
+  const ldy = dy
+  const ldz = -dx * sin + dz * cos
+
+  let tMin = 0
+  let tMax = maxDist
+  // X slab
+  if (Math.abs(ldx) < 1e-9) {
+    if (lox < -halfX || lox > halfX) return null
+  } else {
+    let t0 = (-halfX - lox) / ldx
+    let t1 = (halfX - lox) / ldx
+    if (t0 > t1) {
+      const swap = t0
+      t0 = t1
+      t1 = swap
+    }
+    if (t0 > tMin) tMin = t0
+    if (t1 < tMax) tMax = t1
+    if (tMin > tMax) return null
+  }
+  // Y slab
+  if (Math.abs(ldy) < 1e-9) {
+    if (loy < -halfY || loy > halfY) return null
+  } else {
+    let t0 = (-halfY - loy) / ldy
+    let t1 = (halfY - loy) / ldy
+    if (t0 > t1) {
+      const swap = t0
+      t0 = t1
+      t1 = swap
+    }
+    if (t0 > tMin) tMin = t0
+    if (t1 < tMax) tMax = t1
+    if (tMin > tMax) return null
+  }
+  // Z slab
+  if (Math.abs(ldz) < 1e-9) {
+    if (loz < -halfZ || loz > halfZ) return null
+  } else {
+    let t0 = (-halfZ - loz) / ldz
+    let t1 = (halfZ - loz) / ldz
+    if (t0 > t1) {
+      const swap = t0
+      t0 = t1
+      t1 = swap
+    }
+    if (t0 > tMin) tMin = t0
+    if (t1 < tMax) tMax = t1
+    if (tMin > tMax) return null
+  }
+  return tMin
 }
 
 /** Kill every live voxel within `radius` of a world point. Returns their indices. */

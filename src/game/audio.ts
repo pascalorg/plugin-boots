@@ -2,7 +2,8 @@
  * Procedural SFX — no assets, no copyright, all WebAudio synthesis. The
  * palette chases the classic tactical-FPS timbres: dry noise-crack gunshots
  * with a low thump and a short slap-back, cadenced cloth-on-concrete
- * footsteps, glass as a burst of inharmonic partials.
+ * footsteps, glass as a burst of inharmonic partials. Materials get distinct
+ * voices: papery drywall, knocking/cracking wood studs, creaking doors.
  *
  * One shared AudioContext behind a soft limiter; every voice is fire-and-
  * forget with envelope-driven gain so nothing needs manual cleanup.
@@ -39,6 +40,18 @@ function noise(c: AudioContext): AudioBuffer {
   for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1
   noiseBuffer = buffer
   return buffer
+}
+
+/**
+ * Round-robin ±8% pitch/filter variance — cycling a fixed detune table
+ * guarantees consecutive one-shots never land identical (pure random can),
+ * so repeated footsteps/shots/crunches don't fatigue the ear.
+ */
+const RR_STEPS = [1, 1.06, 0.94, 1.03, 0.92, 1.08, 0.97, 1.05] as const
+let rrIndex = 0
+function rr(): number {
+  rrIndex = (rrIndex + 1) % RR_STEPS.length
+  return RR_STEPS[rrIndex] ?? 1
 }
 
 type BurstOpts = {
@@ -98,18 +111,20 @@ export const sfx = {
   },
 
   pistolShot(): void {
-    burst({ duration: 0.09, gain: 0.9, filterType: 'highpass', freq: 900 })
-    burst({ duration: 0.05, gain: 0.5, freq: 3200, q: 0.6 })
-    thump(150, 0.1, 0.8)
+    const v = rr()
+    burst({ duration: 0.09, gain: 0.9, filterType: 'highpass', freq: 900 * v })
+    burst({ duration: 0.05, gain: 0.5, freq: 3200 * v, q: 0.6 })
+    thump(150 * v, 0.1, 0.8)
     // slap-back
-    burst({ duration: 0.06, gain: 0.16, filterType: 'highpass', freq: 700, delay: 0 }, 0.07)
+    burst({ duration: 0.06, gain: 0.16, filterType: 'highpass', freq: 700 * v }, 0.07)
   },
 
   rifleShot(): void {
-    burst({ duration: 0.11, gain: 1.0, filterType: 'highpass', freq: 600 })
-    burst({ duration: 0.07, gain: 0.5, freq: 2400, q: 0.5 })
-    thump(110, 0.13, 0.9)
-    burst({ duration: 0.09, gain: 0.2, filterType: 'highpass', freq: 500 }, 0.08)
+    const v = rr()
+    burst({ duration: 0.11, gain: 1.0, filterType: 'highpass', freq: 600 * v })
+    burst({ duration: 0.07, gain: 0.5, freq: 2400 * v, q: 0.5 })
+    thump(110 * v, 0.13, 0.9)
+    burst({ duration: 0.09, gain: 0.2, filterType: 'highpass', freq: 500 * v }, 0.08)
   },
 
   knifeSwing(): void {
@@ -122,8 +137,37 @@ export const sfx = {
   },
 
   voxelCrunch(intensity = 1): void {
-    burst({ duration: 0.1, gain: 0.35 * intensity, freq: 900, freqEnd: 300, q: 0.7 })
-    thump(120, 0.09, 0.3 * intensity)
+    const v = rr()
+    burst({ duration: 0.1, gain: 0.35 * intensity, freq: 900 * v, freqEnd: 300 * v, q: 0.7 })
+    thump(120 * v, 0.09, 0.3 * intensity)
+  },
+
+  /** Soft papery powder crunch — drier and lighter than voxelCrunch. */
+  drywallCrunch(intensity = 1): void {
+    const v = rr()
+    burst({ duration: 0.09, gain: 0.3 * intensity, freq: 600 * v, freqEnd: 250 * v, q: 0.9 })
+    // tiny dust tail
+    burst({ duration: 0.12, gain: 0.07 * intensity, filterType: 'highpass', freq: 3800 * v }, 0.025)
+  },
+
+  /** Sharp wood crack: hot burst + resonant body + trailing splinter ticks. */
+  studSnap(): void {
+    const v = rr()
+    burst({ duration: 0.04, gain: 0.85, filterType: 'highpass', freq: 1200 * v, q: 0.7 })
+    thump(180 * v, 0.09, 0.5)
+    const ticks = 2 + Math.floor(Math.random() * 2)
+    let at = 0
+    for (let i = 0; i < ticks; i++) {
+      at += 0.03 + Math.random() * 0.05
+      burst({ duration: 0.025, gain: 0.18, freq: 2200 + Math.random() * 1800, q: 3 }, at)
+    }
+  },
+
+  /** Dull wood knock — the stud takes the hit but holds. */
+  studHit(): void {
+    const v = rr()
+    thump(160 * v, 0.07, 0.35)
+    burst({ duration: 0.04, gain: 0.22, freq: 750 * v, q: 1.4 })
   },
 
   crumble(size: number): void {
@@ -134,6 +178,20 @@ export const sfx = {
         i * 0.045 + Math.random() * 0.03,
       )
       thump(90 + Math.random() * 60, 0.12, 0.25, i * 0.05)
+    }
+  },
+
+  /** Framing gives way: rubble like crumble, laced with studSnap cracks. */
+  woodCrumble(size: number): void {
+    const n = Math.min(5, 1 + Math.floor(size / 8))
+    for (let i = 0; i < n; i++) {
+      const at = i * 0.05 + Math.random() * 0.03
+      burst({ duration: 0.12, gain: 0.26, freq: 400 + Math.random() * 400, freqEnd: 180, q: 0.9 }, at)
+      thump(80 + Math.random() * 50, 0.12, 0.24, at)
+      if (i % 2 === 0) {
+        burst({ duration: 0.035, gain: 0.4, filterType: 'highpass', freq: 1300 + Math.random() * 400 }, at + 0.01)
+        burst({ duration: 0.025, gain: 0.15, freq: 2400 + Math.random() * 1600, q: 3 }, at + 0.05 + Math.random() * 0.03)
+      }
     }
   },
 
@@ -193,6 +251,49 @@ export const sfx = {
   place(): void {
     thump(180, 0.09, 0.4)
     burst({ duration: 0.06, gain: 0.2, freq: 900, q: 1 })
+  },
+
+  /** Quiet hinge groan — slow AM wobble on a rising sawtooth. */
+  doorCreak(): void {
+    const c = ensureContext()
+    if (!c || !master) return
+    const t = c.currentTime
+    const v = rr()
+    const osc = c.createOscillator()
+    osc.type = 'sawtooth'
+    osc.frequency.setValueAtTime(90 * v, t)
+    osc.frequency.exponentialRampToValueAtTime(160 * v, t + 0.4)
+    const filter = c.createBiquadFilter()
+    filter.type = 'bandpass'
+    filter.frequency.value = 320 * v
+    filter.Q.value = 1.4
+    const am = c.createGain()
+    am.gain.value = 0.05
+    const lfo = c.createOscillator()
+    lfo.frequency.value = 7
+    const lfoDepth = c.createGain()
+    lfoDepth.gain.value = 0.03
+    lfo.connect(lfoDepth)
+    lfoDepth.connect(am.gain)
+    const env = c.createGain()
+    env.gain.setValueAtTime(0.0001, t)
+    env.gain.exponentialRampToValueAtTime(1, t + 0.05)
+    env.gain.setValueAtTime(1, t + 0.3)
+    env.gain.exponentialRampToValueAtTime(0.0001, t + 0.4)
+    osc.connect(filter)
+    filter.connect(am)
+    am.connect(env)
+    env.connect(master)
+    osc.start(t)
+    lfo.start(t)
+    osc.stop(t + 0.45)
+    lfo.stop(t + 0.45)
+  },
+
+  /** Two short square blips — the latch catching. */
+  doorLatch(): void {
+    thump(550, 0.035, 0.2, 0, 'square')
+    thump(380, 0.035, 0.2, 0.04, 'square')
   },
 
   hitmarker(): void {

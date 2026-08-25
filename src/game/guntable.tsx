@@ -71,7 +71,7 @@ export function GunTable({ world }: { world: GameWorld }) {
       Math.hypot(playerRig.position.x - position.x, playerRig.position.z - position.z) < 2.4
     if (near !== promptShown.current) {
       promptShown.current = near
-      session.hud.prompt(near ? 'E — Gear up' : null)
+      session.hud.prompt(near ? 'E — Gear up' : null, 'guntable')
     }
     const ePressed = session.input.state.keys.has('KeyE')
     if (near && ePressed && !prevE.current) {
@@ -80,7 +80,7 @@ export function GunTable({ world }: { world: GameWorld }) {
       s.giveWeapon('rifle')
       s.setWeapon('rifle')
       sfx.pickup()
-      session.hud.prompt(null)
+      session.hud.prompt(null, 'guntable')
       promptShown.current = false
     }
     prevE.current = ePressed

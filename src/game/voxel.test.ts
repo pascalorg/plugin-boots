@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Vector3 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
-import { buildVoxelGrid, findUnsupportedIslands, raycastVoxels, removeSphere } from './voxel'
+import {
+  buildVoxelGrid,
+  dropInteriorCells,
+  findUnsupportedIslands,
+  raycastVoxels,
+  raycastYawObb,
+  removeSphere,
+} from './voxel'
 
 /** A 2m long × 1m tall × 0.2m thick wall segment centered at origin. */
 function wallGrid(cell = 0.2) {
@@ -65,6 +72,87 @@ describe('raycastVoxels', () => {
   test('misses when aimed off-grid', () => {
     const grid = wallGrid()
     expect(raycastVoxels(grid, 0, 5, 5, 0, 0, -1, 20)).toBeNull()
+  })
+})
+
+describe('dropInteriorCells', () => {
+  test('a 10x5x3 box keeps only z-layers 0 and 2', () => {
+    const geometry = new BoxGeometry(2, 1, 0.6)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.3), new Vector3(1, 0.5, 0.3))
+    const grid = buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.2)
+    expect(grid.nx).toBe(10)
+    expect(grid.ny).toBe(5)
+    expect(grid.nz).toBe(3)
+    expect(grid.count).toBe(150)
+    const skinned = dropInteriorCells(grid)
+    expect(skinned.count).toBe(100)
+    expect(skinned.aliveCount).toBe(100)
+    for (let i = 0; i < skinned.count; i++) {
+      const iz = skinned.coords[i * 3 + 2]!
+      expect(iz === 0 || iz === 2).toBe(true)
+      // The rebuilt index map resolves every kept cell back to itself.
+      const key =
+        skinned.coords[i * 3]! +
+        skinned.nx * (skinned.coords[i * 3 + 1]! + skinned.ny * iz)
+      expect(skinned.index.get(key)).toBe(i)
+    }
+    // The dropped middle layer is gone from the lookup entirely.
+    expect(skinned.index.get(5 + skinned.nx * (2 + skinned.ny * 1))).toBeUndefined()
+  })
+
+  test('thin grids (≤2 cells thick) keep everything', () => {
+    const grid = wallGrid() // 10 × 5 × 1
+    expect(dropInteriorCells(grid)).toBe(grid)
+  })
+
+  test('picks the smallest axis when it is not z', () => {
+    // 3 × 5 × 10 box: x is the thickness axis.
+    const geometry = new BoxGeometry(0.6, 1, 2)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-0.3, -0.5, -1), new Vector3(0.3, 0.5, 1))
+    const grid = buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.2)
+    const skinned = dropInteriorCells(grid)
+    expect(skinned.count).toBe(100)
+    for (let i = 0; i < skinned.count; i++) {
+      const ix = skinned.coords[i * 3]!
+      expect(ix === 0 || ix === 2).toBe(true)
+    }
+  })
+})
+
+describe('raycastYawObb', () => {
+  test('hits an axis-aligned box straight on', () => {
+    const t = raycastYawObb(0, 0, 5, 0, 0, -1, 0, 0, 0, 0.5, 0.5, 0.5, 0, 20)
+    expect(t).not.toBeNull()
+    expect(t!).toBeCloseTo(4.5, 5)
+  })
+
+  test('respects the stud yaw convention', () => {
+    // A plank 2 long (local x) × 1 tall × 0.1 thick (local z), yawed so its
+    // length lies along world z (yaw = atan2(dz, dx) = π/2).
+    const yaw = Math.PI / 2
+    // Down the length: enter at world z = 1 → distance 4.
+    let t = raycastYawObb(0, 0, 5, 0, 0, -1, 0, 0, 0, 1, 0.5, 0.05, yaw, 20)
+    expect(t).not.toBeNull()
+    expect(t!).toBeCloseTo(4, 4)
+    // From the side it is only 0.1 thick: enter at world x = 0.05.
+    t = raycastYawObb(5, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0.5, 0.05, yaw, 20)
+    expect(t).not.toBeNull()
+    expect(t!).toBeCloseTo(4.95, 4)
+    // Down the length of the UNROTATED plank the same ray misses.
+    expect(raycastYawObb(0, 0, 5, 0, 0, -1, 0, 0, 0, 1, 0.5, 0.05, 0, 20)).not.toBeNull()
+    expect(raycastYawObb(0, 0.8, 5, 0, 0, -1, 0, 0, 0, 1, 0.5, 0.05, yaw, 20)).toBeNull()
+  })
+
+  test('misses when out of range or off to the side', () => {
+    expect(raycastYawObb(0, 0, 5, 0, 0, -1, 0, 0, 0, 0.5, 0.5, 0.5, 0, 4)).toBeNull()
+    expect(raycastYawObb(3, 0, 5, 0, 0, -1, 0, 0, 0, 0.5, 0.5, 0.5, 0, 20)).toBeNull()
+  })
+
+  test('starts inside → distance 0', () => {
+    const t = raycastYawObb(0, 0, 0, 0, 0, -1, 0, 0, 0, 0.5, 0.5, 0.5, 0.7, 20)
+    expect(t).toBe(0)
   })
 })
 

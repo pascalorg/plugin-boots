@@ -1,5 +1,5 @@
 /**
- * Quake-family first-person kinematics — the part of the game that has to
+ * Classic arena-shooter first-person kinematics — the part of the game that has to
  * FEEL right. Pure math over plain vectors so it unit-tests without three.
  *
  * The grammar (per tick):

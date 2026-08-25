@@ -3,7 +3,7 @@
 **The pitch:** press *Jump in* and the whole editor becomes a game. First person,
 fluid movement, a knife in your hand, guns on a table. Shoot the walls and they
 crumble piece by piece — voxel-style — revealing the framing inside. Glass cracks
-around bullet holes, then shatters. Build new walls Fortnite-style. Press `Esc`
+around bullet holes, then shatters. Build new walls battle-builder style. Press `Esc`
 and you're back in your editor **as if nothing happened** — unless you choose to
 *keep* what you built.
 
@@ -36,7 +36,7 @@ the ground, and people who just want to play in the thing they modeled.
 Panel (DOM)                     Canvas (R3F, mounted via def.system)
 ┌─────────────┐   zustand   ┌──────────────────────────────────────┐
 │ Jump in     │◄──────────►│ GameRoot (phase === 'game')           │
-│ Keep/Discard│  useBoots  │ ├─ Player (CS movement + BVH collide) │
+│ Keep/Discard│  useBoots  │ ├─ Player (fps movement + BVH collide) │
 └─────────────┘             │ ├─ Viewmodel (knife/pistol/rifle)     │
      HUD (DOM overlay,      │ ├─ Destruction (voxel walls, glass,   │
      appended next to       │ │   debris, stud reveal)              │
@@ -58,8 +58,8 @@ Panel (DOM)                     Canvas (R3F, mounted via def.system)
 
 ## Game systems
 
-### Movement (the CS feel)
-Quake-family kinematics, hand-rolled (~150 pure-math lines, unit-tested):
+### Movement (the tactical-shooter feel)
+Classic arena-shooter kinematics, hand-rolled (~150 pure-math lines, unit-tested):
 ground accelerate + friction, capped air-accelerate (real air-strafing),
 gravity, jump buffering, step-offset. Capsule vs world via BVH `shapecast`
 (the three-mesh-bvh `characterMovement` pattern), slide on planes, ground
@@ -80,7 +80,7 @@ reloads.
 - **Voxel walls:** first bullet on a wall hides the host wall object and
   swaps in a voxel replica: the wall's meshes are voxelized (~0.15 m cells,
   BVH containment test — door/window cutouts come free), rendered as ONE
-  `InstancedMesh` with per-instance color jitter (that Minecraft shade).
+  `InstancedMesh` with per-instance color jitter (that blocky voxel shade).
   Bullets zero out voxels in a radius; knife chips one; every removal spawns
   debris. Disconnected islands (flood-fill, throttled) crumble and fall.
 - **Stud reveal (the Bones handshake):** walls thicker than 9 cm get interior
@@ -100,7 +100,7 @@ low thump + delay tail, filtered-noise footsteps cadenced by speed, knife
 swish (bandpass sweep), voxel crunch, glass shatter (inharmonic partials),
 pickup clack, build thunk. One AudioContext, master limiter.
 
-### Builder mode (Fortnite grammar)
+### Builder mode (battle-builder grammar)
 Slot `4` (or `B`): build tool with three pieces — **wall / floor / ramp** —
 `Q` cycles. Ghost preview snapped to a 0.5 m grid + 90° yaw in front of the
 player; LMB places a solid, collidable, immediately-destructible panel.
@@ -110,6 +110,38 @@ panel shows **Keep** / **Discard**: Keep converts wall panels into real
 become `slab` nodes if the schema cooperates, else stay game-only (labeled).
 Paint tool (slot `5`, roadmap): spray-tint a wall's game copy; Keep patches
 the node's material.
+
+### You don't die (the death dynamic)
+No respawn, no teleport-to-spawn — dying breaks the flow and the fiction.
+Instead, a pressure curve:
+- **Hits shove you.** Damage applies a directional knockback impulse (you
+  get pushed around by the horde) + a directional red edge-flash.
+- **Low health** (< 35): pulsing red vignette, heartbeat, and the world's
+  audio dips through a low-pass — concussion, not UI.
+- **Zero health → STAGGERED**, not dead: ~2.5 s of heavy red pulse, halved
+  speed, lowered weapon (can't fire), bots ease off and circle instead of
+  piling on. Then you shake it off: health snaps to 40 and regen resumes.
+- **Regen:** 4 s without damage → +12 hp/s back to 100. Classic, readable,
+  keeps the run going forever. The game is about the chaos, not the fail
+  state.
+
+### Session pacing (grace, then the countdown)
+Jumping in starts **peaceful** — walk the build, break a wall, place
+pieces, no threats. The horde only wakes when you arm yourself: the moment
+you gear up at the table, a small line appears top-center — a slow 5-count
+("They heard you — 5…") — then wave 1 rolls in. Building/knife-only
+sessions stay peaceful by design: the gun is the opt-in.
+
+### Builder-first (the generation after ours)
+The first touch is "oh, it's a game" — but the retention loop is **they
+build**. This plugin is the editor's on-ramp for players raised on
+build-battle and block games, not on home-design software:
+- Build mode is a first-class weapon slot, not a menu.
+- Pieces snap to each other (adjacency grid like build-battle games), hold
+  to place runs of wall, G undoes, everything you place is immediately
+  solid, walkable, and destructible like the rest of the world.
+- After Esc, **Keep** turns the session's pieces into real, editable scene
+  nodes — play becomes authorship. That bridge is the whole thesis.
 
 ### Bots (roadmap, v1-simple)
 "Intruders" toggle: 3–5 capsule bots spawn at the lot edge, steer toward the

@@ -25,6 +25,8 @@ export class Hud {
   private waveEl: HTMLDivElement | null = null
   private unsub: (() => void) | null = null
   private hitTimer: ReturnType<typeof setTimeout> | null = null
+  /** Which system's text the prompt line currently shows (see prompt()). */
+  private promptOwner: string | null = null
 
   mount(container: HTMLElement): void {
     const root = document.createElement('div')
@@ -41,7 +43,7 @@ export class Hud {
       return div
     }
 
-    // Crosshair — four ticks + dot, CS-style but ours.
+    // Crosshair — four ticks + dot, tactical-shooter style but ours.
     const cross = el('position:absolute;left:50%;top:50%;width:0;height:0')
     for (const [x, y, w, h] of [
       [-1, -9, 2, 6],
@@ -98,10 +100,25 @@ export class Hud {
     this.unsub = useBoots.subscribe(render)
   }
 
-  prompt(text: string | null): void {
+  /**
+   * Interaction prompt, shared by several systems (gun table, doors…).
+   * Showing text is last-writer-wins and records `owner`; clearing only
+   * takes effect while that same owner still holds the line, so a stale
+   * `prompt(null, 'doors')` can't blank the gun table's text (and vice
+   * versa). Single-arg callers all share the 'default' owner (old
+   * behavior).
+   */
+  prompt(text: string | null, owner = 'default'): void {
     if (!this.promptEl) return
-    if (text) this.promptEl.textContent = text
-    this.promptEl.style.opacity = text ? '1' : '0'
+    if (text) {
+      this.promptOwner = owner
+      this.promptEl.textContent = text
+      this.promptEl.style.opacity = '1'
+      return
+    }
+    if (this.promptOwner !== null && this.promptOwner !== owner) return
+    this.promptOwner = null
+    this.promptEl.style.opacity = '0'
   }
 
   wave(text: string | null): void {
@@ -128,6 +145,7 @@ export class Hud {
   unmount(): void {
     this.unsub?.()
     this.unsub = null
+    this.promptOwner = null
     if (this.hitTimer) clearTimeout(this.hitTimer)
     this.root?.remove()
     this.root = null

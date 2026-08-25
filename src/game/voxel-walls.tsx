@@ -2,13 +2,30 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useLayoutEffect, useMemo, useRef } from 'react'
-import { Color, DynamicDrawUsage, type InstancedMesh, Matrix4, Quaternion, Vector3 } from 'three'
-import { useDestruction, type VoxelWall } from './destruction'
+import {
+  Color,
+  DynamicDrawUsage,
+  type InstancedMesh,
+  Matrix4,
+  type Mesh,
+  MeshStandardMaterial,
+  Quaternion,
+  Vector3,
+} from 'three'
+import { useDestruction, type VoxelTarget } from './destruction'
 
 /**
- * Renders every damaged wall as one InstancedMesh of voxels (plus its
- * framing, revealed as the shell breaks). Voxel removal writes a zero-scale
- * matrix at the voxel's index — indices stay stable, uploads stay small.
+ * Renders every voxelized target as one InstancedMesh of voxels (for walls:
+ * the two drywall skins), plus the stud cavity revealed as the shell breaks.
+ * Voxel removal writes a zero-scale matrix at the voxel's index — indices
+ * stay stable, uploads stay small.
+ *
+ * Studs are individual meshes (≤ ~40 per wall) driven by StudMember state:
+ * intact = wood box, damaged (hp below max) = darker tint + pinched
+ * cross-section (the dent), broken = hidden (debris already covered the
+ * fall). Chip damage does NOT bump the target revision (only breaks do), so
+ * stud visuals sync every frame — an allocation-free pass of plain
+ * assignments over a handful of meshes.
  */
 
 const _matrix = new Matrix4()
@@ -18,8 +35,38 @@ const _quat = new Quaternion()
 const _color = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 
-function VoxelWallMesh({ wall }: { wall: VoxelWall }) {
+// Shared stud materials — swapped per mesh on damage, never mutated.
+const STUD_WOOD = new MeshStandardMaterial({ color: '#b08d57', roughness: 0.85 })
+const STUD_WOOD_DAMAGED = new MeshStandardMaterial({ color: '#8f6f45', roughness: 0.85 })
+
+/** Apply StudMember state to the stud meshes: visibility, tint, dent. */
+function syncStuds(target: VoxelTarget, refs: (Mesh | null)[], maxHp: number): void {
+  for (let i = 0; i < target.studs.length; i++) {
+    const mesh = refs[i]
+    if (!mesh) continue
+    const stud = target.studs[i]!
+    mesh.visible = !stud.broken
+    if (stud.broken) continue
+    const damaged = stud.hp < maxHp
+    mesh.material = damaged ? STUD_WOOD_DAMAGED : STUD_WOOD
+    if (damaged) {
+      // The dent: pinch the cross-section, keep the long axis full length
+      // (plates lie sideways, so pick axes by size instead of assuming Y).
+      const pinch = 0.6 + (0.4 * Math.max(0, stud.hp)) / maxHp
+      const [sx, sy, sz] = stud.size
+      if (sx >= sy && sx >= sz) mesh.scale.set(1, pinch, pinch)
+      else if (sy >= sx && sy >= sz) mesh.scale.set(pinch, 1, pinch)
+      else mesh.scale.set(pinch, pinch, 1)
+    } else {
+      mesh.scale.set(1, 1, 1)
+    }
+  }
+}
+
+function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
+  const studRefs = useRef<(Mesh | null)[]>([])
+  const studMaxHp = useRef(1)
   const revision = useRef(-1)
 
   useLayoutEffect(() => {
@@ -46,16 +93,27 @@ function VoxelWallMesh({ wall }: { wall: VoxelWall }) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
     mesh.frustumCulled = false
     revision.current = wall.revision
+    // Full hp = the healthiest member at voxelize time (fresh studs are
+    // all at max; robust even if we mount mid-fight).
+    let max = 1
+    for (const stud of wall.studs) if (stud.hp > max) max = stud.hp
+    studMaxHp.current = max
+    syncStuds(wall, studRefs.current, max)
   }, [wall])
 
   useFrame(() => {
     const mesh = meshRef.current
-    if (!mesh || revision.current === wall.revision) return
-    revision.current = wall.revision
-    for (const idx of wall.removedQueue.splice(0)) {
-      mesh.setMatrixAt(idx, ZERO)
+    if (!mesh) return
+    if (revision.current !== wall.revision) {
+      revision.current = wall.revision
+      for (const idx of wall.removedQueue.splice(0)) {
+        mesh.setMatrixAt(idx, ZERO)
+      }
+      mesh.instanceMatrix.needsUpdate = true
     }
-    mesh.instanceMatrix.needsUpdate = true
+    // Studs sync unconditionally: chips (hp loss without break) never bump
+    // revision. Plain assignments only — no allocations.
+    syncStuds(wall, studRefs.current, studMaxHp.current)
   })
 
   return (
@@ -66,12 +124,15 @@ function VoxelWallMesh({ wall }: { wall: VoxelWall }) {
       </instancedMesh>
       {wall.studs.map((stud, i) => (
         <mesh
-          key={`${wall.nodeId}-stud-${i}`}
+          key={`${wall.nodeId}-stud-${stud.id}`}
+          material={STUD_WOOD}
           position={stud.center}
+          ref={(m: Mesh | null) => {
+            studRefs.current[i] = m
+          }}
           rotation={[0, -stud.yaw, 0]}
         >
           <boxGeometry args={stud.size} />
-          <meshStandardMaterial color="#b08d57" roughness={0.85} />
         </mesh>
       ))}
     </group>
@@ -82,7 +143,7 @@ export function VoxelWalls() {
   const version = useDestruction((s) => s.version)
   const walls = useMemo(() => {
     void version
-    return Array.from(useDestruction.getState().walls.values())
+    return Array.from(useDestruction.getState().targets.values())
   }, [version])
   return (
     <>

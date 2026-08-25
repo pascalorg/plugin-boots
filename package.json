@@ -1,7 +1,7 @@
 {
   "name": "@pascal-app/plugin-boots",
   "version": "0.1.0",
-  "description": "Boots \u2014 the Pascal editor becomes a game. Jump in: first-person in the building you're editing; break walls voxel by voxel, shatter glass, build Fortnite-style, fight off robots. Esc, and nothing happened.",
+  "description": "Boots \u2014 the Pascal editor becomes a game. Jump in: first-person in the building you're editing; break walls voxel by voxel, shatter glass, build new walls on the fly, fight off robots. Esc, and nothing happened.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pascalorg/plugin-boots.git"

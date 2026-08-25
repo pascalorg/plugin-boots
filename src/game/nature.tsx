@@ -2,25 +2,26 @@
 
 import { useMemo } from 'react'
 import {
+  BufferAttribute,
+  BufferGeometry,
   CanvasTexture,
+  CircleGeometry,
   Color,
   ConeGeometry,
   CylinderGeometry,
   type InstancedMesh,
   Matrix4,
-  PlaneGeometry,
   Quaternion,
   RepeatWrapping,
   Vector3,
 } from 'three'
-import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import type { GameWorld } from './world'
 
 /**
  * The lot: a grass field with scattered flora replacing the editor's flat
  * gray void. Optimization first — one InstancedMesh per species (grass is a
- * single draw call for ~20k blades), no shadows, static transforms, all
- * placement rejected out of the building's footprint.
+ * single draw call for ~20k blade clusters), no shadows, static transforms,
+ * all placement rejected out of the building's footprint.
  */
 
 /** Deterministic RNG so re-entry looks identical. */
@@ -42,22 +43,82 @@ function groundTexture(): CanvasTexture | null {
   canvas.width = size
   canvas.height = size
   const g = canvas.getContext('2d')!
-  g.fillStyle = '#5d8a44'
+  g.fillStyle = '#4e7c3a'
   g.fillRect(0, 0, size, size)
   const rand = mulberry32(7)
-  for (let i = 0; i < 900; i++) {
-    const shade = 0.85 + rand() * 0.3
-    g.fillStyle = `rgb(${Math.round(93 * shade)}, ${Math.round(138 * shade)}, ${Math.round(68 * shade)})`
-    const r = 2 + rand() * 7
+  g.globalAlpha = 0.28
+  for (let i = 0; i < 2600; i++) {
+    const shade = 0.82 + rand() * 0.36
+    g.fillStyle = `rgb(${Math.round(78 * shade)}, ${Math.round(124 * shade)}, ${Math.round(58 * shade)})`
+    const r = 1 + rand() * 3
     g.beginPath()
     g.arc(rand() * size, rand() * size, r, 0, Math.PI * 2)
     g.fill()
   }
+  g.globalAlpha = 1
   const texture = new CanvasTexture(canvas)
   texture.wrapS = RepeatWrapping
   texture.wrapT = RepeatWrapping
-  texture.repeat.set(28, 28)
+  texture.repeat.set(30, 30)
   return texture
+}
+
+/**
+ * One clump of five tapered blades baked into a single indexed geometry.
+ * Each blade is a two-segment strip (root quad + tip triangle) with a
+ * baked bend and outward lean. Vertex colors run dark at the root to a
+ * light, slightly warm tip and multiply with the per-instance green.
+ */
+function grassClusterGeometry(): BufferGeometry {
+  const rand = mulberry32(5)
+  const blades = 5
+  const positions: number[] = []
+  const colors: number[] = []
+  const indices: number[] = []
+  for (let b = 0; b < blades; b++) {
+    const angle = (b / blades) * Math.PI * 2 + rand() * 1.1
+    const dirX = Math.cos(angle)
+    const dirZ = Math.sin(angle)
+    const spread = rand() * 0.05
+    const rootX = dirX * spread
+    const rootZ = dirZ * spread
+    const height = 0.26 + rand() * 0.18
+    const half = 0.024 + rand() * 0.012
+    const lean = 0.06 + rand() * 0.16
+    const sideX = -dirZ * half
+    const sideZ = dirX * half
+    const midY = height * 0.55
+    const midX = rootX + dirX * lean * 0.35
+    const midZ = rootZ + dirZ * lean * 0.35
+    const base = positions.length / 3
+    // biome-ignore format: vertex rows read better unwrapped
+    positions.push(
+      rootX - sideX, 0, rootZ - sideZ,
+      rootX + sideX, 0, rootZ + sideZ,
+      midX - sideX * 0.42, midY, midZ - sideZ * 0.42,
+      midX + sideX * 0.42, midY, midZ + sideZ * 0.42,
+      rootX + dirX * lean, height, rootZ + dirZ * lean,
+    )
+    // biome-ignore format: one rgb triple per row
+    colors.push(
+      0.4, 0.45, 0.34,
+      0.4, 0.45, 0.34,
+      0.78, 0.8, 0.62,
+      0.78, 0.8, 0.62,
+      1, 1, 0.82,
+    )
+    indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3, base + 2, base + 4, base + 3)
+  }
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', new BufferAttribute(new Float32Array(positions), 3))
+  geometry.setAttribute('color', new BufferAttribute(new Float32Array(colors), 3))
+  // All normals point up so blades shade like the ground plane — no dark
+  // backfaces, keeps the field reading flat and cartoony.
+  const normals = new Float32Array(positions.length)
+  for (let i = 1; i < normals.length; i += 3) normals[i] = 1
+  geometry.setAttribute('normal', new BufferAttribute(normals, 3))
+  geometry.setIndex(indices)
+  return geometry
 }
 
 type Scatter = { matrices: Matrix4[]; colors: Color[] }
@@ -68,7 +129,8 @@ function scatter(
   count: number,
   rMin: number,
   rMax: number,
-  make: (rand: () => number, position: Vector3, matrix: Matrix4) => Color,
+  make: (rand: () => number, position: Vector3, matrix: Matrix4, t: number) => Color,
+  bias = 0.5,
 ): Scatter {
   const rand = mulberry32(seed)
   const center = world.buildingAabb.isEmpty()
@@ -83,7 +145,7 @@ function scatter(
   let guard = count * 6
   while (matrices.length < count && guard-- > 0) {
     const angle = rand() * Math.PI * 2
-    const radius = rMin + (rMax - rMin) * Math.sqrt(rand())
+    const radius = rMin + (rMax - rMin) * rand() ** bias
     position.set(center.x + Math.cos(angle) * radius, 0, center.z + Math.sin(angle) * radius)
     if (
       !world.buildingAabb.isEmpty() &&
@@ -95,7 +157,8 @@ function scatter(
       continue
     }
     const matrix = new Matrix4()
-    colors.push(make(rand, position, matrix))
+    const t = rMax > rMin ? (radius - rMin) / (rMax - rMin) : 0
+    colors.push(make(rand, position, matrix, t))
     matrices.push(matrix)
   }
   return { matrices, colors }
@@ -112,8 +175,10 @@ function setInstances(mesh: InstancedMesh | null, data: Scatter): void {
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
 }
 
-const GRASS_A = new Color('#6ea44f')
-const GRASS_B = new Color('#4f7c38')
+const GRASS_A = new Color('#79b054')
+const GRASS_B = new Color('#55853c')
+const FLOWER_WHITE = new Color('#f6f3e7')
+const FLOWER_YELLOW = new Color('#f2c14e')
 const _quat = new Quaternion()
 const _scale = new Vector3()
 const _yAxis = new Vector3(0, 1, 0)
@@ -121,14 +186,9 @@ const _yAxis = new Vector3(0, 1, 0)
 export function Nature({ world }: { world: GameWorld }) {
   const texture = useMemo(groundTexture, [])
 
-  const grassGeometry = useMemo(() => {
-    const a = new PlaneGeometry(0.09, 1)
-    const b = new PlaneGeometry(0.09, 1)
-    b.rotateY(Math.PI / 2)
-    const merged = mergeGeometries([a, b])!
-    merged.translate(0, 0.5, 0)
-    return merged
-  }, [])
+  const grassGeometry = useMemo(grassClusterGeometry, [])
+
+  const flowerGeometry = useMemo(() => new CircleGeometry(1, 7).rotateX(-Math.PI / 2), [])
 
   const trunkGeometry = useMemo(
     () => new CylinderGeometry(0.14, 0.2, 2.4).translate(0, 1.2, 0),
@@ -138,12 +198,35 @@ export function Nature({ world }: { world: GameWorld }) {
 
   const grass = useMemo(
     () =>
-      scatter(world, 11, 20000, 2, 55, (rand, position, matrix) => {
-        _quat.setFromAxisAngle(_yAxis, rand() * Math.PI)
-        const h = 0.16 + rand() * 0.22
-        _scale.set(1, h, 1)
+      // Bias 0.72 packs clumps denser near the building; the distance term
+      // scales far clumps up so the field stays covered where it thins out.
+      scatter(
+        world,
+        11,
+        20000,
+        2,
+        55,
+        (rand, position, matrix, t) => {
+          _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
+          const s = (0.75 + rand() * 0.5) * (1 + t * 0.9)
+          _scale.set(s, s * (0.8 + rand() * 0.5), s)
+          matrix.compose(position, _quat, _scale)
+          return GRASS_A.clone().lerp(GRASS_B, rand())
+        },
+        0.72,
+      ),
+    [world],
+  )
+
+  const flowers = useMemo(
+    () =>
+      scatter(world, 67, 260, 3, 42, (rand, position, matrix) => {
+        _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
+        const s = 0.05 + rand() * 0.045
+        _scale.set(s, 1, s)
+        position.y = 0.07 + rand() * 0.1
         matrix.compose(position, _quat, _scale)
-        return GRASS_A.clone().lerp(GRASS_B, rand())
+        return (rand() < 0.42 ? FLOWER_YELLOW : FLOWER_WHITE).clone()
       }),
     [world],
   )
@@ -195,7 +278,7 @@ export function Nature({ world }: { world: GameWorld }) {
         {texture ? (
           <meshStandardMaterial map={texture} roughness={1} />
         ) : (
-          <meshStandardMaterial color="#5d8a44" roughness={1} />
+          <meshStandardMaterial color="#4e7c3a" roughness={1} />
         )}
       </mesh>
 
@@ -204,7 +287,16 @@ export function Nature({ world }: { world: GameWorld }) {
         frustumCulled={false}
         ref={(mesh) => setInstances(mesh, grass)}
       >
-        <meshStandardMaterial roughness={1} side={2} />
+        <meshStandardMaterial roughness={1} side={2} vertexColors />
+      </instancedMesh>
+
+      {/* Flower dots: flat discs floating in the blade layer for charm. */}
+      <instancedMesh
+        args={[flowerGeometry, undefined, flowers.matrices.length]}
+        frustumCulled={false}
+        ref={(mesh) => setInstances(mesh, flowers)}
+      >
+        <meshStandardMaterial roughness={1} />
       </instancedMesh>
 
       {/* Trees: trunk + canopy share the scatter transforms. */}
