@@ -185,11 +185,16 @@ describe('drywall sheets', () => {
   test('a flown-off sheet takes no further hits', () => {
     const world = makeWorld()
     const wall = ensureVoxelTarget(world, 'wall-1')!
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 8 && !wall.sheets.some((s) => s.flownOff); i++) {
       damageTarget(world, 'wall-1', new Vector3(-0.6 + i * 0.05, 1.0 + i * 0.15, 0), 0.3)
     }
-    for (const sheet of wall.sheets) {
-      if (sheet.flownOff) expect(sheet.hits).toBeLessThanOrEqual(4)
-    }
+    const flown = wall.sheets.find((s) => s.flownOff)!
+    expect(flown).toBeDefined()
+    const frozen = { hits: flown.hits, torn: flown.torn }
+    // Empty air where the sheet was — more carves land nothing on it.
+    damageTarget(world, 'wall-1', new Vector3(flown.center[0], flown.center[1], flown.center[2]), 0.3)
+    expect(flown.hits).toBe(frozen.hits)
+    expect(flown.torn).toBe(frozen.torn)
+    expect(flown.torn).toBe(flown.cellCount)
   })
 })

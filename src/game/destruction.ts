@@ -51,8 +51,9 @@ import { bvhFor, type GameWorld } from './world'
  *                             rendered board plane of its own, so nothing
  *                             can ever sit coplanar with the skin). Carves
  *                             count `hits` + `torn` cells; at 4 hits or
- *                             half the sheet torn the WHOLE sheet flies off
- *                             (flownOff, shreds + plume, cells removed).
+ *                             ~a third of the sheet torn the WHOLE sheet
+ *                             flies off (flownOff, shreds + plume, cells
+ *                             removed).
  * Voxelize / damage
  *   ensureVoxelTarget(world, nodeId)   voxelize ANY collider group (walls,
  *                             doors, slabs, roofs, items…). Walls get the
@@ -107,10 +108,11 @@ export type StudBox = StudMember
  * One LOGICAL drywall sheet: a per-face, ~1.2 × 2.4 m tile of existing skin
  * voxel indices. Sheets never render anything themselves — the skin voxels
  * ARE the sheet — so no plane can ever z-fight the wall face. Carving cells
- * out of a sheet bumps `torn` (cells) and `hits` (carves); when a sheet has
- * taken SHEET_FLY_HITS carves or lost SHEET_FLY_TORN of its cells, the rest
- * of it tears off the wall in one go (`flownOff`): every remaining cell dies,
- * shreds fly, one big plume erupts.
+ * out of a sheet bumps `torn` (cells) and `hits` (carves); once a sheet has
+ * lost SHEET_FLY_TORN of its cells — or taken SHEET_FLY_HITS carves while
+ * at least SHEET_FLY_MIN_TORN open — the rest of it tears off the wall in
+ * one go (`flownOff`): every remaining cell dies, shreds fly, one big plume
+ * erupts.
  */
 export type SheetMember = {
   id: number
@@ -324,10 +326,13 @@ function buildStuds(
 /** Real-world drywall board footprint the logical sheets tile at. */
 const SHEET_W = 1.2
 const SHEET_H = 2.4
-/** Carves into one sheet before the rest of it flies off the wall. */
-const SHEET_FLY_HITS = 4
-/** …or this fraction of its cells torn, whichever comes first. */
-const SHEET_FLY_TORN = 0.5
+/** A sheet flies off once this fraction of its cells is torn out… */
+const SHEET_FLY_TORN = 0.35
+/** …or after this many carves — but only once the board is genuinely
+ * opened (SHEET_FLY_MIN_TORN), so a long shallow line cut across many
+ * sheets (grazing hits) doesn't shed every board it nicked. */
+const SHEET_FLY_HITS = 3
+const SHEET_FLY_MIN_TORN = 0.2
 
 const EMPTY_SHEET_MAP = new Int32Array(0)
 
@@ -661,9 +666,9 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
 /**
  * Per-carve sheet accounting: every removed cell bumps its sheet's `torn`,
  * every sheet the carve touched takes one `hit`, and any sheet past the
- * fly-off thresholds (SHEET_FLY_HITS carves or SHEET_FLY_TORN of its cells)
- * tears off wholesale. This is what makes drywall die FAST: four pistol
- * rounds into one board and the entire board leaves the wall.
+ * fly-off thresholds (see SHEET_FLY_*) tears off wholesale. This is what
+ * makes drywall die FAST: three pistol rounds into one board and the
+ * entire board leaves the wall.
  */
 function noteSheetCarve(target: VoxelTarget, removed: number[], direction?: Vector3): void {
   if (target.sheets.length === 0) return
@@ -678,7 +683,11 @@ function noteSheetCarve(target: VoxelTarget, removed: number[], direction?: Vect
   for (const sheet of touched) {
     if (sheet.flownOff) continue
     sheet.hits++
-    if (sheet.hits >= SHEET_FLY_HITS || sheet.torn >= sheet.cellCount * SHEET_FLY_TORN) {
+    const tornFrac = sheet.torn / sheet.cellCount
+    if (
+      tornFrac >= SHEET_FLY_TORN ||
+      (sheet.hits >= SHEET_FLY_HITS && tornFrac >= SHEET_FLY_MIN_TORN)
+    ) {
       flySheetOff(target, sheet, direction)
     }
   }

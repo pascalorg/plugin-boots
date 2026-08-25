@@ -282,11 +282,12 @@ describe('voxel collision hands over from the host collider', () => {
 
 describe('unsupported islands crumble after the settle delay', () => {
   test('severing the wall drops everything above the cut', async () => {
-    // A dedicated 6m wall: on the short 2m wall a full-length cut tears
-    // more than half of every sheet, so the round-2 sheet fly-off (by
-    // design) beats the island timer to the top rows. Across 6m each
-    // ~1.2m sheet only loses its cut band (<50%, <4 carves), leaving the
-    // disconnected top for the flood-fill to find.
+    // A dedicated 6m wall and a THIN line cut: fat carves on the short 2m
+    // wall now tear past the sheet fly-off thresholds (by design — round-2
+    // drywall dies fast) and the fly-off would beat the island timer to the
+    // top rows. A 0.25m-radius grazing cut across 6m keeps every ~1.2m
+    // sheet under the fly-off floor, leaving the disconnected top for the
+    // flood-fill to find.
     const wall = boxCollider('wall-long', 'wall', [6, 2.7, 0.12], [0, 1.35, 0])
     const world = makeWorld()
     world.colliders.push(wall)
@@ -296,9 +297,13 @@ describe('unsupported islands crumble after the settle delay', () => {
       meshes: [wall.mesh],
     })
     // A horizontal cut across the full 6m length at y = 2.0.
-    for (let x = -3; x <= 3.001; x += 0.5) {
-      damageTarget(world, 'wall-long', new Vector3(x, 2.0, 0), 0.4)
+    for (let x = -3; x <= 3.001; x += 0.35) {
+      damageTarget(world, 'wall-long', new Vector3(x, 2.0, 0), 0.25)
     }
+    // The grazing cut must not have shed whole sheets — that would empty
+    // the top rows before the island pass gets to prove itself.
+    const cutTarget = useDestruction.getState().targets.get('wall-long')!
+    expect(cutTarget.sheets.some((s) => s.flownOff)).toBe(false)
     const target = useDestruction.getState().targets.get('wall-long')!
     const afterCarve = target.grid.aliveCount
     // Rows above the cut are still alive but disconnected…
