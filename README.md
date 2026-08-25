@@ -6,13 +6,14 @@ Bones shows you what the house is made of. Boots puts you *in* it — eye height
 
 ## Today (v0)
 
-- **Walk the job** — one click drops you into the editor's first-person mode at eye height.
-- **Punch list** — place `boots:job` cones where work is needed (fix / paint / install / clean / inspect), check them off as they're done. The panel is the live punch list; the cones are the scene truth.
+- **Jump in** — one button. Full screen, pointer lock, first person, standing in the building you were just editing. `Esc` to exit.
+- `boots:job` — a punch-list cone node kind (fix / paint / install / clean / inspect, open/done), groundwork for the game loop below.
 
 ## Where it's going
 
 Editing, in first person, with game feel:
 
+- **Punch list** — post job cones where work is needed, see them from the ground, check them off as you go.
 - **Work the cone** — walk up to a job marker and do the work right there: swap the fixture, paint the wall, straighten the door.
 - **Tool belt** — a hotbar of editor tools usable from first person (point at a wall, click, it's patched).
 - **Real collisions** — capsule-vs-scene so you walk through doorways, not walls (BVH against the meshes you're editing).
