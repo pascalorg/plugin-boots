@@ -24,14 +24,11 @@ export default function BootsPanel() {
         <div className="flex items-center gap-2">
           <h2 className="font-semibold text-base">Boots</h2>
           <span className="rounded-full border border-sidebar-border/60 bg-sidebar-accent px-1.5 py-px font-semibold text-[9px] text-sidebar-foreground/70 uppercase tracking-widest">
-            Beta
+            Alpha
           </span>
         </div>
         <p className="text-sidebar-foreground/50 text-xs leading-relaxed">
-          It's a game — and a way to build. Jump in and the editor becomes a first-person world
-          set in the building you're editing: shoot, break, then switch to build mode and make
-          something new. When you're done playing, keep what you built — or press Esc and it's
-          as if nothing happened.
+          Just like Bones, it's alpha. Make sure your building can resist robot zombie attacks.
         </p>
       </header>
 
@@ -95,10 +92,11 @@ export default function BootsPanel() {
         </p>
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the table</p>
-        <p>Peaceful until you grab a gun — then the machines count down.</p>
+        <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build</p>
         <p>Q cycle piece · hold click to place a run · G undo · Esc exit</p>
-        <p>You can't die — you get staggered. Catch your breath and keep going.</p>
+        <p>Pieces snap to what you've placed — look up to stack walls.</p>
+        <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
       </section>
     </div>
   )

@@ -215,3 +215,57 @@ Rough / next:
   corners on the grid).
 
 Checks: `bun run check-types` clean, `bun test` 65 pass / 2385 expects.
+
+## Phase 2, Round 2 — 2026-08-25 (feel tuning: stagger camera, heartbeat sync, countdown drama)
+
+- **Death dynamics** (player.tsx / viewmodel.tsx): stagger camera retuned from
+  live traces — two detuned rolls (peak ~1.9°, under the motion-sickness
+  band) + head-hang slump (SLUMP_PITCH, eased over 0.35s) + FOV tunnel
+  92→86. 0.6s get-up beat at stagger end: exported pure `getUpPitch(u)`
+  (slump releases (1-u)², small upward lift, settles to exactly 0) while the
+  FOV settles back; viewmodel re-raises the weapon from below on the falling
+  edge (negative drawT hold + clamped cubic). Mercy-window shoves dampened
+  to 40% (`STAGGER_SHOVE_SCALE`) — the hit that CAUSES the stagger stays
+  full power. Pile-on sim: 0.57 m net drift, never juggled. `playerDebug`
+  grew `damage`/`drainShove()`/`sample()` (typed `PlayerSample`), published
+  as `globalThis.__bootsPlayer` while mounted, deleted on unmount.
+- **Damage feel** (audio.ts / hud.ts): `HEARTBEAT_HP`, `lowHpSeverity()` and
+  `heartbeatBpm()` (70→150 bpm) exported as THE severity→bpm mapping; HUD
+  beat() drift bug fixed (was on a different denominator). Phase lock:
+  `setHeartbeatPulseListener` fires per audible scheduled lub; hud's new
+  `beatPulse(delayMs)` retimes the visual pulse onto the sound, degrading to
+  self-timing when audio is silent. Stagger overlay re-ordered UNDER the
+  directional edge strips (DOM paint order) + peak softened so damage
+  flashes stay readable mid-stagger.
+- **Pacing** (enemies.tsx / enemies-state.ts): countdown drama with existing
+  voices — a second droneBuzz spin-up swells 0→0.09 across the 5s, relay
+  clack (doorLatch) on ticks 5–2, arming rack (reload) on the last; first
+  wave lands as `HERE THEY COME` (later waves keep `WAVE n`). Headless QA:
+  grace holds under rifle fire, countdown fires exactly once per session
+  incl. resetBots() re-arm, zero pageerrors. Documented: bots steer without
+  collision (can reposition through placed pieces during standoffs; never
+  attack from inside one).
+- **Builder feel** (builder.tsx): wall stacking gate raised mid-height →
+  3/4 height (`STACK_GATE` 0.75): a level gaze at eye height 1.58 cleared a
+  ground wall's midpoint (1.4), so holding fire auto-towered without looking
+  up (live QA find). `builderDebug` (`__bootsBuilder`) dev handle: holdFire
+  stands in for held LMB headless, `ghost()` snapshots the resolved pose.
+- **Copy** (panel.tsx / README.md): countdown wording matches shipped pacing
+  ("five-second countdown… HERE THEY COME"), stack-by-looking-up and
+  machines-back-off stagger lines added; badge aligned to Alpha.
+- Manager integration: enemies.tsx heartbeat now uses the shared
+  `heartbeatBpm(health)` / `lowHpSeverity` from audio.ts (local
+  HEARTBEAT_HP removed); STACK_GATE pinned by a new stacking-reach test;
+  commercial-game-name comment in movement.ts neutralized.
+
+Rough / next:
+- Dedicated `sfx.machineSpinup()` (progress-driven pitch/lowpass sweep)
+  would read better than the fixed-pitch droneBuzz under the countdown.
+- Bot-state E2E hook (`__boots.bots()`) + god/bots-off toggle for headless
+  mercy-ring/drone-climb verification.
+- Builder: floor-on-wall-top (roofed boxes) still absent from the snap
+  grammar; dog shove (~0.27 m) reads slightly under droid (~0.35 m).
+- Dev copies in private-editor node_modules were partially synced by agents
+  during live QA — full rsync at deploy time is mandatory (stale-code burn).
+
+Checks: `bun run check-types` clean, `bun test` 74 pass / 2400 expects.

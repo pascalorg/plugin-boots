@@ -23,9 +23,12 @@ import type { GameWorld } from './world'
  *   for a future directional indicator) and plays sfx.damage().
  *   When health would hit 0 it does NOT kill: health pins to 1 and a 2.5s
  *   STAGGER starts — red pulsing screen, heartbeat, halved move speed, no
- *   jumping, camera sway, weapon droop + fire block (viewmodel). Damage
- *   landing during a stagger still shoves/flashes but costs no health
- *   (mercy window). The stagger ends at health 40 and regen resumes.
+ *   jumping, woozy camera sway + head-hang slump + FOV tunnel, weapon droop
+ *   + fire block (viewmodel). Damage landing during a stagger still
+ *   shoves/flashes but costs no health, and the shove is dampened to 40%
+ *   (mercy window — pushed around, never juggled). The stagger ends at
+ *   health 40 with a get-up beat: the slump releases through `getUpPitch`
+ *   (small upward lift) while the FOV settles back, then regen resumes.
  *
  * `playerRig.shove(dirX, dirZ, power)` — knockback impulse in m/s on the XZ
  *   plane; direction is normalized, impulses accumulate and are consumed
@@ -52,6 +55,34 @@ const STAGGER_TIME = 2.5 // s
 const STAGGER_RECOVER_HP = 40
 const SHOVE_PER_DAMAGE = 2.5 / 12 // m/s of knockback per point of damage
 const SHOVE_MAX = 6
+/** Mercy-window shoves are dampened: downed hits nudge, they don't juggle.
+ * (Bots hold their standoff ring while you're staggered, but the pile-on
+ * hits that land in the same frame the stagger starts — plus any future
+ * splash sources — still shove.) */
+const STAGGER_SHOVE_SCALE = 0.4
+
+// --- Stagger camera feel (all CPU-side rotation/fov math) -------------------
+/** Head-hang while downed: a slow nose-down slump, eased in over SLUMP_EASE. */
+const SLUMP_PITCH = 0.04 // rad
+const SLUMP_EASE = 0.35 // s
+/** Woozy sway: two detuned rolls + one slow pitch, peak amp mid-stagger. */
+const SWAY_ROLL_AMP = 0.03 // rad (layered pair peaks ~0.045)
+const SWAY_PITCH_AMP = 0.02 // rad
+/** Tunnel vision while downed; released with a settle as you get up. */
+const STAGGER_FOV_DROP = 6 // deg
+/** Get-up beat at stagger end: slump releases + a small upward lift. */
+const RECOVER_TIME = 0.6 // s
+const GETUP_LIFT = 0.025 // rad of upward pitch overshoot mid-recovery
+
+/**
+ * Get-up pitch offset (rad) over recovery progress u∈[0,1]: starts at the
+ * full slump (negative), lifts slightly past level as you straighten, and
+ * settles to exactly 0. Pure — exported for headless tests.
+ */
+export function getUpPitch(u: number): number {
+  const t = u < 0 ? 0 : u > 1 ? 1 : u
+  return -SLUMP_PITCH * (1 - t) * (1 - t) + GETUP_LIFT * Math.sin(Math.PI * t) * t
+}
 
 /** Shared with the viewmodel/shooting: where the player is looking from. */
 export const playerRig = {
@@ -82,6 +113,8 @@ let clock = 0
 let lastDamageAt = -Infinity
 /** Seconds left in the current stagger (only meaningful while staggered). */
 let staggerT = 0
+/** Seconds left in the get-up recovery beat (runs after the stagger ends). */
+let recoverT = 0
 /** Locally-pooled fractional regen hp, flushed to the store in chunks. */
 let regenPool = 0
 
@@ -105,7 +138,9 @@ export function damagePlayer(amount: number, fromDir?: { x: number; z: number })
 
   let angle: number | undefined
   if (fromDir) {
-    playerRig.shove(fromDir.x, fromDir.z, Math.min(SHOVE_MAX, amount * SHOVE_PER_DAMAGE))
+    const power =
+      Math.min(SHOVE_MAX, amount * SHOVE_PER_DAMAGE) * (s.staggered ? STAGGER_SHOVE_SCALE : 1)
+    playerRig.shove(fromDir.x, fromDir.z, power)
     // Screen-relative attacker bearing: attacker sits at -fromDir from the
     // player. 0 = straight ahead, +π/2 = to the right (camera yaw only).
     const ax = -fromDir.x
@@ -125,8 +160,42 @@ export function damagePlayer(amount: number, fromDir?: { x: number; z: number })
   else s.setHealth(next)
 }
 
-/** Dev-only handle (used by headless E2E): teleport the player rig. */
-export const playerDebug: { teleport?: (x: number, z: number, yaw: number, pitch?: number) => void } = {}
+/** Snapshot returned by `playerDebug.sample()` (live stagger-tuning traces). */
+export type PlayerSample = {
+  x: number
+  y: number
+  z: number
+  yaw: number
+  pitch: number
+  roll: number
+  fov: number
+  health: number
+  staggered: boolean
+  staggerT: number
+  recoverT: number
+  speed: number
+}
+
+/**
+ * Dev-only handle (used by headless E2E): teleport the player rig, hurt the
+ * player like a bot would, drain queued knockback (tests), and sample the
+ * live camera/stagger state (`sample` only exists while Player is mounted;
+ * it is also published as `globalThis.__bootsPlayer` for page eval).
+ */
+export const playerDebug: {
+  teleport?: (x: number, z: number, yaw: number, pitch?: number) => void
+  damage: typeof damagePlayer
+  drainShove: () => { x: number; z: number }
+  sample?: () => PlayerSample
+} = {
+  damage: damagePlayer,
+  drainShove: () => {
+    const out = { x: shoveAccum.x, z: shoveAccum.z }
+    shoveAccum.x = 0
+    shoveAccum.z = 0
+    return out
+  },
+}
 
 export function Player({ world }: { world: GameWorld }) {
   const camera = useThree((s) => s.camera) as PerspectiveCamera
@@ -164,6 +233,7 @@ export function Player({ world }: { world: GameWorld }) {
     clock = 0
     lastDamageAt = -Infinity
     staggerT = 0
+    recoverT = 0
     regenPool = 0
     camera.fov = GAME_FOV
     camera.updateProjectionMatrix()
@@ -173,9 +243,31 @@ export function Player({ world }: { world: GameWorld }) {
       playerRig.yaw = yaw
       playerRig.pitch = pitch
     }
+    playerDebug.sample = () => {
+      const s = useBoots.getState()
+      return {
+        x: feet.current.x,
+        y: feet.current.y,
+        z: feet.current.z,
+        yaw: playerRig.yaw,
+        pitch: camera.rotation.x,
+        roll: camera.rotation.z,
+        fov: camera.fov,
+        health: s.health,
+        staggered: s.staggered,
+        staggerT,
+        recoverT,
+        speed: playerRig.speed,
+      }
+    }
+    // Page-eval mirror of the dev handle (headless stagger tuning) — game-
+    // root's `__boots` stays the stable surface; this one is player-scoped.
+    ;(globalThis as Record<string, unknown>).__bootsPlayer = playerDebug
     // Restore handled by session.exitGame (it owns savedCamera).
     return () => {
       playerDebug.teleport = undefined
+      playerDebug.sample = undefined
+      delete (globalThis as Record<string, unknown>).__bootsPlayer
     }
   }, [camera, world])
 
@@ -287,13 +379,21 @@ export function Player({ world }: { world: GameWorld }) {
     // --- Stagger: 2.5s of woozy "almost died" instead of dying ------------
     let swayPitch = 0
     let swayRoll = 0
+    let fovTarget = GAME_FOV
     if (staggered) {
       staggerT -= dt
       const progress = 1 - Math.max(0, staggerT) / STAGGER_TIME
       // Half-sine envelope: sway eases in, peaks mid-stagger, eases back out.
       const amp = Math.sin(Math.PI * Math.min(1, progress))
-      swayRoll = Math.sin(clock * 3.4) * 0.055 * amp
-      swayPitch = Math.sin(clock * 2.1) * 0.035 * amp
+      // Two detuned rolls read woozy (drunken drift) where one pure sine
+      // read metronomic; frequencies kept under ~0.45 Hz to stay clear of
+      // the motion-sickness band.
+      swayRoll = (Math.sin(clock * 2.7) + 0.5 * Math.sin(clock * 4.3 + 1.7)) * SWAY_ROLL_AMP * amp
+      // Head-hang: slump eases in fast, holds for the whole stagger, and is
+      // handed off to getUpPitch() at recovery so there is no pitch pop.
+      const slump = Math.min(1, (progress * STAGGER_TIME) / SLUMP_EASE)
+      swayPitch = Math.sin(clock * 1.8 + 0.9) * SWAY_PITCH_AMP * amp - SLUMP_PITCH * slump
+      fovTarget = GAME_FOV - STAGGER_FOV_DROP * slump
       // Visuals/audio while downed are owned elsewhere: the HUD's stagger
       // overlay pulses off store.staggered, enemies.tsx drives the muffle +
       // heartbeat (health is pinned at 1, well under its 45hp threshold).
@@ -303,14 +403,32 @@ export function Player({ world }: { world: GameWorld }) {
         s.setHealth(STAGGER_RECOVER_HP)
         lastDamageAt = clock // regen resumes REGEN_DELAY after recovery
         regenPool = 0
+        recoverT = RECOVER_TIME // start the get-up beat
       }
-    } else if (boots.health < 100 && clock - lastDamageAt >= REGEN_DELAY) {
-      // Passive regen — pooled locally, flushed ~4x/s to keep HUD re-renders cheap.
-      regenPool += REGEN_RATE * dt
-      if (regenPool >= REGEN_WRITE_CHUNK || boots.health + regenPool >= 100) {
-        useBoots.getState().setHealth(Math.min(100, boots.health + regenPool))
-        regenPool = 0
+    } else {
+      if (recoverT > 0) {
+        // Get-up: slump releases with a small upward lift, FOV settles back.
+        recoverT -= dt
+        const u = 1 - Math.max(0, recoverT) / RECOVER_TIME
+        swayPitch = getUpPitch(u)
+        fovTarget = GAME_FOV - STAGGER_FOV_DROP * (1 - u) * (1 - u)
       }
+      if (boots.health < 100 && clock - lastDamageAt >= REGEN_DELAY) {
+        // Passive regen — pooled locally, flushed ~4x/s to keep HUD re-renders cheap.
+        regenPool += REGEN_RATE * dt
+        if (regenPool >= REGEN_WRITE_CHUNK || boots.health + regenPool >= 100) {
+          useBoots.getState().setHealth(Math.min(100, boots.health + regenPool))
+          regenPool = 0
+        }
+      }
+    }
+
+    // Smoothed FOV toward the stagger/recovery target (snap when close so
+    // updateProjectionMatrix stops running once settled).
+    if (camera.fov !== fovTarget) {
+      const d = fovTarget - camera.fov
+      camera.fov = Math.abs(d) < 0.02 ? fovTarget : camera.fov + d * Math.min(1, dt * 6)
+      camera.updateProjectionMatrix()
     }
 
     camera.position.copy(playerRig.position)

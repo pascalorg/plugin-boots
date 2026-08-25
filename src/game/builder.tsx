@@ -24,7 +24,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * XZ) of the raw ghost; otherwise the plain grid pose is used.
  *   walls  — chain end-to-end along the neighbor's axis (only when your
  *            snapped yaw is parallel to it), and stack on top when your aim
- *            ray passes above the neighbor's mid-height.
+ *            ray passes above 3/4 of the neighbor's height (a real upward
+ *            tilt — level gaze never stacks).
  *   floors — tile edge-to-edge on the neighbor's plane (4 sides).
  *   ramps  — low edge snaps to a floor edge (rising away from the floor) or
  *            to a wall base (high edge kisses the wall top: WALL_H rise).
@@ -38,10 +39,14 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *   PIECE_DIMS / piecePose      piece geometry + pose from base elevation.
  *   resolveSnap(piece, placed, raw, aimYAt)   pure snap resolver → snapped
  *       pose or null. `aimYAt(x, z)` = aim-ray height over that XZ point
- *       (gates wall stacking). RETURNS A REUSED MODULE OBJECT — copy fields
- *       before the next call if you keep them.
+ *       (gates wall stacking at 3/4 of the neighbor's height). RETURNS A
+ *       REUSED MODULE OBJECT — copy fields before the next call if you
+ *       keep them.
  *   isOccupied(placed, piece, x, y, z, yaw)   identical-pose test, yaw
  *       compared modulo the piece's symmetry (wall π, floor π/2, ramp 2π).
+ *   builderDebug (dev, `globalThis.__bootsBuilder` in-game)   holdFire
+ *       stands in for the held LMB in headless E2E; ghost() snapshots the
+ *       resolved ghost pose.
  * ──────────────────────────────────────────────────────────────────────────
  */
 
@@ -54,6 +59,10 @@ const REACH = 3.2
 const SNAP_RANGE = 1.1
 /** Min seconds between hold-to-place stamps. */
 const PLACE_INTERVAL = 0.18
+/** Wall stacking wants the aim ray above this fraction of the neighbor's
+ * height at its XZ — a real upward tilt (a level gaze at eye height 1.58
+ * already clears a ground wall's midpoint, so 0.5 auto-towered). */
+const STACK_GATE = 0.75
 
 export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   wall: [3, WALL_H, 0.12],
@@ -162,7 +171,7 @@ function consider(x: number, y: number, z: number, yaw: number): void {
  * Candidate poses from nearby placed pieces; nearest one within SNAP_RANGE
  * of the raw ghost wins, null means "use the plain grid". Pure — pass
  * `aimYAt(x, z)` = height of the aim ray above that XZ point (gates wall
- * stacking at the neighbor's mid-height). Returned object is REUSED.
+ * stacking at 3/4 of the neighbor's height). Returned object is REUSED.
  */
 export function resolveSnap(
   piece: BuildPiece,
@@ -195,8 +204,13 @@ export function resolveSnap(
         consider(px + ax * SPAN, py, pz + az * SPAN, p.yaw)
         consider(px - ax * SPAN, py, pz - az * SPAN, p.yaw)
       }
-      // Stack on top when the aim ray passes above the neighbor's mid-height.
-      if (aimYAt(px, pz) > py + WALL_H * 0.5) consider(px, py + WALL_H, pz, p.yaw)
+      // Stack on top when the aim ray passes above 3/4 of the neighbor's
+      // height. Mid-height was too lenient: a LEVEL gaze (eye 1.58) already
+      // clears a ground wall's midpoint (1.4), so holding fire auto-towered
+      // without ever looking up (live QA find). 0.75·H (2.1) demands a real
+      // upward tilt while staying reachable for 3-high stacks from the
+      // ground (see builder.test.ts stacking-reach cases).
+      if (aimYAt(px, pz) > py + WALL_H * STACK_GATE) consider(px, py + WALL_H, pz, p.yaw)
     } else if (piece === 'floor' && p.piece === 'floor') {
       // Tile edge-to-edge on the same plane, 4 sides, neighbor's yaw.
       const ax = Math.cos(p.yaw)
@@ -243,6 +257,20 @@ type GhostState = {
   yaw: number
   piece: BuildPiece
   occupied: boolean
+}
+
+/** Per-frame mirror of the resolved ghost for the dev handle (no allocs). */
+const _debugGhost: GhostState = { x: 0, y: 0, z: 0, yaw: 0, piece: 'wall', occupied: false }
+
+/**
+ * Dev-only handle (published as `globalThis.__bootsBuilder` while the game
+ * runs — same pattern as `__bootsPlayer`): headless E2E can't engage pointer
+ * lock, so `holdFire` stands in for the held LMB (it is OR-ed with the real
+ * input each frame). `ghost()` snapshots the currently resolved ghost pose.
+ */
+export const builderDebug: { holdFire: boolean; ghost: () => GhostState } = {
+  holdFire: false,
+  ghost: () => ({ ..._debugGhost }),
 }
 
 const _raw: RawGhost = { x: 0, y: 0, z: 0, yaw: 0 }
@@ -340,6 +368,14 @@ export function Builder() {
   const buildPiece = useBoots((s) => s.buildPiece)
   const active = weapon === 'builder'
 
+  useEffect(() => {
+    ;(globalThis as Record<string, unknown>).__bootsBuilder = builderDebug
+    return () => {
+      builderDebug.holdFire = false
+      delete (globalThis as Record<string, unknown>).__bootsBuilder
+    }
+  }, [])
+
   useFrame((_, dt) => {
     const session = getSession()
     if (!session) return
@@ -348,7 +384,7 @@ export function Builder() {
     if (!active) {
       if (ghost) setGhost(null)
       lastPlaced.current.has = false
-      prevFire.current = session.input.state.firing
+      prevFire.current = session.input.state.firing || builderDebug.holdFire
       return
     }
 
@@ -373,12 +409,18 @@ export function Builder() {
     ) {
       setGhost({ x: gx, y: gy, z: gz, yaw: gyaw, piece: buildPiece, occupied })
     }
+    _debugGhost.x = gx
+    _debugGhost.y = gy
+    _debugGhost.z = gz
+    _debugGhost.yaw = gyaw
+    _debugGhost.piece = buildPiece
+    _debugGhost.occupied = occupied
 
     // Place: on press, and while held whenever the ghost pose changes
     // (min PLACE_INTERVAL apart). Occupied poses are skipped, no sound.
     // Staggered hands can't stamp (matches the viewmodel's fire block);
     // prevFire still tracks the raw button so recovery doesn't edge-place.
-    const firing = session.input.state.firing
+    const firing = session.input.state.firing || builderDebug.holdFire
     if (firing && !useBoots.getState().staggered && placeCooldown.current <= 0) {
       const last = lastPlaced.current
       const moved =

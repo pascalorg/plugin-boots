@@ -28,8 +28,8 @@ export type MoveConfig = {
   jumpSpeed: number
 }
 
-/** Tuned arcade-fast (Serious-Sam-era pacing): quick run, snappy stops,
- * real air-strafe. Circle-strafing is the core verb. */
+/** Tuned arcade-fast (classic-arena-shooter pacing): quick run, snappy
+ * stops, real air-strafe. Circle-strafing is the core verb. */
 export const MOVE: MoveConfig = {
   gravity: 16,
   runSpeed: 6.5,

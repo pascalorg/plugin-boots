@@ -70,6 +70,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const dipDepth = useRef(0)
   /** 0→1 while staggered: weapon droops (down + muzzle-down), firing blocked. */
   const droop = useRef(0)
+  const prevStaggered = useRef(false)
 
   useFrame((_, rawDt) => {
     const session = getSession()
@@ -110,6 +111,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // Weapon droop while staggered — slow lerp both ways so the arm sags
     // and recovers smoothly instead of snapping.
     droop.current += ((staggered ? 1 : 0) - droop.current) * Math.min(1, dt * 6)
+    // Get-up re-ready: when the stagger ends, re-raise the weapon from below
+    // (negative drawT = a short fully-lowered hold before the 0.14s rise, so
+    // the re-grip lands inside the camera's get-up beat).
+    if (prevStaggered.current && !staggered) drawT.current = -0.4
+    prevStaggered.current = staggered
 
     // Any switch (slots, wheel, gear-table pickup) restarts the draw-in.
     if (current !== prevWeapon.current) {
@@ -150,7 +156,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const invDt = dt > 1e-5 ? 1 / dt : 0
 
     // Draw-in: rise from below with a muzzle-down tilt, ease-out cubic.
-    const drawEase = 1 - (1 - drawT.current) ** 3
+    // (clamp keeps the cubic sane for the get-up hold's negative drawT)
+    const drawEase = 1 - (1 - clamp(drawT.current, 0, 1)) ** 3
     const draw = 1 - drawEase
 
     // Idle breathing: slow sine, tiny.

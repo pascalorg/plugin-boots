@@ -14,7 +14,9 @@ import { spawnDebris } from './debris'
  *   spawns, no wave text. Walking, building, breaking walls never wake the
  *   horde; only picking up a gun (pistol/rifle in useBoots.owned) does.
  * - ALERT: the first gun pickup starts a one-shot ALERT_SECONDS countdown
- *   ("They heard you — 5"); at 0 the wave director takes over (WAVE 1).
+ *   ("They heard you — 5") over a rising machine spin-up, a clack per tick;
+ *   at 0 the line flashes HERE THEY COME and the wave director takes over
+ *   (WAVE 1). resetBots() re-arms the whole grace→alert cycle.
  * - MERCY: while the player is staggered bots never attack — ground bots
  *   hold a 4–6 m ring, drones climb +1 m and hover (see enemies.tsx).
  */

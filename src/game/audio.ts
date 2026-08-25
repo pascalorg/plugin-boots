@@ -12,7 +12,41 @@
  * Damage-feel hooks (driven from enemies.tsx off health/stagger):
  * - sfx.setMuffle(0..1) — concussion: sweeps the master lowpass 19kHz→700Hz.
  * - sfx.heartbeat() — looping lub-dub, returns { setRate, setLevel, stop }.
+ * - heartbeatBpm(health) — THE single severity→bpm mapping. Both the audible
+ *   heartbeat (enemies.tsx: `handle.setRate(heartbeatBpm(health))`) and the
+ *   HUD's red pulse (hud.ts beat()) must use it so they never drift apart.
+ * - setHeartbeatPulseListener(cb) — phase hook: cb(delayMs) fires once per
+ *   scheduled audible lub, delayMs before it sounds. hud.ts registers its
+ *   beatPulse() here on mount so the visual pulse lands on the sound.
  */
+
+/** Health at/below which the low-HP heartbeat (audio + HUD pulse) engages. */
+export const HEARTBEAT_HP = 45
+
+/** Low-HP severity 0..1: 0 at/above HEARTBEAT_HP, 1 at 0hp. */
+export function lowHpSeverity(health: number): number {
+  return Math.min(1, Math.max(0, (HEARTBEAT_HP - health) / HEARTBEAT_HP))
+}
+
+/**
+ * Single source of truth for heartbeat pacing: ~70bpm at the 45hp threshold
+ * rising to 150bpm at 0hp. Used by hud.ts's vignette pulse and meant for
+ * enemies.tsx's `heartbeat().setRate(...)` — same curve, zero drift.
+ */
+export function heartbeatBpm(health: number): number {
+  return 70 + 80 * lowHpSeverity(health)
+}
+
+/**
+ * Called once per scheduled audible lub with the ms until it sounds, so the
+ * HUD can phase-lock its visual pulse. Registered by hud.ts on mount; pass
+ * null to clear. Silent beats (level ~0) do NOT fire it — the HUD falls back
+ * to self-timing at heartbeatBpm().
+ */
+let heartbeatPulseListener: ((delayMs: number) => void) | null = null
+export function setHeartbeatPulseListener(cb: ((delayMs: number) => void) | null): void {
+  heartbeatPulseListener = cb
+}
 
 /** Muffle sweep endpoints — fully open vs. concussed. */
 const MUFFLE_OPEN_HZ = 19000
@@ -151,9 +185,11 @@ export const sfx = {
    * scheduled sample-accurately via a 100ms lookahead interval, so the pulse
    * stays steady even when the tab hiccups. setRate/setLevel take effect on
    * the next unscheduled beat. Starts silent-safe: with level 0 the timer
-   * runs but schedules nothing. Driven from enemies.tsx off health (rate and
-   * level climb as health falls below 45). Always returns a handle (no-op
-   * without WebAudio).
+   * runs but schedules nothing. Driven from enemies.tsx off health — feed
+   * setRate with heartbeatBpm(health) (the shared mapping, see header) so
+   * audio and HUD stay in step. Each audible lub also pings the registered
+   * heartbeat-pulse listener (see setHeartbeatPulseListener). Always returns
+   * a handle (no-op without WebAudio).
    */
   heartbeat(): HeartbeatHandle {
     const c = ensureContext()
@@ -170,6 +206,7 @@ export const sfx = {
           const when = nextBeat - now
           thump(90, 0.14, 0.5 * level, when) // lub
           thump(70, 0.16, 0.4 * level, when + 0.12) // dub
+          heartbeatPulseListener?.(when * 1000) // phase-lock the HUD pulse
         }
         nextBeat += 60 / bpm
       }

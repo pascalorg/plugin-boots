@@ -41,7 +41,7 @@ describe('resolveSnap: walls', () => {
     expect(snap).toBeNull()
   })
 
-  test('stacks on top when the aim ray passes above mid-height', () => {
+  test('stacks on top when the aim ray passes above 3/4 of the height', () => {
     const pieces = [placed('wall', 0, 0, 0, 0)]
     // Perpendicular yaw so only the stack candidate exists.
     const raw = { x: 0, y: 0, z: 0, yaw: Math.PI / 2 }
@@ -52,6 +52,18 @@ describe('resolveSnap: walls', () => {
     expect(snap!.y).toBeCloseTo(2.8)
     expect(snap!.z).toBeCloseTo(0)
     expect(snap!.yaw).toBeCloseTo(0) // stacked wall adopts the wall below
+  })
+
+  // Stacking-reach cases: STACK_GATE = 0.75 · WALL_H (2.8) = 2.1.
+  test('a level gaze at eye height (1.58) does NOT stack — real tilt required', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0)]
+    const raw = { x: 0, y: 0, z: 0, yaw: Math.PI / 2 }
+    // 1.58 clears the old mid-height gate (1.4) — that auto-towered.
+    expect(resolveSnap('wall', pieces, raw, () => 1.58)).toBeNull()
+    // Just above the 3/4 gate (2.1) stacks.
+    const snap = resolveSnap('wall', pieces, raw, () => 2.2)
+    expect(snap).not.toBeNull()
+    expect(snap!.y).toBeCloseTo(2.8)
   })
 
   test('nearest candidate wins, plain grid when nothing is in range', () => {

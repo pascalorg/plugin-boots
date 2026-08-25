@@ -4,7 +4,7 @@ import { useFrame } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import { type Group, Vector3 } from 'three'
 import { useBoots } from '../store'
-import { type HeartbeatHandle, sfx } from './audio'
+import { HEARTBEAT_HP, type HeartbeatHandle, heartbeatBpm, lowHpSeverity, sfx } from './audio'
 import { ALERT_SECONDS, BOT_STATS, type Bot, bots, resetBots, spawnBot, waveState } from './enemies-state'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
@@ -12,12 +12,19 @@ import type { GameWorld } from './world'
 
 /**
  * Wave-based horde: humanoid droids, robot dogs, FPV drones — they beeline
- * for you and you mow them down. Ground bots probe ahead with a cheap
- * whisker so they hug obstacles instead of phasing through the table.
+ * for you and you mow them down. Bots steer, they don't collide: pursuit
+ * (and the mercy ring below) moves positions directly, so during standoffs
+ * they can pass through placed builder pieces and props. Accepted for now —
+ * they never attack from inside a piece, they just reposition through it.
  *
  * Pacing (see enemies-state.ts for the state shape):
  * - Peaceful until the first gun pickup, then a 5s "They heard you"
  *   countdown on the wave line, then WAVE 1 and the normal director.
+ * - Countdown audio: a second droneBuzz voice acts as a distant machine
+ *   spin-up, swelling 0→full across the 5s; each tick lands a relay clack
+ *   (doorLatch), the final second an arming rack (reload). At zero the
+ *   spin-up stops and the wave line flashes HERE THEY COME (first wave
+ *   only; later waves keep the plain WAVE N label).
  * - Melee routes through player.tsx `damagePlayer` (knockback + directional
  *   flash + stagger come for free — no local sfx/flash here).
  * - Stagger mercy: bots never attack a staggered player; ground bots hold a
@@ -31,8 +38,6 @@ const KIND_CYCLE = ['droid', 'dog', 'droid', 'drone', 'dog', 'drone'] as const
 /** Stagger-mercy standoff ring for ground bots (m). */
 const MERCY_MIN = 4
 const MERCY_MAX = 6
-/** Heartbeat kicks in below this hp; rate ramps 70→150 bpm toward 0 hp. */
-const HEARTBEAT_HP = 45
 
 const _toPlayer = new Vector3()
 const _center = new Vector3()
@@ -60,6 +65,12 @@ export function Enemies({ world }: { world: GameWorld }) {
   const [tick, setTick] = useState(0)
   const signature = useRef('')
   const buzz = useRef<ReturnType<typeof sfx.droneBuzz>>(null)
+  /** Second buzz voice: the distant machine spin-up under the countdown. */
+  const spinup = useRef<ReturnType<typeof sfx.droneBuzz>>(null)
+  /** Last countdown second a tell played for (0 = none pending). */
+  const countdownTick = useRef(0)
+  /** Label shown while waveLabelT runs; null → plain `WAVE n`. */
+  const spawnLabel = useRef<string | null>(null)
   const waveLabelT = useRef(0)
   const waveText = useRef<string | null>(null)
   const staggerWas = useRef(false)
@@ -70,6 +81,8 @@ export function Enemies({ world }: { world: GameWorld }) {
     buzz.current = sfx.droneBuzz()
     return () => {
       buzz.current?.stop()
+      spinup.current?.stop()
+      spinup.current = null
       heart.current?.stop()
       heart.current = null
       sfx.setMuffle?.(0)
@@ -93,9 +106,10 @@ export function Enemies({ world }: { world: GameWorld }) {
       if (!heart.current && typeof sfx.heartbeat === 'function') {
         heart.current = sfx.heartbeat()
       }
-      const severity = (HEARTBEAT_HP - Math.max(0, boots.health)) / HEARTBEAT_HP
-      heart.current?.setRate(70 + 80 * severity)
-      heart.current?.setLevel(0.35 + 0.4 * severity)
+      // Shared severity→bpm mapping (audio.ts) — the HUD's red pulse uses
+      // the same curve, so sound and vignette never drift.
+      heart.current?.setRate(heartbeatBpm(boots.health))
+      heart.current?.setLevel(0.35 + 0.4 * lowHpSeverity(boots.health))
     } else if (heart.current) {
       heart.current.stop()
       heart.current = null
@@ -106,16 +120,35 @@ export function Enemies({ world }: { world: GameWorld }) {
       if (boots.owned.includes('pistol') || boots.owned.includes('rifle')) {
         waveState.alerted = true
         waveState.countdown = ALERT_SECONDS
+        // Distant machine spin-up under the ticking line (stop any stale
+        // voice first — resetBots() mid-session re-arms the alert).
+        spinup.current?.stop()
+        spinup.current = sfx.droneBuzz()
+        countdownTick.current = ALERT_SECONDS + 1
       }
     } else if (waveState.countdown > 0) {
       waveState.countdown -= dt
+      // Per-second tell: a relay clack each tick, the arming rack on the
+      // last one — the lot's machinery waking up, somewhere out there.
+      const tick = Math.max(1, Math.ceil(waveState.countdown))
+      if (tick !== countdownTick.current) {
+        countdownTick.current = tick
+        if (tick === 1) sfx.reload()
+        else sfx.doorLatch()
+      }
+      // Rising cue: the spin-up swells 0→full across the whole countdown.
+      spinup.current?.setIntensity((1 - waveState.countdown / ALERT_SECONDS) * 0.09)
       if (waveState.countdown <= 0) {
+        spinup.current?.stop()
+        spinup.current = null
+        spawnLabel.current = 'HERE THEY COME' // first wave only
         spawnWave(world) // WAVE 1
         waveLabelT.current = 3
       }
     } else if (bots.length === 0) {
       waveState.intermission -= dt
       if (waveState.intermission <= 0) {
+        spawnLabel.current = null
         spawnWave(world)
         waveLabelT.current = 3
       }
@@ -131,7 +164,7 @@ export function Enemies({ world }: { world: GameWorld }) {
       } else if (bots.length === 0) {
         label = `next wave — ${Math.max(1, Math.ceil(waveState.intermission))}`
       } else if (waveLabelT.current > 0) {
-        label = `WAVE ${waveState.wave}`
+        label = spawnLabel.current ?? `WAVE ${waveState.wave}`
       }
     }
     if (label !== waveText.current) {
