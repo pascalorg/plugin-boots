@@ -593,3 +593,42 @@ new finding. All in: `bun run check-types` clean, `bun test` green.
 Open: exercise countCoplanarSuspects + overlay hiding against a REAL
 Bones-installed scene in-browser (fixtures so far had overlayRoots 0);
 owner feel-pass on the char-collapse burst now that colors land.
+
+## 2026-08-25 — Phase 4 round 1: hammer / grenade / ADS / theatre (manager stitch)
+
+Combat + world groups landed in parallel; the manager pass wired the seams:
+
+- **Slot 6: the warhammer** (weapons.ts `smashRadius` 0.55 + arsenal def,
+  weapon-models WarhammerModel, viewmodel two-phase wind-up→slam swing with
+  the hit resolving at impact, shooting.ts smash routing: crater +4–6 rim
+  nibbles + area knockback via smashKnockback). `'hammer'` added to
+  store.ts WeaponId — both `as WeaponId` bridge casts deleted.
+- **THE MEGA-GRENADE** (grenade.tsx): G throws everywhere (builder undo
+  lives on Z), arc + single bounce, 2.5 s fuse with beeps, radius-3.2 carve
+  (fallback path until destruction.damageExplosion lands), bot fling,
+  playerRig.shake kick, dust storm. Manager wiring: `<Grenades world/>`
+  mounted in game-root's ActiveGame, HUD pip driven per frame from the
+  component (`hud.grenadePip`), viewmodel's opaque dynamic-import bridge
+  flipped to a static `import { throwGrenade } from './grenade'`.
+- **ADS (RMB, pistol/rifle)**: viewmodel writes playerRig.ads (±12/s) and
+  now drives `hud.setAds` (crosshair ticks→dot morph); player.tsx lerps
+  FOV 92→60 + scales sensitivity; shooting.ts aimDirection now cuts spread
+  ×(1−0.75·ads) — the accuracy payoff existed nowhere before this pass.
+- **Siren countdown theatre** (guntable.tsx): boots pair + warhammer on the
+  tables, rear pickup grants minigun+hammer, siren beacon spins its
+  `beacon-light` head ~7 rad/s + red point light + sfx.sirenLoop — now
+  gated on the landed `waveState.countdownActive` flag (fallback expr
+  removed).
+- **Material dust routing** (destruction.ts → dust.tsx): wall carves +
+  sheet fly-offs emit kind `'drywall'` (puff, upgrading to plume+haze when
+  heavy), plain volumes emit `'concrete'` (half-size gray), framing hits
+  emit nothing (wood = splinters from debris alone — shooting.ts chip
+  dropped for segments). shooting.ts's local DustOpts façade widened to
+  the material union.
+- **Copy/keys coherence**: panel.tsx Controls now lists 6 hammer, RMB aim,
+  G grenade, R rotate, Z undo; hud.ts controls pill already matched;
+  destruction.ts G-undo comment → Z-undo.
+
+Suite: 206 pass / 0 fail, tsc clean. STALLED from round 1 (specs handed to
+round 2): collapse agent's skeleton collapse + `damageExplosion` export
+(grenade currently runs its fallback carve in-game), trees-host scope.

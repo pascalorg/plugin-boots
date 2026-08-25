@@ -12,9 +12,10 @@ import {
   planWallMask,
   raycastPieceCell,
   resolveSnap,
+  rotatedYaw,
   trimmedWallSpan,
 } from './builder'
-import { dropTarget, resetDestruction, useDestruction } from './destruction'
+import { dropTarget, ensureVoxelTarget, resetDestruction, useDestruction } from './destruction'
 import { playerRig } from './player'
 import { fire } from './shooting'
 import type { WeaponDef } from './weapons'
@@ -23,9 +24,10 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 /**
  * Builder grammar, headless: the pure snap resolver (wall chains + stacks,
  * floor tiling, roof low-edge docking), identical-pose occupancy, the 3×3
- * cell-mask math (cell picking, Keep's mask → node planning), and the
- * destructibility route for placed pieces (nodeType 'block' → voxelize on
- * first hit, dropTarget on undo).
+ * cell-mask math (cell picking, Keep's mask → node planning), the R-rotate
+ * quarter-turn math, and the destructibility route for placed pieces
+ * (nodeType 'block' → voxelize INSTANTLY at placement, dropTarget on
+ * Z-undo).
  */
 
 let nextId = 1
@@ -218,6 +220,52 @@ describe('isOccupied: identical poses up to piece symmetry', () => {
     const pieces = [placed('floor', 0, 0, 0, 0)]
     expect(isOccupied(pieces, 'floor', 0, 0, 0, Math.PI / 2)).toBe(true)
     expect(isOccupied(pieces, 'floor', 0, 0, 3, 0)).toBe(false)
+  })
+})
+
+// --- R rotate: manual quarter turns over the auto-facing yaw ----------------
+
+describe('rotatedYaw: quarter-turn offset math', () => {
+  test('each press adds 90°, four presses wrap back to the base yaw', () => {
+    expect(rotatedYaw(0, 0)).toBeCloseTo(0)
+    expect(rotatedYaw(0, 1)).toBeCloseTo(Math.PI / 2)
+    expect(Math.abs(rotatedYaw(0, 2))).toBeCloseTo(Math.PI) // π ≡ −π at the wrap seam
+    expect(rotatedYaw(0, 3)).toBeCloseTo(-Math.PI / 2) // 3π/2 wraps negative
+    expect(rotatedYaw(0, 4)).toBeCloseTo(0)
+    expect(rotatedYaw(Math.PI / 2, 1)).toBeCloseTo(-Math.PI) // base + turn wraps too
+  })
+
+  test('result stays wrapped in [−π, π) and negative turns wrap the other way', () => {
+    for (let turns = -5; turns <= 9; turns++) {
+      const yaw = rotatedYaw(Math.PI / 2, turns)
+      expect(yaw).toBeGreaterThanOrEqual(-Math.PI - 1e-9)
+      expect(yaw).toBeLessThan(Math.PI + 1e-9)
+    }
+    expect(rotatedYaw(0, -1)).toBeCloseTo(rotatedYaw(0, 3))
+    expect(rotatedYaw(0, -3)).toBeCloseTo(rotatedYaw(0, 1))
+  })
+
+  test('walls: two presses land on the same box (π symmetry); roofs: all 4 turns are distinct ascents', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0), placed('roof', 6, 0, 0, 0)]
+    expect(isOccupied(pieces, 'wall', 0, 0, 0, rotatedYaw(0, 2))).toBe(true)
+    expect(isOccupied(pieces, 'wall', 0, 0, 0, rotatedYaw(0, 1))).toBe(false)
+    // Roof yaw symmetry is 2π: R cycles the 4 ascent orientations, only a
+    // full cycle returns to the occupied pose.
+    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 0))).toBe(true)
+    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 1))).toBe(false)
+    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 2))).toBe(false)
+    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 3))).toBe(false)
+    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 4))).toBe(true)
+  })
+
+  test('the rotated yaw steers the snap resolver (chain ↔ corner toggle)', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0)]
+    const raw = { x: 3.9, y: 0, z: 0.6, yaw: 0 }
+    // Auto-facing parallel → chains; one R press turns it perpendicular →
+    // the corner stays on the plain grid; a second press is parallel again.
+    expect(resolveSnap('wall', pieces, { ...raw, yaw: rotatedYaw(0, 0) }, aimLow)).not.toBeNull()
+    expect(resolveSnap('wall', pieces, { ...raw, yaw: rotatedYaw(0, 1) }, aimLow)).toBeNull()
+    expect(resolveSnap('wall', pieces, { ...raw, yaw: rotatedYaw(0, 2) }, aimLow)).not.toBeNull()
   })
 })
 
@@ -431,8 +479,41 @@ describe('placed pieces are destructible', () => {
     expect(fire(world, GUN)).toBe('wall') // voxelized + carved, not a spark
     expect(useDestruction.getState().targets.has('__boots-piece-1')).toBe(true)
 
-    // G-undo path: PlacedPieceMesh cleanup calls dropTarget(nodeId).
+    // Z-undo path: PlacedPieceMesh cleanup calls dropTarget(nodeId).
     dropTarget('__boots-piece-1')
     expect(useDestruction.getState().targets.has('__boots-piece-1')).toBe(false)
+  })
+})
+
+// --- Instant bricks: placements voxelize the moment they land ---------------
+
+describe('instant voxelize at placement (PlacedPieceMesh wiring, mock level)', () => {
+  test('ensureVoxelTarget clads the fresh piece and disables its collider — no double-solid', () => {
+    const world = worldWithPlacedWall()
+    const entry = world.colliders[0]!
+
+    // What the layout effect does right after pushing the collider entry.
+    const target = ensureVoxelTarget(world, entry.nodeId)
+    expect(target).not.toBeNull()
+    expect(target!.kind).toBe('volume') // placed pieces are plain adaptive volumes
+    expect(target!.grid.count).toBeGreaterThan(0)
+    expect(useDestruction.getState().targets.has('__boots-piece-1')).toBe(true)
+    // The mesh collider hands over to the voxel replica in the same call.
+    expect(entry.disabled).toBe(true)
+    // Idempotent: mask edits re-run the effect against a fresh entry, but a
+    // repeat call for a live target must return the SAME target untouched.
+    expect(ensureVoxelTarget(world, entry.nodeId)).toBe(target!)
+
+    // Shots carve the pre-clad replica directly — no first-hit flip left.
+    playerRig.position.set(0, 1.4, 5)
+    playerRig.yaw = 0
+    playerRig.pitch = 0
+    playerRig.speed = 0
+    playerRig.grounded = true
+    expect(fire(world, GUN)).toBe('wall')
+
+    // Z-undo / unmount cleanup still drops the replica cleanly.
+    dropTarget(entry.nodeId)
+    expect(useDestruction.getState().targets.has(entry.nodeId)).toBe(false)
   })
 })

@@ -100,8 +100,9 @@ export default function BootsPanel() {
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the table</p>
         <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
-        <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one</p>
-        <p>Q cycle piece · hold click to place a run · G undo · Esc exit</p>
+        <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer</p>
+        <p>RMB aim (pistol/rifle) · G grenade</p>
+        <p>Q cycle piece · R rotate · hold click to place a run · Z undo · Esc exit</p>
         <p>F edits a placed piece's 3×3 cells — pocket the middle for a window.</p>
         <p>Pieces snap to what you've placed — look up to stack walls, cap them with floors.</p>
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>

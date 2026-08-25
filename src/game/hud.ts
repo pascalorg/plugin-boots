@@ -29,6 +29,16 @@ import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
  *   edit mode ('F edit · click toggle cells'), on its OWN element above the
  *   shared prompt() line so door/table prompts never clobber it. Last write
  *   wins; null hides it. Cleared automatically on unmount.
+ * - grenadePip(readyFraction) — bottom-right dot + 'G' label above the
+ *   weapon line. 0 = just thrown (dim), ramps brighter across the 5s
+ *   cooldown, ≥1 = ready (full bright, dot turns green). grenade.tsx
+ *   drives it per frame from grenadeCooldownLeft()/GRENADE_COOLDOWN
+ *   (guarded: `hud.grenadePip?.(f)`); writes are change-gated so per-frame
+ *   calls are free while the value holds.
+ * - setAds(v) — aim-down-sights crosshair morph, v in 0..1: the four
+ *   crosshair ticks fade OUT and a small center dot fades IN as v→1.
+ *   viewmodel.tsx drives it per frame from playerRig.ads (guarded:
+ *   `hud.setAds?.(v)`); change-gated like grenadePip.
  */
 
 const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
@@ -42,6 +52,7 @@ const WEAPON_LABEL: Record<string, string> = {
   rifle: 'RIFLE',
   minigun: 'THE BIG ONE',
   builder: 'BUILD',
+  hammer: 'HAMMER',
 }
 
 export class Hud {
@@ -55,6 +66,10 @@ export class Hud {
   private lowHpEl: HTMLDivElement | null = null
   private staggerEl: HTMLDivElement | null = null
   private waveEl: HTMLDivElement | null = null
+  private pipEl: HTMLDivElement | null = null
+  private pipDotEl: HTMLDivElement | null = null
+  private crossTicksEl: HTMLDivElement | null = null
+  private crossDotEl: HTMLDivElement | null = null
   private unsub: (() => void) | null = null
   private hitTimer: ReturnType<typeof setTimeout> | null = null
   private flashTimer: ReturnType<typeof setTimeout> | null = null
@@ -66,6 +81,10 @@ export class Hud {
   private health = 100
   /** Which system's text the prompt line currently shows (see prompt()). */
   private promptOwner: string | null = null
+  /** Last grenadePip() fraction written (change gate; -1 = never). */
+  private pipF = -1
+  /** Last setAds() value written (change gate; -1 = never). */
+  private lastAds = -1
 
   mount(container: HTMLElement): void {
     const root = document.createElement('div')
@@ -82,8 +101,10 @@ export class Hud {
       return div
     }
 
-    // Crosshair — four ticks + dot, tactical-shooter style but ours.
+    // Crosshair — four ticks (hip) that ADS morphs into a lone center dot:
+    // setAds(v) cross-fades ticks (1-v) against the dot (v).
     const cross = el('position:absolute;left:50%;top:50%;width:0;height:0')
+    this.crossTicksEl = cross
     for (const [x, y, w, h] of [
       [-1, -9, 2, 6],
       [-1, 3, 2, 6],
@@ -94,6 +115,10 @@ export class Hud {
       tick.style.cssText = `position:absolute;left:${x}px;top:${y}px;width:${w}px;height:${h}px;background:rgba(80,255,120,0.9);box-shadow:0 0 2px rgba(0,0,0,0.8)`
       cross.appendChild(tick)
     }
+    // ADS center dot — sibling of the tick group so the two fade freely.
+    this.crossDotEl = el(
+      'position:absolute;left:50%;top:50%;width:3px;height:3px;margin:-1.5px 0 0 -1.5px;border-radius:50%;background:rgba(80,255,120,0.95);box-shadow:0 0 2px rgba(0,0,0,0.8);opacity:0',
+    )
 
     this.hitmarkerEl = el(
       'position:absolute;left:50%;top:50%;width:0;height:0;opacity:0;transition:opacity 0.12s',
@@ -143,13 +168,33 @@ export class Hud {
     )
 
     this.weaponEl = el(
-      `position:absolute;right:28px;bottom:24px;color:#fff;font:${FONT};font-size:15px;letter-spacing:0.12em;text-shadow:0 1px 3px rgba(0,0,0,0.8);text-align:right`,
+      `position:absolute;right:28px;bottom:24px;color:#fff;font:${FONT};font-size:15px;letter-spacing:0.12em;text-shadow:0 1px 3px rgba(0,0,0,0.8);text-align:right;white-space:nowrap`,
     )
+    // Grenade-ready pip — dot + 'G' just above the weapon line. Starts in
+    // the READY state (green, full bright): grenade cooldown begins at 0.
+    this.pipEl = el(
+      `position:absolute;right:28px;bottom:50px;display:flex;align-items:center;gap:5px;color:#fff;font:${FONT};font-size:11px;letter-spacing:0.08em;text-shadow:0 1px 3px rgba(0,0,0,0.8);opacity:1`,
+    )
+    this.pipDotEl = document.createElement('div')
+    this.pipDotEl.style.cssText =
+      'width:8px;height:8px;border-radius:50%;background:rgba(80,255,120,0.95);box-shadow:0 0 3px rgba(0,0,0,0.8)'
+    this.pipEl.appendChild(this.pipDotEl)
+    const pipLabel = document.createElement('span')
+    pipLabel.textContent = 'G'
+    this.pipEl.appendChild(pipLabel)
+    // Change gates start from the mounted visual state (pip ready, hip ADS 0)
+    // so the first driven frame diffs against what's actually on screen.
+    this.pipF = 1
+    this.lastAds = 0
     this.healthEl = el(
       `position:absolute;left:28px;bottom:24px;color:#fff;font:${FONT};font-size:20px;text-shadow:0 1px 3px rgba(0,0,0,0.8)`,
     )
+    // white-space:nowrap matters: with left:50% the shrink-to-fit width is
+    // only half the viewport, so the long '⚠ AI robot zombies incoming — N'
+    // countdown would wrap on narrow windows without it. ~300px at 13px —
+    // fits a one-line render down to well under 640px-wide canvases.
     this.waveEl = el(
-      `position:absolute;left:50%;top:20px;transform:translateX(-50%);color:#fff;font:${FONT};letter-spacing:0.1em;text-shadow:0 1px 3px rgba(0,0,0,0.8)`,
+      `position:absolute;left:50%;top:20px;transform:translateX(-50%);color:#fff;font:${FONT};letter-spacing:0.1em;text-shadow:0 1px 3px rgba(0,0,0,0.8);white-space:nowrap`,
     )
     this.promptEl = el(
       `position:absolute;left:50%;bottom:96px;transform:translateX(-50%);color:#fff;font:${FONT};background:rgba(0,0,0,0.5);padding:6px 12px;border-radius:6px;opacity:0`,
@@ -160,8 +205,8 @@ export class Hud {
       `position:absolute;left:50%;bottom:132px;transform:translateX(-50%);color:rgba(255,255,255,0.85);font:${FONT};font-size:12px;letter-spacing:0.08em;background:rgba(0,0,0,0.4);padding:4px 10px;border-radius:6px;opacity:0;transition:opacity 0.15s`,
     )
     el(
-      `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em`,
-      'Esc to exit',
+      `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em;white-space:nowrap`,
+      'Esc exit · G grenade · 6 hammer · Z undo',
     )
 
     container.appendChild(root)
@@ -265,6 +310,46 @@ export class Hud {
   }
 
   /**
+   * Grenade-ready pip (bottom-right, above the weapon line). `readyFraction`
+   * 0..1: 0 = just thrown, 1 = ready. Dim while cooling (opacity ramps with
+   * the fraction), snaps to full bright + green dot at ready. Safe to call
+   * every frame — the write is gated on a 1%-quantized change. Caller:
+   * grenade.tsx, as `hud.grenadePip?.(1 - cooldownLeft / GRENADE_COOLDOWN)`.
+   */
+  grenadePip(readyFraction: number): void {
+    const pip = this.pipEl
+    const dot = this.pipDotEl
+    if (!pip || !dot) return
+    const v = Math.min(1, Math.max(0, readyFraction))
+    const q = v >= 1 ? 1 : Math.round(v * 100) / 100
+    if (q === this.pipF) return
+    const wasReady = this.pipF === 1
+    this.pipF = q
+    pip.style.opacity = q >= 1 ? '1' : String(0.25 + 0.4 * q)
+    const ready = q >= 1
+    if (ready !== wasReady) {
+      dot.style.background = ready ? 'rgba(80,255,120,0.95)' : 'rgba(255,255,255,0.85)'
+    }
+  }
+
+  /**
+   * Aim-down-sights crosshair morph. `v` 0..1 (playerRig.ads): the four hip
+   * ticks fade OUT (opacity 1-v) and the small center dot fades IN (opacity
+   * v). Safe to call every frame — change-gated. Caller: viewmodel.tsx, as
+   * `hud.setAds?.(rigFeel.ads)`.
+   */
+  setAds(v: number): void {
+    const ticks = this.crossTicksEl
+    const dot = this.crossDotEl
+    if (!ticks || !dot) return
+    const q = Math.min(1, Math.max(0, v))
+    if (q === this.lastAds) return
+    this.lastAds = q
+    ticks.style.opacity = String(1 - q)
+    dot.style.opacity = String(q)
+  }
+
+  /**
    * Builder edit-mode hint line ('F edit · click toggle cells'). Persistent
    * until cleared with null — dedicated element, so the shared prompt()
    * line stays free for doors/gun-table interactions. Last write wins.
@@ -334,5 +419,11 @@ export class Hud {
     this.edgeEls = null
     this.lowHpEl = null
     this.staggerEl = null
+    this.pipEl = null
+    this.pipDotEl = null
+    this.crossTicksEl = null
+    this.crossDotEl = null
+    this.pipF = -1
+    this.lastAds = -1
   }
 }

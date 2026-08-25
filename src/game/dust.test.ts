@@ -4,8 +4,9 @@ import { clearDust, coneDirection, dustCounts, spawnDust, spawnHaze } from './du
 
 /**
  * Pure-logic pins for the dust module: cone sampling math, per-kind spawn
- * counts, plume auto-haze, pool-pressure halving, and both legacy call
- * shapes. Rendering (DustSystem) is DOM-bound and covered by review.
+ * counts, plume auto-haze, material-kind routing (drywall/concrete/wood),
+ * pool-pressure halving, and both legacy call shapes. Rendering (DustSystem)
+ * is DOM-bound and covered by review.
  */
 
 afterEach(clearDust)
@@ -80,6 +81,47 @@ describe('spawnDust kinds', () => {
     const n = dustCounts().puffs
     expect(n).toBeGreaterThanOrEqual(2)
     expect(n).toBeLessThanOrEqual(3)
+  })
+})
+
+describe('spawnDust material kinds', () => {
+  test('wood spawns nothing at all (splinters come from debris)', () => {
+    spawnDust(P, 1, { kind: 'wood' })
+    spawnDust(1, 2, 3, 1, 'wood')
+    expect(dustCounts().puffs).toBe(0)
+    expect(dustCounts().haze).toBe(0)
+  })
+
+  test('concrete spawns 2-3 puffs and never a haze, even at full intensity', () => {
+    spawnDust(P, 1, { kind: 'concrete' })
+    const n = dustCounts().puffs
+    expect(n).toBeGreaterThanOrEqual(2)
+    expect(n).toBeLessThanOrEqual(3)
+    expect(dustCounts().haze).toBe(0)
+  })
+
+  test('drywall at heavy intensity upgrades to a plume + auto haze', () => {
+    spawnDust(P, 1, { kind: 'drywall' })
+    const n = dustCounts().puffs
+    expect(n).toBeGreaterThanOrEqual(6)
+    expect(n).toBeLessThanOrEqual(9)
+    expect(dustCounts().haze).toBe(1)
+  })
+
+  test('drywall at light intensity stays a puff', () => {
+    spawnDust(P, 0.3, { kind: 'drywall' })
+    const n = dustCounts().puffs
+    expect(n).toBeGreaterThanOrEqual(2)
+    expect(n).toBeLessThanOrEqual(3)
+    expect(dustCounts().haze).toBe(0)
+  })
+
+  test('legacy 5-arg scalar form accepts a material kind', () => {
+    spawnDust(1, 2, 3, 1, 'concrete')
+    const n = dustCounts().puffs
+    expect(n).toBeGreaterThanOrEqual(2)
+    expect(n).toBeLessThanOrEqual(3)
+    expect(dustCounts().haze).toBe(0)
   })
 })
 

@@ -10,7 +10,7 @@ import {
   useDestruction,
 } from './destruction'
 import { spawnDust } from './dust'
-import { damageBot, raycastBots } from './enemies-state'
+import { bots, damageBot, raycastBots } from './enemies-state'
 import { hitGlass, raycastGlass } from './glass'
 import { playerRig } from './player'
 import type { WeaponDef } from './weapons'
@@ -28,6 +28,10 @@ import type { GameWorld } from './world'
  * carves in the same shot — walls get the skins + framing anatomy
  * automatically. Kind-'wall' targets carve at weapon.tearRadius (drywall
  * tears MASSIVE holes fast); everything else carves at weapon.holeRadius.
+ * SMASH weapons (weapon.smashRadius — the warhammer) override both lanes
+ * (`smashRadius ?? tearRadius ?? holeRadius` / `smashRadius ?? holeRadius`),
+ * add 4-6 ragged rim nibbles per crater, and shove every bot within
+ * 1.5×range of the impact point (see smashKnockback).
  *
  * ── Sound ownership (no double-voicing) ───────────────────────────────
  *   voxel skins   drywallCrunch here (carve); plain volumes self-voice in
@@ -173,8 +177,12 @@ export function aimDirection(target: Vector3, spread: number): Vector3 {
     -Math.cos(playerRig.yaw) * cp,
   )
   if (spread > 0) {
-    // Movement widens the cone — reward planted feet.
-    const total = spread * (1 + playerRig.speed * 0.25) * (playerRig.grounded ? 1 : 1.8)
+    // Movement widens the cone — reward planted feet. Aiming down sights
+    // (playerRig.ads 0..1, written by viewmodel) tightens it: full ADS cuts
+    // spread to 25% — the accuracy payoff for the zoom.
+    const ads = playerRig.ads < 0 ? 0 : playerRig.ads > 1 ? 1 : playerRig.ads
+    const total =
+      spread * (1 + playerRig.speed * 0.25) * (playerRig.grounded ? 1 : 1.8) * (1 - 0.75 * ads)
     target.x += (Math.random() - 0.5) * 2 * total
     target.y += (Math.random() - 0.5) * 2 * total
     target.z += (Math.random() - 0.5) * 2 * total
@@ -191,7 +199,9 @@ export function aimDirection(target: Vector3, spread: number): Vector3 {
 type DustOpts = {
   normal?: Vector3
   direction?: Vector3
-  kind?: 'chip' | 'puff' | 'plume'
+  /** Shape kinds plus the phase-4 material tags (dust.tsx resolves the
+   * materials to shape + styling; 'wood' deliberately emits nothing). */
+  kind?: 'chip' | 'puff' | 'plume' | 'drywall' | 'concrete' | 'wood'
 }
 const dust = spawnDust as unknown as (
   position: Vector3,
@@ -230,11 +240,22 @@ function isWallTarget(world: GameWorld, nodeId: string): boolean {
   return useDestruction.getState().targets.get(nodeId)?.kind === 'wall' || world.walls.has(nodeId)
 }
 
+/** SMASH nibble scratch (warhammer ragged rim) — module temps, no per-swing
+ * allocations. */
+const _nibbleDir = new Vector3()
+const _nibblePoint = new Vector3()
+
 /** Carve into a destructible node. Walls tear at weapon.tearRadius (falls
  * back to holeRadius) and get the papery crunch on top — but emit NO dust
  * here; destruction.ts owns all wall emission. Non-wall volumes carve at
  * holeRadius with a small chip (+ carve-through puff when heavy). Returns
- * voxels removed. */
+ * voxels removed.
+ *
+ * SMASH weapons (warhammer — weapon.smashRadius set) use the canonical
+ * resolution from weapons.ts: `smashRadius ?? tearRadius ?? holeRadius` for
+ * walls, `smashRadius ?? holeRadius` for everything else — and the crater
+ * gets 4–6 extra small carve spheres at random points on its rim, so the
+ * blow reads as a ragged crushed edge (≈ 36+ voxels), never a clean ball. */
 function carve(
   world: GameWorld,
   nodeId: string,
@@ -243,9 +264,22 @@ function carve(
   direction: Vector3,
 ): number {
   const wall = isWallTarget(world, nodeId)
-  const radius = wall ? (weapon.tearRadius ?? weapon.holeRadius) : weapon.holeRadius
-  const removed = carveTarget(world, nodeId, point, radius, direction)
+  const radius = wall
+    ? (weapon.smashRadius ?? weapon.tearRadius ?? weapon.holeRadius)
+    : (weapon.smashRadius ?? weapon.holeRadius)
+  let removed = carveTarget(world, nodeId, point, radius, direction)
   if (removed === 0) return 0
+  if (weapon.smashRadius !== undefined) {
+    // Ragged edge: nibble the crater rim with 4-6 small off-center spheres.
+    const nibbles = 4 + Math.floor(Math.random() * 3)
+    for (let i = 0; i < nibbles; i++) {
+      _nibbleDir
+        .set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize()
+      _nibblePoint.copy(point).addScaledVector(_nibbleDir, radius * (0.85 + Math.random() * 0.3))
+      removed += carveTarget(world, nodeId, _nibblePoint, 0.12 + Math.random() * 0.09, direction)
+    }
+  }
   if (wall) {
     sfx.drywallCrunch(Math.min(1, removed / 10))
   } else {
@@ -253,6 +287,27 @@ function carve(
     heavyPuff(point, direction, removed)
   }
   return removed
+}
+
+const _smashCenter = new Vector3()
+const _smashPush = new Vector3()
+
+/** Warhammer follow-through: every bot near the impact gets shoved hard
+ * away from it — positions moved directly (2.4 m at the center tapering to
+ * ~0.6 m at the edge); the pathing capsule pass resolves any wall they land
+ * against next frame. Drones keep their altitude — the blow reads on XZ. */
+function smashKnockback(center: Vector3, range: number): void {
+  for (const bot of bots) {
+    if (bot.state !== 'alive') continue
+    const d = bot.position.distanceTo(center)
+    if (d > range) continue
+    _smashPush.subVectors(bot.position, center)
+    _smashPush.y = 0
+    if (_smashPush.lengthSq() < 1e-6) _smashPush.set(-_direction.x, 0, -_direction.z)
+    if (_smashPush.lengthSq() < 1e-6) _smashPush.set(1, 0, 0)
+    _smashPush.normalize()
+    bot.position.addScaledVector(_smashPush, 0.6 + 1.8 * (1 - d / range))
+  }
 }
 
 export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
@@ -325,6 +380,15 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
   const botHit = raycastBots(_origin, _direction, bestDist + TIE)
   if (botHit) winner = 'bot'
 
+  // SMASH weapons (warhammer): heavy area knockback around the impact —
+  // whatever class the blow landed on (a whiff still shoves at max reach).
+  // Runs BEFORE the class dispatch so a killed bot still flings its pack.
+  if (weapon.smashRadius !== undefined) {
+    const impactDist = winner === 'bot' && botHit ? botHit.distance : bestDist
+    _smashCenter.copy(_origin).addScaledVector(_direction, impactDist)
+    smashKnockback(_smashCenter, weapon.range * 1.5)
+  }
+
   if (winner === 'bot' && botHit) {
     damageBot(botHit.bot, weapon.damage)
     // Metal chassis: sparks only, no dust.
@@ -353,7 +417,9 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
       ? d3.damageSegment(world, segmentHit.nodeId, memberId, dmg, segmentHit.point)
       : damageStud(world, segmentHit.nodeId, memberId, dmg, segmentHit.point)
     if (!applied) sfx.voxelCrunch(0.25)
-    chip(segmentHit.point, 0.3)
+    // Material contract (phase 4): framing is WOOD — no dust at all, the
+    // splinters come from damageSegment's own debris (dust.tsx returns
+    // early on kind 'wood'; skipping the call keeps that intent local).
     return 'wall'
   }
   if (winner === 'voxel' && voxelHit) {

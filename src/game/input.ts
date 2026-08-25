@@ -36,6 +36,7 @@ const GAME_KEYS = new Set([
   'Digit3',
   'Digit4',
   'Digit5',
+  'Digit6',
   'Tab',
 ])
 

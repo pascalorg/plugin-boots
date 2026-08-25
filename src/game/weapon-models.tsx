@@ -13,12 +13,26 @@
  * silhouettes tuned to read at the low-right viewmodel pose — every weapon
  * gets per-part color contrast (dark frame / light steel / wood / one blue
  * accent) so the shapes separate at a glance. Static JSX only.
+ *
+ * Prop models (same conventions — grip/rest point at the origin, -Z forward):
+ * - WarhammerModel: massive two-handed hammer, haft rises +Y from the grip.
+ * - GrenadeModel: canister grenade, body centered on the origin.
+ * - BootsPairModel: pair of work boots, soles on y=0 (tabletop-ready).
+ * - SirenBeaconModel: rotating beacon, base on y=0; the inner light bar
+ *   lives in a child group tagged userData={{ role: 'beacon-light' }} —
+ *   consumers find it by that tag and drive rotation.y for the sweep.
  */
 
-export const MUZZLE_OFFSETS: Record<'pistol' | 'rifle' | 'minigun', [number, number, number]> = {
+export const MUZZLE_OFFSETS: Record<
+  'pistol' | 'rifle' | 'minigun' | 'hammer',
+  [number, number, number]
+> = {
   pistol: [0, 0.05, -0.26],
   rifle: [0, 0.055, -0.61],
   minigun: [0, 0.07, -0.82],
+  // Melee: never shows a muzzle flash, but the weapon-id index in the
+  // viewmodel is typed over all gun-shaped ids — this is the strike face.
+  hammer: [0, 0.175, -0.11],
 }
 
 const STEEL = '#2b2e33'
@@ -468,6 +482,309 @@ export function HammerModel() {
       <mesh position={[0, 0.188, 0.048]} rotation={[-0.3, 0, 0]}>
         <boxGeometry args={[0.05, 0.03, 0.05]} />
         <meshStandardMaterial color={ACCENT} metalness={0.3} roughness={0.4} />
+      </mesh>
+    </group>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Prop / heavy-weapon models (phase 4).
+ * ------------------------------------------------------------------------- */
+
+const GRIP_WRAP = '#54381f'
+const GRIP_WRAP_DARK = '#3f2a17'
+const LEATHER = '#a97b4f'
+const LEATHER_DARK = '#7d5732'
+const LACE = '#d9c8a0'
+const SOLE_RUBBER = '#332a22'
+const OLIVE = '#4b5240'
+const OLIVE_DARK = '#383e30'
+const BEACON_RED = '#d8362a'
+const BEACON_GLOW = '#ff4b3a'
+
+/** Leather wrap band heights around the warhammer grip (alternating shades). */
+const WARHAMMER_WRAPS: readonly number[] = [-0.17, -0.125, -0.08, -0.035, 0.01, 0.055]
+
+/**
+ * Massive two-handed war hammer. Grip at the origin (both hands stack just
+ * above/below it), long dark-wood haft rising +Y, huge worn-steel head up
+ * top: flat strike face toward -Z, tapered back spike toward +Z.
+ */
+export function WarhammerModel() {
+  return (
+    <group>
+      {/* Haft: long tapered dark-wood shaft, grip-heavy at the bottom. */}
+      <mesh position={[0, 0.3, 0]}>
+        <cylinderGeometry args={[0.019, 0.024, 1.05, 10]} />
+        <meshStandardMaterial color={WOOD_DARK} roughness={0.8} />
+      </mesh>
+      {/* Wrapped grip: stacked leather bands, alternating worn shades. */}
+      {WARHAMMER_WRAPS.map((y, i) => (
+        <mesh key={i} position={[0, y, 0]}>
+          <cylinderGeometry args={[0.029, 0.029, 0.04, 10]} />
+          <meshStandardMaterial color={i % 2 ? GRIP_WRAP_DARK : GRIP_WRAP} roughness={0.9} />
+        </mesh>
+      ))}
+      {/* Butt cap: steel pommel ring closing the haft. */}
+      <mesh position={[0, -0.215, 0]}>
+        <cylinderGeometry args={[0.03, 0.026, 0.035, 10]} />
+        <meshStandardMaterial color={STEEL} metalness={0.4} roughness={0.5} />
+      </mesh>
+      {/* Langets: worn steel straps running down the haft from the head. */}
+      <mesh position={[0, 0.64, 0.028]}>
+        <boxGeometry args={[0.018, 0.22, 0.012]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.35} roughness={0.6} />
+      </mesh>
+      <mesh position={[0, 0.64, -0.028]}>
+        <boxGeometry args={[0.018, 0.22, 0.012]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.35} roughness={0.6} />
+      </mesh>
+      {/* Collar: steel socket where the haft enters the head. */}
+      <mesh position={[0, 0.755, 0]}>
+        <cylinderGeometry args={[0.034, 0.03, 0.055, 10]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.45} />
+      </mesh>
+      {/* Head: the huge rectangular mass, worn steel. */}
+      <mesh position={[0, 0.84, -0.02]}>
+        <boxGeometry args={[0.13, 0.13, 0.2]} />
+        <meshStandardMaterial color={STEEL} metalness={0.5} roughness={0.55} />
+      </mesh>
+      {/* Strike face: proud lighter block at the -Z end… */}
+      <mesh position={[0, 0.84, -0.135]}>
+        <boxGeometry args={[0.145, 0.145, 0.035]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.5} roughness={0.4} />
+      </mesh>
+      {/* …with a dark hammered face plate. */}
+      <mesh position={[0, 0.84, -0.155]}>
+        <boxGeometry args={[0.12, 0.12, 0.008]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.55} roughness={0.35} />
+      </mesh>
+      {/* Back spike: tapered spike off the +Z end of the head. */}
+      <mesh position={[0, 0.84, 0.16]} rotation={[Math.PI / 2, 0, 0]}>
+        <coneGeometry args={[0.045, 0.17, 6]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.5} roughness={0.45} />
+      </mesh>
+      {/* Top cap: worn strap over the head's crown. */}
+      <mesh position={[0, 0.912, -0.02]}>
+        <boxGeometry args={[0.06, 0.018, 0.15]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.4} roughness={0.55} />
+      </mesh>
+    </group>
+  )
+}
+
+/**
+ * Chunky canister grenade, body centered on the origin (that's the palm),
+ * fuze head up top with the safety lever strapped down the +Z flank and the
+ * pull-pin ring poking out toward -Z.
+ */
+export function GrenadeModel() {
+  return (
+    <group>
+      {/* Canister body. */}
+      <mesh position={[0, 0, 0]}>
+        <cylinderGeometry args={[0.034, 0.034, 0.095, 12]} />
+        <meshStandardMaterial color={OLIVE} roughness={0.6} />
+      </mesh>
+      {/* Rolled ribs: darker rings around the can. */}
+      <mesh position={[0, 0.022, 0]}>
+        <cylinderGeometry args={[0.0355, 0.0355, 0.011, 12]} />
+        <meshStandardMaterial color={OLIVE_DARK} roughness={0.7} />
+      </mesh>
+      <mesh position={[0, -0.022, 0]}>
+        <cylinderGeometry args={[0.0355, 0.0355, 0.011, 12]} />
+        <meshStandardMaterial color={OLIVE_DARK} roughness={0.7} />
+      </mesh>
+      {/* Bottom crimp cap. */}
+      <mesh position={[0, -0.053, 0]}>
+        <cylinderGeometry args={[0.028, 0.026, 0.014, 12]} />
+        <meshStandardMaterial color={OLIVE_DARK} roughness={0.7} />
+      </mesh>
+      {/* Fuze housing + cap. */}
+      <mesh position={[0, 0.062, 0]}>
+        <cylinderGeometry args={[0.017, 0.019, 0.03, 10]} />
+        <meshStandardMaterial color={STEEL} metalness={0.4} roughness={0.5} />
+      </mesh>
+      <mesh position={[0, 0.081, 0]}>
+        <cylinderGeometry args={[0.02, 0.02, 0.01, 10]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
+      </mesh>
+      {/* Safety lever: shoulder plate off the fuze, strap down the flank. */}
+      <mesh position={[0, 0.074, 0.024]} rotation={[-0.4, 0, 0]}>
+        <boxGeometry args={[0.017, 0.01, 0.045]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
+      </mesh>
+      <mesh position={[0, 0.012, 0.041]} rotation={[0.06, 0, 0]}>
+        <boxGeometry args={[0.017, 0.095, 0.007]} />
+        <meshStandardMaterial color={STEEL_LIGHT} metalness={0.45} roughness={0.4} />
+      </mesh>
+      {/* Pull pin: stub through the fuze… */}
+      <mesh position={[0, 0.062, -0.02]}>
+        <boxGeometry args={[0.008, 0.008, 0.02]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.5} roughness={0.4} />
+      </mesh>
+      {/* …and the ring hanging off it. */}
+      <mesh position={[0, 0.062, -0.044]}>
+        <torusGeometry args={[0.016, 0.0035, 6, 14]} />
+        <meshStandardMaterial color={STEEL_DARK} metalness={0.55} roughness={0.35} />
+      </mesh>
+    </group>
+  )
+}
+
+/** One work boot, toe toward -Z; `side` mirrors it left/right of the pair. */
+function boot(side: -1 | 1) {
+  return (
+    <group position={[side * 0.078, 0, 0]} rotation={[0, side * -0.07, 0]}>
+      {/* Sole: dark rubber slab flat on y=0. */}
+      <mesh position={[0, 0.014, -0.02]}>
+        <boxGeometry args={[0.105, 0.028, 0.3]} />
+        <meshStandardMaterial color={SOLE_RUBBER} roughness={0.9} />
+      </mesh>
+      {/* Heel block: proud step under the shaft. */}
+      <mesh position={[0, 0.038, 0.085]}>
+        <boxGeometry args={[0.108, 0.02, 0.1]} />
+        <meshStandardMaterial color={SOLE_RUBBER} roughness={0.9} />
+      </mesh>
+      {/* Vamp: tan leather over the foot. */}
+      <mesh position={[0, 0.063, -0.045]}>
+        <boxGeometry args={[0.095, 0.07, 0.21]} />
+        <meshStandardMaterial color={LEATHER} roughness={0.75} />
+      </mesh>
+      {/* Toe cap: darker scuffed leather nose. */}
+      <mesh position={[0, 0.054, -0.135]}>
+        <boxGeometry args={[0.088, 0.052, 0.07]} />
+        <meshStandardMaterial color={LEATHER_DARK} roughness={0.8} />
+      </mesh>
+      {/* Shaft: ankle-high upper at the rear. */}
+      <mesh position={[0, 0.148, 0.055]}>
+        <boxGeometry args={[0.095, 0.13, 0.12]} />
+        <meshStandardMaterial color={LEATHER} roughness={0.75} />
+      </mesh>
+      {/* Padded collar rim. */}
+      <mesh position={[0, 0.218, 0.055]}>
+        <boxGeometry args={[0.1, 0.024, 0.126]} />
+        <meshStandardMaterial color={LEATHER_DARK} roughness={0.85} />
+      </mesh>
+      {/* Tongue: leans forward off the shaft, under the laces. */}
+      <mesh position={[0, 0.14, -0.012]} rotation={[0.35, 0, 0]}>
+        <boxGeometry args={[0.052, 0.11, 0.014]} />
+        <meshStandardMaterial color={LEATHER_DARK} roughness={0.8} />
+      </mesh>
+      {/* Laces: thin cross bars climbing the tongue line. */}
+      <mesh position={[0, 0.092, -0.038]} rotation={[0.35, 0, 0]}>
+        <boxGeometry args={[0.062, 0.007, 0.011]} />
+        <meshStandardMaterial color={LACE} roughness={0.85} />
+      </mesh>
+      <mesh position={[0, 0.122, -0.027]} rotation={[0.35, 0, 0]}>
+        <boxGeometry args={[0.062, 0.007, 0.011]} />
+        <meshStandardMaterial color={LACE} roughness={0.85} />
+      </mesh>
+      <mesh position={[0, 0.152, -0.016]} rotation={[0.35, 0, 0]}>
+        <boxGeometry args={[0.062, 0.007, 0.011]} />
+        <meshStandardMaterial color={LACE} roughness={0.85} />
+      </mesh>
+      <mesh position={[0, 0.182, -0.005]} rotation={[0.35, 0, 0]}>
+        <boxGeometry args={[0.062, 0.007, 0.011]} />
+        <meshStandardMaterial color={LACE} roughness={0.85} />
+      </mesh>
+      {/* Pull tab off the back of the collar. */}
+      <mesh position={[0, 0.222, 0.122]} rotation={[0.2, 0, 0]}>
+        <boxGeometry args={[0.024, 0.035, 0.008]} />
+        <meshStandardMaterial color={LEATHER_DARK} roughness={0.85} />
+      </mesh>
+    </group>
+  )
+}
+
+/**
+ * A pair of tan leather work boots, toes toward -Z, soles flat on y=0 —
+ * sized (~0.3m long, ~0.23m tall) to sit on a tabletop as a display prop.
+ */
+export function BootsPairModel() {
+  return (
+    <group>
+      {boot(-1)}
+      {boot(1)}
+    </group>
+  )
+}
+
+/**
+ * Small police-style rotating beacon, base flat on y=0. The dome is
+ * translucent red; the inner light bar lives in a child group tagged
+ * userData={{ role: 'beacon-light' }} whose origin is the spin axis —
+ * consumers find it by that tag and drive rotation.y.
+ */
+export function SirenBeaconModel() {
+  return (
+    <group>
+      {/* Base: dark squat cylinder with a steel trim ring. */}
+      <mesh position={[0, 0.02, 0]}>
+        <cylinderGeometry args={[0.075, 0.082, 0.04, 14]} />
+        <meshStandardMaterial color={POLYMER_DARK} roughness={0.7} />
+      </mesh>
+      <mesh position={[0, 0.044, 0]}>
+        <cylinderGeometry args={[0.06, 0.062, 0.012, 14]} />
+        <meshStandardMaterial color={STEEL} metalness={0.4} roughness={0.5} />
+      </mesh>
+      {/* Inner light bar: rotates about this group's y axis. */}
+      <group position={[0, 0.095, 0]} userData={{ role: 'beacon-light' }}>
+        {/* Hub the bar rides on. */}
+        <mesh position={[0, 0, 0]}>
+          <cylinderGeometry args={[0.012, 0.012, 0.055, 8]} />
+          <meshStandardMaterial color={STEEL_DARK} metalness={0.45} roughness={0.4} />
+        </mesh>
+        {/* The bar itself: hot red, glows through the dome. */}
+        <mesh position={[0, 0, 0]}>
+          <boxGeometry args={[0.078, 0.032, 0.02]} />
+          <meshStandardMaterial
+            color={BEACON_GLOW}
+            emissive={BEACON_GLOW}
+            emissiveIntensity={1.4}
+            roughness={0.4}
+          />
+        </mesh>
+        {/* Lamp faces at both ends: brightest spots of the sweep. */}
+        <mesh position={[0.042, 0, 0]}>
+          <boxGeometry args={[0.008, 0.028, 0.026]} />
+          <meshStandardMaterial
+            color="#ffd9d4"
+            emissive="#ffb3aa"
+            emissiveIntensity={1.8}
+            roughness={0.3}
+          />
+        </mesh>
+        <mesh position={[-0.042, 0, 0]}>
+          <boxGeometry args={[0.008, 0.028, 0.026]} />
+          <meshStandardMaterial
+            color="#ffd9d4"
+            emissive="#ffb3aa"
+            emissiveIntensity={1.8}
+            roughness={0.3}
+          />
+        </mesh>
+      </group>
+      {/* Dome: translucent red shell over the light bar. */}
+      <mesh position={[0, 0.093, 0]}>
+        <cylinderGeometry args={[0.055, 0.058, 0.086, 14]} />
+        <meshStandardMaterial
+          color={BEACON_RED}
+          transparent
+          opacity={0.45}
+          metalness={0.1}
+          roughness={0.25}
+        />
+      </mesh>
+      <mesh position={[0, 0.136, 0]}>
+        <sphereGeometry args={[0.055, 14, 10]} />
+        <meshStandardMaterial
+          color={BEACON_RED}
+          transparent
+          opacity={0.45}
+          metalness={0.1}
+          roughness={0.25}
+        />
       </mesh>
     </group>
   )

@@ -1,14 +1,16 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { type ReactNode, useEffect, useMemo, useRef } from 'react'
-import { type Group, Matrix4, type Mesh, Vector3 } from 'three'
-import { type WeaponId, useBoots } from '../store'
+import { type ComponentType, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { type Group, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
+import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
+import { waveState } from './enemies-state'
 import { playerRig } from './player'
 import { getSession } from './session'
-import { MinigunModel } from './weapon-models'
+import * as weaponModels from './weapon-models'
+import { HammerModel, MinigunModel } from './weapon-models'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -19,14 +21,30 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * meshes double as the colliders, so when a table voxelizes the destruction
  * manager hides the very top + legs the player sees and the voxel replica
  * takes over ("everything should be able to break apart").
+ *
+ * Set dressing (phase 4):
+ * - First table: a pair of work boots beside the guns, and the SIREN BEACON
+ *   on the far corner. The beacon is a persistent fixture — it survives the
+ *   pickup (that's when it matters) and only leaves if the table breaks.
+ *   While the post-pickup alert countdown runs it spins its light ~7 rad/s,
+ *   casts a small red point light, and drives sfx.sirenLoop quietly.
+ * - Rear table: the warhammer lies next to the rotary gun; picking up there
+ *   grants BOTH — the big one and the hammer join the loadout together.
  */
 
-/** store.ts gains 'minigun' in WeaponId this round (builder-3x3 agent); this
- * cast bridges until it lands and collapses to a no-op after. */
-const MINIGUN = 'minigun' as WeaponId
+/**
+ * Models owned by the arsenal agent land in weapon-models.tsx this round.
+ * Guarded lookups so this file is green before/after they land; each has a
+ * primitive fallback so the tables read right either way.
+ */
+const externalModels = weaponModels as unknown as Partial<Record<string, ComponentType>>
+const ExternalWarhammer = externalModels.WarhammerModel
+const BootsPair: ComponentType = externalModels.BootsPairModel ?? FallbackBootsPair
+const SirenModel: ComponentType = externalModels.SirenBeaconModel ?? FallbackSirenBeacon
 
 const TABLE_SIZE: [number, number, number] = [1.7, 0.06, 0.8]
 const TABLE_HEIGHT = 0.82
+const TABLE_TOP = TABLE_HEIGHT + 0.03
 const GRAB_RANGE = 2.4
 
 export function tablePosition(world: GameWorld): Vector3 {
@@ -54,7 +72,7 @@ export function GunTable({ world }: { world: GameWorld }) {
   const frontPos = useMemo(() => tablePosition(world), [world])
   const rearPos = useMemo(() => minigunTablePosition(world), [world])
   const geared = useBoots((s) => s.owned.includes('rifle'))
-  const hasMinigun = useBoots((s) => s.owned.includes(MINIGUN))
+  const hasMinigun = useBoots((s) => s.owned.includes('minigun'))
 
   return (
     <>
@@ -64,7 +82,7 @@ export function GunTable({ world }: { world: GameWorld }) {
         yaw={world.spawnYaw}
         nodeId="__boots-table"
         taken={geared}
-        prompt="E — Gear up"
+        prompt="Press E — gear up"
         promptOwner="guntable"
         onPickup={() => {
           const s = useBoots.getState()
@@ -72,6 +90,7 @@ export function GunTable({ world }: { world: GameWorld }) {
           s.giveWeapon('rifle')
           s.setWeapon('rifle')
         }}
+        fixtures={<SirenBeacon />}
       >
         {/* pistol on display */}
         <Spin position={[-0.4, TABLE_HEIGHT + 0.12, 0]}>
@@ -87,6 +106,10 @@ export function GunTable({ world }: { world: GameWorld }) {
             <meshStandardMaterial color="#33363b" metalness={0.35} roughness={0.45} />
           </mesh>
         </Spin>
+        {/* work boots, sitting beside the guns — part of gearing up */}
+        <group position={[-0.68, TABLE_TOP, 0.12]} rotation={[0, 0.5, 0]}>
+          <BootsPair />
+        </group>
       </WeaponTable>
       <WeaponTable
         world={world}
@@ -94,12 +117,13 @@ export function GunTable({ world }: { world: GameWorld }) {
         yaw={world.spawnYaw}
         nodeId="__boots-table-2"
         taken={hasMinigun}
-        prompt="E — The big one"
+        prompt="Press E — the big one"
         promptOwner="guntable2"
         onPickup={() => {
           const s = useBoots.getState()
-          s.giveWeapon(MINIGUN)
-          s.setWeapon(MINIGUN)
+          s.giveWeapon('minigun')
+          s.giveWeapon('hammer')
+          s.setWeapon('minigun')
         }}
       >
         {/* the big one on display: the real model, laid along the table */}
@@ -110,6 +134,22 @@ export function GunTable({ world }: { world: GameWorld }) {
             </group>
           </group>
         </Spin>
+        {/* the warhammer, lying on its side along the table's front edge —
+            the rear-table pickup grants both. Model space: haft +Y, so the
+            Euler XYZ z-roll (applied first) lays it head-toward-+X, then the
+            small y-yaw skews it naturally on the tabletop. Scaled to fit the
+            1.7 m top (the haft alone is ~1.05 m). */}
+        <group position={[0.08, TABLE_TOP + 0.05, 0.26]} rotation={[0, 0.12, -Math.PI / 2]}>
+          {ExternalWarhammer ? (
+            <group scale={0.8}>
+              <ExternalWarhammer />
+            </group>
+          ) : (
+            <group scale={1.4}>
+              <HammerModel />
+            </group>
+          )}
+        </group>
       </WeaponTable>
     </>
   )
@@ -128,6 +168,142 @@ function Spin({ position, children }: { position: [number, number, number]; chil
   )
 }
 
+type SirenHandle = { start: () => void; stop: () => void }
+
+/**
+ * sfx.sirenLoop lands this round (feedback agent): a factory returning a
+ * { start, stop } rotating-alarm whine. Guarded so the beacon stays a silent
+ * prop until it exists; tolerates either a factory or a plain handle.
+ */
+function resolveSirenLoop(): SirenHandle | null {
+  const raw = (sfx as unknown as Record<string, unknown>).sirenLoop
+  let handle: unknown = null
+  if (typeof raw === 'function') handle = (raw as (this: typeof sfx) => unknown).call(sfx)
+  else if (raw && typeof raw === 'object') handle = raw
+  const h = handle as Partial<SirenHandle> | null
+  if (h && typeof h.start === 'function' && typeof h.stop === 'function') return h as SirenHandle
+  return null
+}
+
+/**
+ * The alert countdown window: bots-pathing owns the flag semantics in
+ * enemies-state.ts — `waveState.countdownActive` is true exactly while the
+ * post-pickup ALERT_SECONDS countdown runs (false before, after, and on
+ * resetBots()).
+ */
+function alertCountdownActive(): boolean {
+  return waveState.countdownActive
+}
+
+/**
+ * The siren beacon on the first table's corner. Dormant until the alert
+ * countdown starts, then: the 'beacon-light' child (tagged by the model via
+ * userData) spins ~7 rad/s, a small red point light exists for exactly the
+ * countdown window, and sfx.sirenLoop plays quietly. Everything stops when
+ * the countdown ends and on unmount.
+ */
+function SirenBeacon() {
+  const rootRef = useRef<Group>(null)
+  const headRef = useRef<Object3D | null>(null)
+  const activeRef = useRef(false)
+  const [active, setActive] = useState(false)
+  const sirenRef = useRef<SirenHandle | null>(null)
+  const sirenResolved = useRef(false)
+
+  useEffect(() => {
+    const root = rootRef.current
+    if (root) {
+      root.traverse((obj) => {
+        if (!headRef.current && (obj.userData as { role?: string })?.role === 'beacon-light') {
+          headRef.current = obj
+        }
+      })
+    }
+    return () => {
+      if (activeRef.current) sirenRef.current?.stop()
+      activeRef.current = false
+    }
+  }, [])
+
+  useFrame((_, dt) => {
+    const on = alertCountdownActive()
+    if (on !== activeRef.current) {
+      activeRef.current = on
+      setActive(on)
+      if (on) {
+        if (!sirenResolved.current) {
+          sirenResolved.current = true
+          sirenRef.current = resolveSirenLoop()
+        }
+        sirenRef.current?.start()
+      } else {
+        sirenRef.current?.stop()
+      }
+    }
+    if (on && headRef.current) headRef.current.rotation.y += dt * 7
+  })
+
+  return (
+    <group ref={rootRef} position={[0.76, TABLE_TOP, -0.3]}>
+      <SirenModel />
+      {active && <pointLight color="#ff2222" intensity={2} distance={6} position={[0, 0.14, 0]} />}
+    </group>
+  )
+}
+
+/** Primitive stand-in until the arsenal agent's BootsPairModel lands. */
+function FallbackBootsPair() {
+  return (
+    <group>
+      {[-0.06, 0.06].map((x, i) => (
+        <group key={i} position={[x, 0, 0]} rotation={[0, i ? -0.14 : 0.14, 0]}>
+          {/* sole */}
+          <mesh position={[0, 0.015, 0]}>
+            <boxGeometry args={[0.085, 0.03, 0.26]} />
+            <meshStandardMaterial color="#2e2620" roughness={0.9} />
+          </mesh>
+          {/* foot */}
+          <mesh position={[0, 0.065, 0.02]}>
+            <boxGeometry args={[0.08, 0.07, 0.2]} />
+            <meshStandardMaterial color="#7a5a38" roughness={0.85} />
+          </mesh>
+          {/* shaft */}
+          <mesh position={[0, 0.135, 0.07]}>
+            <boxGeometry args={[0.078, 0.095, 0.1]} />
+            <meshStandardMaterial color="#6b4d30" roughness={0.85} />
+          </mesh>
+        </group>
+      ))}
+    </group>
+  )
+}
+
+/** Primitive stand-in until the arsenal agent's SirenBeaconModel lands —
+ * same contract: the rotating head is tagged userData role 'beacon-light'. */
+function FallbackSirenBeacon() {
+  return (
+    <group>
+      {/* base puck */}
+      <mesh position={[0, 0.02, 0]}>
+        <cylinderGeometry args={[0.055, 0.065, 0.04, 12]} />
+        <meshStandardMaterial color="#26282c" roughness={0.7} />
+      </mesh>
+      {/* rotating red head */}
+      <group position={[0, 0.04, 0]} userData={{ role: 'beacon-light' }}>
+        <mesh position={[0, 0.05, 0]}>
+          <cylinderGeometry args={[0.042, 0.05, 0.095, 12]} />
+          <meshStandardMaterial color="#c43a35" emissive="#7a1512" roughness={0.35} />
+        </mesh>
+        {/* lens slit so the spin reads */}
+        <mesh position={[0, 0.05, -0.038]}>
+          <boxGeometry args={[0.03, 0.055, 0.02]} />
+          <meshStandardMaterial color="#ff6a5e" emissive="#ff2a1f" emissiveIntensity={1.2} roughness={0.3} />
+        </mesh>
+      </group>
+    </group>
+  )
+}
+
 function WeaponTable({
   world,
   position,
@@ -137,6 +313,7 @@ function WeaponTable({
   prompt,
   promptOwner,
   onPickup,
+  fixtures,
   children,
 }: {
   world: GameWorld
@@ -149,6 +326,9 @@ function WeaponTable({
   prompt: string
   promptOwner: string
   onPickup: () => void
+  /** Persistent set dressing: survives the pickup, leaves only if the table
+   * breaks (the siren beacon — its whole job happens AFTER `taken`). */
+  fixtures?: ReactNode
   children: ReactNode
 }) {
   const solidRefs = useRef<(Mesh | null)[]>([])
@@ -239,6 +419,7 @@ function WeaponTable({
           <meshStandardMaterial color="#54402c" roughness={0.85} />
         </mesh>
       ))}
+      {!broken && fixtures}
       {!taken && !broken && children}
     </group>
   )

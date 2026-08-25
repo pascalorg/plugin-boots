@@ -37,12 +37,21 @@
  *   viewmodel drives it: setSpin every frame from the spin-up state, shot()
  *   per fired round, stop() on unmount/holster. ALWAYS returns a handle
  *   (silent no-op without WebAudio) — no null check.
+ * - sfx.sirenLoop() — { start(), stop() } quiet rotating-alarm whine for the
+ *   countdown beacon: two alternating triangle tones (720/580Hz, 1.1s full
+ *   period) under a slow AM sweep, level ~0.05. start() is idempotent while
+ *   running and works again after stop(); ALWAYS returns a handle (silent
+ *   no-op without WebAudio) — no null check.
  *
  * Phase-3 material one-shots: paperTear() (drywall skin ripping off in
  * plates), charSnap() (charred wood breaking — higher/shorter than
  * studSnap). crumble()/woodCrumble() now seat a low rumble bed + drifting
  * dust hiss under the bursts, scaling with `size`, for the heavy slow-lobby
  * collapse feel.
+ *
+ * Phase-4 one-shots: hammerSmash() — the warhammer's deep thunder crack
+ * (60–90Hz thump stack + masonry snap + long dust tail, loud but limited);
+ * grenadeBeep() — short 900Hz arming blip for the fuse/HUD pip.
  */
 
 /** Health at/below which the low-HP heartbeat (audio + HUD pulse) engages. */
@@ -202,6 +211,12 @@ export type TreeCrackleHandle = {
 export type MinigunHandle = {
   setSpin: (v: number) => void
   shot: () => void
+  stop: () => void
+}
+
+/** Handle returned by sfx.sirenLoop() — the countdown beacon alarm. */
+export type SirenLoopHandle = {
+  start: () => void
   stop: () => void
 }
 
@@ -366,6 +381,28 @@ export const sfx = {
     const v = rr()
     thump(160 * v, 0.07, 0.35)
     burst({ duration: 0.04, gain: 0.22, freq: 750 * v, q: 1.4 })
+  },
+
+  /**
+   * Warhammer wall smash — deep thunder crack. A 60–90Hz thump stack under
+   * a lowpass boom carries the thunder body, a hot highpass snap + mid
+   * crack land the masonry break, and a long hiss-and-rumble tail reads as
+   * dust pouring off the wall. LOUD by design — the master compressor keeps
+   * it inside the mix. Round-robin detuned so chained swings never repeat.
+   */
+  hammerSmash(): void {
+    const v = rr()
+    // masonry crack — hot and instant
+    burst({ duration: 0.05, gain: 0.9, filterType: 'highpass', freq: 1100 * v, q: 0.7 })
+    burst({ duration: 0.08, gain: 0.5, freq: 2300 * v, freqEnd: 900 * v, q: 1.2 })
+    // thunder body — stacked 60–90Hz thumps + a lowpass boom
+    thump(88 * v, 0.22, 0.85)
+    thump(72 * v, 0.3, 0.8, 0.015)
+    thump(60, 0.42, 0.75, 0.03)
+    burst({ duration: 0.4, gain: 0.75, filterType: 'lowpass', freq: 700, freqEnd: 90 })
+    // long dust tail — high debris hiss over a settling rumble
+    burst({ duration: 0.7, gain: 0.09, filterType: 'highpass', freq: 4000 * v }, 0.08)
+    burst({ duration: 0.55, gain: 0.16, filterType: 'lowpass', freq: 260, freqEnd: 70 }, 0.12)
   },
 
   /** Rubble fall, weighted: low rumble bed + dust hiss under the bursts. */
@@ -744,6 +781,102 @@ export const sfx = {
         lfo.stop(end)
       },
     }
+  },
+
+  /**
+   * Quiet rotating-alarm whine — the gun-table siren beacon during the
+   * post-pickup countdown. Two alternating triangle tones (720/580Hz, one
+   * full swap every 1.1s) ride a slow ~0.9Hz AM sweep — the beacon head
+   * passing the ear — at level ~0.05 so it sits far under the guns. Tone
+   * flips run on the same lookahead scheduler as heartbeat(), so the
+   * alternation survives tab throttling. start() is a no-op while running
+   * (and works again after stop()); stop() ramps out, kills the
+   * oscillators and is idempotent. ALWAYS returns a handle — silent no-op
+   * without WebAudio.
+   */
+  sirenLoop(): SirenLoopHandle {
+    let osc: OscillatorNode | null = null
+    let lfo: OscillatorNode | null = null
+    let gain: GainNode | null = null
+    let timer: ReturnType<typeof setInterval> | null = null
+    const HALF = 0.55 // s per tone — full 720/580 period 1.1s
+    return {
+      start: () => {
+        const c = ensureContext()
+        if (!c || !master || osc) return
+        const o = c.createOscillator()
+        o.type = 'triangle'
+        o.frequency.value = 720
+        // Slow AM — the rotating head sweeping toward and away.
+        const am = c.createGain()
+        am.gain.value = 0.75
+        lfo = c.createOscillator()
+        lfo.type = 'sine'
+        lfo.frequency.value = 0.9
+        const lfoDepth = c.createGain()
+        lfoDepth.gain.value = 0.25
+        lfo.connect(lfoDepth)
+        lfoDepth.connect(am.gain)
+        const g = c.createGain()
+        g.gain.value = 0
+        o.connect(am)
+        am.connect(g)
+        g.connect(master)
+        o.start()
+        lfo.start()
+        o.onended = () => {
+          g.disconnect()
+          lfoDepth.disconnect()
+        }
+        g.gain.setTargetAtTime(0.05, c.currentTime, 0.15)
+        osc = o
+        gain = g
+        let hi = true
+        let nextFlip = c.currentTime + HALF
+        const schedule = () => {
+          const now = c.currentTime
+          if (nextFlip < now) nextFlip = now + 0.02 // resync after throttling
+          while (nextFlip < now + 0.4) {
+            hi = !hi
+            o.frequency.setTargetAtTime(hi ? 720 : 580, nextFlip, 0.04)
+            nextFlip += HALF
+          }
+        }
+        timer = setInterval(schedule, 150)
+        schedule()
+      },
+      stop: () => {
+        if (timer) {
+          clearInterval(timer)
+          timer = null
+        }
+        if (!osc || !ctx) return
+        gain?.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.08)
+        const end = ctx.currentTime + 0.4
+        osc.stop(end)
+        lfo?.stop(end)
+        osc = null
+        lfo = null
+        gain = null
+      },
+    }
+  },
+
+  /** Short 900Hz arming blip — the grenade fuse / HUD-pip beep. */
+  grenadeBeep(): void {
+    const c = ensureContext()
+    if (!c || !master) return
+    const t = c.currentTime
+    const osc = c.createOscillator()
+    osc.type = 'square'
+    osc.frequency.value = 900
+    const gain = c.createGain()
+    gain.gain.setValueAtTime(0.16, t)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.06)
+    osc.connect(gain)
+    gain.connect(master)
+    osc.start(t)
+    osc.stop(t + 0.08)
   },
 
   explosion(): void {

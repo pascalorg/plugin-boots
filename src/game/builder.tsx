@@ -1,13 +1,13 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { BoxGeometry, type BufferGeometry, Matrix4, type Group, type Mesh } from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { type BuildPiece, FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
-import { dropTarget } from './destruction'
+import { dropTarget, ensureVoxelTarget } from './destruction'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -16,8 +16,26 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * Build mode, battle-builder grammar: wall / floor / roof (Q cycles), ghost
  * in front of you, LMB stamps it in. Placements are game-only state — the
  * panel's Keep converts walls (and, best-effort, roofs) into real scene
- * nodes afterwards, Discard forgets everything. G undoes (piece + collider
- * + any voxel replica).
+ * nodes afterwards, Discard forgets everything. Z undoes (piece + collider
+ * + any voxel replica) — G is the grenade now.
+ *
+ * ── R ROTATE (phase 4) ────────────────────────────────────────────────────
+ * KeyR (edge) adds a quarter turn to the ghost's AUTO-FACING yaw — a manual
+ * offset that persists until the piece TYPE changes or edit mode toggles
+ * (then it resets to 0). The offset feeds the RAW ghost yaw, so it also
+ * steers the snap resolver (a rotated wall stops/starts chaining with its
+ * neighbor); geometric snap poses keep their own yaw. For 'roof' pieces the
+ * same quarter turns cycle all 4 ascent orientations (roof yaw symmetry is
+ * 2π, so every press is a distinct incline direction).
+ *
+ * ── INSTANT BRICKS (phase 4) ──────────────────────────────────────────────
+ * A placed piece is voxel-clad THE MOMENT it lands: PlacedPieceMesh routes
+ * itself through ensureVoxelTarget in its layout effect (before first
+ * paint), so the merged-box mesh ledger-hides immediately, its collider
+ * entry disables (voxels take over collision — never double-solid), and the
+ * piece reads as bricks from the first frame. Degenerate grids fall back to
+ * the plain solid mesh. Undo/mask-edit cleanup still drops the replica via
+ * dropTarget.
  *
  * ── PLACEMENT GRAMMAR (phase 2) ───────────────────────────────────────────
  * ADJACENCY SNAP: the raw ghost (1.5 m grid + 90° yaw, reach shortens with
@@ -71,6 +89,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *       keep them.
  *   isOccupied(placed, piece, x, y, z, yaw)   identical-pose test, yaw
  *       compared modulo the piece's symmetry (wall π, floor π/2, roof 2π).
+ *   rotatedYaw(autoYaw, quarterTurns)   pure R-rotate math: auto-facing yaw
+ *       + quarter turns, wrapped to [−π, π) so poses stay comparable.
  *   builderDebug (dev, `globalThis.__bootsBuilder` in-game)   holdFire
  *       stands in for the held LMB in headless E2E; ghost() snapshots the
  *       resolved ghost pose.
@@ -564,9 +584,21 @@ export const builderDebug: { holdFire: boolean; ghost: () => GhostState } = {
 
 const _raw: RawGhost = { x: 0, y: 0, z: 0, yaw: 0 }
 
+/**
+ * Pure R-rotate math: the ghost's auto-facing yaw plus `quarterTurns` manual
+ * 90° presses, wrapped to [−π, π) so repeated pressing never grows the
+ * angle unboundedly (sameYaw and pose storage stay well-conditioned).
+ * Negative turn counts are valid (wrap the other way).
+ */
+export function rotatedYaw(autoYaw: number, quarterTurns: number): number {
+  const yaw = autoYaw + (((quarterTurns % 4) + 4) % 4) * (Math.PI / 2)
+  return ((((yaw + Math.PI) % TWO_PI) + TWO_PI) % TWO_PI) - Math.PI
+}
+
 /** Raw grid ghost: reach shortens as you pitch away from level so the ghost
- * tracks your aim (stacking a wall means looking UP at it). */
-function rawGhost(): RawGhost {
+ * tracks your aim (stacking a wall means looking UP at it). `quarterTurns`
+ * is the manual R-rotate offset over the auto-facing yaw. */
+function rawGhost(quarterTurns: number): RawGhost {
   const reach = REACH * Math.max(0.35, Math.cos(playerRig.pitch))
   const tx = playerRig.position.x - Math.sin(playerRig.yaw) * reach
   const tz = playerRig.position.z - Math.cos(playerRig.yaw) * reach
@@ -574,7 +606,7 @@ function rawGhost(): RawGhost {
   _raw.x = Math.round(tx / GRID) * GRID
   _raw.y = Math.max(0, Math.round(feetY / LEVEL_STEP) * LEVEL_STEP)
   _raw.z = Math.round(tz / GRID) * GRID
-  _raw.yaw = (Math.round(playerRig.yaw / (Math.PI / 2)) * Math.PI) / 2
+  _raw.yaw = rotatedYaw((Math.round(playerRig.yaw / (Math.PI / 2)) * Math.PI) / 2, quarterTurns)
   return _raw
 }
 
@@ -585,23 +617,27 @@ function aimHeightAt(x: number, z: number): number {
 }
 
 /** One placed piece: the RENDERED merged-cell mesh doubles as its collider,
- * so when the piece voxelizes the destruction manager ledger-hides the mesh
- * the player sees and the voxel replica takes over. A mask edit swaps the
- * piece OBJECT in the store, so this effect re-runs: the old collider entry
- * is spliced out (and any voxel replica of the old shape dropped) and a
- * fresh entry with the new merged-cell BVH goes in. Placed entries are
- * always APPENDED after the world's build-time colliders, so splicing them
- * out never shifts the door colliderIndices. */
+ * and the piece is voxel-clad THE MOMENT it lands — the layout effect
+ * routes it straight through ensureVoxelTarget (before first paint), which
+ * ledger-hides this mesh, disables the collider entry it just pushed
+ * (voxels own collision + bullets from frame one — never double-solid),
+ * and hands rendering to the voxel replica: bricks from the beginning.
+ * A mask edit swaps the piece OBJECT in the store, so this effect re-runs:
+ * the old collider entry is spliced out (and the voxel replica of the old
+ * shape dropped) and a fresh entry with the new merged-cell BVH goes in,
+ * then re-voxelizes into the new shape. Placed entries are always APPENDED
+ * after the world's build-time colliders, so splicing them out never shifts
+ * the door colliderIndices. */
 function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorld }) {
   const meshRef = useRef<Mesh>(null)
   const geometry = geometryForMask(piece.piece, piece.mask)
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const mesh = meshRef.current
     if (!mesh || !geometry) return
     // A mask edit on a voxelized piece re-registers this SAME mesh object,
-    // but ensureVoxelTarget had ledger-hidden it — bring it back (the piece
-    // "heals" into its new mask shape; the old replica is dropped below).
+    // but ensureVoxelTarget had ledger-hidden it — bring it back before
+    // re-cladding (also the visible fallback if voxelization refuses).
     mesh.visible = true
     mesh.updateWorldMatrix(true, false)
     if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
@@ -615,12 +651,16 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
       nodeType: 'block',
     }
     world.colliders.push(entry)
+    // INSTANT BRICKS: voxelize now, not on first hit. ensureVoxelTarget
+    // hides the mesh and sets entry.disabled itself; a null return means a
+    // degenerate grid — the plain solid mesh above stays as the fallback.
+    ensureVoxelTarget(world, entry.nodeId)
     return () => {
       entry.disabled = true
       const index = world.colliders.indexOf(entry)
       if (index !== -1) world.colliders.splice(index, 1)
-      // If the piece had voxelized, drop the replica too (G-undo or a mask
-      // edit would otherwise leave carved voxels of the old shape floating).
+      // Drop the voxel replica too (Z-undo or a mask edit would otherwise
+      // leave carved voxels of the old shape floating).
       dropTarget(entry.nodeId)
     }
   }, [world, piece, geometry])
@@ -678,6 +718,11 @@ export function Builder() {
   const prevFire = useRef(false)
   const prevUndo = useRef(false)
   const prevEditKey = useRef(false)
+  const prevRotate = useRef(false)
+  /** Manual R-rotate quarter turns over the auto-facing yaw (0..3). Resets
+   * when the piece type changes or edit mode toggles. */
+  const rotateTurns = useRef(0)
+  const rotatePiece = useRef<BuildPiece>('wall')
   const placeCooldown = useRef(0)
   /** Pose of the last stamp — hold-to-place fires again once it changes. */
   const lastPlaced = useRef({ has: false, piece: 'wall' as BuildPiece, x: 0, y: 0, z: 0, yaw: 0 })
@@ -715,8 +760,10 @@ export function Builder() {
       if (ghost) setGhost(null)
       if (edit) setEdit(null)
       lastPlaced.current.has = false
+      rotateTurns.current = 0
       prevFire.current = session.input.state.firing || builderDebug.holdFire
       prevEditKey.current = session.input.state.keys.has('KeyF')
+      prevRotate.current = session.input.state.keys.has('KeyR')
       return
     }
 
@@ -739,9 +786,13 @@ export function Builder() {
     // ── EDIT MODE ─────────────────────────────────────────────────────────
     if (edit) {
       if (ghost) setGhost(null)
-      // G undo is paused while editing, but keep its edge tracker warm so
-      // holding G across the exit never fires a stale undo.
-      prevUndo.current = session.input.state.keys.has('KeyG')
+      // Z undo is paused while editing, but keep its edge tracker warm so
+      // holding Z across the exit never fires a stale undo. Edit mode also
+      // resets the manual R-rotate offset (contract: edit toggle resets it)
+      // and keeps R's edge tracker warm.
+      prevUndo.current = session.input.state.keys.has('KeyZ')
+      rotateTurns.current = 0
+      prevRotate.current = session.input.state.keys.has('KeyR')
       const piece = useBoots.getState().placed.find((p) => p.id === edit.id)
       const hit = piece ? raycastPieceCell(piece, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE) : null
       // Exit: F again, the piece is gone, or the aim left it.
@@ -792,9 +843,24 @@ export function Builder() {
       }
     }
 
-    // Resolve this frame's ghost: raw grid pose, then adjacency snap.
+    // R ROTATE: a quarter turn per press over the auto-facing yaw. The
+    // offset resets when the piece TYPE changes (a wall's turn shouldn't
+    // secretly re-aim your next roof) — for roofs the same turns cycle the
+    // 4 ascent orientations (2π symmetry makes each press distinct).
+    if (buildPiece !== rotatePiece.current) {
+      rotatePiece.current = buildPiece
+      rotateTurns.current = 0
+    }
+    const rotateDown = session.input.state.keys.has('KeyR')
+    if (rotateDown && !prevRotate.current) {
+      rotateTurns.current = (rotateTurns.current + 1) % 4
+    }
+    prevRotate.current = rotateDown
+
+    // Resolve this frame's ghost: raw grid pose (with the manual rotate
+    // offset), then adjacency snap.
     const placed = useBoots.getState().placed
-    const raw = rawGhost()
+    const raw = rawGhost(rotateTurns.current)
     const snap = resolveSnap(buildPiece, placed, raw, aimHeightAt)
     const gx = snap ? snap.x : raw.x
     const gy = snap ? snap.y : raw.y
@@ -848,7 +914,8 @@ export function Builder() {
     }
     prevFire.current = firing
 
-    const undoDown = session.input.state.keys.has('KeyG')
+    // UNDO on KeyZ (G is the grenade everywhere now).
+    const undoDown = session.input.state.keys.has('KeyZ')
     if (undoDown && !prevUndo.current) {
       const removed = useBoots.getState().removeLastPlaced()
       if (removed) sfx.weaponSwitch()

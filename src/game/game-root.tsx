@@ -18,6 +18,7 @@ import { clearDust, dustDebug, DustSystem } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, resetGlass } from './glass'
+import { Grenades } from './grenade'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
 import { Player, playerDebug } from './player'
@@ -340,6 +341,7 @@ function ActiveGame() {
       <Debris />
       <DustSystem />
       <GameSky world={world} />
+      <Grenades world={world} />
       <GunTable world={world} />
       <Doors world={world} />
       <PlacedPieces world={world} />

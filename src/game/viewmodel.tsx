@@ -7,6 +7,7 @@ import type { WeaponId } from '../store'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { builderDebug } from './builder'
+import { throwGrenade } from './grenade'
 import { MOVE } from './movement'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -18,6 +19,7 @@ import {
   MUZZLE_OFFSETS,
   PistolModel,
   RifleModel,
+  WarhammerModel,
 } from './weapon-models'
 import { WEAPONS } from './weapons'
 import type { GameWorld } from './world'
@@ -38,13 +40,8 @@ import type { GameWorld } from './world'
  * stock running off the bottom-right corner. Every part stays > 0.11 in front
  * of the camera through recoil (+0.07 z) and draw-in, clear of the near plane.
  */
-/** store.ts gains 'minigun' in WeaponId this round (builder-3x3 agent); this
- * cast bridges until it lands and collapses to a no-op after. */
-const MINIGUN = 'minigun' as WeaponId
-
-// The `| 'minigun'` widening is a no-op once WeaponId includes it.
 const POSES: Record<
-  WeaponId | 'minigun',
+  WeaponId,
   { pos: [number, number, number]; rot: [number, number, number] }
 > = {
   knife: { pos: [0.3, -0.3, -0.42], rot: [0.05, -0.24, 0.12] },
@@ -53,8 +50,36 @@ const POSES: Record<
   // The big one rides lower and closer to center — it's huge, most of the
   // drum should sit at the bottom-right edge with the barrels crossing in.
   minigun: { pos: [0.22, -0.36, -0.56], rot: [0.01, -0.05, 0.02] },
+  // Warhammer at carry: grip low-right, the model's +Y haft pitched hard
+  // forward (rot.x ≈ -1.25) so the huge head rides ahead at chest height
+  // like a lance — the swing offsets below rotate the whole pose group.
+  hammer: { pos: [0.3, -0.42, -0.42], rot: [-1.25, -0.16, 0.1] },
   builder: { pos: [0.32, -0.33, -0.46], rot: [0.07, -0.28, 0.14] },
 }
+
+/**
+ * ADS (right-mouse aim) poses: pistol/rifle only. Centered x=0 so the
+ * sights converge on the crosshair, raised just under the eye line, level
+ * rotation. viewmodel blends POSES→ADS_POSES with playerRig.ads (0..1,
+ * written here at ±12/s); player-feel consumes the same scalar for the
+ * FOV 92→60 interp and the look-sensitivity scale, and shooting-side
+ * spread scaling hangs off it too (grenade agent's routing edit).
+ */
+const ADS_POSES: Partial<
+  Record<WeaponId, { pos: [number, number, number]; rot: [number, number, number] }>
+> = {
+  pistol: { pos: [0, -0.21, -0.38], rot: [0, 0, 0] },
+  rifle: { pos: [0, -0.235, -0.44], rot: [0, 0, 0] },
+}
+/** playerRig.ads ramp speed (1/s) — full transition in ~0.08s each way. */
+const ADS_RATE = 12
+/** How much of the bob/breath/look-lag survives at full ADS. */
+const ADS_STEADY = 0.25
+
+/** playerRig gains ads + shake(power) this round (player-feel agent) —
+ * typed as optional so writes/calls stay green before AND after. */
+type RigFeel = typeof playerRig & { ads?: number; shake?: (power: number) => void }
+const rigFeel = playerRig as RigFeel
 
 const DRAW_TIME = 0.14
 const DIP_TIME = 0.3
@@ -65,6 +90,28 @@ const SPIN_DOWN_TIME = 0.9
  * 1 → (1 - SPIN_DRAG) with spin level, recovering over the spin-down. */
 const SPIN_DRAG = 0.45
 const TWO_PI = Math.PI * 2
+
+/**
+ * Warhammer swing — a two-phase strike, NOT the knife's instant poke:
+ * click starts a 0.25s wind-up (head raises over the shoulder), then a
+ * 0.12s accelerating slam drives it down-and-forward; the hit resolves at
+ * the END of the slam — the moment the head lands — never on click. A
+ * 0.28s recover eases back to carry. Switching weapons or getting
+ * staggered mid-swing cancels the hit.
+ */
+const HAMMER_WINDUP = 0.25
+const HAMMER_SLAM = 0.12
+const HAMMER_RECOVER = 0.28
+/** Pose offsets at wind-up peak / slam impact (pitch rad, y, z). */
+const HAMMER_RAISE = { pitch: 0.9, y: 0.06, z: 0.05 }
+const HAMMER_STRIKE = { pitch: -0.65, y: -0.2, z: -0.12 }
+
+type HammerPhase = 'idle' | 'windup' | 'slam' | 'recover'
+
+/** audio.ts gains sfx.hammerSmash() this round (feedback agent) — guarded. */
+function playHammerSmash(): void {
+  ;(sfx as unknown as { hammerSmash?: () => void }).hammerSmash?.()
+}
 
 /** audio.ts gains sfx.minigun() this round (audio agent) — feature-detect so
  * the trigger works either way; shots fall back to rifle cracks until then. */
@@ -116,6 +163,10 @@ export function Viewmodel({ world }: { world: GameWorld }) {
    * restore-to-1 write happen exactly once when the barrels rest. */
   const spinDragging = useRef(false)
 
+  // Warhammer two-phase swing state (constants above own the timings).
+  const hammerPhase = useRef<HammerPhase>('idle')
+  const hammerT = useRef(0)
+
   // Kill the whine if the session unmounts mid-spin, and hand the player
   // their legs back (speedScale contract: writers restore exactly 1).
   useEffect(
@@ -146,8 +197,13 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       else if (action === 'Digit2') switchWeapon('pistol')
       else if (action === 'Digit3') switchWeapon('rifle')
       else if (action === 'Digit4' || action === 'KeyB') switchWeapon('builder')
-      else if (action === 'Digit5') switchWeapon(MINIGUN)
-      else if (action === 'WheelUp' || action === 'WheelDown') {
+      else if (action === 'Digit5') switchWeapon('minigun')
+      else if (action === 'Digit6') switchWeapon('hammer')
+      else if (action === 'KeyG') {
+        // G is the grenade EVERYWHERE (group contract) — builder undo lives
+        // on KeyZ now, so there is nothing left for G to collide with.
+        throwGrenade(world)
+      } else if (action === 'WheelUp' || action === 'WheelDown') {
         const list = [...state.owned, 'builder' as const]
         const at = list.indexOf(state.weapon)
         const next = list[(at + (action === 'WheelDown' ? 1 : list.length - 1)) % list.length]!
@@ -182,6 +238,23 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // the re-grip lands inside the camera's get-up beat).
     if (prevStaggered.current && !staggered) drawT.current = -0.4
     prevStaggered.current = staggered
+
+    // --- ADS (right-mouse aim), pistol/rifle only ---------------------------
+    // playerRig.ads is the shared 0..1 aim scalar (we own the writes):
+    // player-feel interps FOV 92→60 and scales look sensitivity off it,
+    // shooting-side spread scaling reads it too; the pose blend below
+    // consumes it locally. Linear ramp ±12/s ≈ 80 ms each way. No ADS for
+    // knife/minigun/hammer/builder.
+    const adsTarget =
+      (current === 'pistol' || current === 'rifle') && session.input.state.altFiring && !staggered
+        ? 1
+        : 0
+    const adsPrev = rigFeel.ads ?? 0
+    const ads = adsPrev + clamp(adsTarget - adsPrev, -ADS_RATE * dt, ADS_RATE * dt)
+    rigFeel.ads = ads
+    // HUD crosshair morph (ticks fade out, center dot fades in) — the HUD
+    // change-gates the write, so the per-frame call is free once settled.
+    session.hud.setAds?.(ads)
 
     // Any switch (slots, wheel, gear-table pickup) restarts the draw-in.
     if (current !== prevWeapon.current) {
@@ -221,48 +294,91 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
     if (current !== 'builder' && !staggered) {
       const def = WEAPONS[current]
-      const spunUp = def.spinUp === undefined || spinT.current >= 1
-      const wantsShot = (def.auto ? firing : firing && !prevFiring.current) && spunUp
-      if (wantsShot && cooldown.current <= 0) {
-        // Carry the frame-grid remainder (capped at one interval) so fast
-        // rates average true — at 60fps a plain reset turns 24/s into 20/s.
-        cooldown.current = Math.max(cooldown.current, -1 / def.rate) + 1 / def.rate
-        if (def.melee) {
-          swingT.current = 0
-          sfx.knifeSwing()
-        } else {
-          recoilT.current = 0
-          flashT.current = def.id === 'minigun' ? 0.03 : 0.045
-          playerRig.recoil += def.kick
-          const muzzle = def.id === 'knife' ? MUZZLE_OFFSETS.rifle : MUZZLE_OFFSETS[def.id]
-          const flash = flashRef.current
-          if (flash) {
-            flash.position.set(muzzle[0], muzzle[1], muzzle[2])
-            if (def.id === 'minigun') {
-              // Rapid flicker: random roll + size per shot so the near-
-              // continuous stream shimmers instead of freezing into a card.
-              flash.rotation.z = Math.random() * TWO_PI
-              const fs = 1.4 + Math.random()
-              flash.scale.set(fs, fs, 1)
-            } else {
-              flash.rotation.z = 0
-              flash.scale.set(1, 1, 1)
-            }
-          }
-          if (def.id === 'pistol') sfx.pistolShot()
-          else if (def.id === 'minigun') {
-            if (spinSfx.current) spinSfx.current.shot()
-            else sfx.rifleShot() // fallback until audio.ts ships sfx.minigun()
-          } else sfx.rifleShot()
+      if (def.id === 'hammer') {
+        // Two-phase strike: the click only STARTS the wind-up — the hit
+        // resolves when the slam lands (swing machine below). Cooldown is
+        // paid up front so rate 0.9 gates swing STARTS.
+        const wantsSwing = def.auto ? firing : firing && !prevFiring.current
+        if (wantsSwing && cooldown.current <= 0 && hammerPhase.current === 'idle') {
+          cooldown.current = Math.max(cooldown.current, -1 / def.rate) + 1 / def.rate
+          hammerPhase.current = 'windup'
+          hammerT.current = 0
         }
-        const outcome = fire(world, def)
-        if (outcome === 'bot') {
-          session.hud.hitmarker()
-          sfx.hitmarker()
+      } else {
+        const spunUp = def.spinUp === undefined || spinT.current >= 1
+        const wantsShot = (def.auto ? firing : firing && !prevFiring.current) && spunUp
+        if (wantsShot && cooldown.current <= 0) {
+          // Carry the frame-grid remainder (capped at one interval) so fast
+          // rates average true — at 60fps a plain reset turns 24/s into 20/s.
+          cooldown.current = Math.max(cooldown.current, -1 / def.rate) + 1 / def.rate
+          if (def.melee) {
+            swingT.current = 0
+            sfx.knifeSwing()
+          } else {
+            recoilT.current = 0
+            flashT.current = def.id === 'minigun' ? 0.03 : 0.045
+            playerRig.recoil += def.kick
+            const muzzle = def.id === 'knife' ? MUZZLE_OFFSETS.rifle : MUZZLE_OFFSETS[def.id]
+            const flash = flashRef.current
+            if (flash) {
+              flash.position.set(muzzle[0], muzzle[1], muzzle[2])
+              if (def.id === 'minigun') {
+                // Rapid flicker: random roll + size per shot so the near-
+                // continuous stream shimmers instead of freezing into a card.
+                flash.rotation.z = Math.random() * TWO_PI
+                const fs = 1.4 + Math.random()
+                flash.scale.set(fs, fs, 1)
+              } else {
+                flash.rotation.z = 0
+                flash.scale.set(1, 1, 1)
+              }
+            }
+            if (def.id === 'pistol') sfx.pistolShot()
+            else if (def.id === 'minigun') {
+              if (spinSfx.current) spinSfx.current.shot()
+              else sfx.rifleShot() // fallback until audio.ts ships sfx.minigun()
+            } else sfx.rifleShot()
+          }
+          const outcome = fire(world, def)
+          if (outcome === 'bot') {
+            session.hud.hitmarker()
+            sfx.hitmarker()
+          }
         }
       }
     }
     prevFiring.current = firing
+
+    // --- Warhammer swing machine -------------------------------------------
+    // Runs outside the trigger block so an in-flight swing keeps animating,
+    // but switching away or getting staggered mid-swing CANCELS the hit.
+    if (hammerPhase.current !== 'idle') {
+      if (current !== 'hammer' || staggered) {
+        hammerPhase.current = 'idle'
+      } else {
+        hammerT.current += dt
+        if (hammerPhase.current === 'windup' && hammerT.current >= HAMMER_WINDUP) {
+          hammerPhase.current = 'slam'
+          hammerT.current = 0
+          sfx.knifeSwing() // the down-arc whoosh; the smash voices at impact
+        } else if (hammerPhase.current === 'slam' && hammerT.current >= HAMMER_SLAM) {
+          hammerPhase.current = 'recover'
+          hammerT.current = 0
+          // IMPACT — the moment the head lands. Route through the shared
+          // smash path: fire() with the hammer def (smashRadius mirrored
+          // into hole/tear radii until shooting routes it explicitly).
+          const outcome = fire(world, WEAPONS.hammer)
+          rigFeel.shake?.(1.0)
+          playHammerSmash()
+          if (outcome === 'bot') {
+            session.hud.hitmarker()
+            sfx.hitmarker()
+          }
+        } else if (hammerPhase.current === 'recover' && hammerT.current >= HAMMER_RECOVER) {
+          hammerPhase.current = 'idle'
+        }
+      }
+    }
 
     // --- Procedural weapon pose ------------------------------------------
     const pose = POSES[current]
@@ -322,18 +438,58 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const rumX = rumble > 0 ? Math.sin(breathT.current * 71) * 0.0035 * rumble : 0
     const rumY = rumble > 0 ? Math.sin(breathT.current * 57 + 1.3) * 0.003 * rumble : 0
 
+    // ADS pose blend: lerp the carry pose toward the centered aim pose and
+    // steady the procedural motion (bob/breath/look-lag) toward ADS_STEADY
+    // at full aim — planted sights, not a bouncing scope.
+    const adsPose = ADS_POSES[current]
+    const aim = adsPose ? ads : 0
+    const steady = 1 - (1 - ADS_STEADY) * aim
+    const baseX = adsPose ? pose.pos[0] + (adsPose.pos[0] - pose.pos[0]) * aim : pose.pos[0]
+    const baseY = adsPose ? pose.pos[1] + (adsPose.pos[1] - pose.pos[1]) * aim : pose.pos[1]
+    const baseZ = adsPose ? pose.pos[2] + (adsPose.pos[2] - pose.pos[2]) * aim : pose.pos[2]
+    const baseRX = adsPose ? pose.rot[0] + (adsPose.rot[0] - pose.rot[0]) * aim : pose.rot[0]
+    const baseRY = adsPose ? pose.rot[1] + (adsPose.rot[1] - pose.rot[1]) * aim : pose.rot[1]
+    const baseRZ = adsPose ? pose.rot[2] + (adsPose.rot[2] - pose.rot[2]) * aim : pose.rot[2]
+
+    // Warhammer swing offsets — zero for every other weapon and at rest.
+    // Wind-up eases OUT (heave the mass up), the slam eases IN (t² — gravity
+    // takes it), recover releases through a smoothstep back to carry.
+    let hamPitch = 0
+    let hamY = 0
+    let hamZ = 0
+    if (current === 'hammer' && hammerPhase.current !== 'idle') {
+      if (hammerPhase.current === 'windup') {
+        const k = 1 - (1 - Math.min(1, hammerT.current / HAMMER_WINDUP)) ** 2
+        hamPitch = HAMMER_RAISE.pitch * k
+        hamY = HAMMER_RAISE.y * k
+        hamZ = HAMMER_RAISE.z * k
+      } else if (hammerPhase.current === 'slam') {
+        const a = Math.min(1, hammerT.current / HAMMER_SLAM)
+        const k = a * a
+        hamPitch = HAMMER_RAISE.pitch + (HAMMER_STRIKE.pitch - HAMMER_RAISE.pitch) * k
+        hamY = HAMMER_RAISE.y + (HAMMER_STRIKE.y - HAMMER_RAISE.y) * k
+        hamZ = HAMMER_RAISE.z + (HAMMER_STRIKE.z - HAMMER_RAISE.z) * k
+      } else {
+        const r = Math.min(1, hammerT.current / HAMMER_RECOVER)
+        const k = 1 - r * r * (3 - 2 * r)
+        hamPitch = HAMMER_STRIKE.pitch * k
+        hamY = HAMMER_STRIKE.y * k
+        hamZ = HAMMER_STRIKE.z * k
+      }
+    }
+
     const p = poseRef.current
     if (p) {
       const sag = droop.current
       p.position.set(
-        pose.pos[0] + bobX + breatheX + lagYaw.current * 0.35 + rumX,
-        pose.pos[1] + bobY + breatheY - dip - draw * 0.24 - swing * 0.1 + lagPitch.current * 0.3 - sag * 0.06 + rumY,
-        pose.pos[2] + recoil * 0.07,
+        baseX + (bobX + breatheX + lagYaw.current * 0.35) * steady + rumX,
+        baseY + (bobY + breatheY + lagPitch.current * 0.3) * steady - dip - draw * 0.24 - swing * 0.1 - sag * 0.06 + rumY + hamY,
+        baseZ + recoil * 0.07 + hamZ,
       )
       p.rotation.set(
-        pose.rot[0] - draw * 0.55 - dip * 1.4 - swing * 1.7 + recoil * 0.14 + lagPitch.current - sag * 0.12,
-        pose.rot[1] + lagYaw.current + swing * 0.5,
-        pose.rot[2] + bobRoll + swing * 0.3 + sag * 0.07,
+        baseRX + hamPitch - draw * 0.55 - dip * 1.4 - swing * 1.7 + recoil * 0.14 + lagPitch.current * steady - sag * 0.12,
+        baseRY + lagYaw.current * steady + swing * 0.5,
+        baseRZ + bobRoll * steady + swing * 0.3 + sag * 0.07,
       )
     }
   })
@@ -341,7 +497,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const showKnife = weapon === 'knife'
   const showPistol = weapon === 'pistol'
   const showRifle = weapon === 'rifle'
-  const showMinigun = weapon === MINIGUN
+  const showMinigun = weapon === 'minigun'
+  const showHammer = weapon === 'hammer'
   const showBuilder = weapon === 'builder'
 
   return (
@@ -373,6 +530,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         >
           <MinigunModel />
         </group>
+        <group visible={showHammer}>
+          <WarhammerModel />
+        </group>
+        {/* Builder tool keeps the small claw hammer — the warhammer above is
+            the slot-6 weapon. */}
         <group visible={showBuilder}>
           <HammerModel />
         </group>

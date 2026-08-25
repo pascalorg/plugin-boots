@@ -1,7 +1,7 @@
 /** Arcade arsenal — no reloads, no ammo scarcity, just rate and punch. */
 
 export type WeaponDef = {
-  id: 'knife' | 'pistol' | 'rifle' | 'minigun'
+  id: 'knife' | 'pistol' | 'rifle' | 'minigun' | 'hammer'
   /** Shots (or swings) per second. */
   rate: number
   /** Hold-to-fire. Semi-auto requires a trigger release between shots. */
@@ -28,6 +28,19 @@ export type WeaponDef = {
    * back down. Undefined = instant trigger like every other gun.
    */
   spinUp?: number
+  /**
+   * Melee SMASH carve radius (the warhammer): one blow crushes a
+   * `smashRadius` sphere out of EVERY voxel target class — walls and plain
+   * volumes alike — with the manager's ragged edge nibbles on top (≈ 36+
+   * voxels at 0.55). Canonical resolution once shooting routes it:
+   * `smashRadius ?? tearRadius ?? holeRadius` for walls,
+   * `smashRadius ?? holeRadius` for the rest. Until that routing lands the
+   * def mirrors the value into tearRadius (walls smash true) and rides a
+   * hair under it in holeRadius (0.52 — the arsenal data invariant keeps
+   * tear > drill for every def), so today's carve paths already smash at
+   * ~the right size; once shooting reads smashRadius both lanes are exact.
+   */
+  smashRadius?: number
 }
 
 export const WEAPONS: Record<WeaponDef['id'], WeaponDef> = {
@@ -83,5 +96,23 @@ export const WEAPONS: Record<WeaponDef['id'], WeaponDef> = {
     melee: false,
     kick: 0.004,
     spinUp: 0.45,
+  },
+  // Slot 6: the warhammer. One swing per ~1.1s through a two-phase
+  // animation (viewmodel owns the 0.25s wind-up + 0.12s slam; the hit
+  // lands at the slam, not on click). Crushes bots outright and smashes a
+  // 0.55 m crater into anything voxel; `kick: 0` — the camera punch comes
+  // from playerRig.shake at impact instead of a pitch kick.
+  hammer: {
+    id: 'hammer',
+    rate: 0.9,
+    auto: true,
+    damage: 220,
+    holeRadius: 0.52, // rides just under smashRadius (see the field doc)
+    tearRadius: 0.55, // mirrors smashRadius (see the field doc)
+    spread: 0,
+    range: 2.6,
+    melee: true,
+    kick: 0,
+    smashRadius: 0.55,
   },
 }

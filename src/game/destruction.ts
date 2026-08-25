@@ -779,7 +779,9 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
   _sheetCenter.set(sheet.center[0], sheet.center[1], sheet.center[2])
   _sheetNormal.set(sheet.normal[0], sheet.normal[1], sheet.normal[2])
   spawnDust(_sheetCenter, 1, {
-    kind: 'plume',
+    // Material tag (phase 4): a whole board leaving IS the heavy-drywall
+    // case — dust.tsx upgrades intensity-1 drywall to a plume + auto haze.
+    kind: 'drywall',
     normal: _sheetNormal,
     direction: direction ? _plumeDir.copy(direction) : undefined,
   })
@@ -908,8 +910,10 @@ export function damageTarget(
   // MASSIVE billowing plume coned through the hole; plain volumes keep a
   // modest puff scaled by how much material the carve took out.
   if (target.kind === 'wall') {
+    // Material tag (phase 4): 'drywall' puffs on light grazes and upgrades
+    // to the full plume (+ auto haze) once the carve is heavy (≥ ~5 cells).
     spawnDust(point, Math.min(1, 0.45 + removed.length / 18), {
-      kind: 'plume',
+      kind: 'drywall',
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
     // A few small torn-edge paper shards flutter off the hole's rim —
@@ -929,8 +933,10 @@ export function damageTarget(
     // Sheet accounting (hits + torn cells) — may fly whole sheets off.
     noteSheetCarve(target, removed, direction)
   } else {
+    // Material tag (phase 4): plain volumes voice as CONCRETE — small,
+    // short-lived, grayer puffs (dust.tsx owns the styling).
     spawnDust(point, Math.min(1, 0.25 + removed.length / 30), {
-      kind: 'puff',
+      kind: 'concrete',
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
   }
@@ -1184,7 +1190,7 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
 /** Legacy alias. */
 export const collideVoxelWalls = collideVoxelTargets
 
-/** Forget one voxel target (builder G-undo unmounts its source mesh): the
+/** Forget one voxel target (builder Z-undo unmounts its source mesh): the
  * replica unmounts and any pending island collapse for it is cancelled.
  * No-op if the node never voxelized. */
 export function dropTarget(nodeId: string): void {

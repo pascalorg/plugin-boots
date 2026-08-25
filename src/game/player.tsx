@@ -44,6 +44,21 @@ import type { GameWorld } from './world'
  *   Reset to 1 on session start. Keep values in (0, 1.5] — 0 would pin the
  *   player in place.
  *
+ * `playerRig.ads` — aim-down-sights blend (0..1), WRITTEN by the viewmodel
+ *   (arsenal owns the write; smooth or snap it there — this side just tracks
+ *   it). Consumed here every frame: the camera FOV target lerps 92→60 with
+ *   ads (the stagger tunnel drop stacks on top), the smoothed FOV only calls
+ *   updateProjectionMatrix while |delta| > 0.1, and look sensitivity scales
+ *   by current fov/92 so aimed flicks stay proportional on screen. Reset to
+ *   0 on session start.
+ *
+ * `playerRig.shake(power)` — camera-shake impulse (explosions, heavy hits;
+ *   arsenal/grenade call it). Impulses ACCUMULATE into a power pool (capped
+ *   at 4) that decays ~6/s; each frame a random pitch/yaw offset of
+ *   ±0.012 rad × power is applied ON TOP of the camera rotation write only —
+ *   playerRig.yaw/pitch state is never touched, so look input, viewmodel
+ *   sway and the mouse feel stay clean. Safe to call from anywhere.
+ *
  * REGEN: 4s after the last damage, health climbs +12/s to 100. Store writes
  * are throttled to ~4/s (fractional hp pools locally) to avoid re-render
  * storms in HUD subscribers.
@@ -54,8 +69,18 @@ import type { GameWorld } from './world'
 
 const SENSITIVITY = 0.0021
 const GAME_FOV = 92
+/** Full aim-down-sights FOV; playerRig.ads lerps GAME_FOV→ADS_FOV. */
+const ADS_FOV = 60
 const FOOTSTEP_STRIDE = 2.3
 const MAX_PITCH = Math.PI / 2 - 0.02
+
+// --- Camera shake (playerRig.shake) -----------------------------------------
+/** Rad of random pitch/yaw offset per unit of shake power. */
+const SHAKE_AMP = 0.012
+/** Exponential decay rate (/s) of the accumulated shake power. */
+const SHAKE_DECAY = 6
+/** Impulse cap — even stacked explosions top out at ≈ ±0.048 rad of jitter. */
+const SHAKE_MAX = 4
 
 const REGEN_DELAY = 4 // s after last damage before regen kicks in
 const REGEN_RATE = 12 // hp/s
@@ -116,6 +141,9 @@ export const playerRig = {
   /** Move-speed multiplier (see the API block): scales run/walk target
    * speeds in the move loop. Writers restore 1; reset on session start. */
   speedScale: 1,
+  /** Aim-down-sights blend 0..1 (see the API block): viewmodel writes it,
+   * the frame loop lerps FOV 92→60 and scales look sensitivity by fov/92. */
+  ads: 0,
   /** Knockback: queue an XZ impulse (m/s); consumed into velocity next frame. */
   shove(dirX: number, dirZ: number, power: number): void {
     const len = Math.hypot(dirX, dirZ)
@@ -123,10 +151,18 @@ export const playerRig = {
     shoveAccum.x += (dirX / len) * power
     shoveAccum.z += (dirZ / len) * power
   },
+  /** Camera-shake impulse (see the API block): accumulates power (cap 4),
+   * decays ~6/s, applied as a random rotation OFFSET only — never state. */
+  shake(power: number): void {
+    if (!(power > 0)) return
+    shakePower = Math.min(SHAKE_MAX, shakePower + power)
+  },
 }
 
 // --- Module-level combat state (reset when the Player mounts) --------------
 const shoveAccum = { x: 0, z: 0 }
+/** Accumulated camera-shake power (playerRig.shake), decayed in the loop. */
+let shakePower = 0
 /** Reused MoveConfig for playerRig.speedScale ≠ 1 — module temp, only the
  * two target speeds are rewritten per frame, never a fresh object. */
 const scaledMove: MoveConfig = { ...MOVE }
@@ -251,9 +287,11 @@ export function Player({ world }: { world: GameWorld }) {
     playerRig.yawVelocity = 0
     playerRig.pitchVelocity = 0
     playerRig.speedScale = 1
+    playerRig.ads = 0
     // Fresh combat clock per session.
     shoveAccum.x = 0
     shoveAccum.z = 0
+    shakePower = 0
     clock = 0
     lastDamageAt = -Infinity
     staggerT = 0
@@ -311,19 +349,21 @@ export function Player({ world }: { world: GameWorld }) {
     }
     const staggered = useBoots.getState().staggered
 
-    // Look.
+    // Look. Sensitivity scales with the CURRENT (smoothed) fov so ADS zoom
+    // keeps flicks proportional on screen — fov/92 = 1 at hip, ~0.65 aimed.
     const { dx, dy } = input.consumeLook()
+    const sens = SENSITIVITY * (camera.fov / GAME_FOV)
     const prevPitch = playerRig.pitch
-    playerRig.yaw -= dx * SENSITIVITY
+    playerRig.yaw -= dx * sens
     playerRig.pitch = Math.max(
       -MAX_PITCH,
-      Math.min(MAX_PITCH, playerRig.pitch - dy * SENSITIVITY),
+      Math.min(MAX_PITCH, playerRig.pitch - dy * sens),
     )
     // Look velocity from the applied deltas (mouse-driven, so teleports
     // don't spike it), smoothed at ~10 Hz for the viewmodel sway.
     const invDt = 1 / Math.max(dt, 1e-4)
     const smooth = Math.min(1, dt * 10)
-    playerRig.yawVelocity += (-dx * SENSITIVITY * invDt - playerRig.yawVelocity) * smooth
+    playerRig.yawVelocity += (-dx * sens * invDt - playerRig.yawVelocity) * smooth
     playerRig.pitchVelocity += ((playerRig.pitch - prevPitch) * invDt - playerRig.pitchVelocity) * smooth
     playerRig.recoil = Math.max(0, playerRig.recoil - dt * 6 * playerRig.recoil - dt * 0.02)
 
@@ -410,9 +450,13 @@ export function Player({ world }: { world: GameWorld }) {
     )
 
     // --- Stagger: 2.5s of woozy "almost died" instead of dying ------------
+    // ADS zoom base: the viewmodel writes playerRig.ads (0..1); FOV lerps
+    // 92→60 with it and the stagger tunnel drop stacks on top of that base.
+    const ads = playerRig.ads < 0 ? 0 : playerRig.ads > 1 ? 1 : playerRig.ads
+    const baseFov = GAME_FOV + (ADS_FOV - GAME_FOV) * ads
     let swayPitch = 0
     let swayRoll = 0
-    let fovTarget = GAME_FOV
+    let fovTarget = baseFov
     if (staggered) {
       staggerT -= dt
       const progress = 1 - Math.max(0, staggerT) / STAGGER_TIME
@@ -426,7 +470,7 @@ export function Player({ world }: { world: GameWorld }) {
       // handed off to getUpPitch() at recovery so there is no pitch pop.
       const slump = Math.min(1, (progress * STAGGER_TIME) / SLUMP_EASE)
       swayPitch = Math.sin(clock * 1.8 + 0.9) * SWAY_PITCH_AMP * amp - SLUMP_PITCH * slump
-      fovTarget = GAME_FOV - STAGGER_FOV_DROP * slump
+      fovTarget = baseFov - STAGGER_FOV_DROP * slump
       // Visuals/audio while downed are owned elsewhere: the HUD's stagger
       // overlay pulses off store.staggered, enemies.tsx drives the muffle +
       // heartbeat (health is pinned at 1, well under its 45hp threshold).
@@ -444,7 +488,7 @@ export function Player({ world }: { world: GameWorld }) {
         recoverT -= dt
         const u = 1 - Math.max(0, recoverT) / RECOVER_TIME
         swayPitch = getUpPitch(u)
-        fovTarget = GAME_FOV - STAGGER_FOV_DROP * (1 - u) * (1 - u)
+        fovTarget = baseFov - STAGGER_FOV_DROP * (1 - u) * (1 - u)
       }
       if (boots.health < 100 && clock - lastDamageAt >= REGEN_DELAY) {
         // Passive regen — pooled locally, flushed ~4x/s to keep HUD re-renders cheap.
@@ -456,17 +500,33 @@ export function Player({ world }: { world: GameWorld }) {
       }
     }
 
-    // Smoothed FOV toward the stagger/recovery target (snap when close so
-    // updateProjectionMatrix stops running once settled).
+    // Smoothed FOV toward the ads/stagger/recovery target (snap when the
+    // delta drops under 0.1 deg so updateProjectionMatrix stops running
+    // once settled — the last 0.1 deg is invisible).
     if (camera.fov !== fovTarget) {
       const d = fovTarget - camera.fov
-      camera.fov = Math.abs(d) < 0.02 ? fovTarget : camera.fov + d * Math.min(1, dt * 6)
+      camera.fov = Math.abs(d) < 0.1 ? fovTarget : camera.fov + d * Math.min(1, dt * 6)
       camera.updateProjectionMatrix()
+    }
+
+    // Camera shake (playerRig.shake impulses): a decaying random pitch/yaw
+    // OFFSET on the rotation write only — yaw/pitch state stays untouched.
+    let shakePitch = 0
+    let shakeYaw = 0
+    if (shakePower > 0) {
+      shakePitch = (Math.random() * 2 - 1) * SHAKE_AMP * shakePower
+      shakeYaw = (Math.random() * 2 - 1) * SHAKE_AMP * shakePower
+      shakePower -= shakePower * Math.min(1, dt * SHAKE_DECAY)
+      if (shakePower < 0.01) shakePower = 0
     }
 
     camera.position.copy(playerRig.position)
     camera.rotation.order = 'YXZ'
-    camera.rotation.set(playerRig.pitch + playerRig.recoil + swayPitch, playerRig.yaw, swayRoll)
+    camera.rotation.set(
+      playerRig.pitch + playerRig.recoil + swayPitch + shakePitch,
+      playerRig.yaw + shakeYaw,
+      swayRoll,
+    )
 
     // Fall off the world guard.
     if (feet.current.y < -30) {

@@ -25,13 +25,22 @@ import {
  *
  * API (callers should feature-check the named exports):
  *   spawnDust(position, intensity, opts?) — impact dust at a world point.
- *     intensity 0..1. opts.kind:
+ *     intensity 0..1. opts.kind takes a SHAPE or a MATERIAL:
+ *     shapes —
  *       'chip'  — 1 tiny short-lived fleck (non-wall bullet hits)
  *       'puff'  — 2–3 quads, ~1 s (default; also what legacy calls get)
  *       'plume' — 6–9 big quads, 2.5–4 s + one auto haze (drywall tears)
+ *     materials (phase 4 — emit these from destruction's per-removal tag) —
+ *       'drywall'  — full gypsum behavior: puff, upgrading to plume
+ *                    (+ auto haze) at intensity ≥ 0.7 (heavy tears)
+ *       'concrete' — small-but-present: half-size, shorter-lived, grayer
+ *                    puffs (also the CMU/generic-voxel voice)
+ *       'wood'     — NO dust at all (returns early — wood reads as
+ *                    splinters from debris alone)
  *     opts.normal/direction aim a ~35° cone around
  *     normal*0.8 + direction*0.2; with neither, the old 360° ring is used.
- *     Legacy scalar form spawnDust(x, y, z, intensity) is still accepted.
+ *     Legacy scalar form spawnDust(x, y, z, intensity, kind?) is still
+ *     accepted (5th arg optional, shape or material).
  *   spawnHaze(position, radius?) — one large, faint, slow-rising quad,
  *     4–6 s — call ONCE per crumble/collapse. Legacy (x, y, z) accepted.
  *   clearDust() — session teardown (also runs on <DustSystem/> unmount).
@@ -45,12 +54,18 @@ const PRESSURE = 0.7
 
 export type DustKind = 'chip' | 'puff' | 'plume'
 
+/** Material tags (phase 4) — what destruction/collapse emit per removal. */
+export type DustMaterial = 'drywall' | 'concrete' | 'wood'
+
+/** Drywall at/above this intensity upgrades from puff to plume (+haze). */
+const DRYWALL_HEAVY = 0.7
+
 export type DustOpts = {
   /** Surface normal at the impact — main axis of the ejection cone. */
   normal?: Vector3
   /** Shot/travel direction — bends the cone slightly downrange. */
   direction?: Vector3
-  kind?: DustKind
+  kind?: DustKind | DustMaterial
 }
 
 type QuadSlot = {
@@ -68,8 +83,12 @@ type QuadSlot = {
   spin: number
   /** Peak opacity 0..1 — dust obscures, it never emits. */
   alpha: number
-  /** Per-quad brightness jitter on the shared gypsum color. */
+  /** Per-quad brightness jitter on the base color. */
   shade: number
+  /** Base color (gypsum by default; concrete quads go grayer). */
+  cr: number
+  cg: number
+  cb: number
   /** Which of the 3 atlas tiles this quad samples. */
   tile: number
   /** Air-drag coefficient (chips brake hard, plumes hang). */
@@ -77,6 +96,16 @@ type QuadSlot = {
   ttl: number
   ttl0: number
 }
+
+/** Warm gypsum gray-beige (#b7b0a4) — drywall core, not smoke, not glow. */
+const DUST_R = 0.718
+const DUST_G = 0.69
+const DUST_B = 0.643
+
+/** Concrete/CMU carve gray (#9e9e9b) — flatter and cooler than gypsum. */
+const CONC_R = 0.62
+const CONC_G = 0.62
+const CONC_B = 0.607
 
 function makePool(n: number): QuadSlot[] {
   return Array.from({ length: n }, () => ({
@@ -92,6 +121,9 @@ function makePool(n: number): QuadSlot[] {
     spin: 0,
     alpha: 0.5,
     shade: 1,
+    cr: DUST_R,
+    cg: DUST_G,
+    cb: DUST_B,
     tile: 0,
     drag: 3.2,
     ttl: 0,
@@ -105,11 +137,6 @@ let puffCursor = 0
 let hazeCursor = 0
 let puffLive = 0
 let hazeLive = 0
-
-/** Warm gypsum gray-beige (#b7b0a4) — drywall core, not smoke, not glow. */
-const DUST_R = 0.718
-const DUST_G = 0.69
-const DUST_B = 0.643
 
 /**
  * Unit direction inside a cone of half-angle `spreadRad` around the unit
@@ -162,28 +189,52 @@ const _axis = new Vector3()
 const _vel = new Vector3()
 
 export function spawnDust(position: Vector3, intensity: number, opts?: DustOpts): void
-/** Legacy scalar form — behaves as kind 'puff'. */
-export function spawnDust(x: number, y: number, z: number, intensity: number): void
-export function spawnDust(a: Vector3 | number, b?: number, c?: number | DustOpts, d?: number): void {
+/** Legacy scalar form — kind optional (shape or material), default 'puff'. */
+export function spawnDust(
+  x: number,
+  y: number,
+  z: number,
+  intensity: number,
+  kind?: DustKind | DustMaterial,
+): void
+export function spawnDust(
+  a: Vector3 | number,
+  b?: number,
+  c?: number | DustOpts,
+  d?: number,
+  e?: DustKind | DustMaterial,
+): void {
   let x: number
   let y: number
   let z: number
   let intensity: number
   let opts: DustOpts | undefined
+  let rawKind: DustKind | DustMaterial
   if (typeof a === 'number') {
     x = a
     y = b ?? 0
     z = typeof c === 'number' ? c : 0
     intensity = d ?? 0.5
+    rawKind = e ?? 'puff'
   } else {
     x = a.x
     y = a.y
     z = a.z
     intensity = b ?? 0.5
     opts = typeof c === 'object' ? c : undefined
+    rawKind = opts?.kind ?? 'puff'
   }
+  // Wood never dusts — splinters read from debris alone (material contract).
+  if (rawKind === 'wood') return
   const k = Math.min(1, Math.max(0, intensity))
-  const kind: DustKind = opts?.kind ?? 'puff'
+  // Resolve material tags to a shape + styling. Drywall keeps the full
+  // gypsum behavior (plume + auto haze once the tear is heavy); concrete
+  // stays a puff but goes half-size, shorter-lived and grayer below.
+  const concrete = rawKind === 'concrete'
+  let kind: DustKind
+  if (rawKind === 'drywall') kind = k >= DRYWALL_HEAVY ? 'plume' : 'puff'
+  else if (rawKind === 'concrete') kind = 'puff'
+  else kind = rawKind
 
   // Ejection axis: cone around normal*0.8 + direction*0.2 (either alone
   // works too); with no vectors at all, fall back to the old 360° ring.
@@ -234,6 +285,16 @@ export function spawnDust(a: Vector3 | number, b?: number, c?: number | DustOpts
       s.drag = 1.5
       s.ttl = 2.5 + Math.random() * 1.5
     }
+    if (concrete) {
+      // Small-but-present: half-size, shorter-lived, brakes a bit harder.
+      s.size *= 0.5
+      s.ttl = 0.4 + Math.random() * 0.25
+      s.alpha = 0.36 + k * 0.1
+      s.drag = 4.2
+    }
+    s.cr = concrete ? CONC_R : DUST_R
+    s.cg = concrete ? CONC_G : DUST_G
+    s.cb = concrete ? CONC_B : DUST_B
     if (hasAxis) {
       coneDirection(_vel, _axis, CONE_SPREAD, Math.random(), Math.random())
       s.vx = _vel.x * speed
@@ -280,6 +341,9 @@ function spawnHazeAt(x: number, y: number, z: number, radius?: number): void {
   s.spin = (Math.random() - 0.5) * 0.24
   s.alpha = 0.28 + Math.random() * 0.07
   s.shade = 0.95 + Math.random() * 0.1
+  s.cr = DUST_R
+  s.cg = DUST_G
+  s.cb = DUST_B
   s.tile = Math.floor(Math.random() * 3)
   s.drag = 0
   s.ttl = 4 + Math.random() * 2
@@ -491,7 +555,7 @@ function stepPool(
     _scale.set(grow, grow, 1)
     _matrix.compose(_pos, _quat, _scale)
     mesh.setMatrixAt(i, _matrix)
-    _color.setRGB(DUST_R * s.shade, DUST_G * s.shade, DUST_B * s.shade)
+    _color.setRGB(s.cr * s.shade, s.cg * s.shade, s.cb * s.shade)
     mesh.setColorAt(i, _color)
     alphaAttr.array[i] = s.alpha * fade
     tileAttr.array[i] = s.tile
