@@ -50,10 +50,9 @@ import { bvhFor, type GameWorld } from './world'
  *                             of EXISTING skin voxels on one wall face (no
  *                             rendered board plane of its own, so nothing
  *                             can ever sit coplanar with the skin). Carves
- *                             count `hits` + `torn` cells; at 4 hits or
- *                             ~a third of the sheet torn the WHOLE sheet
- *                             flies off (flownOff, shreds + plume, cells
- *                             removed).
+ *                             count `hits` + `torn` cells; past the
+ *                             SHEET_FLY_* gates the WHOLE sheet flies off
+ *                             (flownOff, shreds + plume, cells removed).
  * Voxelize / damage
  *   ensureVoxelTarget(world, nodeId)   voxelize ANY collider group (walls,
  *                             doors, slabs, roofs, items…). Walls get the
@@ -326,16 +325,17 @@ function buildStuds(
 /** Real-world drywall board footprint the logical sheets tile at. */
 const SHEET_W = 1.2
 const SHEET_H = 2.4
-/** A sheet flies off once this fraction of its cells is torn out — one
- * pistol tear is ~17% of a board, so the SECOND concentrated hit sheds it
- * (drywall dies fast; play-tested against the headless battery, where
- * spread shots straddle sheet seams and slip through existing holes). */
+/** A sheet flies off once this fraction of its cells is torn out… */
 const SHEET_FLY_TORN = 0.25
-/** …or after this many carves — but only once the board is genuinely
- * opened (SHEET_FLY_MIN_TORN), so a long shallow line cut across many
- * sheets (grazing hits, ~14% each) doesn't shed every board it nicked. */
-const SHEET_FLY_HITS = 3
-const SHEET_FLY_MIN_TORN = 0.18
+/** …or on its SHEET_FLY_HITS'th carve once the board is genuinely opened
+ * (SHEET_FLY_MIN_TORN). Tuned against the headless battery: one pistol
+ * tear is ~16-20% of a board, and follow-up shots mostly slip through the
+ * hole they made — so a board that's already open dies on its very next
+ * hit (drywall dies FAST), while a long shallow line cut across many
+ * sheets (~11% each) still crumbles via the island pass instead of
+ * shedding every board it nicked. */
+const SHEET_FLY_HITS = 2
+const SHEET_FLY_MIN_TORN = 0.15
 
 const EMPTY_SHEET_MAP = new Int32Array(0)
 
@@ -670,8 +670,8 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
  * Per-carve sheet accounting: every removed cell bumps its sheet's `torn`,
  * every sheet the carve touched takes one `hit`, and any sheet past the
  * fly-off thresholds (see SHEET_FLY_*) tears off wholesale. This is what
- * makes drywall die FAST: three pistol rounds into one board and the
- * entire board leaves the wall.
+ * makes drywall die FAST: two pistol rounds into one board and the entire
+ * board leaves the wall.
  */
 function noteSheetCarve(target: VoxelTarget, removed: number[], direction?: Vector3): void {
   if (target.sheets.length === 0) return
