@@ -1,7 +1,7 @@
 {
   "name": "@pascal-app/plugin-boots",
   "version": "0.1.0",
-  "description": "Boots — first-person mode for the Pascal editor. Put your boots on, walk the job, and work the punch list from the ground.",
+  "description": "Boots \u2014 the Pascal editor becomes a game. Jump in: first-person in the building you're editing; break walls voxel by voxel, shatter glass, build Fortnite-style, fight off robots. Esc, and nothing happened.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pascalorg/plugin-boots.git"
@@ -36,22 +36,24 @@
     "react-dom": "^18 || ^19",
     "three": "^0.185",
     "zod": "^4",
-    "zustand": "^5"
+    "zustand": "^5",
+    "three-mesh-bvh": ">=0.8 <1"
   },
   "devDependencies": {
     "@pascal-app/core": "0.9.1",
     "@pascal-app/editor": "0.9.1",
     "@pascal-app/viewer": "0.9.1",
     "@react-three/fiber": "^9",
-    "@types/node": "^22.19.12",
     "@types/bun": "^1.3.5",
     "@types/howler": "^2.2.12",
+    "@types/node": "^22.19.12",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
     "@types/three": "^0.184.0",
     "react": "^19",
     "react-dom": "^19",
     "three": "^0.185",
+    "three-mesh-bvh": "^0.9.10",
     "typescript": "6.0.3",
     "zod": "^4",
     "zustand": "^5"

@@ -1,80 +1,23 @@
 'use client'
 
-import { useEditor } from '@pascal-app/editor'
-import { flushSync } from 'react-dom'
-
-/** Fixed bottom-center hint mounted straight on <body> — the sidebar (and this
- * panel with it) can unmount while first-person mode is up, so the hint can't
- * live in this React tree. Removed by the store subscription on exit. */
-const HINT_ID = 'boots-esc-hint'
-
-function mountEscHint() {
-  if (document.getElementById(HINT_ID)) return
-  const hint = document.createElement('div')
-  hint.id = HINT_ID
-  hint.textContent = 'Esc to exit'
-  hint.style.cssText = [
-    'position:fixed',
-    'bottom:28px',
-    'left:50%',
-    'transform:translateX(-50%)',
-    'padding:8px 16px',
-    'border-radius:999px',
-    'background:rgba(0,0,0,0.55)',
-    'color:#fff',
-    'font:600 13px/1 system-ui,sans-serif',
-    'letter-spacing:0.04em',
-    'z-index:2147483647',
-    'pointer-events:none',
-    'user-select:none',
-  ].join(';')
-  document.body.appendChild(hint)
-}
-
-function unmountEscHint() {
-  document.getElementById(HINT_ID)?.remove()
-}
-
-type EditorFirstPerson = {
-  isFirstPersonMode?: boolean
-  setFirstPersonMode?: (value: boolean) => void
-}
+import { useState } from 'react'
+import { useBoots } from './store'
+import { discardPlaced, keepPlaced } from './game/keep'
+import { enterGame } from './game/session'
 
 /**
- * Jump in: fullscreen + the host's first-person mode, in one click.
- *
- * Both `requestFullscreen` and the pointer lock the host's
- * FirstPersonControls requests on mount need the SAME user activation, so
- * fullscreen fires first (fire-and-forget) and the mode flips inside
- * `flushSync` — mirroring the host's own overlay button — so the controls
- * mount synchronously while the click gesture is still live.
- * `setFirstPersonMode` is duck-typed: it ships in current hosts but not in
- * the published editor types this package compiles against.
+ * The Boots left-rail panel. One big verb: Jump in — the whole editor
+ * becomes a game. After a session where you built pieces, the panel offers
+ * to keep them (converted into real walls) or discard everything.
  */
-function jumpIn() {
-  const editor = useEditor.getState() as unknown as EditorFirstPerson
-  if (!editor.setFirstPersonMode) return
-
-  void document.documentElement.requestFullscreen?.().catch(() => {})
-  flushSync(() => editor.setFirstPersonMode?.(true))
-  mountEscHint()
-
-  // Esc releases the pointer lock, which makes the host exit first-person
-  // mode — follow it: drop the hint and leave fullscreen.
-  const unsubscribe = (
-    useEditor as unknown as {
-      subscribe: (listener: (state: EditorFirstPerson) => void) => () => void
-    }
-  ).subscribe((state) => {
-    if (state.isFirstPersonMode) return
-    unsubscribe()
-    unmountEscHint()
-    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
-  })
-}
-
-/** The Boots left-rail panel — one button. Put your boots on. */
 export default function BootsPanel() {
+  const pendingDecision = useBoots((s) => s.pendingDecision)
+  const placed = useBoots((s) => s.placed)
+  const [lastKept, setLastKept] = useState<string | null>(null)
+
+  const wallCount = placed.filter((p) => p.piece === 'wall').length
+  const otherCount = placed.length - wallCount
+
   return (
     <div className="flex flex-col gap-4 p-4 text-sidebar-foreground">
       <header className="flex flex-col gap-1">
@@ -85,17 +28,75 @@ export default function BootsPanel() {
           </span>
         </div>
         <p className="text-sidebar-foreground/50 text-xs leading-relaxed">
-          Walk the building you're editing, first person, full screen.
+          It's a game. Jump in and the editor becomes a first-person shooter set in the building
+          you're editing — break the walls, shatter the glass, build new ones, hold off the
+          machines. Press Esc and it's as if nothing happened.
         </p>
       </header>
 
       <button
         className="flex w-full items-center justify-center gap-2 rounded-md bg-sidebar-accent px-3 py-2 font-semibold text-sm hover:bg-sidebar-accent/80"
-        onClick={jumpIn}
+        onClick={() => {
+          setLastKept(null)
+          enterGame()
+        }}
         type="button"
       >
         ⏵ Jump in
       </button>
+
+      {pendingDecision && placed.length > 0 && (
+        <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
+          <p className="text-xs leading-relaxed">
+            You built <span className="font-semibold">{placed.length}</span> piece
+            {placed.length > 1 ? 's' : ''} in-game
+            {wallCount > 0 ? ` (${wallCount} wall${wallCount > 1 ? 's' : ''} can become real)` : ''}
+            .
+          </p>
+          <div className="flex gap-2">
+            <button
+              className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
+              onClick={() => {
+                const result = keepPlaced()
+                setLastKept(
+                  `Kept ${result.kept} wall${result.kept === 1 ? '' : 's'}${
+                    result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''
+                  }`,
+                )
+              }}
+              type="button"
+            >
+              Keep{wallCount > 0 ? ` ${wallCount} wall${wallCount > 1 ? 's' : ''}` : ''}
+            </button>
+            <button
+              className="flex-1 rounded-md border border-sidebar-border/60 px-2 py-1.5 text-xs hover:bg-sidebar-accent/60"
+              onClick={() => {
+                discardPlaced()
+                setLastKept('Discarded')
+              }}
+              type="button"
+            >
+              Discard
+            </button>
+          </div>
+          {otherCount > 0 && (
+            <p className="text-[11px] text-sidebar-foreground/40">
+              Floors & ramps stay game-only for now.
+            </p>
+          )}
+        </section>
+      )}
+      {lastKept && <p className="text-[11px] text-sidebar-foreground/50">{lastKept}</p>}
+
+      <section className="flex flex-col gap-1 text-[11px] text-sidebar-foreground/50 leading-relaxed">
+        <p className="font-semibold text-sidebar-foreground/70 uppercase tracking-wider text-[10px]">
+          Controls
+        </p>
+        <p>WASD move · Space jump · Shift walk</p>
+        <p>Mouse shoot · E gear up at the table</p>
+        <p>1 knife · 2 pistol · 3 rifle · 4/B build</p>
+        <p>Q cycle piece · G undo · Esc exit</p>
+      </section>
     </div>
   )
 }

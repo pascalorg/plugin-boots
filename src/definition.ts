@@ -67,6 +67,9 @@ export const jobDefinition: JobDefinition = {
   },
 
   renderer: { kind: 'parametric', module: () => import('./renderer') },
+  // The game engine rides the system slot: mounted in-canvas whenever Boots
+  // is installed in the scene, inert until the panel enters game phase.
+  system: { module: () => import('./game/system'), priority: 8 },
 
   presentation: {
     label: 'Job marker',

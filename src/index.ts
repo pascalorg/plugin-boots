@@ -37,7 +37,8 @@ export const bootsHostPanel: PluginHostPanel = {
   icon: { kind: 'url', src: BOOTS_ICON },
   component: () => import('./panel'),
   pluginId: bootsPlugin.id,
-  description: 'Jump into the building you are editing — full screen, first person.',
+  description:
+    "It's a game — jump in and the editor becomes a first-person shooter set in the building you're editing. Esc, and nothing happened.",
   creator: {
     name: 'Pascal',
     url: 'https://github.com/pascalorg',
