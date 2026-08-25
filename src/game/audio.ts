@@ -18,6 +18,13 @@
  * - setHeartbeatPulseListener(cb) — phase hook: cb(delayMs) fires once per
  *   scheduled audible lub, delayMs before it sounds. hud.ts registers its
  *   beatPulse() here on mount so the visual pulse lands on the sound.
+ *
+ * Loop voices (both null-safe: null without WebAudio, stop() idempotent):
+ * - sfx.droneBuzz() — { setIntensity(0..1), stop } fixed-pitch hover buzz.
+ * - sfx.machineSpinup() — { setProgress(0..1), stop } gear-up countdown
+ *   voice: distant machinery waking up. progress sweeps pitch 50→180Hz,
+ *   lowpass 350→2200Hz, AM 18→40Hz and level 0→~0.09 (capped so it stays
+ *   distant) on short smoothed ramps — call setProgress freely, no zipper.
  */
 
 /** Health at/below which the low-HP heartbeat (audio + HUD pulse) engages. */
@@ -152,6 +159,12 @@ function thump(freq: number, duration: number, gainValue: number, when = 0, type
   gain.connect(master)
   osc.start(t)
   osc.stop(t + duration + 0.05)
+}
+
+/** Handle returned by sfx.machineSpinup() — the 5s gear-up countdown voice. */
+export type MachineSpinupHandle = {
+  setProgress: (p: number) => void
+  stop: () => void
 }
 
 /** Handle returned by sfx.heartbeat(). */
@@ -452,6 +465,69 @@ export const sfx = {
         gain.gain.setTargetAtTime(0.0001, c.currentTime, 0.05)
         osc.stop(c.currentTime + 0.3)
         lfo.stop(c.currentTime + 0.3)
+      },
+    }
+  },
+
+  /**
+   * Distant machinery waking up — the gear-up countdown voice. A sawtooth
+   * rises 50→180Hz through a lowpass opening 350→2200Hz, with a slow AM
+   * tremolo speeding 18→40Hz and level swelling 0→~0.09 (hard ceiling so it
+   * reads as far-away), ALL driven by setProgress(0..1). Targets move on
+   * short setTargetAtTime ramps, so per-frame setProgress calls are smooth
+   * (no zipper) and allocation-free. Routes through the master chain, so
+   * setMuffle concusses it like everything else. stop() ramps to silence,
+   * then the ended oscillators disconnect the chain; stop is idempotent and
+   * setProgress after stop is a no-op. Returns null without WebAudio.
+   */
+  machineSpinup(): MachineSpinupHandle | null {
+    const c = ensureContext()
+    if (!c || !master) return null
+    const osc = c.createOscillator()
+    osc.type = 'sawtooth'
+    osc.frequency.value = 50
+    const filter = c.createBiquadFilter()
+    filter.type = 'lowpass'
+    filter.frequency.value = 350
+    filter.Q.value = 0.9
+    // Tremolo: idles between ~0.4 and 1.0 of the swell level.
+    const am = c.createGain()
+    am.gain.value = 0.7
+    const lfo = c.createOscillator()
+    lfo.frequency.value = 18
+    const lfoDepth = c.createGain()
+    lfoDepth.gain.value = 0.3
+    lfo.connect(lfoDepth)
+    lfoDepth.connect(am.gain)
+    const gain = c.createGain()
+    gain.gain.value = 0.0
+    osc.connect(filter)
+    filter.connect(am)
+    am.connect(gain)
+    gain.connect(master)
+    osc.start()
+    lfo.start()
+    let stopped = false
+    osc.onended = () => {
+      gain.disconnect()
+      lfoDepth.disconnect()
+    }
+    return {
+      setProgress: (p: number) => {
+        if (stopped) return
+        const x = Math.min(1, Math.max(0, p))
+        const t = c.currentTime
+        osc.frequency.setTargetAtTime(50 + 130 * x, t, 0.1)
+        filter.frequency.setTargetAtTime(350 + 1850 * x, t, 0.1)
+        lfo.frequency.setTargetAtTime(18 + 22 * x, t, 0.1)
+        gain.gain.setTargetAtTime(Math.min(0.09, 0.12 * x), t, 0.08)
+      },
+      stop: () => {
+        if (stopped) return
+        stopped = true
+        gain.gain.setTargetAtTime(0.0001, c.currentTime, 0.05)
+        osc.stop(c.currentTime + 0.35)
+        lfo.stop(c.currentTime + 0.35)
       },
     }
   },

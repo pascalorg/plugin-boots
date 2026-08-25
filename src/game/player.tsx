@@ -18,15 +18,16 @@ import type { GameWorld } from './world'
  *   player. `fromDir` is the horizontal direction FROM the attacker TO the
  *   player (i.e. the push direction), any length — it's normalized here.
  *   It: lowers health (never below 0), resets the regen clock, shoves the
- *   player away (~2.5 m/s per 12 dmg, capped), flashes the HUD vignette
+ *   player away (~2.5 m/s per 12 dmg, floored at 2.2 m/s so even light hits
+ *   read as a shove, capped at 6), flashes the HUD vignette
  *   (passing the screen-relative attacker angle: 0 = ahead, +π/2 = right,
  *   for a future directional indicator) and plays sfx.damage().
  *   When health would hit 0 it does NOT kill: health pins to 1 and a 2.5s
  *   STAGGER starts — red pulsing screen, heartbeat, halved move speed, no
  *   jumping, woozy camera sway + head-hang slump + FOV tunnel, weapon droop
  *   + fire block (viewmodel). Damage landing during a stagger still
- *   shoves/flashes but costs no health, and the shove is dampened to 40%
- *   (mercy window — pushed around, never juggled). The stagger ends at
+ *   shoves/flashes but costs no health, and the shove is dampened to 40% of
+ *   the floored value (mercy window — pushed around, never juggled). The stagger ends at
  *   health 40 with a get-up beat: the slump releases through `getUpPitch`
  *   (small upward lift) while the FOV settles back, then regen resumes.
  *
@@ -54,6 +55,11 @@ const REGEN_WRITE_CHUNK = 3 // hp per store write ≈ 4 writes/s at REGEN_RATE
 const STAGGER_TIME = 2.5 // s
 const STAGGER_RECOVER_HP = 40
 const SHOVE_PER_DAMAGE = 2.5 / 12 // m/s of knockback per point of damage
+/** Floor so every hit READS as a shove: light hits (dog nips at 9 dmg would
+ * be 1.875 m/s ≈ 0.27 m of slide) get lifted to ~0.31 m of slide at ground
+ * friction 7. Applied BEFORE the mercy dampening, so downed nudges scale off
+ * the floored value — the stagger-causing hit itself stays full power. */
+const SHOVE_MIN = 2.2
 const SHOVE_MAX = 6
 /** Mercy-window shoves are dampened: downed hits nudge, they don't juggle.
  * (Bots hold their standoff ring while you're staggered, but the pile-on
@@ -139,7 +145,8 @@ export function damagePlayer(amount: number, fromDir?: { x: number; z: number })
   let angle: number | undefined
   if (fromDir) {
     const power =
-      Math.min(SHOVE_MAX, amount * SHOVE_PER_DAMAGE) * (s.staggered ? STAGGER_SHOVE_SCALE : 1)
+      Math.min(SHOVE_MAX, Math.max(SHOVE_MIN, amount * SHOVE_PER_DAMAGE)) *
+      (s.staggered ? STAGGER_SHOVE_SCALE : 1)
     playerRig.shove(fromDir.x, fromDir.z, power)
     // Screen-relative attacker bearing: attacker sits at -fromDir from the
     // player. 0 = straight ahead, +π/2 = to the right (camera yaw only).

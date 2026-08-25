@@ -95,7 +95,7 @@ export default function BootsPanel() {
         <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build</p>
         <p>Q cycle piece · hold click to place a run · G undo · Esc exit</p>
-        <p>Pieces snap to what you've placed — look up to stack walls.</p>
+        <p>Pieces snap to what you've placed — look up to stack walls, cap them with floors.</p>
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
       </section>
     </div>

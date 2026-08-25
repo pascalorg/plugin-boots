@@ -19,6 +19,12 @@ import { spawnDebris } from './debris'
  *   (WAVE 1). resetBots() re-arms the whole grace→alert cycle.
  * - MERCY: while the player is staggered bots never attack — ground bots
  *   hold a 4–6 m ring, drones climb +1 m and hover (see enemies.tsx).
+ *
+ * DEV/E2E: `debugFlags.botsFrozen` — while true the enemies frame loop
+ * skips ALL bot steering and attacks (pursuit, mercy-ring standoff, drone
+ * hover-tracking, melee); bots keep animating in place and dying bots still
+ * finish their tumble. Toggled via the `__boots.setBotsFrozen(v)` dev handle
+ * (game-root.tsx); resetBots() clears it so it never leaks across sessions.
  */
 
 export type BotKind = 'droid' | 'dog' | 'drone'
@@ -51,6 +57,9 @@ export const BOT_STATS: Record<
 export const bots: Bot[] = []
 let botId = 1
 
+/** Dev/E2E toggles — see header. Not used by any gameplay path directly. */
+export const debugFlags = { botsFrozen: false }
+
 /** Length of the "they heard you" countdown after the first gun pickup. */
 export const ALERT_SECONDS = 5
 
@@ -70,6 +79,7 @@ export function resetBots(): void {
   waveState.intermission = 4
   waveState.alerted = false
   waveState.countdown = ALERT_SECONDS
+  debugFlags.botsFrozen = false
 }
 
 export function spawnBot(kind: BotKind, x: number, z: number): void {

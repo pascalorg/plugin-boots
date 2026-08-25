@@ -269,3 +269,60 @@ Rough / next:
   during live QA — full rsync at deploy time is mandatory (stale-code burn).
 
 Checks: `bun run check-types` clean, `bun test` 74 pass / 2400 expects.
+
+## Phase 2, Round 3 — 2026-08-25 (roofing, spin-up voice, shove floor, E2E hooks)
+
+- **Builder feel** (builder.tsx + tests): floors now ROOF walls — new
+  `resolveSnap` case `floor`-on-`wall`: two candidates at the wall top
+  (`py + WALL_H`), centers offset `ROOF_OFFSET = SPAN/2 = 1.5` along the
+  wall normal so the floor edge sits flush on the wall line, floor adopts
+  the wall yaw (π/2 symmetry). Gated by the same 3/4-height aim test as
+  wall stacking, evaluated at the wall's XZ — level-gaze ground tiling
+  beside a wall never teleports up, and the Y weight in `consider()` keeps
+  a same-level tile winning under a tilted aim. 7 new tests (gate, both
+  sides, rotated wall, ground-tiling guard, tile-vs-roof priority,
+  roof-level occupancy modulo floor symmetry).
+- **Damage feel** (audio.ts): dedicated `sfx.machineSpinup()` countdown
+  voice (the round-2 wishlist item) — `{ setProgress(0..1), stop }`;
+  sawtooth 50→180 Hz through a lowpass 350→2200 Hz with AM tremolo
+  18→40 Hz, level 0→0.09 hard-capped so it stays distant; all four targets
+  ride `setTargetAtTime` ramps (safe per frame, no zipper, no allocs);
+  routes through master so setMuffle concusses it; stop idempotent.
+  `MachineSpinupHandle` exported; documented in the file-header "Loop
+  voices" section + method JSDoc.
+- **Death dynamics** (player.tsx + tests): `SHOVE_MIN = 2.2` m/s knockback
+  floor inside the SHOVE_MAX clamp, applied before mercy dampening — a dog
+  nip (9 dmg, raw 1.875 m/s ≈ 0.27 m slide) now reads as a real shove
+  (~0.31 m); droid/drone/cap unchanged; mercy on a floored hit = 0.88 m/s.
+  3 new tests (floor, above-floor passthrough, mercy-on-floored).
+- **Pacing** (enemies.tsx / enemies-state.ts / game-root.tsx): countdown
+  swapped from the second droneBuzz to `machineSpinup` (null-guarded),
+  driving raw progress `1 − countdown/ALERT_SECONDS`; identical lifecycle
+  (stop stale voice on resetBots re-arm, stop+null at zero, stop on
+  unmount). New dev/E2E hooks: `debugFlags.botsFrozen` (enemies-state,
+  cleared by resetBots) freezes ALL steering/attacks while walk cycles
+  idle; `__boots.bots()` (plain snapshots) + `__boots.setBotsFrozen(v)` on
+  the dev handle. Headless QA (fresh server, full src rsync first): grace,
+  once-per-session countdown on the new voice, HERE THEY COME one-shot,
+  freeze 0.0000 maxDelta over 5 s, mercy ring dists 4.03/5.99 m with hp
+  pinned at 1 through a pile-on, get-up trace fov 92→86→settle + health
+  landing exactly 40, Esc restore clean, zero pageerrors.
+- **Copy** (panel.tsx / README.md): roofing documented — "look up to stack
+  walls, cap them with floors" / "floors tile and cap wall tops (build a
+  box of walls, roof it with floors)". Full claim→code re-verification of
+  every panel/README line passed (countdown, mercy, keys, keep-scope).
+- Manager integration: seam audit only, nothing dangling — enemies melee
+  routes through `damagePlayer` (floor + flash + stagger for free),
+  `hud.damageFlash(angle)` signature matches its one caller, muffle +
+  heartbeat driven from the enemies stagger edge, staggered flows
+  store→player/viewmodel/enemies, PlacedPieces colliders are pose-generic
+  so roof-level floors are walkable.
+
+Rough / next:
+- Roofed-box live QA (walk up a ramp onto a placed roof) not yet run
+  headless; builder snap covered by unit tests only this round.
+- Doors still untested on blank-canvas QA scenes (no door nodes).
+- Dev server on :3002 dies with the agent that started it — restart is
+  part of the deploy runbook now.
+
+Checks: `bun run check-types` clean, `bun test` 84 pass / 2429 expects.

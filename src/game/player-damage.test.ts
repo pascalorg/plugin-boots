@@ -7,8 +7,9 @@ import { damagePlayer, getUpPitch, playerDebug } from './player'
  * loop half (stagger timer, sway, regen ticking) needs R3F and is covered by
  * live QA; this pins the store-visible contract the pacing agent builds on:
  * health floors at 1 + staggered flips on lethal hits, the mercy window eats
- * damage (and dampens knockback) while staggered, and the get-up pitch curve
- * keeps its shape (slump → small lift → exactly level).
+ * damage (and dampens knockback) while staggered, knockback is floored so
+ * every hit reads as a shove, and the get-up pitch curve keeps its shape
+ * (slump → small lift → exactly level).
  */
 describe('damagePlayer', () => {
   beforeEach(() => {
@@ -56,6 +57,19 @@ describe('damagePlayer', () => {
     expect(shove.z).toBeCloseTo(0, 5)
   })
 
+  test('a dog nip (9 dmg) is floored to the 2.2 m/s minimum shove', () => {
+    damagePlayer(9, { x: 1, z: 0 })
+    const shove = playerDebug.drainShove()
+    expect(shove.x).toBeCloseTo(2.2, 5) // raw 9 * 2.5/12 = 1.875 → floor
+    expect(shove.z).toBeCloseTo(0, 5)
+  })
+
+  test('the floor does not touch hits already above it (drone, 14 dmg)', () => {
+    damagePlayer(14, { x: 0, z: 1 })
+    const shove = playerDebug.drainShove()
+    expect(shove.z).toBeCloseTo((14 * 2.5) / 12, 5) // ≈2.9167, unchanged
+  })
+
   test('shove power caps at 6 m/s for huge hits', () => {
     damagePlayer(90, { x: 0, z: 1 })
     const shove = playerDebug.drainShove()
@@ -67,6 +81,13 @@ describe('damagePlayer', () => {
     damagePlayer(12, { x: 1, z: 0 })
     const shove = playerDebug.drainShove()
     expect(shove.x).toBeCloseTo(2.5 * 0.4, 5)
+  })
+
+  test('mercy dampening applies to the floored value (9 dmg downed → 2.2 * 0.4)', () => {
+    useBoots.setState({ health: 1, staggered: true })
+    damagePlayer(9, { x: 1, z: 0 })
+    const shove = playerDebug.drainShove()
+    expect(shove.x).toBeCloseTo(2.2 * 0.4, 5)
   })
 
   test('the hit that CAUSES the stagger still shoves at full power', () => {

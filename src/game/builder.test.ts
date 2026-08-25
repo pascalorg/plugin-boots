@@ -86,6 +86,75 @@ describe('resolveSnap: floors', () => {
   })
 })
 
+describe('resolveSnap: floor on wall top (roofing)', () => {
+  // Same STACK_GATE as walls: aim ray must clear 0.75 · WALL_H = 2.1 at the
+  // wall's XZ, so ground-level floor tiling beside a wall never lifts.
+  test('a level gaze never lifts the floor onto the wall — real tilt required', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0)]
+    const raw = { x: 0.3, y: 0, z: 1.2, yaw: 0 }
+    expect(resolveSnap('floor', pieces, raw, aimLow)).toBeNull()
+    // Eye-height level gaze (1.58) is still below the 2.1 gate.
+    expect(resolveSnap('floor', pieces, raw, () => 1.58)).toBeNull()
+  })
+
+  test('upward tilt roofs the wall: floor at the top, edge flush, near side', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0)]
+    // Wall yaw 0 → normal (0, 1): candidates at z ±1.5, y = WALL_H.
+    const snap = resolveSnap('floor', pieces, { x: 0.3, y: 0, z: 1.2, yaw: 0 }, aimHigh)
+    expect(snap).not.toBeNull()
+    expect(snap!.x).toBeCloseTo(0)
+    expect(snap!.y).toBeCloseTo(2.8)
+    expect(snap!.z).toBeCloseTo(1.5) // the player's side of the wall plane
+    expect(snap!.yaw).toBeCloseTo(0) // adopts the wall's yaw
+    // Edge flush: near floor edge z = 1.5 − 1.5 = 0, on the wall line.
+  })
+
+  test('the far side of the wall plane is the second candidate', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0)]
+    const snap = resolveSnap('floor', pieces, { x: -0.3, y: 0, z: -1.2, yaw: Math.PI / 2 }, aimHigh)
+    expect(snap).not.toBeNull()
+    expect(snap!.y).toBeCloseTo(2.8)
+    expect(snap!.z).toBeCloseTo(-1.5)
+    expect(snap!.yaw).toBeCloseTo(0) // wall yaw adopted (floor is π/2-symmetric)
+  })
+
+  test('rotated wall: candidates offset along the wall normal', () => {
+    const pieces = [placed('wall', 0, 0, 0, Math.PI / 2)]
+    // Wall runs along Z, normal (1, 0): candidates at x ±1.5.
+    const snap = resolveSnap('floor', pieces, { x: 1.2, y: 0, z: 0.3, yaw: 0 }, aimHigh)
+    expect(snap).not.toBeNull()
+    expect(snap!.x).toBeCloseTo(1.5)
+    expect(snap!.y).toBeCloseTo(2.8)
+    expect(snap!.z).toBeCloseTo(0)
+  })
+
+  test('ground tiling beside a wall stays flat under a level gaze', () => {
+    const pieces = [placed('floor', 0, 0, 0, 0), placed('wall', 3, 0, 1.5, 0)]
+    const snap = resolveSnap('floor', pieces, { x: 3, y: 0, z: 0.6, yaw: 0 }, aimLow)
+    expect(snap).not.toBeNull()
+    expect(snap!.x).toBeCloseTo(3) // the floor-tile candidate, not a roof pose
+    expect(snap!.y).toBeCloseTo(0)
+    expect(snap!.z).toBeCloseTo(0)
+  })
+
+  test('same-level tile outweighs the roof pose when both are in range', () => {
+    const pieces = [placed('floor', 0, 0, 0, 0), placed('wall', 3, 0, 0.9, 0)]
+    // aimHigh: the roof candidate at (3, 2.8, −0.6) IS considered (XZ 0.9 ≤
+    // SNAP_RANGE) but the Y weight keeps the ground tile at (3, 0, 0) ahead.
+    const snap = resolveSnap('floor', pieces, { x: 3, y: 0, z: 0.3, yaw: 0 }, aimHigh)
+    expect(snap).not.toBeNull()
+    expect(snap!.y).toBeCloseTo(0)
+    expect(snap!.z).toBeCloseTo(0)
+  })
+
+  test('occupancy at roof level respects the floor π/2 symmetry', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0), placed('floor', 0, 2.8, 1.5, 0)]
+    expect(isOccupied(pieces, 'floor', 0, 2.8, 1.5, Math.PI / 2)).toBe(true) // same square
+    expect(isOccupied(pieces, 'floor', 0, 2.8, -1.5, 0)).toBe(false) // far side still free
+    expect(isOccupied(pieces, 'floor', 0, 0, 1.5, 0)).toBe(false) // ground level still free
+  })
+})
+
 describe('resolveSnap: ramps', () => {
   test('low edge docks to a floor edge, rising away from the floor', () => {
     const pieces = [placed('floor', 0, 0, 0, 0)]

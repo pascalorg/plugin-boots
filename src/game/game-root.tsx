@@ -7,6 +7,7 @@ import { clearDebris, Debris } from './debris'
 import { resetDestruction, useDestruction } from './destruction'
 import { Doors, doorsDebug } from './doors'
 import { Enemies } from './enemies'
+import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, resetGlass } from './glass'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
@@ -42,6 +43,19 @@ function ActiveGame() {
       state: () => useBoots.getState(),
       wallNodes: () => Array.from(world.walls.values()).map((w) => w.node),
       doors: doorsDebug,
+      // Bot snapshots (plain copies, never live refs) + a freeze toggle the
+      // enemies loop respects — see enemies-state.ts header (debugFlags).
+      bots: () =>
+        bots.map((b) => ({
+          kind: b.kind,
+          x: b.position.x,
+          y: b.position.y,
+          z: b.position.z,
+          hp: b.health,
+        })),
+      setBotsFrozen: (v: boolean) => {
+        debugFlags.botsFrozen = v
+      },
       studs: () =>
         Array.from(useDestruction.getState().targets.values()).flatMap((target) =>
           target.studs.map((stud) => ({

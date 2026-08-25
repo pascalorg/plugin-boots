@@ -26,7 +26,11 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *            snapped yaw is parallel to it), and stack on top when your aim
  *            ray passes above 3/4 of the neighbor's height (a real upward
  *            tilt — level gaze never stacks).
- *   floors — tile edge-to-edge on the neighbor's plane (4 sides).
+ *   floors — tile edge-to-edge on the neighbor's plane (4 sides), and roof a
+ *            wall's top (py + WALL_H) when your aim ray passes the same 3/4
+ *            gate as wall stacking: two candidates, one each side of the
+ *            wall plane, floor edge flush with the wall line — a level gaze
+ *            at ground level keeps tiling flat, never teleports up.
  *   ramps  — low edge snaps to a floor edge (rising away from the floor) or
  *            to a wall base (high edge kisses the wall top: WALL_H rise).
  * HOLD-TO-PLACE: holding LMB stamps a piece whenever the (possibly snapped)
@@ -74,6 +78,9 @@ export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
  * plank covers a 3 m run + WALL_H rise, so every piece tiles on 3 m. */
 const SPAN = 3
 const RAMP_HALF_RUN = SPAN / 2
+/** Floor-center offset from the wall plane when roofing a wall top — half
+ * the floor's span, so the floor's edge sits flush on the wall line. */
+const ROOF_OFFSET = SPAN / 2
 
 const RAMP_TILT = -Math.atan2(WALL_H, 3)
 
@@ -221,6 +228,21 @@ export function resolveSnap(
       const nz = Math.cos(p.yaw)
       consider(px + nx * SPAN, py, pz + nz * SPAN, p.yaw)
       consider(px - nx * SPAN, py, pz - nz * SPAN, p.yaw)
+    } else if (piece === 'floor' && p.piece === 'wall') {
+      // Roof a wall: the floor lands at the wall's top (py + WALL_H) with
+      // its edge flush on the wall line — center offset half a floor along
+      // the wall normal, one candidate each side of the wall plane. The
+      // floor adopts the wall's yaw (its π/2 symmetry makes parallel and
+      // perpendicular identical anyway). Gated by the same 3/4-height aim
+      // test as wall stacking, evaluated at the wall's XZ, so ground-level
+      // floor tiling beside a wall never teleports to the roof.
+      if (aimYAt(px, pz) > py + WALL_H * STACK_GATE) {
+        const nx = Math.sin(p.yaw)
+        const nz = Math.cos(p.yaw)
+        const topY = py + WALL_H
+        consider(px + nx * ROOF_OFFSET, topY, pz + nz * ROOF_OFFSET, p.yaw)
+        consider(px - nx * ROOF_OFFSET, topY, pz - nz * ROOF_OFFSET, p.yaw)
+      }
     } else if (piece === 'ramp' && p.piece === 'floor') {
       // Low edge on a floor edge, rising away from the floor. With the ramp's
       // low-edge direction L = (-sin yaw, -cos yaw), edge direction d needs

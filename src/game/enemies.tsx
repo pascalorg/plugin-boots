@@ -5,7 +5,16 @@ import { useEffect, useRef, useState } from 'react'
 import { type Group, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { HEARTBEAT_HP, type HeartbeatHandle, heartbeatBpm, lowHpSeverity, sfx } from './audio'
-import { ALERT_SECONDS, BOT_STATS, type Bot, bots, resetBots, spawnBot, waveState } from './enemies-state'
+import {
+  ALERT_SECONDS,
+  BOT_STATS,
+  type Bot,
+  bots,
+  debugFlags,
+  resetBots,
+  spawnBot,
+  waveState,
+} from './enemies-state'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
 import type { GameWorld } from './world'
@@ -20,11 +29,11 @@ import type { GameWorld } from './world'
  * Pacing (see enemies-state.ts for the state shape):
  * - Peaceful until the first gun pickup, then a 5s "They heard you"
  *   countdown on the wave line, then WAVE 1 and the normal director.
- * - Countdown audio: a second droneBuzz voice acts as a distant machine
- *   spin-up, swelling 0→full across the 5s; each tick lands a relay clack
- *   (doorLatch), the final second an arming rack (reload). At zero the
- *   spin-up stops and the wave line flashes HERE THEY COME (first wave
- *   only; later waves keep the plain WAVE N label).
+ * - Countdown audio: sfx.machineSpinup() — a dedicated gear-up voice whose
+ *   setProgress(0..1) sweeps pitch/filter/tremolo/level across the 5s; each
+ *   tick lands a relay clack (doorLatch), the final second an arming rack
+ *   (reload). At zero the spin-up stops and the wave line flashes HERE THEY
+ *   COME (first wave only; later waves keep the plain WAVE N label).
  * - Melee routes through player.tsx `damagePlayer` (knockback + directional
  *   flash + stagger come for free — no local sfx/flash here).
  * - Stagger mercy: bots never attack a staggered player; ground bots hold a
@@ -65,8 +74,8 @@ export function Enemies({ world }: { world: GameWorld }) {
   const [tick, setTick] = useState(0)
   const signature = useRef('')
   const buzz = useRef<ReturnType<typeof sfx.droneBuzz>>(null)
-  /** Second buzz voice: the distant machine spin-up under the countdown. */
-  const spinup = useRef<ReturnType<typeof sfx.droneBuzz>>(null)
+  /** Gear-up voice under the countdown (null without WebAudio). */
+  const spinup = useRef<ReturnType<typeof sfx.machineSpinup>>(null)
   /** Last countdown second a tell played for (0 = none pending). */
   const countdownTick = useRef(0)
   /** Label shown while waveLabelT runs; null → plain `WAVE n`. */
@@ -123,7 +132,7 @@ export function Enemies({ world }: { world: GameWorld }) {
         // Distant machine spin-up under the ticking line (stop any stale
         // voice first — resetBots() mid-session re-arms the alert).
         spinup.current?.stop()
-        spinup.current = sfx.droneBuzz()
+        spinup.current = sfx.machineSpinup?.() ?? null
         countdownTick.current = ALERT_SECONDS + 1
       }
     } else if (waveState.countdown > 0) {
@@ -136,8 +145,9 @@ export function Enemies({ world }: { world: GameWorld }) {
         if (tick === 1) sfx.reload()
         else sfx.doorLatch()
       }
-      // Rising cue: the spin-up swells 0→full across the whole countdown.
-      spinup.current?.setIntensity((1 - waveState.countdown / ALERT_SECONDS) * 0.09)
+      // Rising cue: pitch/filter/tremolo/level all ride progress 0→1 across
+      // the whole countdown (the voice caps its own level — no scaling here).
+      spinup.current?.setProgress(1 - waveState.countdown / ALERT_SECONDS)
       if (waveState.countdown <= 0) {
         spinup.current?.stop()
         spinup.current = null
@@ -173,6 +183,7 @@ export function Enemies({ world }: { world: GameWorld }) {
     }
 
     // Integrate bots.
+    const frozen = debugFlags.botsFrozen // dev/E2E: hold poses, no attacks
     let nearestDrone = Infinity
     for (let i = bots.length - 1; i >= 0; i--) {
       const bot = bots[i]!
@@ -195,16 +206,21 @@ export function Enemies({ world }: { world: GameWorld }) {
 
       if (bot.kind === 'drone') {
         // Mercy: drones climb an extra meter and hold while you're staggered.
-        const targetY =
-          playerRig.position.y +
-          0.9 +
-          (staggered ? 1 : 0) +
-          Math.sin(bot.phase * 0.7 + bot.seed) * 0.5
-        bot.position.y += (targetY - bot.position.y) * Math.min(1, dt * 2.2)
+        if (!frozen) {
+          const targetY =
+            playerRig.position.y +
+            0.9 +
+            (staggered ? 1 : 0) +
+            Math.sin(bot.phase * 0.7 + bot.seed) * 0.5
+          bot.position.y += (targetY - bot.position.y) * Math.min(1, dt * 2.2)
+        }
         nearestDrone = Math.min(nearestDrone, bot.position.distanceTo(playerRig.position))
       }
 
-      if (staggered) {
+      if (frozen) {
+        // Dev freeze (debugFlags.botsFrozen): no steering, no attacks — the
+        // walk cycle keeps idling so frozen bots still read as alive.
+      } else if (staggered) {
         // Mercy window: nobody attacks a downed player. Ground bots steer to
         // hold a 4–6 m standoff ring; drones freeze in place (climb above).
         if (bot.kind !== 'drone' && dist > 0.001 && (dist < MERCY_MIN || dist > MERCY_MAX)) {
