@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/assets/boots-icon.webp" width="240" alt="Boots — bring your construction boots" />
+</p>
+
 # Boots
 
 **First-person mode for the [Pascal editor](https://github.com/pascalorg/editor). Put your boots on, walk the job, and work the punch list from the ground.**
