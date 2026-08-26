@@ -210,6 +210,31 @@ describe('zero-thickness ceiling planes (host levels emit 0 m plates)', () => {
     // the probe above is not trivially true.
     expect(probeTargetSupport(wallUp, { ...ctx, targets: () => [] })).toBe(false)
   })
+
+  test('the plate is CONTACT-ONLY support — it never props a wall floating higher in the gap band', () => {
+    // Host scenes stack a real slab (2.5–2.55) on top of the ceiling plane
+    // (2.48); L2 walls bear on the SLAB at 2.55. Carving the slab strip
+    // under a wall must drop it even though live plate cells survive 6.5 cm
+    // below its base — a finish plane carries only what RESTS on it (QA
+    // round 2 follow-up: pre-gate the cascade stalled with the wall propped
+    // by the plate).
+    const world = makeWorld()
+    world.colliders.push(boxCollider('ceil-1', 'ceiling', [6.5, 0.0002, 5], [0, 2.48, 0]))
+    world.colliders.push(boxCollider('wall-up', 'wall', [2, 2.45, 0.1], [0, 2.55 + 2.45 / 2, 0]))
+    const ceiling = ensureVoxelTarget(world, 'ceil-1')!
+    const wallUp = ensureVoxelTarget(world, 'wall-up')!
+    expect(ceiling.contactOnlySupport).toBe(true)
+    const ctx = {
+      colliders: world.colliders,
+      targets: () => [ceiling],
+      terrainY: 0,
+    }
+    // Base at 2.55, plate top ~2.485: drop 0.065 > PLATE_CONTACT_SLACK.
+    expect(probeTargetSupport(wallUp, ctx)).toBe(false)
+    // A real slab in the same band WOULD hold it (not contact-gated).
+    const slabUnder = ensureVoxelTarget(makeWorld([4, 0.3, 3]), 'slab-1')!
+    expect(slabUnder.contactOnlySupport).toBeFalsy()
+  })
 })
 
 describe('floors for things — debris/dust landing probe', () => {
@@ -225,6 +250,36 @@ describe('floors for things — debris/dust landing probe', () => {
     // Through-hole: the probe falls past the carved column to the terrain.
     damageTarget(world, 'slab-1', new Vector3(1, 2.85, 1), 0.7)
     expect(probeLandingY(world, 1, 4, 1)).toBeLessThan(0.1)
+  })
+
+  test('the probe ignores WALL grids — debris torn off a wall never floats on its own source', () => {
+    // An upper-storey wall standing on the slab; its debris pops off the
+    // face and probes at apex while still inside the wall's plan band. The
+    // wall's own live cells beneath the apex must NOT read as the floor —
+    // the piece lands on the SLAB below.
+    const world = makeWorld()
+    const wall = boxCollider('wall-up', 'wall', [2, 2.45, 0.1], [0, 3 + 2.45 / 2, 0.5])
+    world.colliders.push(wall)
+    world.walls.set('wall-up', {
+      node: {
+        id: 'wall-up',
+        start: [-1, 0.5],
+        end: [1, 0.5],
+        height: 2.45,
+        thickness: 0.1,
+      },
+      root: wall.root,
+      meshes: [wall.mesh],
+    } as never)
+    ensureVoxelTarget(world, 'slab-1')
+    const wallT = ensureVoxelTarget(world, 'wall-up')!
+    expect(wallT.kind).toBe('wall')
+    damageTarget(world, 'wall-up', new Vector3(0, 4.3, 0.5), 0.4)
+    // Probe inside the wall band, mid-height: live wall cells sit right
+    // below, but the resolved floor is the slab top (~3), not ~4.
+    const floor = probeLandingY(world, 0.3, 4.1, 0.5)
+    expect(floor).toBeLessThan(3.1)
+    expect(floor).toBeGreaterThan(2.8)
   })
 })
 

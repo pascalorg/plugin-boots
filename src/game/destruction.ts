@@ -224,6 +224,13 @@ export type VoxelTarget = {
   removedQueue: number[]
   /** Bumped on every change so the renderer knows to re-upload. */
   revision: number
+  /** True for plates SYNTHESIZED under zero-extent ceiling planes: their
+   * cells hold another target up only by direct contact (structure.ts
+   * PLATE_CONTACT_SLACK), never across the general SUPPORT_GAP band — a
+   * ceiling FINISH surface carries a wall RESTING on it, not one floating
+   * 7 cm above (QA round 2 follow-up: the plate must not prop a wall whose
+   * real slab was carved out from under it). */
+  contactOnlySupport?: boolean
 }
 
 /** Legacy alias — every voxelized target uses the same shape. */
@@ -712,6 +719,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   let kind: VoxelTarget['kind'] = wall ? 'wall' : 'volume'
   let slabThickness = 0
   let slabJoistsHang = false
+  let contactOnlySupport = false
   if (wall) {
     // Wall anatomy needs ≥ 3 layers across the thickness so the two drywall
     // skins survive dropInteriorCells with a real cavity between them —
@@ -761,6 +769,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
       _bounds.max.y += 0.005
       _bounds.min.y = _bounds.max.y - PLATE_SYNTH_T
       extent = PLATE_SYNTH_T
+      contactOnlySupport = true
     }
     if (
       extent > 0.001 &&
@@ -811,6 +820,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     sheetByCell: sheetInfo?.sheetByCell ?? EMPTY_SHEET_MAP,
     removedQueue: [],
     revision: 0,
+    contactOnlySupport,
   }
 
   // Hide the host meshes through the keep-aware path: a wall's render mesh
@@ -1490,6 +1500,10 @@ export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
  * whose top is above the probe point are skipped (a probe from inside a
  * wall's box must not "land" on that wall's top), and voxelized nodes are
  * covered by their grids since voxelization disables the host collider.
+ * WALL grids are skipped entirely: debris/dust spawns AT wall faces, so a
+ * downward DDA through the source wall's own cells would resolve the wall
+ * itself as the floor and leave pieces (and dust) hovering mid-air at the
+ * face — floors are slabs/plates/volumes, never wall bodies.
  * Called once per debris piece (at apex) / dust burst — never per frame.
  */
 export function probeLandingY(world: GameWorld, x: number, y: number, z: number): number {
@@ -1505,7 +1519,7 @@ export function probeLandingY(world: GameWorld, x: number, y: number, z: number)
   }
   for (const target of useDestruction.getState().targets.values()) {
     const grid = target.grid
-    if (grid.aliveCount === 0) continue
+    if (target.kind === 'wall' || grid.aliveCount === 0) continue
     const reach = y + 0.01 - best
     if (reach <= 0) break
     const hit = raycastVoxels(grid, x, y + 0.01, z, 0, -1, 0, reach)

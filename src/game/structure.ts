@@ -67,11 +67,22 @@ const XZ_MARGIN = 0.05
  * close to our bottom) — rejects same-row corner interpenetration while
  * tolerating a few cm of slab-top/wall-base overlap. */
 const MIN_DROP_SLACK = 0.06
+/** Contact-only supporters (synthesized ceiling plates, see VoxelTarget
+ * .contactOnlySupport) hold a base cell up only when their top face sits
+ * within this of the cell's BOTTOM — a finish plane carries what RESTS on
+ * it, not a wall floating higher inside the SUPPORT_GAP band (that wall's
+ * real slab is gone and it must fall). */
+export const PLATE_CONTACT_SLACK = 0.04
 
 // ── Pure probe (unit-testable — no module state) ────────────────────────────
 
 /** Minimal target shape the probe needs (VoxelTarget satisfies it). */
-export type SupportTargetLike = { nodeId: string; grid: VoxelGridData }
+export type SupportTargetLike = {
+  nodeId: string
+  grid: VoxelGridData
+  /** Synthesized finish plates: support by direct contact only. */
+  contactOnlySupport?: boolean
+}
 
 /** Minimal collider shape (world.ts ColliderEntry satisfies it). */
 export type SupportColliderLike = {
@@ -150,7 +161,12 @@ export function probeTargetSupport(target: SupportTargetLike, ctx: SupportProbeC
     for (const other of ctx.targets()) {
       if (other.nodeId === target.nodeId || other.grid.aliveCount === 0) continue
       const hit = raycastVoxels(other.grid, cx, cy, cz, 0, -1, 0, reach)
-      if (hit && hit.distance >= minDrop) return true
+      if (!hit || hit.distance < minDrop) continue
+      // Contact-only supporters: top face must sit within
+      // PLATE_CONTACT_SLACK of this cell's bottom (hit.distance measures
+      // from the cell CENTER, so subtract the half-cell to the bottom).
+      if (other.contactOnlySupport && hit.distance - halfCell > PLATE_CONTACT_SLACK) continue
+      return true
     }
   }
   return false
