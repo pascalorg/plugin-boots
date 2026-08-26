@@ -6,6 +6,7 @@ import { Color, CylinderGeometry, DynamicDrawUsage, Euler, type InstancedMesh, M
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { collideCapsule } from './collision'
+import { spawnCrater } from './craters'
 import { spawnDebris } from './debris'
 import * as destruct from './destruction'
 import { collideVoxelTargets, damageSegment, damageTarget, useDestruction } from './destruction'
@@ -330,6 +331,10 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   }
 
   sfx.explosion()
+
+  // Ground scar — craters.tsx owns the green-vs-road/building call and the
+  // 16-slot ring buffer; a blast on pavement or indoors is a no-op here.
+  spawnCrater(world, center, BLAST_RADIUS)
 
   // Dust storm — a handful of plumes (each auto-spawns haze) ringed by
   // puffs, plus one wide lingering haze. All feature-checked (contract).

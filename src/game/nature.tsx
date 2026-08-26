@@ -16,6 +16,7 @@ import {
   ShapeGeometry,
   Vector3,
 } from 'three'
+import { Craters } from './craters'
 import { type GameWorld, pointOnRoad } from './world'
 
 /**
@@ -241,6 +242,81 @@ function setInstances(mesh: InstancedMesh | null, data: Scatter): void {
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
 }
 
+// --- Clearable scatter fields (craters strip blades) ---------------------------
+
+/** A live instanced field (grass, flowers) that ground scars can clear. */
+type ScatterField = { mesh: InstancedMesh; matrices: Matrix4[] }
+
+const scatterFields = new Set<ScatterField>()
+
+/**
+ * Register an instanced field for radius clearing; returns the
+ * unregister. The component refs below call this — exported so headless
+ * tests can wire a field without rendering.
+ */
+export function registerScatterField(mesh: InstancedMesh, matrices: Matrix4[]): () => void {
+  const field: ScatterField = { mesh, matrices }
+  scatterFields.add(field)
+  return () => {
+    scatterFields.delete(field)
+  }
+}
+
+/** Registered field count (tests/debug). */
+export function scatterFieldCount(): number {
+  return scatterFields.size
+}
+
+const _clearedMatrix = new Matrix4().makeScale(0, 0, 0)
+
+/**
+ * Zero-scale every registered instance within r of (x, z) — craters.tsx
+ * calls this once per detonation (O(instances) per call, never per
+ * frame). Instanced attributes are rebuilt from `matrices` whenever a
+ * mesh re-attaches, so the source matrices are zeroed too: a cleared
+ * blade stays cleared for the session. Returns how many were cleared.
+ */
+export function clearScatterInRadius(x: number, z: number, r: number): number {
+  const rSq = r * r
+  let cleared = 0
+  for (const field of scatterFields) {
+    const { mesh, matrices } = field
+    let touched = false
+    for (let i = 0; i < matrices.length; i++) {
+      const e = matrices[i]!.elements
+      // Already cleared — a zero-scale matrix parks at the origin; skip it
+      // so a crater near (0, 0) never double-counts dead blades.
+      if (e[0] === 0 && e[5] === 0 && e[10] === 0) continue
+      const dx = e[12]! - x
+      const dz = e[14]! - z
+      if (dx * dx + dz * dz > rSq) continue
+      matrices[i]!.copy(_clearedMatrix)
+      mesh.setMatrixAt(i, _clearedMatrix)
+      touched = true
+      cleared++
+    }
+    if (touched) mesh.instanceMatrix.needsUpdate = true
+  }
+  return cleared
+}
+
+/**
+ * Ref factory: attach = upload instances + register the field for
+ * clearing; detach = unregister. Memoized per Scatter in the component so
+ * React doesn't churn the registration on unrelated renders.
+ */
+function fieldRef(data: Scatter): (mesh: InstancedMesh | null) => void {
+  let unregister: (() => void) | null = null
+  return (mesh) => {
+    unregister?.()
+    unregister = null
+    if (mesh) {
+      setInstances(mesh, data)
+      unregister = registerScatterField(mesh, data.matrices)
+    }
+  }
+}
+
 const GRASS_A = new Color('#79b054')
 const GRASS_B = new Color('#55853c')
 const FLOWER_WHITE = new Color('#f6f3e7')
@@ -321,6 +397,11 @@ export function Nature({ world }: { world: GameWorld }) {
     [world],
   )
 
+  // Grass + flowers are clearable fields (craters strip the blades they
+  // cover); bushes/rocks survive a blast, so they bind the plain way.
+  const grassRef = useMemo(() => fieldRef(grass), [grass])
+  const flowersRef = useMemo(() => fieldRef(flowers), [flowers])
+
   const center = world.buildingAabb.isEmpty()
     ? new Vector3()
     : world.buildingAabb.getCenter(new Vector3())
@@ -340,7 +421,7 @@ export function Nature({ world }: { world: GameWorld }) {
       <instancedMesh
         args={[grassGeometry, undefined, grass.matrices.length]}
         frustumCulled={false}
-        ref={(mesh) => setInstances(mesh, grass)}
+        ref={grassRef}
       >
         <meshStandardMaterial roughness={1} side={2} vertexColors />
       </instancedMesh>
@@ -349,7 +430,7 @@ export function Nature({ world }: { world: GameWorld }) {
       <instancedMesh
         args={[flowerGeometry, undefined, flowers.matrices.length]}
         frustumCulled={false}
-        ref={(mesh) => setInstances(mesh, flowers)}
+        ref={flowersRef}
       >
         <meshStandardMaterial roughness={1} />
       </instancedMesh>
@@ -371,6 +452,9 @@ export function Nature({ world }: { world: GameWorld }) {
         <icosahedronGeometry args={[0.5, 0]} />
         <meshStandardMaterial roughness={0.9} />
       </instancedMesh>
+
+      {/* Blast scars live with the lawn — same mount, same teardown. */}
+      <Craters />
     </group>
   )
 }
