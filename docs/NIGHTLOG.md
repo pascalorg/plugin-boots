@@ -873,3 +873,32 @@ half; pre-check 'wall' raced the early-session window-pocket carve. The
 positive half (pane shatters when the boom is within 3.2 m) still needs a
 verified run with the lob landing on the player's side ~1.5 m from the
 pane. Queued for feedback next round.
+
+### QA round-2 item 3 (door lane) — resolved + re-verified headless
+
+The doorway-never-clears FAIL decomposed into three stacked causes, each
+now fixed and verified:
+1. collectWorld's wall sweep baked the closed leaf/frame into the wall's
+   voxel grid — fixed by the hosted-child mesh fence (f968e01).
+2. ResurrectionSweep re-hid nested door/window meshes ~0.5 s after
+   jump-in — fixed by fencing the sweep through collectMeshes (83b5160).
+3. ensureVoxelTarget's `visible = false` on the wall's render mesh CULLED
+   the nested door/window roots (three.js visibility cascades): invisible
+   closed doors that still blocked an apparently-open doorway. Fixed in
+   5b8be1d: hideForGameKeepingRoots masks (layers 0 — masks don't cascade)
+   any mesh on a path down to another live node's registered root
+   (world.solidRoots fence) and visible-hides only kept-free branches;
+   restore rides the session teardown ledger, hideForGame gained a mask-0
+   guard so the sweep can't undo it. +3 planner tests (380 green).
+
+Re-verify (canonical repro /tmp/boots-qa7/run6.mjs, fresh-drawn room +
+mid-wall door): closed prompt span [-0.4..0.4]; closed leaf renders and
+blocks (identify 2.2 m pair, walk stops); E opens; OPEN identify clear at
+span center and ±0.3 (first hits 6.5 m THROUGH the doorway); open
+walk-through passes, y flat (no invisible-voxel climbing);
+DOOR_RESULT {closedBlocked:true, openThrough:true}. Scene c2cf8aafeb0e:
+E prompt + toggle green, countCoplanarSuspects 0, masks stable over 8 s,
+shots through open front door carve ZERO wall_s voxels. Residual blockage
+at door_bed1/door_bed2 there is fixture authoring (doors centered exactly
+on wall junctions — the neighbor wall's uncut end owns half the aperture),
+not a game bug.
