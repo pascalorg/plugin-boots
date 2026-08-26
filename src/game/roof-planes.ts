@@ -1,4 +1,4 @@
-import type { Mesh } from 'three'
+import type { Color, Mesh } from 'three'
 import { type RoofPlaneBasis, roofPlaneFrame } from './roof-framing'
 
 /**
@@ -143,13 +143,22 @@ function clusterNormals(tris: readonly Tri[]): NormalCluster[] {
   return clusters
 }
 
+/** RoofPlaneBasis + the assembly thickness the shell exposed — the roof
+ * voxel lane (destruction.ts Phase C2) needs it to size the per-plane
+ * pinned grid; buildRafters accepts these unchanged (structural superset). */
+export type RoofPlane = RoofPlaneBasis & {
+  /** Outer − inner surface offset along the plane normal (metres). */
+  thickness: number
+}
+
 /**
  * Enumerate the sloped planes of a roof node's collected meshes as
- * world-space RoofPlaneBasis records (the buildRafters input). Flat roofs
- * and pure walls yield an empty array — the caller keeps its volume grid
- * and simply frames nothing.
+ * world-space RoofPlane records (RoofPlaneBasis + thickness — the
+ * buildRafters input plus what the voxel lane needs). Flat roofs and pure
+ * walls yield an empty array — the caller keeps its volume grid and simply
+ * frames nothing.
  */
-export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlaneBasis[] {
+export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
   const up: Tri[] = []
   const down: Tri[] = []
   collectSlopedTris(meshes, up, down)
@@ -194,7 +203,7 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlaneBasis[] {
     }
   }
 
-  const planes: RoofPlaneBasis[] = []
+  const planes: RoofPlane[] = []
   for (const cluster of upClusters) {
     const len = Math.sqrt(
       cluster.nx * cluster.nx + cluster.ny * cluster.ny + cluster.nz * cluster.nz,
@@ -261,7 +270,80 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlaneBasis[] {
       ],
       eaveLength: maxA - minA,
       slopeLength: maxU - minU,
+      thickness,
     })
   }
   return planes
+}
+
+/**
+ * Dominant ROOF SURFACE color of the merged shell — the fix for the C2 QA
+ * defect where targetBaseColor grabbed the FIRST material slot (usually the
+ * white Wall/Trim tone) so voxelized roofs rendered white. The merged CSG
+ * mesh carries material groups; the roof surface is whichever material owns
+ * the most sloped UP-facing triangle area, so sum that per material slot
+ * and return the winner's color (cloned). Returns null when no sloped face
+ * carries a colored material — callers keep their existing fallback.
+ */
+export function roofSurfaceColor(meshes: readonly Mesh[]): Color | null {
+  const areas = new Map<Color, number>()
+  const v = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+  for (const mesh of meshes) {
+    const geometry = mesh.geometry
+    const position = geometry.getAttribute('position')
+    if (!position) continue
+    const index = geometry.getIndex()
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    const total = index ? index.count : position.count
+    const groups =
+      geometry.groups.length > 0 ? geometry.groups : [{ start: 0, count: total, materialIndex: 0 }]
+    const m = mesh.matrixWorld.elements
+    const world = (vi: number, o: number): void => {
+      const x = position.getX(vi)
+      const y = position.getY(vi)
+      const z = position.getZ(vi)
+      v[o] = m[0]! * x + m[4]! * y + m[8]! * z + m[12]!
+      v[o + 1] = m[1]! * x + m[5]! * y + m[9]! * z + m[13]!
+      v[o + 2] = m[2]! * x + m[6]! * y + m[10]! * z + m[14]!
+    }
+    for (const group of groups) {
+      const material = materials[Math.min(group.materialIndex ?? 0, materials.length - 1)]
+      const color = (material as { color?: Color } | undefined)?.color
+      if (!color) continue
+      const start = group.start
+      const end = Math.min(total, group.start + group.count)
+      let area = 0
+      for (let i = start; i + 2 < end; i += 3) {
+        world(index ? index.getX(i) : i, 0)
+        world(index ? index.getX(i + 1) : i + 1, 3)
+        world(index ? index.getX(i + 2) : i + 2, 6)
+        const ux = v[3]! - v[0]!
+        const uy = v[4]! - v[1]!
+        const uz = v[5]! - v[2]!
+        const wx = v[6]! - v[0]!
+        const wy = v[7]! - v[1]!
+        const wz = v[8]! - v[2]!
+        const cx = uy * wz - uz * wy
+        const cy = uz * wx - ux * wz
+        const cz = ux * wy - uy * wx
+        const len = Math.sqrt(cx * cx + cy * cy + cz * cz)
+        if (len < 1e-8) continue
+        const ny = cy / len
+        // Sloped and UP-facing only — the shingle side, never undersides,
+        // fascia, or gable-end trim.
+        if (ny <= 0 || !slopedPitchOk(ny)) continue
+        area += len / 2
+      }
+      if (area > 0) areas.set(color, (areas.get(color) ?? 0) + area)
+    }
+  }
+  let best: Color | null = null
+  let bestArea = 0
+  for (const [color, area] of areas) {
+    if (area > bestArea) {
+      bestArea = area
+      best = color
+    }
+  }
+  return best ? best.clone() : null
 }

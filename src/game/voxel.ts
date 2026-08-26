@@ -57,8 +57,9 @@ const basisIsYawOnly = (q: VoxelBasis) => q.x === 0 && q.z === 0
 const yawOfBasis = (q: VoxelBasis) => 2 * Math.atan2(q.y, q.w)
 
 /** out = q ⊗ v ⊗ q⁻¹ — rotate a world vector into the grid frame when q is
- * a VoxelGridData basis. Allocation-free (writes into `out`). */
-const rotateByBasis = (
+ * a VoxelGridData basis. Allocation-free (writes into `out`). Exported for
+ * the roof-plane lane (destruction.ts skin/sheet math on pitched grids). */
+export const rotateByBasis = (
   q: VoxelBasis,
   x: number,
   y: number,
@@ -74,7 +75,7 @@ const rotateByBasis = (
 }
 
 /** Rotate by the conjugate (grid → world) — see rotateByBasis. */
-const rotateByBasisInverse = (
+export const rotateByBasisInverse = (
   q: VoxelBasis,
   x: number,
   y: number,
