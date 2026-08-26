@@ -7,9 +7,11 @@ import {
   damageTarget,
   ensureVoxelTarget,
   isTearLaneNode,
+  probeLandingY,
   resetDestruction,
   useDestruction,
 } from './destruction'
+import { probeTargetSupport } from './structure'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -141,6 +143,88 @@ describe('slab sandwich anatomy', () => {
     expect(target.kind).toBe('volume')
     expect(target.segments.length).toBe(0)
     expect(target.sheets.length).toBe(0)
+  })
+
+  test('an ELEVATED thin slab hangs full-depth joists below its deck', () => {
+    // Host slab-tool default (0.05 m) drawn as a second-storey floor: too
+    // thin for embedded framing, but something must hold a floor up — the
+    // joists frame at full 2×10 depth with tops at the slab underside.
+    const world = makeWorld([4, 0.05, 3]) // top at y=3, underside 2.95
+    const target = ensureVoxelTarget(world, 'slab-1')!
+    expect(target.kind).toBe('slab')
+    expect(target.segments.length).toBeGreaterThan(0)
+    for (const joist of target.segments) {
+      expect(joist.size[1]).toBeCloseTo(0.235, 6) // full 2×10 depth
+      expect(joist.center[1] + joist.size[1] / 2).toBeCloseTo(2.95, 6) // tops at underside
+    }
+    // Same 16" o.c. layout machinery as embedded joists.
+    const lines = new Set(target.segments.map((s) => Math.round(s.center[0] * 1000)))
+    expect(lines.size).toBe(10)
+  })
+
+  test('a GROUND-LEVEL thin slab still carries no framing', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('slab-ground', 'slab', [4, 0.05, 3], [10, 0.025, 10]))
+    const target = ensureVoxelTarget(world, 'slab-ground')!
+    expect(target.kind).toBe('slab')
+    expect(target.segments.length).toBe(0)
+  })
+})
+
+describe('zero-thickness ceiling planes (host levels emit 0 m plates)', () => {
+  test('a 0-extent ceiling voxelizes as a thin plate hugging the surface, not an isotropic volume', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('ceil-1', 'ceiling', [6.5, 0.0002, 5], [0, 2.48, 0]))
+    const target = ensureVoxelTarget(world, 'ceil-1')!
+    expect(target.kind).toBe('slab')
+    const { grid } = target
+    expect(grid.count).toBeGreaterThan(0)
+    // Every cell top stays within a couple cm of the plane — the volume
+    // lane's ~0.15 m cells used to interpenetrate the base row of walls
+    // standing ON the plane and defeat the structure probe's min-drop gate.
+    for (let i = 0; i < grid.count; i++) {
+      const top = grid.centers[i * 3 + 1]! + grid.cellY / 2
+      expect(top).toBeGreaterThan(2.44)
+      expect(top).toBeLessThan(2.51)
+    }
+  })
+
+  test('a wall whose only underpinning is the voxelized ceiling plane stays SUPPORTED', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('ceil-1', 'ceiling', [6.5, 0.0002, 5], [0, 2.48, 0]))
+    // Upper-storey wall bearing on the plane (base at 2.5, like the host's
+    // level-2 walls; not in world.walls, so it grids via the volume lane —
+    // the probe only needs its base row).
+    world.colliders.push(boxCollider('wall-up', 'wall', [2, 2.45, 0.1], [0, 2.5 + 2.45 / 2, 0]))
+    const ceiling = ensureVoxelTarget(world, 'ceil-1')!
+    const wallUp = ensureVoxelTarget(world, 'wall-up')!
+    // Voxelization disabled both host colliders — support must come from
+    // the ceiling PLATE cells alone.
+    const ctx = {
+      colliders: world.colliders,
+      targets: () => [ceiling],
+      terrainY: 0,
+    }
+    expect(probeTargetSupport(wallUp, ctx)).toBe(true)
+    // Counterfactual: with the plate gone the wall really is unsupported —
+    // the probe above is not trivially true.
+    expect(probeTargetSupport(wallUp, { ...ctx, targets: () => [] })).toBe(false)
+  })
+})
+
+describe('floors for things — debris/dust landing probe', () => {
+  test('probeLandingY reports the highest live surface below the point', () => {
+    const world = makeWorld()
+    // Over the intact slab: the host collider top (y = 3).
+    expect(probeLandingY(world, 0, 4, 0)).toBeCloseTo(3, 5)
+    // Off every surface: the lot's terrain plane.
+    expect(probeLandingY(world, 30, 4, 30)).toBe(0)
+    // Voxelized (host collider disabled) — the grid answers, same plane.
+    ensureVoxelTarget(world, 'slab-1')
+    expect(Math.abs(probeLandingY(world, 0, 4, 0) - 3)).toBeLessThan(0.06)
+    // Through-hole: the probe falls past the carved column to the terrain.
+    damageTarget(world, 'slab-1', new Vector3(1, 2.85, 1), 0.7)
+    expect(probeLandingY(world, 1, 4, 1)).toBeLessThan(0.1)
   })
 })
 

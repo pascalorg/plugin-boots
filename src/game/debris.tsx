@@ -50,8 +50,12 @@ type DebrisSlot = {
   sx: number
   sy: number
   sz: number
-  /** Rest half-height for the ground plane check. */
+  /** Landing plane + rest half-height — the y the piece settles at. */
   ground: number
+  /** Rest half-height alone (ground = landing plane Y + rest). */
+  rest: number
+  /** One-shot landing probe done (fires at apex, see useFrame). */
+  probed: boolean
   ttl: number
   ttl0: number
   bounced: boolean
@@ -76,6 +80,8 @@ const slots: DebrisSlot[] = Array.from({ length: CAPACITY }, () => ({
   sy: 0.1,
   sz: 0.1,
   ground: 0.05,
+  rest: 0.05,
+  probed: false,
   ttl: 0,
   ttl0: 1,
   bounced: false,
@@ -83,6 +89,22 @@ const slots: DebrisSlot[] = Array.from({ length: CAPACITY }, () => ({
 const colors: Color[] = Array.from({ length: CAPACITY }, () => new Color(1, 1, 1))
 let cursor = 0
 let liveCount = 0
+
+/**
+ * Landing-plane probe ("floors for things", MULTILEVEL-PLAN Phase B):
+ * (x, y, z) → world Y of the highest live surface below. Injected per
+ * session by game-root (destruction.probeLandingY over colliders + voxel
+ * targets) so this module keeps zero scene knowledge. Each piece probes
+ * ONCE, at its apex — by then it has drifted clear of the face it was torn
+ * from, so upper-storey debris lands on the upper floor, not the terrain.
+ * Off-slab horizontal drift after the probe is accepted (the plan defers
+ * true debris-vs-voxel collision forever).
+ */
+export type DebrisGroundProbe = (x: number, y: number, z: number) => number
+let groundProbe: DebrisGroundProbe | null = null
+export function setDebrisGroundProbe(probe: DebrisGroundProbe | null): void {
+  groundProbe = probe
+}
 
 export function spawnDebris(
   x: number,
@@ -125,7 +147,9 @@ export function spawnDebris(
   slot.sx = size
   slot.sy = size
   slot.sz = size
-  slot.ground = size / 2
+  slot.rest = size / 2
+  slot.ground = slot.rest
+  slot.probed = false
   slot.ttl = ttl * (0.7 + Math.random() * 0.6)
   slot.ttl0 = slot.ttl
   slot.bounced = false
@@ -205,7 +229,9 @@ export function spawnFlatDebris(
   slot.sx = Math.max(0.05, w) * (0.7 + Math.random() * 0.3)
   slot.sy = Math.max(0.05, h) * (0.7 + Math.random() * 0.3)
   slot.sz = PLATE_THICKNESS
-  slot.ground = 0.045
+  slot.rest = 0.045
+  slot.ground = slot.rest
+  slot.probed = false
   slot.ttl = 2.6 + Math.random() * 1.5
   slot.ttl0 = slot.ttl
   slot.bounced = false
@@ -245,6 +271,33 @@ export function debrisCensus(): {
     meanVy: live > 0 ? vy / live : 0,
     meanVyFlat: flats > 0 ? vyFlat / flats : 0,
   }
+}
+
+/** Per-live-piece plain-data dump for the `__boots.debris()` handle —
+ * position, resolved landing plane (`ground` = plane + rest half-height)
+ * and settle state. QA asserts upper-storey debris rests on the upper
+ * floor from this, without traversing instance matrices. */
+export function debrisDump(): Array<{
+  x: number
+  y: number
+  z: number
+  flat: boolean
+  ground: number
+  settled: boolean
+}> {
+  const out: Array<{ x: number; y: number; z: number; flat: boolean; ground: number; settled: boolean }> = []
+  for (const s of slots) {
+    if (!s.alive) continue
+    out.push({
+      x: +s.px.toFixed(3),
+      y: +s.py.toFixed(3),
+      z: +s.pz.toFixed(3),
+      flat: s.flat,
+      ground: +s.ground.toFixed(3),
+      settled: s.bounced,
+    })
+  }
+  return out
 }
 
 const GRAVITY = 14
@@ -313,6 +366,13 @@ export function Debris() {
       s.rx += s.wx * dt
       s.ry += s.wy * dt
       s.rz += s.wz * dt
+      // One-shot landing probe at apex (first descending frame): pick the
+      // floor this piece rests on — an upper-storey slab, a wall top, or
+      // the terrain plane. See setDebrisGroundProbe.
+      if (!s.probed && s.vy <= 0) {
+        s.probed = true
+        if (groundProbe) s.ground = s.rest + groundProbe(s.px, s.py, s.pz)
+      }
       const half = s.ground
       if (s.py < half && s.vy < 0) {
         s.py = half

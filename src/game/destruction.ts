@@ -463,6 +463,26 @@ function buildSegments(wall: WallEntry, layout: StudMember[]): SegmentMember[] {
  * Y). 'floor' is defensive — hosts register floors as slabs today. */
 const SLAB_KINDS = new Set(['slab', 'ceiling', 'floor'])
 
+/** Synthesized plate thickness for ZERO-extent horizontals. Host ceiling
+ * planes are 0 m thick; gridded isotropically they produce ~0.15 m cells
+ * that interpenetrate the base row of any wall standing ON the plane, and
+ * the structure probe's min-drop gate then rejects those hits as same-row
+ * contact — upper walls "lose" their only underpinning the moment the
+ * ceiling voxelizes anywhere and crumble (QA round 2, 2026-08-26). A
+ * nominal plate hugging the plane from below keeps cell tops within a
+ * couple cm of the surface, so walls bearing on the plane stay supported. */
+const PLATE_SYNTH_T = 0.05
+/** Toppings thinner than this carry no EMBEDDED framing (mirrors thin
+ * walls)… */
+const JOIST_EMBED_MIN = 0.12
+/** …but a thin slab whose underside sits this far above the lot plane is a
+ * real inter-storey floor — something must hold it up, so its joists HANG
+ * below the topping (subfloor-over-joists). This makes the framing reveal
+ * work on host-default 0.05 m slabs, which the slab inspector cannot
+ * thicken today. Ceiling planes never frame (the floor above owns the
+ * assembly's lumber). */
+const ELEVATED_FLOOR_MIN_BASE = 1.0
+
 /** Real joist lumber: 2×10 section (38 × 235 mm), 16" o.c. like the studs. */
 const JOIST_W = 0.038
 const JOIST_D = 0.235
@@ -476,19 +496,27 @@ const JOIST_TOP_DROP = 0.04
  * the real 38 × 235 mm section with tops at slabTop − 0.04. Long runs split
  * into ~1.2 m charcoal sticks exactly like wall plates, hp 2, so they chip,
  * snap, and splash-chip through the same segment machinery as studs. Thin
- * toppings (< 0.12 m) carry no framing, mirroring thin walls.
+ * toppings (< JOIST_EMBED_MIN) carry no EMBEDDED framing, mirroring thin
+ * walls — but with `hungBelow` (elevated inter-storey floors) the joists
+ * frame at full depth with their TOPS at the slab underside instead, the
+ * subfloor-over-joists picture a real thin floor deck presents from below.
  */
-function buildJoists(bounds: Box3, thickness: number): SegmentMember[] {
-  if (thickness < 0.12) return []
+function buildJoists(bounds: Box3, thickness: number, hungBelow = false): SegmentMember[] {
+  if (thickness < JOIST_EMBED_MIN && !hungBelow) return []
   bounds.getSize(_size)
   const alongX = _size.x <= _size.z // joists RUN along the short plan axis
   const runLength = (alongX ? _size.x : _size.z) - 0.04
   const spread = alongX ? _size.z : _size.x
   if (runLength < 0.3 || spread < 0.1) return []
   // Depth clamps just inside the sandwich (same spirit as wall segments) so
-  // lumber never pokes proud of the ceiling skin on thin slabs.
-  const depth = Math.min(JOIST_D, Math.max(0.06, thickness - JOIST_TOP_DROP - 0.01))
-  const centerY = bounds.max.y - JOIST_TOP_DROP - depth / 2
+  // lumber never pokes proud of the ceiling skin on thin slabs; hung joists
+  // frame at full depth below the deck.
+  const depth = hungBelow
+    ? JOIST_D
+    : Math.min(JOIST_D, Math.max(0.06, thickness - JOIST_TOP_DROP - 0.01))
+  const centerY = hungBelow
+    ? bounds.min.y - depth / 2
+    : bounds.max.y - JOIST_TOP_DROP - depth / 2
   const yaw = alongX ? 0 : Math.PI / 2 // local +x maps to (cos yaw, sin yaw)
   const midRun = alongX ? (bounds.min.x + bounds.max.x) / 2 : (bounds.min.z + bounds.max.z) / 2
   const segments: SegmentMember[] = []
@@ -683,6 +711,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   let grid: ReturnType<typeof buildVoxelGrid>
   let kind: VoxelTarget['kind'] = wall ? 'wall' : 'volume'
   let slabThickness = 0
+  let slabJoistsHang = false
   if (wall) {
     // Wall anatomy needs ≥ 3 layers across the thickness so the two drywall
     // skins survive dropInteriorCells with a real cavity between them —
@@ -722,7 +751,17 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     // skins with the joist cavity between. Plan cells stay ~0.3 m. Thick or
     // non-plate shapes (piers, ramps mis-kinded as slabs) keep the volume.
     _bounds.getSize(_size)
-    const extent = _size.y
+    let extent = _size.y
+    if (extent <= 0.001 && Math.min(_size.x, _size.z) > PLATE_SYNTH_T * 2) {
+      // Zero-extent plate (host ceiling planes): synthesize a nominal plate
+      // hugging the surface from BELOW so it takes the sandwich lane — see
+      // PLATE_SYNTH_T for why the isotropic volume grid must not win here.
+      // max.y nudges up 5 mm so the surface sits strictly inside the top
+      // cell layer (a face exactly on a cell boundary voxelizes flakily).
+      _bounds.max.y += 0.005
+      _bounds.min.y = _bounds.max.y - PLATE_SYNTH_T
+      extent = PLATE_SYNTH_T
+    }
     if (
       extent > 0.001 &&
       extent <= MAX_ANATOMY_THICKNESS &&
@@ -737,6 +776,10 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
       if (grid.count > 0) {
         kind = 'slab'
         slabThickness = extent
+        slabJoistsHang =
+          nodeType !== 'ceiling' &&
+          extent < JOIST_EMBED_MIN &&
+          _bounds.min.y > ELEVATED_FLOOR_MIN_BASE
       } else {
         grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
       }
@@ -755,7 +798,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid))
     : kind === 'slab'
-      ? buildJoists(_bounds, slabThickness)
+      ? buildJoists(_bounds, slabThickness, slabJoistsHang)
       : []
   const target: VoxelTarget = {
     nodeId,
@@ -1437,6 +1480,43 @@ export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
     if (collider.nodeId === nodeId) return SLAB_KINDS.has(collider.nodeType)
   }
   return false
+}
+
+/**
+ * One-shot landing-plane resolve for debris/dust ("floors for things",
+ * MULTILEVEL-PLAN Phase B polish): the HIGHEST live surface at or below
+ * (x, y, z) — a live (non-disabled) collider top, a live voxel cell of any
+ * target (downward DDA), else the lot's terrain plane at y = 0. Colliders
+ * whose top is above the probe point are skipped (a probe from inside a
+ * wall's box must not "land" on that wall's top), and voxelized nodes are
+ * covered by their grids since voxelization disables the host collider.
+ * Called once per debris piece (at apex) / dust burst — never per frame.
+ */
+export function probeLandingY(world: GameWorld, x: number, y: number, z: number): number {
+  let best = 0
+  for (const collider of world.colliders) {
+    if (collider.disabled) continue
+    const box = collider.worldBox
+    const top = box.max.y
+    if (top <= best || top > y + 0.02) continue
+    if (x < box.min.x - 0.02 || x > box.max.x + 0.02) continue
+    if (z < box.min.z - 0.02 || z > box.max.z + 0.02) continue
+    best = top
+  }
+  for (const target of useDestruction.getState().targets.values()) {
+    const grid = target.grid
+    if (grid.aliveCount === 0) continue
+    const reach = y + 0.01 - best
+    if (reach <= 0) break
+    const hit = raycastVoxels(grid, x, y + 0.01, z, 0, -1, 0, reach)
+    // distance ≥ 0.02 rejects "probe point already inside a live cell"
+    // (a piece would otherwise freeze at its own apex height).
+    if (hit && hit.distance >= 0.02) {
+      const top = y + 0.01 - hit.distance
+      if (top > best) best = top
+    }
+  }
+  return best
 }
 
 export type SegmentRayHit = {

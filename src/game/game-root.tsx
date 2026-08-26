@@ -7,15 +7,16 @@ import { type Object3D, Raycaster, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { GameBoundary } from './boundary'
 import { Builder, PlacedPieces } from './builder'
-import { clearDebris, Debris } from './debris'
+import { clearDebris, Debris, debrisDump, setDebrisGroundProbe } from './debris'
 import {
   prevoxelizeTick,
+  probeLandingY,
   resetDestruction,
   useDestruction,
   type VoxelTarget,
 } from './destruction'
 import { Doors, doorsDebug } from './doors'
-import { clearDust, dustDebug, DustSystem } from './dust'
+import { clearDust, dustDebug, DustSystem, setDustFloorProbe } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, resetGlass } from './glass'
@@ -380,6 +381,14 @@ function ActiveGame() {
     // restores every visibility flip untouched.
     for (const root of world.overlayRoots) hideForGame(root)
 
+    // Floors for things (MULTILEVEL-PLAN Phase B polish): debris and dust
+    // resolve their landing plane through one shared downward probe over
+    // live colliders + voxel targets — upper-storey debris rests on the
+    // upper floor instead of falling to the terrain plane.
+    const landingProbe = (x: number, y: number, z: number) => probeLandingY(world, x, y, z)
+    setDebrisGroundProbe(landingProbe)
+    setDustFloorProbe(landingProbe)
+
     // Dev/E2E handle — lets headless tests aim and fire deterministically.
     ;(globalThis as Record<string, unknown>).__boots = {
       world,
@@ -433,6 +442,10 @@ function ActiveGame() {
       sheets: () => dumpDestructionMembers('sheets'),
       // Dust debug — plain-data dump from dust.tsx, never a live ref.
       dust: () => dustDebug(),
+      // Debris debug — per-live-piece position + resolved landing plane
+      // (debris.tsx debrisDump; floors-for-things QA reads settle heights
+      // straight off this instead of traversing instance matrices).
+      debris: () => debrisDump(),
       // Unbreakable-face tripwire (owner round 2026-08-25, feedback B):
       // visible bones-overlay meshes that would actually render right now —
       // MUST be 0 during a session; non-zero means a hide was undone or a
@@ -471,6 +484,8 @@ function ActiveGame() {
     }
     return () => {
       delete (globalThis as Record<string, unknown>).__boots
+      setDebrisGroundProbe(null)
+      setDustFloorProbe(null)
       resetDestruction()
       resetGlass()
       clearDebris()

@@ -125,6 +125,9 @@ type QuadSlot = {
   tile: number
   /** Air-drag coefficient (chips brake hard, plumes hang). */
   drag: number
+  /** Landing plane the quad settles onto (one-shot probe at spawn) — a
+   * plume upstairs sinks to the upper floor, not through the slab. */
+  floor: number
   ttl: number
   ttl0: number
 }
@@ -158,10 +161,25 @@ function makePool(n: number): QuadSlot[] {
     cb: DUST_B,
     tile: 0,
     drag: 3.2,
+    floor: 0,
     ttl: 0,
     ttl0: 1,
   }))
 }
+
+/**
+ * Landing-plane probe ("floors for things", MULTILEVEL-PLAN Phase B) —
+ * same injection contract as debris.setDebrisGroundProbe: (x, y, z) →
+ * world Y of the highest live surface below. One probe per spawn BURST
+ * (all quads of a burst share the floor), never per frame.
+ */
+export type DustFloorProbe = (x: number, y: number, z: number) => number
+let floorProbe: DustFloorProbe | null = null
+export function setDustFloorProbe(probe: DustFloorProbe | null): void {
+  floorProbe = probe
+}
+/** Quad centers hover this far above their floor once settled. */
+const FLOOR_REST = 0.06
 
 const puffs = makePool(PUFF_CAP)
 const haze = makePool(HAZE_CAP)
@@ -289,6 +307,7 @@ export function spawnDust(
   if (puffLive > PUFF_CAP * PRESSURE) count = Math.max(1, count >> 1)
 
   const jitter = kind === 'plume' ? 0.45 : 0.2
+  const floorY = floorProbe ? floorProbe(x, y, z) : 0
   for (let n = 0; n < count; n++) {
     const s = puffs[puffCursor]!
     puffCursor = (puffCursor + 1) % PUFF_CAP
@@ -342,6 +361,7 @@ export function spawnDust(
     s.spin = (Math.random() - 0.5) * (kind === 'plume' ? 0.8 : 1.6)
     s.shade = 0.9 + Math.random() * 0.16
     s.tile = Math.floor(Math.random() * 3)
+    s.floor = floorY
     s.ttl0 = s.ttl
   }
 
@@ -379,6 +399,7 @@ function spawnHazeAt(x: number, y: number, z: number, radius?: number): void {
   s.cb = DUST_B
   s.tile = Math.floor(Math.random() * 3)
   s.drag = 0
+  s.floor = 0 // haze only drifts UP — the clamp never applies
   s.ttl = 2.4 + Math.random()
   s.ttl0 = s.ttl
 }
@@ -409,6 +430,11 @@ export function dustDebug(): Record<string, unknown> {
     hazeMeta: haze
       .filter((s) => s.alive)
       .map((s) => ({ size: s.size, ttl: s.ttl, alpha: s.alpha })),
+    // Floors-for-things QA: per-live-puff height vs its probed floor —
+    // no live puff should ever sit below floor (it settles ON the slab).
+    puffMeta: puffs
+      .filter((s) => s.alive)
+      .map((s) => ({ y: +s.py.toFixed(3), floor: +s.floor.toFixed(3) })),
   }
 }
 
@@ -590,6 +616,12 @@ function stepPool(
     s.px += s.vx * dt
     s.py += s.vy * dt
     s.pz += s.vz * dt
+    // Settle ON the spawn-probed floor — a plume never sinks through the
+    // slab it was kicked up from (setDustFloorProbe).
+    if (isPuff && s.py < s.floor + FLOOR_REST) {
+      s.py = s.floor + FLOOR_REST
+      if (s.vy < 0) s.vy = 0
+    }
     s.roll += s.spin * dt
     const k = 1 - s.ttl / s.ttl0 // 0 → 1 over life
     const grow = s.size * (0.55 + 1.65 * k)
