@@ -81,7 +81,7 @@ Hitscan via BVH raycast. Muzzle flash = 2-frame emissive quad. Tracer = fading
 line. Recoil = camera kick + viewmodel spring. `1/2/3/5` + wheel to switch,
 `R` reloads.
 
-### Destruction (the reason to live) — SHIPPED, phase 3 anatomy
+### Destruction (the reason to live) — SHIPPED through the multilevel pass
 Walls are a real **sandwich**, torn down layer by layer:
 - **Pre-voxelized cladding:** walls swap to their voxel replica ON JUMP-IN
   (not on first hit) — the building already reads as voxels at spawn, with
@@ -118,8 +118,9 @@ pickup clack, build thunk. One AudioContext, master limiter.
 ### Builder mode (battle-builder grammar) — SHIPPED, 3x3 editing
 Slot `4` (or `B`): build tool with three pieces — **wall / floor / roof**
 (everything vertical is a wall, everything inclined is a ROOF — never
-"ramp") — `Q` cycles. Ghost preview snapped to adjacency grid + 90° yaw,
-stacking + hold-to-place runs, `G` undoes; LMB places a solid, collidable,
+"ramp") — `Q` cycles. Ghost preview slot-locked to the occupancy lattice
+(grammar v2), `R` rotates, stacking + hold-to-place runs, `Z` undoes
+(`G` is the grenade); LMB places a solid, collidable,
 immediately-destructible panel.
 **3x3 masks:** each wall piece is a 3x3 cell grid (9-bit mask). Shoot out
 the center cell = window pocket; kill a side column = shorter wall; any
@@ -165,10 +166,12 @@ build-battle and block games, not on home-design software:
 - After Esc, **Keep** turns the session's pieces into real, editable scene
   nodes — play becomes authorship. That bridge is the whole thesis.
 
-### Bots (roadmap, v1-simple)
-"Intruders" toggle: 3–5 capsule bots spawn at the lot edge, steer toward the
-player (seek + obstacle ray-probe), melee for vignette damage. 100 hp,
-hitscan-damageable, fall-and-fade death. No navmesh in v1 (Yuka later).
+### Bots — SHIPPED (waves)
+Gear up at the table → siren countdown → robot waves (droid/dog/drone)
+spawn at the lot edge and steer toward the player (seek + obstacle
+ray-probe, WALL RULE: path around, never through, until breached), melee
+for knockback + vignette damage. Hitscan-damageable, fall-and-fade death,
+mercy ring while staggered. No navmesh yet (Yuka later if hordes grow).
 
 ### Nature (the lot) — SHIPPED, combat trees
 Replace the flat gray void: a big grass-green ground disc (canvas-noise
@@ -207,9 +210,33 @@ vignette, and the pill: **Esc to exit**.
   rotary gun + rear table, combat trees (fell/burn/char to stump), dust
   storm, 3x3 wall masks + window Keep, overcast never-blue sky, volume
   island collapse, Bones overlay hide. QA r3/r4 full pass, 60 fps in-game.
-- **T4 (next):** owner feel-pass on char-collapse burst, Bones overlay
-  hide against a REAL Bones-installed scene, host plugin-tree destruction
-  path, paint tool, rounds/objectives, co-op.
+- **T4 (phase 4) — SHIPPED:** warhammer (slot 6), infinite mega-grenade
+  on `G` (stick model, wind-up, tumbling flight, staggered blast rings +
+  ground craters), ADS on right-click (rifle semi-auto, −75% spread),
+  siren-beacon countdown theatre, material-keyed dust (drywall max /
+  concrete small / wood splinters-only), boots + placards on the tables,
+  bots path AROUND walls until breached, structural 30%-support collapse
+  + hanging-stick rule, resurrection sweep, pipeline pre-warm. P4R3
+  hardening: window interaction hitboxes never become solid colliders,
+  hosted door/window children survive their wall's voxelization
+  (mask-hide via `solidRoots` fence — doors render, open, and clear).
+- **T5 (phase 5) — SHIPPED:** BUILD GRAMMAR V2 integrated — slot-locked
+  ghost (grid.ts targeting), piece-slots.ts as the single occupancy
+  authority (grounding, collapse rings, turbo lockout), `Z` undoes,
+  E-interact on doors/windows/cabinets, turbo clad FIFO budget.
+- **Multilevel (MULTILEVEL-PLAN A–B3) — SHIPPED:** whole-building
+  presence (all storeys stacked + collidable, spawn on lowest ground,
+  stairs walkable), quaternion voxel grids (full orthonormal basis, so
+  pitched roofs voxelize along their own plane and still read as roofs),
+  slab sandwich (floors/ceilings get the wall anatomy on its side:
+  sheathing/ceiling skins, joists, both-face sheets, tear-lane routing,
+  under-column support probe, sampled crumble debris), support cascade
+  (cross-target probe + staggered whole-wall crumbles).
+- **T6 (next):** shape-preserving item destruction (glass-like sub-meshes
+  through the glass system, fine-cell silhouette voxelize), pyramid
+  grammar (roof 2x2 corner heights, floor quadrant masks), paint tool,
+  real Bones members as framing when Bones is installed, bots opening
+  doors, co-op.
 
 ## Risks & mitigations
 - Host camera controls fighting the game camera → write pose in a late
