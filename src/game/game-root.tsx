@@ -27,6 +27,7 @@ import { aimDirection, fire } from './shooting'
 import { GameSky } from './sky'
 import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
+import { PipelineWarmup } from './warmup'
 import { VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
 import {
@@ -455,6 +456,7 @@ function ActiveGame() {
       <Builder />
       <Enemies world={world} />
       <Nature world={world} />
+      <PipelineWarmup />
       <TreesDestruct world={world} />
     </>
   )

@@ -1022,6 +1022,144 @@ export const raycastStuds = raycastSegments
  * stick SNAPS like charcoal — it breaks into 2-3 tumbling pieces spread
  * along its long axis, more splinters, a snap voice. Returns true when
  * damage applied (false: unknown/already broken). */
+// ── Structural collapse (owner rule 2026-08-25) ─────────────────────────────
+// "The wall's top must collapse when less than 30% of the supports (wood
+// frame) still connect it to the floor" — plus its little sibling: a stick
+// hanging above its own chain's break falls immediately.
+//
+// Vertical segments bucket into CHAINS by their XZ column (one chain per
+// stud line). A chain supports the wall up to the BOTTOM of its lowest
+// broken segment (unbroken chain → supports to the top). When fewer than
+// STRUCT_RATIO of the chains support a given height, everything above the
+// 30%-support ceiling comes down: voxels layer by layer (staggered for the
+// avalanche read), remaining sheets fly, remaining segments snap.
+
+const STRUCT_RATIO = 0.3
+const structTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function scheduleStructureCheck(world: GameWorld, nodeId: string): void {
+  const prior = structTimers.get(nodeId)
+  if (prior) clearTimeout(prior)
+  structTimers.set(
+    nodeId,
+    setTimeout(() => {
+      structTimers.delete(nodeId)
+      const target = useDestruction.getState().targets.get(nodeId)
+      if (target) checkStructuralCollapse(world, target)
+    }, 160),
+  )
+}
+
+function breakSegmentQuiet(target: VoxelTarget, segment: SegmentMember): void {
+  segment.hp = 0
+  segment.broken = true
+  const pieces = 2
+  for (let i = 0; i < pieces; i++) {
+    const t = ((i + 0.5) / pieces - 0.5) * segment.size[1]
+    spawnDebris(segment.center[0], segment.center[1] + t, segment.center[2], 0.06, WOOD, 1.1, 3)
+  }
+}
+
+function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
+  if (target.kind !== 'wall' || target.segments.length === 0) return
+  // Bucket vertical segments into stud chains by XZ column (5 cm quantize).
+  const chains = new Map<string, SegmentMember[]>()
+  for (const segment of target.segments) {
+    const [sx, sy, sz] = segment.size
+    if (sy < Math.max(sx, sz)) continue // plates are horizontal chains
+    const key = `${Math.round(segment.center[0] * 20)},${Math.round(segment.center[2] * 20)}`
+    const arr = chains.get(key)
+    if (arr) arr.push(segment)
+    else chains.set(key, [segment])
+  }
+  if (chains.size === 0) return
+
+  let wallTop = -Infinity
+  let changed = false
+  const supportTops: number[] = []
+  for (const arr of chains.values()) {
+    arr.sort((a, b) => a.center[1] - b.center[1])
+    let top = Infinity
+    let below = false
+    for (const segment of arr) {
+      wallTop = Math.max(wallTop, segment.center[1] + segment.size[1] / 2)
+      if (segment.broken) {
+        top = Math.min(top, segment.center[1] - segment.size[1] / 2)
+        below = true
+      } else if (below) {
+        // Hanging stick above its chain's break — it falls now.
+        breakSegmentQuiet(target, segment)
+        changed = true
+      }
+    }
+    supportTops.push(top)
+  }
+
+  // 30%-support ceiling: the height the need-th sturdiest chain still holds.
+  const total = supportTops.length
+  const need = Math.max(1, Math.ceil(total * STRUCT_RATIO))
+  const sorted = supportTops.slice().sort((a, b) => a - b)
+  const ceiling = sorted[total - need]!
+  if (ceiling !== Infinity && ceiling < wallTop - 0.05) {
+    // Everything above the ceiling comes down: voxels in staggered layers…
+    const { grid } = target
+    const layers = new Map<number, number[]>()
+    for (let i = 0; i < grid.count; i++) {
+      if (!grid.alive[i]) continue
+      const y = grid.centers[i * 3 + 1]!
+      if (y <= ceiling) continue
+      const band = Math.floor((y - ceiling) / 0.4)
+      const arr = layers.get(band)
+      if (arr) arr.push(i)
+      else layers.set(band, [i])
+    }
+    const bands = Array.from(layers.keys()).sort((a, b) => a - b)
+    for (const band of bands) {
+      const indices = layers.get(band)!
+      setTimeout(() => {
+        const live = useDestruction.getState().targets.get(target.nodeId)
+        if (!live) return
+        let removed = 0
+        for (const idx of indices) {
+          if (!live.grid.alive[idx]) continue
+          live.grid.alive[idx] = 0
+          live.grid.aliveCount--
+          live.removedQueue.push(idx)
+          removed++
+          if (removed <= 8) {
+            spawnDebris(
+              live.grid.centers[idx * 3]!,
+              live.grid.centers[idx * 3 + 1]!,
+              live.grid.centers[idx * 3 + 2]!,
+              live.grid.cell,
+              live.baseColor,
+              1.6,
+            )
+          }
+        }
+        live.revision++
+        useDestruction.getState().bump()
+      }, 60 * band)
+    }
+    // …remaining sheets above fly, remaining segments above snap.
+    for (const sheet of target.sheets ?? []) {
+      if (!sheet.flownOff && sheet.center[1] > ceiling) flySheetOff(target, sheet)
+    }
+    for (const segment of target.segments) {
+      if (!segment.broken && segment.center[1] > ceiling - 0.05) {
+        breakSegmentQuiet(target, segment)
+      }
+    }
+    changed = true
+    sfx.woodCrumble(24)
+  }
+
+  if (changed) {
+    target.revision++
+    useDestruction.getState().bump()
+  }
+}
+
 export function damageSegment(
   world: GameWorld,
   nodeId: string,
@@ -1029,7 +1167,6 @@ export function damageSegment(
   damage: number,
   point: Vector3,
 ): boolean {
-  void world // reserved (future: structural collapse of the wall above)
   const target = useDestruction.getState().targets.get(nodeId)
   if (!target) return false
   const segment = target.segments.find((s) => s.id === segmentId)
@@ -1075,6 +1212,9 @@ export function damageSegment(
     spawnDebris(point.x, point.y, point.z, 0.02 + Math.random() * 0.025, WOOD, 2.4, 1.2)
   }
   sfx.studSnap()
+  // A break may drop hanging sticks or trip the 30%-support rule — check
+  // after a short settle so bursts coalesce into one avalanche.
+  scheduleStructureCheck(world, nodeId)
   return true
 }
 
@@ -1206,6 +1346,8 @@ export function dropTarget(nodeId: string): void {
 export function resetDestruction(): void {
   for (const timer of islandTimers.values()) clearTimeout(timer)
   islandTimers.clear()
+  for (const timer of structTimers.values()) clearTimeout(timer)
+  structTimers.clear()
   prevoxelizeSkip.clear()
   useDestruction.getState().reset()
 }

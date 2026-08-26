@@ -92,18 +92,18 @@ export function GunTable({ world }: { world: GameWorld }) {
         }}
         fixtures={<SirenBeacon />}
       >
-        {/* pistol on display — the real viewmodel gun, scaled up to read */}
-        <Spin position={[-0.4, TABLE_HEIGHT + 0.12, 0]}>
-          <group rotation={[0, Math.PI / 2, 0]} scale={1.3}>
+        {/* pistol on display — lying flat on the tabletop (owner call) */}
+        <group position={[-0.4, TABLE_TOP + 0.03, 0.05]} rotation={[0, 0.45, 0]}>
+          <group rotation={[-Math.PI / 2 + 0.08, Math.PI / 2, 0]} scale={1.3}>
             <PistolModel />
           </group>
-        </Spin>
-        {/* rifle on display — the real model, laid out like the heavy table */}
-        <Spin position={[0.35, TABLE_HEIGHT + 0.14, 0]}>
-          <group rotation={[0, Math.PI / 2, 0]} scale={1.15}>
+        </group>
+        {/* rifle on display — lying flat along the table (owner call) */}
+        <group position={[0.35, TABLE_TOP + 0.04, -0.08]} rotation={[0, -0.12, 0]}>
+          <group rotation={[-Math.PI / 2 + 0.06, Math.PI / 2, 0]} scale={1.15}>
             <RifleModel />
           </group>
-        </Spin>
+        </group>
         {/* work boots, sitting beside the guns — toes toward the player
          * walking up (owner call: you should recognize the boots at a
          * glance), with a small placard behind them. */}
@@ -113,7 +113,7 @@ export function GunTable({ world }: { world: GameWorld }) {
         <TableSign
           position={[0, TABLE_TOP, -0.28]}
           rotation={[0, 0, 0]}
-          text="PUT YOUR BOOTS ON"
+          text={geared ? 'YOU ARE COOKED' : 'PUT YOUR BOOTS ON'}
         />
       </WeaponTable>
       <WeaponTable
@@ -251,7 +251,9 @@ function SirenBeacon() {
   return (
     <group ref={rootRef} position={[0.76, TABLE_TOP, -0.3]}>
       <SirenModel />
-      {active && <pointLight color="#ff2222" intensity={2} distance={6} position={[0, 0.14, 0]} />}
+      {/* ALWAYS mounted: adding a light mid-session recompiles pipelines
+       * (the gear-up lag burst) — only intensity animates. */}
+      <pointLight color="#ff2222" distance={6} intensity={active ? 2 : 0} position={[0, 0.14, 0]} />
     </group>
   )
 }
