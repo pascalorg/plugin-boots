@@ -10,7 +10,7 @@ import { waveState } from './enemies-state'
 import { playerRig } from './player'
 import { getSession } from './session'
 import * as weaponModels from './weapon-models'
-import { HammerModel, MinigunModel } from './weapon-models'
+import { HammerModel, MinigunModel, PistolModel, RifleModel } from './weapon-models'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -62,9 +62,9 @@ export function minigunTablePosition(world: GameWorld): Vector3 {
   const fwdX = -Math.sin(world.spawnYaw)
   const fwdZ = -Math.cos(world.spawnYaw)
   return new Vector3(
-    world.spawn.x - fwdX * 3 + fwdZ * 0.6,
+    world.spawn.x - fwdX * 4.5 + fwdZ * 0.6,
     0,
-    world.spawn.z - fwdZ * 3 - fwdX * 0.6,
+    world.spawn.z - fwdZ * 4.5 - fwdX * 0.6,
   )
 }
 
@@ -92,19 +92,17 @@ export function GunTable({ world }: { world: GameWorld }) {
         }}
         fixtures={<SirenBeacon />}
       >
-        {/* pistol on display */}
+        {/* pistol on display — the real viewmodel gun, scaled up to read */}
         <Spin position={[-0.4, TABLE_HEIGHT + 0.12, 0]}>
-          <mesh>
-            <boxGeometry args={[0.05, 0.07, 0.26]} />
-            <meshStandardMaterial color="#23262b" metalness={0.4} roughness={0.4} />
-          </mesh>
+          <group rotation={[0, Math.PI / 2, 0]} scale={1.3}>
+            <PistolModel />
+          </group>
         </Spin>
-        {/* rifle on display */}
+        {/* rifle on display — the real model, laid out like the heavy table */}
         <Spin position={[0.35, TABLE_HEIGHT + 0.14, 0]}>
-          <mesh>
-            <boxGeometry args={[0.06, 0.09, 0.72]} />
-            <meshStandardMaterial color="#33363b" metalness={0.35} roughness={0.45} />
-          </mesh>
+          <group rotation={[0, Math.PI / 2, 0]} scale={1.15}>
+            <RifleModel />
+          </group>
         </Spin>
         {/* work boots, sitting beside the guns — toes toward the player
          * walking up (owner call: you should recognize the boots at a
@@ -113,7 +111,7 @@ export function GunTable({ world }: { world: GameWorld }) {
           <BootsPair />
         </group>
         <TableSign
-          position={[-0.68, TABLE_TOP, -0.28]}
+          position={[0, TABLE_TOP, -0.28]}
           rotation={[0, 0, 0]}
           text="PUT YOUR BOOTS ON"
         />
