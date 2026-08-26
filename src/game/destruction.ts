@@ -5,7 +5,7 @@ import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
-import { hideForGame } from './session'
+import { hideForGameKeepingRoots } from './session'
 import {
   buildVoxelGrid,
   dropInteriorCells,
@@ -653,7 +653,19 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     revision: 0,
   }
 
-  for (const mesh of meshes) hideForGame(mesh)
+  // Hide the host meshes through the keep-aware path: a wall's render mesh
+  // is the scene-graph PARENT of its hosted door/window/item roots (the
+  // host's WallRenderer nests them), so a plain `visible = false` would
+  // cull live doors and windows along with the wall. Masking keeps them
+  // rendering; every other node's own root is fenced the same way the
+  // collect-time mesh sweep fences (world.solidRoots). The node's OWN root
+  // must not fence its own hide.
+  const keepRoots = new Set(world.solidRoots ?? [])
+  if (wall) keepRoots.delete(wall.root)
+  for (const collider of world.colliders) {
+    if (collider.nodeId === nodeId) keepRoots.delete(collider.root)
+  }
+  for (const mesh of meshes) hideForGameKeepingRoots(mesh, keepRoots)
   for (const collider of world.colliders) {
     if (collider.nodeId === nodeId) collider.disabled = true
   }

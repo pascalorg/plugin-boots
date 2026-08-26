@@ -854,3 +854,22 @@ into a ramp — ramp stays registered on the W slot, the overlapping R slot
 stays placeable, ramp pose is off the R lattice. Re-queue: skeleton
 collapse on real scenes + owner feel-pass on char-collapse burst
 (GRAND-PLAN line 65 / MASTERPLAN T4); trees-host scope untouched.
+
+### P4R3 manager QA re-run (post-fix, headed, /tmp/boots-night/p4r3/qa3.mjs)
+
+PASS: setup, c-ghost-occupied, a-glazing-lane (glass,glass,glass,none — the
+previously BLOCKED gate; window hitbox fix confirmed live), i-exit ×2,
+j-pageerrors 0, j-console 0.
+b-grenade-flight: core spec PROVEN (pre-check glass → grenade crossed the
+pane plane at +0.37 s → instant re-check non-glass = shattered mid-flight →
+boom +2.65 s, carve 431). Flagged FAIL only on the script's stale
+`wallsUnchangedAtCheck` (walls −4 tolerance): the probe pistol shot now
+flies through the freed sash and tears the interior wall (tearRadius
+0.45 m ≫ 4 voxels) — pre-fix it was eaten by the hitbox. Recalibrate.
+b-grenade-detonation: FAIL is a lob-placement artifact — the grenade
+rested 4.12 m from the glazing point and the pane correctly SURVIVED
+(post-check glass), which demonstrates the ≤3.2 m radius rule's negative
+half; pre-check 'wall' raced the early-session window-pocket carve. The
+positive half (pane shatters when the boom is within 3.2 m) still needs a
+verified run with the lob landing on the player's side ~1.5 m from the
+pane. Queued for feedback next round.

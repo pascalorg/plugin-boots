@@ -55,9 +55,87 @@ function findEditorCanvas(): HTMLCanvasElement | null {
 }
 
 export function hideForGame(object: Object3D): void {
-  if (!current || !object.visible) return
+  // The mask-0 guard: an object maskForGame already game-hid must never be
+  // re-hidden via `visible = false` — three.js visibility CASCADES, so that
+  // flip would cull hosted-child subtrees (nested door/window roots) that
+  // the mask hide deliberately left rendering. The resurrection sweep hits
+  // this path every ~0.5 s on voxelized wall meshes.
+  if (!current || !object.visible || object.layers.mask === 0) return
   current.hiddenObjects.push({ object, visible: object.visible })
   object.visible = false
+}
+
+/**
+ * Game-hide an object WITHOUT culling its scene-graph descendants: zero its
+ * layers mask (masks don't cascade — children keep rendering) instead of
+ * flipping `visible`. Restore rides the session teardown list, which also
+ * survives dev-time ActiveGame remounts correctly: remount healing restores
+ * only the visibility ledger, a re-voxelize re-masks idempotently (mask
+ * already 0 → no duplicate record), and the one teardown entry still puts
+ * the original mask back on exit.
+ */
+export function maskForGame(object: Object3D): void {
+  if (!current || object.layers.mask === 0) return
+  const mask = object.layers.mask
+  object.layers.mask = 0
+  current.teardown.push(() => {
+    object.layers.mask = mask
+  })
+}
+
+/** The hide plan for one node subtree that may NEST other live nodes'
+ * registered roots (`keep`): branches free of kept roots hide wholesale
+ * (`hide` → visible = false), while meshes standing on a path DOWN TO a
+ * kept root can only be masked (`mask` → layers 0) so the kept subtree
+ * keeps rendering. Kept roots themselves are never entered. Pure —
+ * exported for unit tests. */
+export function planHideKeepingRoots(
+  object: Object3D,
+  keep: ReadonlySet<Object3D>,
+): { hide: Object3D[]; mask: Object3D[] } {
+  const hide: Object3D[] = []
+  const mask: Object3D[] = []
+  const containsKept = (obj: Object3D): boolean => {
+    for (const child of obj.children) {
+      if (keep.has(child) || containsKept(child)) return true
+    }
+    return false
+  }
+  const walk = (obj: Object3D): void => {
+    if (!containsKept(obj)) {
+      hide.push(obj)
+      return
+    }
+    if ((obj as { isMesh?: boolean }).isMesh) mask.push(obj)
+    for (const child of obj.children) {
+      if (!keep.has(child)) walk(child)
+    }
+  }
+  walk(object)
+  return { hide, mask }
+}
+
+/**
+ * Hide one node's render subtree for the session while every registered
+ * root in `keep` nested inside it KEEPS RENDERING — the voxelize-time twin
+ * of collectWorld's hosted-child mesh fence. The host's WallRenderer mounts
+ * hosted doors / windows / wall items INSIDE the wall's render mesh, so the
+ * old plain `visible = false` on that mesh culled them along: invisible
+ * closed doors that still blocked an apparently-open doorway (QA round-2
+ * item 3). Without a keep set (hand-built test worlds) this is exactly
+ * hideForGame.
+ */
+export function hideForGameKeepingRoots(
+  object: Object3D,
+  keep: ReadonlySet<Object3D> | undefined,
+): void {
+  if (!keep || keep.size === 0) {
+    hideForGame(object)
+    return
+  }
+  const plan = planHideKeepingRoots(object, keep)
+  for (const obj of plan.hide) hideForGame(obj)
+  for (const obj of plan.mask) maskForGame(obj)
 }
 
 /**
