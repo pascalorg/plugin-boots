@@ -6,6 +6,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { Hud } from './hud'
 import { GameInput } from './input'
+import { captureDemolition } from './save-demolition'
 
 /**
  * The out-of-React session singleton: DOM concerns (canvas, fullscreen,
@@ -318,5 +319,8 @@ export function exitGame(): void {
   if (document.pointerLockElement) document.exitPointerLock()
 
   const placed = useBoots.getState().placed
-  useBoots.getState().setPendingDecision(placed.length > 0)
+  // Snapshot leveled scene nodes BEFORE the game tree (and the destruction
+  // state with it) unmounts — the panel offers to save the demolition too.
+  const leveled = captureDemolition()
+  useBoots.getState().setPendingDecision(placed.length > 0 || leveled > 0)
 }

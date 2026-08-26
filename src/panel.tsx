@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { useBoots } from './store'
 import { discardPlaced, keepPlaced } from './game/keep'
+import { deleteDestroyed, discardDemolition, useDemolition } from './game/save-demolition'
 import { enterGame } from './game/session'
 
 /**
@@ -14,6 +15,7 @@ import { enterGame } from './game/session'
 export default function BootsPanel() {
   const pendingDecision = useBoots((s) => s.pendingDecision)
   const placed = useBoots((s) => s.placed)
+  const destroyed = useDemolition((s) => s.destroyed)
   const [lastKept, setLastKept] = useState<string | null>(null)
 
   const wallCount = placed.filter((p) => p.piece === 'wall').length
@@ -44,7 +46,7 @@ export default function BootsPanel() {
         ⏵ Jump in
       </button>
 
-      {pendingDecision && placed.length > 0 && (
+      {pendingDecision && (placed.length > 0 || destroyed.length > 0) && (
         <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
           <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
             Nothing was saved while you played — shooting, breaking, all of it stays in the game.
@@ -57,6 +59,13 @@ export default function BootsPanel() {
             {wallCount > 0 ? ` (${wallCount} wall${wallCount > 1 ? 's' : ''} can become real)` : ''}
             .
           </p>
+          {destroyed.length > 0 && (
+            <p className="text-xs leading-relaxed">
+              You fully leveled <span className="font-semibold">{destroyed.length}</span> building
+              element{destroyed.length > 1 ? 's' : ''} — saving deletes {destroyed.length > 1 ? 'them' : 'it'} from
+              the building (undoable). Partially damaged walls always stay intact.
+            </p>
+          )}
           <div className="flex gap-2">
             <button
               className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
@@ -73,25 +82,27 @@ export default function BootsPanel() {
                 ]
                   .filter(Boolean)
                   .join(', ')
+                const removed = deleteDestroyed()
                 setLastKept(
                   `Kept ${walls} wall${walls === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
-                    result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''
-                  }`,
+                    removed > 0 ? ` · deleted ${removed} leveled element${removed === 1 ? '' : 's'}` : ''
+                  }${result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''}`,
                 )
               }}
               type="button"
             >
-              Keep{wallCount > 0 ? ` ${wallCount} wall${wallCount > 1 ? 's' : ''}` : ''}
+              Save changes
             </button>
             <button
               className="flex-1 rounded-md border border-sidebar-border/60 px-2 py-1.5 text-xs hover:bg-sidebar-accent/60"
               onClick={() => {
                 discardPlaced()
-                setLastKept('Discarded')
+                discardDemolition()
+                setLastKept('Discarded — your building is exactly as it was')
               }}
               type="button"
             >
-              Discard
+              Discard all
             </button>
           </div>
           {otherCount > 0 && (
