@@ -25,6 +25,21 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   dust (drywall max / concrete small / wood splinters-only).
 - Prod pins: boots `7f5b912` + bones `cdd3dab` (z-fight fix) via PR #419.
 
+- Phase 4 (complete): warhammer slot 6, mega-grenade on G (infinite,
+  stick-grenade model with in-hand wind-up + tumbling flight, staggered
+  blast rings — no detonation hitch), ADS (buttons-bitmask input fix,
+  rifle semi-auto while aiming), siren countdown theatre, material-keyed
+  dust, boots + signs on the tables ("YOU ARE COOKED" after gear-up),
+  bots path around walls, structural 30%-support collapse + hanging-stick
+  rule, resurrection sweep (host wall rebuilds can't resurrect
+  undamageable drywall), pipeline pre-warm (no gear-up lag).
+- Phase 5 (complete): BUILD GRAMMAR V2 INTEGRATED — the ghost is
+  slot-locked (grid.ts targeting, rawGhost/resolveSnap retired),
+  piece-slots.ts is the single occupancy authority (grounding, collapse
+  rings, died-slot turbo lockout), whole-building stacked-levels
+  presence, E-interact on doors/windows/cabinets, quaternion voxel grids,
+  turbo clad FIFO budget. 375 tests / 12.4k assertions green.
+
 ## In flight
 
 - Phase 4 round 2 (fleet): QA-driven refinements — builder/keep/hud/
@@ -33,18 +48,17 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
 - E2E gap verification (agent): Bones-installed scene (coplanar suspects
   = 0 in game) + host Nature-tree ignite path.
 
-## Next (phase 5 — builder revamp, starts when phase 4 releases builder.tsx)
+## Next (phase 6 — the shape-preserving pass)
 
-Build Grammar v2 integration per the REVIEW's 5-agent plan. Foundations
-ALREADY SHIPPED (`grid.ts` + `support.ts`, 33 tests, ad1b970): absolute
-world grid (CELL 3 / STOREY 2.8 / REACH 6), slots = wall edges / floor
-faces / roof diagonals, player-anchored targeting (yaw-cardinal neighbor +
-DDA ray override + ±35° pitch bands), R = wall far-edge flip (beats the
-ray) / roof ascent cycle, ring-ordered support collapse. Remaining agents:
-ghost-targeting (builder.tsx — the ghost NEVER floats again), support
-hooks (collapse via dropTarget), store+keep (slotId on pieces), QA
-(ceiling flow, ramp-chaining flow, turbo bridge, collapse cascade — see
-"the two flows" section of the spec).
+1. Items keep their SHAPE when breaking (owner call): glass-like item
+   sub-meshes (shower panels…) route through the GLASS shatter system;
+   opaque parts voxelize at fine silhouette-preserving cells; v2 = convex
+   mesh fracture.
+2. Pyramid grammar: roof 2×2 corner heights + floor 2×2 quadrant masks
+   (the FULL_MASK ripple round).
+3. Paint tool; bots opening doors; real Bones members as the framing when
+   Bones is installed (plugin-trees per-instance hide API is already
+   shipped as reserve: globalThis.__pascalTreesRuntime).
 
 ## Backlog (owner-fed, ordered)
 
