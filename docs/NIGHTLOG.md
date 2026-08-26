@@ -684,3 +684,55 @@ Tests: destruction/grenade/shooting suites green including 3 new tests
 (explosion carve, blast isolation, staggered skeleton snap). Full-tree
 tsc/test pending the phase-5 builder agent's in-flight rewrite of
 builder.tsx (their errors, their files — recheck before ship).
+
+## Phase 5, round 1 — Build Grammar v2 lands (2026-08-26, manager stitch)
+
+The ghost is SLOT-LOCKED. Four agents + manager wired the whole v2 contract
+(REVIEW-binding) on top of the shipped grid.ts/support.ts foundations:
+
+- **ghost-targeting** (builder.tsx/.test.ts): rawGhost/resolveSnap/aimHeightAt
+  and the old snap constants are gone — one authority per frame,
+  `grid.resolveTargetSlot` (reused input, no hot-loop allocs). Ghost renders
+  at the slot pose ONLY; blue/red = TargetResult.valid; failing reason feeds
+  hud.ghostStatus. R = rotState 0..3 (wall far-edge flip / roof ascent /
+  floor no-op), resets on piece-TYPE switch only. Turbo: press 0.15 s, held
+  new-slot ≥0.05 s, per-hold dedupe Set, died-slot lockout. Placement →
+  registerPlacement (registry refusal rolls the store back); Z-undo →
+  onPieceRemoved. PlacedPieces owns session wiring: scene-support probe
+  (skips `__boots-piece-*`; disabled colliders defer to live voxels in the
+  slot AABB +0.35 m), collapse listener (removePlaced + debris + crumble),
+  resetPieceSlots on unmount. builderDebug.ghost() exposes slot poses for QA.
+- **support-hooks** (piece-slots.ts NEW + support.ts): the single occupancy
+  authority — slotId ↔ pieceId 1:1, SupportGraph over grid.slotsTouching,
+  memoized isSupported (occupied → BFS, empty → terrain ∨ scene probe ∨
+  supported neighbor), onPieceRemoved = THE removal entry point, BFS-ring
+  cascade at 50 ms/ring via onCollapse, died-slot lockout (150 ms) stamped
+  on undo/destruction/cascade, cleared on re-fill. flushCollapse for
+  teardown/QA.
+- **store-keep** (store.ts, keep.ts + tests): PlacedPiece.slotId? (legacy
+  pieces render-only, off-graph); addPlaced returns the stored piece;
+  removePlaced(id) for cascade eviction anywhere in the list. Keep now
+  ATTEMPTS real slab nodes for floors (3×3 world footprint, yaw-rotated,
+  schema-parse guarded — skips like roofs, never throws); walls/roofs
+  untouched; keep tests round-trip REAL @pascal-app/core schemas.
+- **hud-panel** (hud.ts, panel.tsx): hud.ghostStatus(reason, owner) — red
+  line 16 px under the crosshair ("needs support" / "occupied" / "too far"),
+  owner-keyed, change-gated, type-aliased to grid's TargetResult reason.
+  Panel copy: the mandated grid/ceiling/R/ramp-chain sentence verbatim;
+  shortcuts deduped.
+- **manager stitch**: the two unowned destruction seams —
+  settleSupportAfterRemoval funnels EVERY voxel-removal path (carve, island
+  crumble, avalanche bands, sheet fly-offs, dropTarget): a placed piece
+  carved to zero voxels runs the exact undo cleanup (store removal → unmount
+  splices collider + drops replica → onPieceRemoved lockout + cascade);
+  scene carves fire a 160 ms-debounced notifySceneSupportChanged so pieces
+  propped by demolished scene geometry fall. +2 integration tests
+  (builder.test.ts). Also fixed a float-boundary flake in the lockout test
+  (stamp+150 exact-edge assert rounds below the window at big
+  performance.now values).
+
+Landed alongside (parallel owner pass, committed separately): carve splash
+chips framing (chipSegmentSplash, hp-1 floor). Suite: 307 pass / 0 fail,
+tsc clean, real exit codes checked. Known QA-watch items: no budgeted
+placement-voxelize queue (turbo worst case ~20 ensureVoxelTarget/s), panel
+copy still says floors stay game-only (Keep now attempts slabs).

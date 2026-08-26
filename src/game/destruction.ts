@@ -1,8 +1,10 @@
 import { Box3, Color, Matrix4, type Mesh, Vector3 } from 'three'
 import { create } from 'zustand'
+import { useBoots } from '../store'
 import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
+import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { hideForGame } from './session'
 import {
   buildVoxelGrid,
@@ -15,8 +17,6 @@ import {
   type VoxelGridData,
   type VoxelSource,
 } from './voxel'
-import { useBoots } from '../store'
-import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { bvhFor, type GameWorld } from './world'
 
 /**
@@ -941,6 +941,44 @@ function chipSegmentSplash(target: VoxelTarget, point: Vector3, radius: number):
   if (voiced) sfx.studHit()
 }
 
+// ── Build-grammar v2 slot wiring (phase 5) ──────────────────────────────────
+// Destruction is the third door pieces leave through (undo Z and the support
+// cascade are the other two) and the only event that changes what the SCENE
+// can prop up. Every voxel-removal path funnels through
+// settleSupportAfterRemoval:
+//   placed piece (nodeId `__boots-piece-*`) fully dead → the SAME cleanup
+//     as undo: store removal (unmount splices the collider + dropTarget)
+//     then piece-slots.onPieceRemoved (died-slot lockout + orphan cascade);
+//   scene geometry → debounced piece-slots.notifySceneSupportChanged(), so
+//     pieces propped by a demolished scene wall re-check and fall.
+
+/** Collider nodeId prefix builder.tsx gives placed pieces (kept in sync). */
+const PLACED_PIECE_PREFIX = '__boots-piece-'
+/** Debounce for the scene-support sweep — matches the island/structure
+ * settle rhythm so one burst of carves pays for one re-probe. */
+const SCENE_SUPPORT_SETTLE_MS = 160
+let sceneSupportTimer: ReturnType<typeof setTimeout> | null = null
+
+function settleSupportAfterRemoval(target: VoxelTarget): void {
+  if (target.nodeId.startsWith(PLACED_PIECE_PREFIX)) {
+    if (target.grid.aliveCount > 0) return
+    const pieceId = Number(target.nodeId.slice(PLACED_PIECE_PREFIX.length))
+    if (!Number.isFinite(pieceId)) return
+    // Store removal first (undo-ordering contract): unmounting the mesh
+    // splices its collider entry and drops this voxel replica. No debris
+    // burst here — the carve that killed it already threw its own.
+    useBoots.getState().removePlaced(pieceId)
+    const slotId = slotOf(pieceId)
+    if (slotId) onPieceRemoved(slotId) // lockout stamp + BFS-ring cascade
+    return
+  }
+  if (sceneSupportTimer !== null) return
+  sceneSupportTimer = setTimeout(() => {
+    sceneSupportTimer = null
+    notifySceneSupportChanged()
+  }, SCENE_SUPPORT_SETTLE_MS)
+}
+
 /** Carve a sphere out of any target at a world point (voxelizes on first
  * hit); spawns debris, queues the island check. Returns how many voxels
  * were removed. `direction` (optional, phase 3) is the shot direction —
@@ -1037,10 +1075,12 @@ export function damageTarget(
     setTimeout(() => {
       islandTimers.delete(nodeId)
       crumbleIslands(target)
+      settleSupportAfterRemoval(target) // island crumble can zero a piece
     }, 140),
   )
   // Cladding all gone? The bare frame can't stand — skeleton snap.
   maybeSkeletonSnap(target)
+  settleSupportAfterRemoval(target)
   return removed.length
 }
 
@@ -1229,6 +1269,7 @@ function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
         useDestruction.getState().bump()
         // The avalanche can strip the LAST cladding cells — skeleton snap.
         maybeSkeletonSnap(live)
+        settleSupportAfterRemoval(live) // avalanche layers change scene support
       }, 60 * band)
     }
     // …remaining sheets above fly, remaining segments above snap.
@@ -1247,6 +1288,7 @@ function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
   if (changed) {
     target.revision++
     useDestruction.getState().bump()
+    settleSupportAfterRemoval(target) // fly-offs strip scene-support voxels
   }
 }
 
@@ -1580,10 +1622,21 @@ export function dropTarget(nodeId: string): void {
     islandTimers.delete(nodeId)
   }
   const state = useDestruction.getState()
-  if (state.targets.delete(nodeId)) state.bump()
+  if (state.targets.delete(nodeId)) {
+    state.bump()
+    // A scene replica leaving changes what can prop placed pieces; piece
+    // replicas don't (their own unmount already runs the slot cleanup).
+    if (!nodeId.startsWith(PLACED_PIECE_PREFIX)) {
+      notifySceneSupportChanged()
+    }
+  }
 }
 
 export function resetDestruction(): void {
+  if (sceneSupportTimer !== null) {
+    clearTimeout(sceneSupportTimer)
+    sceneSupportTimer = null
+  }
   for (const timer of islandTimers.values()) clearTimeout(timer)
   islandTimers.clear()
   for (const timer of structTimers.values()) clearTimeout(timer)

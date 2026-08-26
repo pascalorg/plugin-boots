@@ -24,17 +24,26 @@ import {
   TWO_THIRD_WALL_MASK,
   wallExitTransform,
 } from './builder'
-import { dropTarget, ensureVoxelTarget, resetDestruction, useDestruction } from './destruction'
+import {
+  damageTarget,
+  dropTarget,
+  ensureVoxelTarget,
+  resetDestruction,
+  useDestruction,
+} from './destruction'
 import { resolveTargetSlot, STOREY, type TargetInput, parseSlotId } from './grid'
 import {
   DIED_SLOT_LOCKOUT_MS,
   diedAt,
+  flushCollapse,
   isDeathLocked,
   isOccupied as slotIsOccupied,
   isSupported as slotIsSupported,
+  onCollapse,
   onPieceRemoved,
   registerPlacement,
   resetPieceSlots,
+  setSceneSupportProbe,
 } from './piece-slots'
 import { playerRig } from './player'
 import { fire } from './shooting'
@@ -729,6 +738,111 @@ describe('placed pieces are destructible', () => {
     // Z-undo path: PlacedPieceMesh cleanup calls dropTarget(nodeId).
     dropTarget('__boots-piece-1')
     expect(useDestruction.getState().targets.has('__boots-piece-1')).toBe(false)
+  })
+})
+
+// --- Destruction ↔ slot registry seams (manager wiring, phase 5) ------------
+// Destruction is the THIRD door a piece leaves through (undo Z and the
+// support cascade are the others): a replica carved to zero voxels must run
+// the exact undo cleanup, and scene carves must re-check scene-propped
+// pieces (destruction.settleSupportAfterRemoval → piece-slots).
+
+/** One box collider registered the way PlacedPieceMesh / scene walls do it. */
+function worldWithBoxCollider(nodeId: string): GameWorld {
+  const pose = piecePose('wall', 0)
+  const mesh = new Mesh(new BoxGeometry(...PIECE_DIMS.wall))
+  mesh.position.set(0, pose.y, 0)
+  mesh.updateMatrixWorld(true)
+  mesh.geometry.computeBoundingBox()
+  const entry: ColliderEntry = {
+    mesh,
+    bvh: bvhFor(mesh),
+    inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+    worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+    root: mesh,
+    nodeId,
+    nodeType: 'block',
+  }
+  return {
+    colliders: [entry],
+    walls: new Map(),
+    glass: [],
+    doors: [],
+    overlayRoots: [],
+    buildingAabb: entry.worldBox.clone(),
+    spawn: new Vector3(0, 0, 6),
+    spawnYaw: 0,
+    levelId: null,
+  }
+}
+
+describe('destruction ↔ slot registry (the third door pieces leave through)', () => {
+  afterEach(() => {
+    resetDestruction()
+    resetPieceSlots()
+    useBoots.setState({ placed: [] })
+  })
+
+  test('a piece carved to zero voxels runs the undo cleanup and cascades', () => {
+    const store = useBoots.getState()
+    const base = store.addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0, slotId: 'Wz:0,0,0' })
+    const upper = store.addPlaced({
+      piece: 'wall',
+      position: [0, STOREY, 0],
+      yaw: 0,
+      slotId: 'Wz:0,0,1',
+    })
+    registerPlacement('Wz:0,0,0', base.id)
+    registerPlacement('Wz:0,0,1', upper.id)
+    // The PlacedPieces collapse listener, headless: store removal per ring.
+    const off = onCollapse((pieceId) => {
+      useBoots.getState().removePlaced(pieceId)
+    })
+
+    const nodeId = `__boots-piece-${base.id}`
+    const world = worldWithBoxCollider(nodeId)
+    expect(ensureVoxelTarget(world, nodeId)).not.toBeNull()
+    // Blast-sized carve: every voxel of the replica dies in one call…
+    damageTarget(world, nodeId, new Vector3(0, piecePose('wall', 0).y, 0), 10)
+
+    // …so the piece leaves the store + registry and stamps the lockout,
+    expect(useBoots.getState().placed.find((p) => p.id === base.id)).toBeUndefined()
+    expect(slotIsOccupied('Wz:0,0,0')).toBe(false)
+    expect(diedAt('Wz:0,0,0')).toBeGreaterThan(0)
+    // and the orphaned piece above falls through the SAME path.
+    flushCollapse()
+    expect(slotIsOccupied('Wz:0,0,1')).toBe(false)
+    expect(diedAt('Wz:0,0,1')).toBeGreaterThan(0)
+    expect(useBoots.getState().placed.length).toBe(0)
+    off()
+  })
+
+  test('scene carves re-check scene-propped pieces (debounced notify)', async () => {
+    let alive = true
+    setSceneSupportProbe((slotId) => slotId === 'F:2,2,1' && alive)
+    const propped = useBoots
+      .getState()
+      .addPlaced({ piece: 'floor', position: [6, STOREY, 6], yaw: 0, slotId: 'F:2,2,1' })
+    registerPlacement('F:2,2,1', propped.id)
+    expect(slotIsSupported('F:2,2,1')).toBe(true) // probe answer now cached
+    const off = onCollapse((pieceId) => {
+      useBoots.getState().removePlaced(pieceId)
+    })
+
+    // The scene geometry propping it gets demolished.
+    alive = false
+    const world = worldWithBoxCollider('scene-block-1')
+    expect(ensureVoxelTarget(world, 'scene-block-1')).not.toBeNull()
+    damageTarget(world, 'scene-block-1', new Vector3(0, piecePose('wall', 0).y, 0), 0.4)
+
+    // The cached answer stands until the debounced sweep lands…
+    expect(slotIsOccupied('F:2,2,1')).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 220))
+    flushCollapse()
+    // …then the orphan cascades out of the registry AND the store.
+    expect(slotIsOccupied('F:2,2,1')).toBe(false)
+    expect(useBoots.getState().placed.length).toBe(0)
+    off()
   })
 })
 
