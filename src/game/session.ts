@@ -1,3 +1,4 @@
+import { useScene } from '@pascal-app/core'
 import { useEditor } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
 import type { Object3D, PerspectiveCamera } from 'three'
@@ -264,6 +265,24 @@ export function enterGame(): boolean {
     document.removeEventListener('pointerlockchange', onLockChange)
     document.removeEventListener('fullscreenchange', onFullscreenChange)
   })
+
+  // ── Scene-write sentinel ────────────────────────────────────────────────
+  // THE promise: nothing you do in the game is saved. The host autosaves its
+  // draft from the live scene store, so the guarantee holds iff the store is
+  // NEVER written during play (Keep runs after exit, behind its own button).
+  // This sentinel watches the store for the whole session and screams if any
+  // code path violates that — a canary, not a fixer.
+  {
+    const nodesAtEnter = useScene.getState().nodes
+    const unsub = useScene.subscribe((state) => {
+      if (state.nodes !== nodesAtEnter && useBoots.getState().phase === 'game') {
+        console.error(
+          '[boots] INVARIANT VIOLATION: the scene store changed during play — nothing in-game may write it. Investigate immediately.',
+        )
+      }
+    })
+    session.teardown.push(unsub)
+  }
 
   useBoots.getState().resetSession()
   useBoots.getState().setPhase('game')

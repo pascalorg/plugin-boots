@@ -46,6 +46,11 @@ export default function BootsPanel() {
 
       {pendingDecision && placed.length > 0 && (
         <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
+          <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
+            Nothing was saved while you played — shooting, breaking, all of it stays in the game.
+            Only the button below writes anything, and Discard leaves your building exactly as it
+            was.
+          </p>
           <p className="text-xs leading-relaxed">
             You built <span className="font-semibold">{placed.length}</span> piece
             {placed.length > 1 ? 's' : ''} in-game
