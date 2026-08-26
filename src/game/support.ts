@@ -80,6 +80,15 @@ export class SupportGraph {
     this.supportedCache = null
   }
 
+  /** Forget every slot (session teardown — piece-slots.ts resets through
+   * here so the injected adjacency/probe closures survive for the next
+   * session). */
+  clear(): void {
+    this.present.clear()
+    this.grounded.clear()
+    this.supportedCache = null
+  }
+
   /** True iff the slot holds a piece connected to any grounded slot
    * through present slots. Cached until the graph or world changes. */
   isSupported(slotId: SlotId): boolean {

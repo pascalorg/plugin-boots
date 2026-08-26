@@ -84,6 +84,10 @@ const TIE = 0.01
 const DESTRUCTIBLE = new Set([
   'wall',
   'door',
+  // Window FRAMES (world.ts routes a window's glass meshes to world.glass,
+  // never into colliders, so this only voxelizes the solid surround —
+  // hammer/rifle on a window band reads as breakable, not sparks-only).
+  'window',
   'slab',
   'floor',
   'ceiling',

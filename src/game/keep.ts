@@ -39,7 +39,17 @@ import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, type WallPocket } fro
  * pitch atan(WALL_H/3) in degrees, no walls below, rotated to the piece
  * yaw. The mask is ignored for roofs (partial roofs keep the full quad);
  * fully-dead roofs are skipped, schema failures fall back to skipped so
- * they stay game-only. FLOORS still have no 1:1 node — always skipped.
+ * they stay game-only.
+ *
+ * FLOORS (build grammar v2): a game floor piece ATTEMPTS a 'slab' registry
+ * node — defaults + schema parse, explicit polygon = the piece's 3 × 3
+ * footprint corners (world XZ, yaw-rotated about the piece center) at the
+ * slot pose, elevation = the piece's base y, autoFromWalls false so the
+ * host never re-derives the outline. Exactly like roofs: the 3×3 mask is
+ * ignored while it has any live cell (FULL_MASK grammar is deferred with
+ * the 2×2 masks), fully-dead floors are skipped, and a missing 'slab'
+ * registry kind or a schema-parse failure counts the piece as skipped so
+ * it stays game-only — the attempt never throws past keepPlaced.
  *
  * Discard forgets everything.
  */
@@ -51,6 +61,8 @@ export type KeepResult = {
   windows: number
   doors: number
   roofs: number
+  /** Floor pieces kept as real 'slab' nodes (each also counts in `kept`). */
+  floors: number
 }
 
 export { planWallMask, trimmedWallSpan } from './builder'
@@ -126,11 +138,49 @@ function createRoofNode(piece: PlacedPiece, levelId: string): boolean {
   }
 }
 
+/** Best-effort floor piece → explicit-polygon 'slab' node. The polygon is
+ * the piece's square footprint in world XZ (slab polygons are [x, z]
+ * pairs, same plane convention as wall start/end), rotated by the piece
+ * yaw about its center — a no-op for the square v2 slots (yaw snaps to
+ * 90°) but correct for any legacy pose. Missing kind / schema throw →
+ * false, and the caller counts the piece as skipped. */
+function createSlabNode(piece: PlacedPiece, levelId: string): boolean {
+  const def = nodeRegistry.get('slab') as RegistryDef | undefined
+  if (!def?.schema) return false
+  const hx = PIECE_DIMS.floor[0] / 2
+  const hz = PIECE_DIMS.floor[2] / 2
+  // Yaw about +Y maps local (x, z) → world (x·cos + z·sin, −x·sin + z·cos)
+  // — the same frame trimmedWallSpan uses for wall endpoints.
+  const cos = Math.cos(piece.yaw)
+  const sin = Math.sin(piece.yaw)
+  const corner = (lx: number, lz: number): [number, number] => [
+    piece.position[0] + lx * cos + lz * sin,
+    piece.position[2] - lx * sin + lz * cos,
+  ]
+  try {
+    const slab = def.schema.parse({
+      ...(def.defaults?.() ?? {}),
+      object: 'node',
+      parentId: levelId,
+      visible: true,
+      metadata: {},
+      polygon: [corner(-hx, -hz), corner(hx, -hz), corner(hx, hz), corner(-hx, hz)],
+      holes: [],
+      elevation: piece.position[1],
+      autoFromWalls: false,
+    })
+    useScene.getState().createNode(slab as AnyNode, levelId as AnyNodeId)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function keepPlaced(): KeepResult {
   const placed = useBoots.getState().placed
   const def = nodeRegistry.get('wall') as RegistryDef | undefined
   const levelId = useViewer.getState().selection.levelId
-  const result: KeepResult = { kept: 0, skipped: 0, windows: 0, doors: 0, roofs: 0 }
+  const result: KeepResult = { kept: 0, skipped: 0, windows: 0, doors: 0, roofs: 0, floors: 0 }
   if (!def?.schema || !levelId) {
     useBoots.getState().resolvePlaced()
     return { ...result, skipped: placed.length }
@@ -140,6 +190,15 @@ export function keepPlaced(): KeepResult {
       if ((piece.mask & FULL_MASK) !== 0 && createRoofNode(piece, levelId)) {
         result.kept++
         result.roofs++
+      } else {
+        result.skipped++
+      }
+      continue
+    }
+    if (piece.piece === 'floor') {
+      if ((piece.mask & FULL_MASK) !== 0 && createSlabNode(piece, levelId)) {
+        result.kept++
+        result.floors++
       } else {
         result.skipped++
       }

@@ -22,6 +22,12 @@ export type PlacedPiece = {
    * with the builder's F edit mode; Keep reads it to trim walls and
    * pocket windows/doors. */
   mask: number
+  /** Build-grammar-v2 grid slot this piece occupies (grid.ts `slotId`
+   * codec, e.g. "Wx:1,0,0"). OPTIONAL: legacy pieces — placed before v2 or
+   * loaded from an old session — carry none. They stay render-only and
+   * OFF the support graph (never registered, never collapsed, never
+   * counted for occupancy); everything else about them keeps working. */
+  slotId?: string
 }
 
 export type BootsPhase = 'editor' | 'game'
@@ -53,7 +59,10 @@ type BootsState = {
   setHealth: (health: number) => void
   setStaggered: (staggered: boolean) => void
   setBuildPiece: (piece: BuildPiece) => void
-  addPlaced: (piece: Omit<PlacedPiece, 'id' | 'mask'> & { mask?: number }) => void
+  /** Append a placement (mask defaults to FULL_MASK, slotId optional —
+   * pass the grid slot so the support graph can track the piece).
+   * Returns the stored piece so callers can wire id ↔ slotId maps. */
+  addPlaced: (piece: Omit<PlacedPiece, 'id' | 'mask'> & { mask?: number }) => PlacedPiece
   /** Replace one placed piece's 9-bit cell mask (builder F edit mode).
    * The piece object is swapped, so its mesh + collider re-register. */
   setPlacedMask: (id: number, mask: number) => void
@@ -64,6 +73,11 @@ type BootsState = {
    * Callers guard the target pose with isOccupied first. */
   transformPlaced: (id: number, piece: BuildPiece, yaw: number) => void
   removeLastPlaced: () => PlacedPiece | undefined
+  /** Remove one placed piece by id — the support-cascade path (collapse
+   * evicts pieces anywhere in the list, not just the last). Returns the
+   * removed piece (its mesh/collider/voxel cleanup mirrors undo) or
+   * undefined when the id is already gone (double-collapse is a no-op). */
+  removePlaced: (id: number) => PlacedPiece | undefined
   resolvePlaced: () => void
   setPendingDecision: (pending: boolean) => void
   resetSession: () => void
@@ -92,10 +106,11 @@ export const useBoots = create<BootsState>((set, get) => ({
   setHealth: (health) => set({ health }),
   setStaggered: (staggered) => set({ staggered }),
   setBuildPiece: (buildPiece) => set({ buildPiece }),
-  addPlaced: (piece) =>
-    set((s) => ({
-      placed: [...s.placed, { mask: FULL_MASK, ...piece, id: placedId++ }],
-    })),
+  addPlaced: (piece) => {
+    const stored: PlacedPiece = { mask: FULL_MASK, ...piece, id: placedId++ }
+    set((s) => ({ placed: [...s.placed, stored] }))
+    return stored
+  },
   setPlacedMask: (id, mask) =>
     set((s) => ({
       placed: s.placed.map((p) => (p.id === id ? { ...p, mask: mask & FULL_MASK } : p)),
@@ -109,6 +124,12 @@ export const useBoots = create<BootsState>((set, get) => ({
     const last = s.placed[s.placed.length - 1]
     if (last) set({ placed: s.placed.slice(0, -1) })
     return last
+  },
+  removePlaced: (id) => {
+    const s = get()
+    const piece = s.placed.find((p) => p.id === id)
+    if (piece) set({ placed: s.placed.filter((p) => p.id !== id) })
+    return piece
   },
   resolvePlaced: () => set({ placed: [], pendingDecision: false }),
   setPendingDecision: (pendingDecision) => set({ pendingDecision }),

@@ -15,6 +15,8 @@ import {
   type VoxelGridData,
   type VoxelSource,
 } from './voxel'
+import { useBoots } from '../store'
+import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { bvhFor, type GameWorld } from './world'
 
 /**

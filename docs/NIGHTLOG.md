@@ -632,3 +632,55 @@ Combat + world groups landed in parallel; the manager pass wired the seams:
 Suite: 206 pass / 0 fail, tsc clean. STALLED from round 1 (specs handed to
 round 2): collapse agent's skeleton collapse + `damageExplosion` export
 (grenade currently runs its fallback carve in-game), trees-host scope.
+
+## Phase 4, round 2 — manager integration pass (2026-08-25)
+
+QA p4r1 gate: FAIL on exactly one item — skeleton collapse (f). Everything
+else passed (hammer, grenade, ADS, bot wall rule, siren theatre, tables,
+R rotate, instant voxel-clad, material dust, Esc restore, 0 errors,
+120 fps steady). This pass closes the gate item + every seam the group
+briefs flagged.
+
+- **Skeleton snap (QA f fix)** (destruction.ts): a wall whose cladding
+  hits ZERO live voxels can no longer keep its bare frame floating —
+  every remaining segment snaps top-down staggered across ~1.5 s
+  (`maybeSkeletonSnap`, armed from damageTarget, island crumbles, sheet
+  fly-offs, and the 30%-support avalanche bands; timers cleared in
+  resetDestruction). Rounds out the round-2 structural-collapse work
+  already in tree (30%-support chain rule + hanging-stick drops,
+  debounced 160 ms after segment breaks).
+- **damageExplosion landed** (destruction.ts): the export grenade.tsx has
+  feature-detected since round 1 — full-depth center carve + 5 ragged rim
+  nibbles per destructible collider group in radius, framing segments
+  inside the blast snap (cap 48, arming the support check). Returns total
+  voxels removed. Grenade detonation now takes the real path; its
+  fallback stays for older checkouts.
+- **Glass vs grenade** (grenade.tsx): flight steps sweep world.glass —
+  a pane crossed mid-arc SHATTERS and the grenade flies on (QA feedback:
+  it used to sail through glazing untouched); on boom every pane inside
+  the 3.2 m radius shatters (shatterPane is idempotent).
+- **Windows shootable** (shooting.ts): 'window' joined DESTRUCTIBLE —
+  window FRAMES voxelize + carve like any solid (world.ts routes glass
+  meshes to world.glass, never into colliders, so only the surround is
+  affected). No more sparks-only dead window bands. Mirrored in
+  destruction's EXPLODABLE + grenade's fallback set.
+- **hud.ghostStatus wired** (builder.tsx): the documented-but-unwired
+  build-ghost status line under the crosshair now runs —
+  `ghostStatus?.(occupied ? 'occupied' : null, 'builder')` per frame,
+  cleared on deactivate/edit-mode/unmount. (Grid-locked phase-5 builder
+  can upgrade the call to the full TargetResult.reason when it lands.)
+- **Warhammer display visibility** (guntable.tsx): QA flagged it nearly
+  invisible flat behind the minigun — it now LEANS against the rear
+  table's +x end, pommel on the floor, head crowning just above the
+  tabletop in the spawn sightline.
+- Checked, already coherent (no change needed): playerRig.ads/shake
+  wiring, siren countdownActive flag, KeyZ undo / KeyG grenade / Digit6
+  hammer bindings, panel.tsx Controls copy, instant-voxelize placement,
+  dust material plumbing ('wood' emits nothing), commercial-name sweep
+  (clean; 'war hammer' is the generic weapon term, user copy says
+  'hammer').
+
+Tests: destruction/grenade/shooting suites green including 3 new tests
+(explosion carve, blast isolation, staggered skeleton snap). Full-tree
+tsc/test pending the phase-5 builder agent's in-flight rewrite of
+builder.tsx (their errors, their files — recheck before ship).

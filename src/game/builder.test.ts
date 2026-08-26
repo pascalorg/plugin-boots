@@ -14,7 +14,6 @@ import {
   planEditExitTransform,
   planWallMask,
   raycastPieceCell,
-  resolveSnap,
   rotatedYaw,
   STAIR_DOWN_MASK,
   STAIR_UP_MASK,
@@ -26,20 +25,35 @@ import {
   wallExitTransform,
 } from './builder'
 import { dropTarget, ensureVoxelTarget, resetDestruction, useDestruction } from './destruction'
+import { resolveTargetSlot, STOREY, type TargetInput, parseSlotId } from './grid'
+import {
+  DIED_SLOT_LOCKOUT_MS,
+  diedAt,
+  isDeathLocked,
+  isOccupied as slotIsOccupied,
+  isSupported as slotIsSupported,
+  onPieceRemoved,
+  registerPlacement,
+  resetPieceSlots,
+} from './piece-slots'
 import { playerRig } from './player'
 import { fire } from './shooting'
 import type { WeaponDef } from './weapons'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
- * Builder grammar, headless: the pure snap resolver (wall chains + stacks,
- * floor tiling, roof low-edge docking), identical-pose occupancy, the 3×3
- * cell-mask math (cell picking, Keep's mask → node planning with height
- * trims + off-center pockets), the R-rotate quarter-turn math, the turbo
- * hold-to-place cadence, the edit-exit stair-mask → ramp transform (masks
- * 311/95, exact-only, occupancy-guarded, transformPlaced store swap), and
- * the destructibility route for placed pieces (nodeType 'block' → voxelize
- * INSTANTLY at placement, dropTarget on Z-undo).
+ * Builder grammar v2, headless: the SLOT-LOCKED ghost (grid.resolveTargetSlot
+ * wired to piece-slots occupancy/support — the pose can never leave the
+ * discrete slot set), the two flows (ceiling = floor one storey up, ramps
+ * chain a storey per cell), R semantics (wall far-edge flip / floor no-op /
+ * roof ascent cycle), the slot-keyed turbo cadence (press → 0.15 s, new
+ * slots ≥ 0.05 s, per-hold dedupe, died-slot lockout), identical-pose
+ * occupancy (edit transforms), the 3×3 cell-mask math (cell picking, Keep's
+ * mask → node planning with height trims + off-center pockets), the
+ * edit-exit stair-mask → ramp transform (masks 311/95, exact-only,
+ * occupancy-guarded, transformPlaced store swap), and the destructibility
+ * route for placed pieces (nodeType 'block' → voxelize INSTANTLY at
+ * placement, dropTarget on Z-undo).
  */
 
 let nextId = 1
@@ -54,166 +68,138 @@ function placed(
   return { id: nextId++, piece, position: [x, y, z], yaw, mask }
 }
 
-/** Aim ray that stays level at this height — gates wall stacking. */
-const aimLow = () => 0
-const aimHigh = () => 100
+// --- Slot-locked ghost: grid targeting × piece-slots authority ---------------
 
-describe('resolveSnap: walls', () => {
-  test('chains end-to-end along the neighbor axis when yaw is parallel', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const snap = resolveSnap('wall', pieces, { x: 3.9, y: 0, z: 0.6, yaw: 0 }, aimLow)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(3)
-    expect(snap!.y).toBeCloseTo(0)
-    expect(snap!.z).toBeCloseTo(0)
-    expect(snap!.yaw).toBeCloseTo(0)
+/** Open world: nothing occupied, everything supported (pure grid checks). */
+const OPEN = { isOccupied: () => false, isSupported: () => true }
+/** The live wiring builder.tsx uses: piece-slots answers both questions. */
+const REGISTRY = { isOccupied: slotIsOccupied, isSupported: slotIsSupported }
+
+function rig(
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+  pitch: number,
+  piece: TargetInput['piece'],
+  rotState = 0,
+): TargetInput {
+  return { position: [x, y, z], yaw, pitch, piece, rotState }
+}
+
+const onLattice = (v: number, step: number) => Math.abs(v / step - Math.round(v / step)) < 1e-9
+
+describe('slot-locked ghost: the pose can never leave the discrete slot set', () => {
+  afterEach(() => {
+    resetPieceSlots()
   })
 
-  test('perpendicular yaw does not chain (corner walls stay on the grid)', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const snap = resolveSnap('wall', pieces, { x: 3.9, y: 0, z: 0.6, yaw: Math.PI / 2 }, aimLow)
-    expect(snap).toBeNull()
+  test('any rig input resolves to a lattice pose (the ghost never floats)', () => {
+    const pieces: TargetInput['piece'][] = ['wall', 'floor', 'roof']
+    const positions: [number, number, number][] = [
+      [1.5, 0, 1.5],
+      [2.9, 0, 0.13],
+      [-4.7, 2.8, 7.2],
+      [0.01, 5.61, -0.01],
+    ]
+    for (const piece of pieces) {
+      for (const [x, y, z] of positions) {
+        for (const yaw of [0, 0.4, -Math.PI / 2, 2.5]) {
+          for (const pitch of [0, 0.8, -0.9]) {
+            for (const rotState of [0, 1, 2]) {
+              const t = resolveTargetSlot(rig(x, y, z, yaw, pitch, piece, rotState), OPEN)
+              expect(parseSlotId(t.slotId)).not.toBeNull()
+              // Slot centers sit on the half-cell lattice; bases on storeys;
+              // yaw on quarter turns — nothing in between, ever.
+              expect(onLattice(t.pose.position[0], 1.5)).toBe(true)
+              expect(onLattice(t.pose.position[1], STOREY)).toBe(true)
+              expect(onLattice(t.pose.position[2], 1.5)).toBe(true)
+              expect(onLattice(t.pose.yaw, Math.PI / 2)).toBe(true)
+            }
+          }
+        }
+      }
+    }
   })
 
-  test('stacks on top when the aim ray passes above 3/4 of the height', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    // Perpendicular yaw so only the stack candidate exists.
-    const raw = { x: 0, y: 0, z: 0, yaw: Math.PI / 2 }
-    expect(resolveSnap('wall', pieces, raw, aimLow)).toBeNull()
-    const snap = resolveSnap('wall', pieces, raw, aimHigh)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(0)
-    expect(snap!.y).toBeCloseTo(2.8)
-    expect(snap!.z).toBeCloseTo(0)
-    expect(snap!.yaw).toBeCloseTo(0) // stacked wall adopts the wall below
+  test('a registered slot reads occupied → red ghost with the reason', () => {
+    const input = rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'wall')
+    const free = resolveTargetSlot(input, REGISTRY)
+    expect(free.slotId).toBe('Wx:1,0,0')
+    expect(free.valid).toBe(true)
+    expect(registerPlacement(free.slotId, 1)).toBe(true)
+    const blocked = resolveTargetSlot(input, REGISTRY)
+    expect(blocked.valid).toBe(false)
+    expect(blocked.reason).toBe('occupied')
+    // Double-registration of the same slot by ANOTHER piece is refused.
+    expect(registerPlacement(free.slotId, 2)).toBe(false)
   })
 
-  // Stacking-reach cases: STACK_GATE = 0.75 · WALL_H (2.8) = 2.1.
-  test('a level gaze at eye height (1.58) does NOT stack — real tilt required', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const raw = { x: 0, y: 0, z: 0, yaw: Math.PI / 2 }
-    // 1.58 clears the old mid-height gate (1.4) — that auto-towered.
-    expect(resolveSnap('wall', pieces, raw, () => 1.58)).toBeNull()
-    // Just above the 3/4 gate (2.1) stacks.
-    const snap = resolveSnap('wall', pieces, raw, () => 2.2)
-    expect(snap).not.toBeNull()
-    expect(snap!.y).toBeCloseTo(2.8)
+  test('ceiling flow: floor piece past the +35° band caps your own cell', () => {
+    // Feet mid cell (0,0), looking steeply up: the target is the top face
+    // of the player's own cell — a ceiling, one storey up.
+    const input = rig(1.5, 0, 1.5, 0, 0.9, 'floor')
+    const alone = resolveTargetSlot(input, REGISTRY)
+    expect(alone.slotId).toBe('F:0,0,1')
+    expect(alone.pose.position).toEqual([1.5, STOREY, 1.5])
+    // Unsupported in an empty world → red (a ceiling needs a wall).
+    expect(alone.valid).toBe(false)
+    expect(alone.reason).toBe('unsupported')
+    // A grounded wall bounding the cell props it → blue.
+    registerPlacement('Wx:0,0,0', 11)
+    const propped = resolveTargetSlot(input, REGISTRY)
+    expect(propped.slotId).toBe('F:0,0,1')
+    expect(propped.valid).toBe(true)
   })
 
-  test('nearest candidate wins, plain grid when nothing is in range', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0), placed('wall', 9, 0, 0, 0)]
-    const snap = resolveSnap('wall', pieces, { x: 5.7, y: 0, z: 0.3, yaw: 0 }, aimLow)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(6) // wall B's near-end candidate outpulls A's
-    expect(resolveSnap('wall', pieces, { x: 30, y: 0, z: 30, yaw: 0 }, aimLow)).toBeNull()
-  })
-})
-
-describe('resolveSnap: floors', () => {
-  test('tiles edge-to-edge on the same plane, any approach side', () => {
-    const pieces = [placed('floor', 0, 0, 0, 0)]
-    const snap = resolveSnap('floor', pieces, { x: 0.6, y: 0, z: 2.4, yaw: Math.PI / 2 }, aimLow)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(0)
-    expect(snap!.y).toBeCloseTo(0)
-    expect(snap!.z).toBeCloseTo(3)
-  })
-})
-
-describe('resolveSnap: floor on wall top (roofing)', () => {
-  // Same STACK_GATE as walls: aim ray must clear 0.75 · WALL_H = 2.1 at the
-  // wall's XZ, so ground-level floor tiling beside a wall never lifts.
-  test('a level gaze never lifts the floor onto the wall — real tilt required', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const raw = { x: 0.3, y: 0, z: 1.2, yaw: 0 }
-    expect(resolveSnap('floor', pieces, raw, aimLow)).toBeNull()
-    // Eye-height level gaze (1.58) is still below the 2.1 gate.
-    expect(resolveSnap('floor', pieces, raw, () => 1.58)).toBeNull()
+  test('ramp chain: every cell you climb targets the next ramp a storey up', () => {
+    // On the ground, facing +X: the first ramp fills the neighbor cell,
+    // ascending away from the player (quarter 1 → pose yaw π/2).
+    const first = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'roof'), OPEN)
+    expect(first.slotId).toBe('R:1,0,0')
+    expect(first.pose.yaw).toBeCloseTo(Math.PI / 2)
+    // Standing at the top of that ramp (feet one storey up, inside its
+    // cell), still facing +X: the NEXT cell, one storey higher.
+    const second = resolveTargetSlot(rig(4.5, STOREY, 1.5, -Math.PI / 2, 0, 'roof'), OPEN)
+    expect(second.slotId).toBe('R:2,0,1')
+    expect(second.pose.position[1]).toBeCloseTo(STOREY)
+    expect(second.pose.yaw).toBeCloseTo(Math.PI / 2)
   })
 
-  test('upward tilt roofs the wall: floor at the top, edge flush, near side', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    // Wall yaw 0 → normal (0, 1): candidates at z ±1.5, y = WALL_H.
-    const snap = resolveSnap('floor', pieces, { x: 0.3, y: 0, z: 1.2, yaw: 0 }, aimHigh)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(0)
-    expect(snap!.y).toBeCloseTo(2.8)
-    expect(snap!.z).toBeCloseTo(1.5) // the player's side of the wall plane
-    expect(snap!.yaw).toBeCloseTo(0) // adopts the wall's yaw
-    // Edge flush: near floor edge z = 1.5 − 1.5 = 0, on the wall line.
+  test('R semantics: wall far-edge flip parity, floor no-op, roof quarter', () => {
+    // Wall: rotState 1 flips to the far edge of the target cell.
+    expect(resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'wall', 1), OPEN).slotId).toBe(
+      'Wx:2,0,0',
+    )
+    expect(resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'wall', 2), OPEN).slotId).toBe(
+      'Wx:1,0,0',
+    )
+    // Floor: rotState is ignored entirely.
+    const f0 = resolveTargetSlot(rig(1.5, 0, 1.5, 0, 0, 'floor', 0), OPEN)
+    const f3 = resolveTargetSlot(rig(1.5, 0, 1.5, 0, 0, 'floor', 3), OPEN)
+    expect(f3.slotId).toBe(f0.slotId)
+    expect(f3.pose.yaw).toBe(f0.pose.yaw)
+    // Roof: each rotState adds a quarter to the ascent.
+    const r1 = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'roof', 1), OPEN)
+    expect(r1.slotId).toBe('R:1,0,0')
+    expect(r1.pose.yaw).toBeCloseTo(Math.PI) // quarter 2: descent back at you
   })
 
-  test('the far side of the wall plane is the second candidate', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const snap = resolveSnap('floor', pieces, { x: -0.3, y: 0, z: -1.2, yaw: Math.PI / 2 }, aimHigh)
-    expect(snap).not.toBeNull()
-    expect(snap!.y).toBeCloseTo(2.8)
-    expect(snap!.z).toBeCloseTo(-1.5)
-    expect(snap!.yaw).toBeCloseTo(0) // wall yaw adopted (floor is π/2-symmetric)
+  test('support flows through the registry: a floor a storey up needs a wall', () => {
+    expect(slotIsSupported('F:0,0,1')).toBe(false)
+    registerPlacement('Wx:0,0,0', 21) // grounded (storey 0)
+    expect(slotIsSupported('F:0,0,1')).toBe(true) // rests on the wall below
+    expect(slotIsSupported('F:5,5,1')).toBe(false) // far away, still floating
   })
 
-  test('rotated wall: candidates offset along the wall normal', () => {
-    const pieces = [placed('wall', 0, 0, 0, Math.PI / 2)]
-    // Wall runs along Z, normal (1, 0): candidates at x ±1.5.
-    const snap = resolveSnap('floor', pieces, { x: 1.2, y: 0, z: 0.3, yaw: 0 }, aimHigh)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(1.5)
-    expect(snap!.y).toBeCloseTo(2.8)
-    expect(snap!.z).toBeCloseTo(0)
-  })
-
-  test('ground tiling beside a wall stays flat under a level gaze', () => {
-    const pieces = [placed('floor', 0, 0, 0, 0), placed('wall', 3, 0, 1.5, 0)]
-    const snap = resolveSnap('floor', pieces, { x: 3, y: 0, z: 0.6, yaw: 0 }, aimLow)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(3) // the floor-tile candidate, not a roof pose
-    expect(snap!.y).toBeCloseTo(0)
-    expect(snap!.z).toBeCloseTo(0)
-  })
-
-  test('same-level tile outweighs the roof pose when both are in range', () => {
-    const pieces = [placed('floor', 0, 0, 0, 0), placed('wall', 3, 0, 0.9, 0)]
-    // aimHigh: the roof candidate at (3, 2.8, −0.6) IS considered (XZ 0.9 ≤
-    // SNAP_RANGE) but the Y weight keeps the ground tile at (3, 0, 0) ahead.
-    const snap = resolveSnap('floor', pieces, { x: 3, y: 0, z: 0.3, yaw: 0 }, aimHigh)
-    expect(snap).not.toBeNull()
-    expect(snap!.y).toBeCloseTo(0)
-    expect(snap!.z).toBeCloseTo(0)
-  })
-
-  test('occupancy at roof level respects the floor π/2 symmetry', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0), placed('floor', 0, 2.8, 1.5, 0)]
-    expect(isOccupied(pieces, 'floor', 0, 2.8, 1.5, Math.PI / 2)).toBe(true) // same square
-    expect(isOccupied(pieces, 'floor', 0, 2.8, -1.5, 0)).toBe(false) // far side still free
-    expect(isOccupied(pieces, 'floor', 0, 0, 1.5, 0)).toBe(false) // ground level still free
-  })
-})
-
-describe('resolveSnap: roofs', () => {
-  test('low edge docks to a floor edge, rising away from the floor', () => {
-    const pieces = [placed('floor', 0, 0, 0, 0)]
-    const snap = resolveSnap('roof', pieces, { x: 2.7, y: 0, z: 0.3, yaw: 0 }, aimLow)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(3)
-    expect(snap!.z).toBeCloseTo(0)
-    // Low edge = center + 1.5·(-sin yaw, -cos yaw) must land on the floor
-    // edge at (1.5, 0) — i.e. the roof climbs away from the floor.
-    const lowX = snap!.x - 1.5 * Math.sin(snap!.yaw)
-    const lowZ = snap!.z - 1.5 * Math.cos(snap!.yaw)
-    expect(lowX).toBeCloseTo(1.5)
-    expect(lowZ).toBeCloseTo(0)
-  })
-
-  test('low edge docks to a wall base, high edge kissing the wall top', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const snap = resolveSnap('roof', pieces, { x: 0.3, y: 0, z: 1.2, yaw: 0 }, aimLow)
-    expect(snap).not.toBeNull()
-    expect(snap!.x).toBeCloseTo(0)
-    expect(snap!.z).toBeCloseTo(1.5)
-    // High edge = center - 1.5·L sits on the wall line (z = 0); the roof
-    // rises WALL_H so it tops out level with the wall.
-    const highZ = snap!.z + 1.5 * Math.cos(snap!.yaw)
-    expect(highZ).toBeCloseTo(0)
+  test('died-slot lockout: onPieceRemoved stamps the slot for 0.15 s', () => {
+    registerPlacement('Wz:0,0,0', 31)
+    onPieceRemoved('Wz:0,0,0')
+    expect(slotIsOccupied('Wz:0,0,0')).toBe(false)
+    const died = diedAt('Wz:0,0,0')
+    expect(died).toBeGreaterThan(0)
+    expect(isDeathLocked('Wz:0,0,0', died + DIED_SLOT_LOCKOUT_MS - 1)).toBe(true)
+    expect(isDeathLocked('Wz:0,0,0', died + DIED_SLOT_LOCKOUT_MS + 1)).toBe(false)
   })
 })
 
@@ -232,6 +218,13 @@ describe('isOccupied: identical poses up to piece symmetry', () => {
     const pieces = [placed('floor', 0, 0, 0, 0)]
     expect(isOccupied(pieces, 'floor', 0, 0, 0, Math.PI / 2)).toBe(true)
     expect(isOccupied(pieces, 'floor', 0, 0, 3, 0)).toBe(false)
+  })
+
+  test('elevated floors: same square matches, far side and ground stay free', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0), placed('floor', 0, 2.8, 1.5, 0)]
+    expect(isOccupied(pieces, 'floor', 0, 2.8, 1.5, Math.PI / 2)).toBe(true) // same square
+    expect(isOccupied(pieces, 'floor', 0, 2.8, -1.5, 0)).toBe(false) // far side still free
+    expect(isOccupied(pieces, 'floor', 0, 0, 1.5, 0)).toBe(false) // ground level still free
   })
 })
 
@@ -270,15 +263,6 @@ describe('rotatedYaw: quarter-turn offset math', () => {
     expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 4))).toBe(true)
   })
 
-  test('the rotated yaw steers the snap resolver (chain ↔ corner toggle)', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0)]
-    const raw = { x: 3.9, y: 0, z: 0.6, yaw: 0 }
-    // Auto-facing parallel → chains; one R press turns it perpendicular →
-    // the corner stays on the plain grid; a second press is parallel again.
-    expect(resolveSnap('wall', pieces, { ...raw, yaw: rotatedYaw(0, 0) }, aimLow)).not.toBeNull()
-    expect(resolveSnap('wall', pieces, { ...raw, yaw: rotatedYaw(0, 1) }, aimLow)).toBeNull()
-    expect(resolveSnap('wall', pieces, { ...raw, yaw: rotatedYaw(0, 2) }, aimLow)).not.toBeNull()
-  })
 })
 
 // --- 3×3 cell grid math ----------------------------------------------------
@@ -513,36 +497,49 @@ describe('trimmedWallSpan: dead columns shorten the node', () => {
 
 // --- Turbo hold-to-place cadence ---------------------------------------------
 
-describe('turboStamp: hold-to-place cadence', () => {
-  test('genre-canon values: 0.15 first, 0.05 per held pose change', () => {
+describe('turboStamp: slot-keyed hold-to-place cadence', () => {
+  test('genre-canon values: 0.15 first, ≥0.05 per new slot', () => {
     expect(TURBO_FIRST).toBeCloseTo(0.15)
     expect(TURBO_NEXT).toBeCloseTo(0.05)
     expect(TURBO_FIRST).toBeGreaterThan(TURBO_NEXT)
   })
 
-  test('fresh press stamps and arms the long lockout; held re-stamps run fast', () => {
-    expect(turboStamp(0, true, false, false)).toBe(TURBO_FIRST)
-    expect(turboStamp(0, true, true, false)).toBe(TURBO_FIRST) // press wins the label
-    expect(turboStamp(0, false, true, false)).toBe(TURBO_NEXT)
+  test('fresh press stamps and arms the long lockout; held new slots run fast', () => {
+    expect(turboStamp(0, true, true, false, false)).toBe(TURBO_FIRST)
+    expect(turboStamp(0, false, true, false, false)).toBe(TURBO_NEXT)
   })
 
-  test('no stamp while cooling, while the pose holds, or over an occupied pose', () => {
-    expect(turboStamp(0.01, true, true, false)).toBeNull() // cooldown gate first
-    expect(turboStamp(0, false, false, false)).toBeNull() // held, pose unchanged
-    expect(turboStamp(0, true, false, true)).toBeNull() // occupied is silent
-    expect(turboStamp(0, false, true, true)).toBeNull()
+  test('no stamp while cooling, on a repeat slot, a dead slot, or a red ghost', () => {
+    expect(turboStamp(0.01, true, true, false, false)).toBeNull() // cooldown gate first
+    expect(turboStamp(0, false, true, true, false)).toBeNull() // one attempt per slot per hold
+    expect(turboStamp(0, false, true, false, true)).toBeNull() // died-slot lockout
+    expect(turboStamp(0, true, false, false, false)).toBeNull() // invalid is silent
+    expect(turboStamp(0, false, false, false, false)).toBeNull()
   })
 
-  test('a held sweep: press stamps at t=0, next pose change waits 0.15, then 0.05 cadence', () => {
-    // Simulate the frame loop's cooldown countdown against a sweeping
-    // crosshair (every frame a new pose), in integer 10 ms frames so the
-    // timeline is exact. turboStamp's gate is unit-agnostic (> 0).
+  test('hovering one slot stamps once per hold — even after the cooldown', () => {
+    const attempted = new Set<string>()
+    const slot = 'Wz:1,0,0'
+    expect(turboStamp(0, true, true, attempted.has(slot), false)).toBe(TURBO_FIRST)
+    attempted.add(slot)
+    // Cooldown long expired, still the same slot: the dedupe holds.
+    expect(turboStamp(-5, false, true, attempted.has(slot), false)).toBeNull()
+  })
+
+  test('a held sweep: press stamps at t=0, the first NEW slot waits 0.15, then 0.05 cadence', () => {
+    // Simulate the frame loop's cooldown countdown against a strafing
+    // crosshair (every frame the ray enters a new slot), in integer 10 ms
+    // frames so the timeline is exact. turboStamp's gate is unit-agnostic
+    // (> 0); the dedupe Set mirrors builder.tsx's holdAttempted.
     const stamps: number[] = []
+    const attempted = new Set<string>()
     let cooldown = 0 // in frames
     for (let frame = 0; frame <= 30; frame++) {
-      const arm = turboStamp(cooldown, frame === 0, true, false)
+      const slot = `Wz:${frame},0,0` // sweeping: a fresh slot every frame
+      const arm = turboStamp(cooldown, frame === 0, true, attempted.has(slot), false)
       if (arm !== null) {
         stamps.push(frame)
+        attempted.add(slot)
         cooldown = Math.round(arm * 100) // seconds → 10 ms frames
       }
       cooldown -= 1

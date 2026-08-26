@@ -2,31 +2,72 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { BoxGeometry, type BufferGeometry, Matrix4, type Group, type Mesh } from 'three'
+import { Box3, BoxGeometry, type BufferGeometry, Color, Matrix4, type Group, type Mesh } from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { type BuildPiece, FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
-import { dropTarget, ensureVoxelTarget } from './destruction'
+import { spawnDebris } from './debris'
+import { dropTarget, ensureVoxelTarget, useDestruction } from './destruction'
+import {
+  CELL,
+  parseSlotId,
+  resolveTargetSlot,
+  type Slot,
+  STOREY,
+  type TargetInput,
+  type TargetResult,
+} from './grid'
+import {
+  isDeathLocked,
+  isOccupied as slotIsOccupied,
+  isSupported as slotIsSupported,
+  onCollapse,
+  onPieceRemoved,
+  registerPlacement,
+  resetPieceSlots,
+  type SceneSupportProbe,
+  setSceneSupportProbe,
+} from './piece-slots'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
- * Build mode, battle-builder grammar: wall / floor / roof (Q cycles), ghost
- * in front of you, LMB stamps it in. Placements are game-only state — the
- * panel's Keep converts walls (and, best-effort, roofs) into real scene
- * nodes afterwards, Discard forgets everything. Z undoes (piece + collider
- * + any voxel replica) — G is the grenade now.
+ * Build mode, grid-locked grammar (BUILD-GRAMMAR-V2 + REVIEW): wall / floor
+ * / roof (Q cycles), the ghost ONLY ever occupies discrete world-grid slots
+ * — it snaps, never floats. Placements are game-only state — the panel's
+ * Keep converts walls (and, best-effort, roofs) into real scene nodes
+ * afterwards, Discard forgets everything. Z undoes (piece + collider + any
+ * voxel replica + support cascade) — G is the grenade now.
  *
- * ── R ROTATE (phase 4) ────────────────────────────────────────────────────
- * KeyR (edge) adds a quarter turn to the ghost's AUTO-FACING yaw — a manual
- * offset that persists until the piece TYPE changes or edit mode toggles
- * (then it resets to 0). The offset feeds the RAW ghost yaw, so it also
- * steers the snap resolver (a rotated wall stops/starts chaining with its
- * neighbor); geometric snap poses keep their own yaw. For 'roof' pieces the
- * same quarter turns cycle all 4 ascent orientations (roof yaw symmetry is
- * 2π, so every press is a distinct incline direction).
+ * ── GRID-LOCKED TARGETING (phase 5) ───────────────────────────────────────
+ * Every frame the builder feeds grid.resolveTargetSlot the player rig
+ * (FEET position, yaw, pitch, piece, R rotState) and a WorldProbe wired to
+ * piece-slots.ts — THE single occupancy/support authority (slotId ↔ placed
+ * piece id, support graph, scene-support probe). The ghost renders AT THE
+ * RESOLVED SLOT POSE ONLY: blue = placeable, red = occupied OR unsupported
+ * OR out of reach (the failing reason drives hud.ghostStatus). Ceilings are
+ * floors one storey up (aim past the +35° pitch band with the floor piece);
+ * ramps chain as you run up them holding place — see "the two flows" in
+ * docs/BUILD-GRAMMAR-V2.md.
+ *
+ * R (edge) bumps rotState (0..3), grid semantics: wall = far-edge flip of
+ * the target cell (parity — beats the ray), floor = no-op (key ignored),
+ * roof = ascent quarter-turn cycle. Persists across placements; resets on
+ * piece-TYPE switch only (REVIEW contract).
+ *
+ * TURBO hold-to-place: the press edge stamps immediately and arms
+ * TURBO_FIRST (0.15 s); while held, every NEW target slot stamps at
+ * TURBO_NEXT (0.05 s) cadence — at most one attempt per slotId per hold
+ * (dedupe Set, cleared on release) and never into a slot whose piece died
+ * < 0.15 s ago (piece-slots.isDeathLocked, stamped by onPieceRemoved).
+ *
+ * Undo (Z) and the support cascade share ONE removal path:
+ * piece-slots.onPieceRemoved(slotId) → orphaned component collapses in BFS
+ * rings (~50 ms apart) → the onCollapse listener (wired in PlacedPieces)
+ * removes each piece from the store, so its unmount runs the exact undo
+ * cleanup (collider splice + voxel dropTarget) + a debris burst.
  *
  * ── INSTANT BRICKS (phase 4) ──────────────────────────────────────────────
  * A placed piece is voxel-clad THE MOMENT it lands: PlacedPieceMesh routes
@@ -36,30 +77,6 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * piece reads as bricks from the first frame. Degenerate grids fall back to
  * the plain solid mesh. Undo/mask-edit cleanup still drops the replica via
  * dropTarget.
- *
- * ── PLACEMENT GRAMMAR (phase 2) ───────────────────────────────────────────
- * ADJACENCY SNAP: the raw ghost (1.5 m grid + 90° yaw, reach shortens with
- * pitch so it tracks your aim) snaps to the nearest candidate generated from
- * placed pieces within reach when that candidate is ≤ SNAP_RANGE (1.1 m,
- * XZ) of the raw ghost; otherwise the plain grid pose is used.
- *   walls  — chain end-to-end along the neighbor's axis (only when your
- *            snapped yaw is parallel to it), and stack on top when your aim
- *            ray passes above 3/4 of the neighbor's height (a real upward
- *            tilt — level gaze never stacks).
- *   floors — tile edge-to-edge on the neighbor's plane (4 sides), and cap a
- *            wall's top (py + WALL_H) when your aim ray passes the same 3/4
- *            gate as wall stacking: two candidates, one each side of the
- *            wall plane, floor edge flush with the wall line — a level gaze
- *            at ground level keeps tiling flat, never teleports up.
- *   roofs  — the inclined piece (everything inclined is a ROOF): low edge
- *            snaps to a floor edge (rising away from the floor) or to a
- *            wall base (high edge kisses the wall top: WALL_H rise).
- * HOLD-TO-PLACE: holding LMB stamps a piece whenever the (possibly snapped)
- * ghost pose changes — turbo cadence: TURBO_FIRST (0.15 s) after the fresh
- * press, TURBO_NEXT (0.05 s) between held re-stamps — sweep a wall run.
- * VALIDITY: an identical pose (piece + position + yaw up to the piece's own
- * symmetry) is never placed twice — the ghost tints red over an occupied
- * pose, blue when free; occupied stamps are skipped silently.
  *
  * ── 3×3 CELL MASK (phase 3) ───────────────────────────────────────────────
  * Every placed piece renders as a 3×3 grid of cell boxes honoring its
@@ -87,50 +104,31 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *   raycastPieceCell(piece, ox, oy, oz, dx, dy, dz, maxDist)   ray vs the
  *       FULL piece box (mask-independent so dead cells can be re-added) →
  *       { t, col, row, bit } | null. RETURNS A REUSED MODULE OBJECT.
- *   resolveSnap(piece, placed, raw, aimYAt)   pure snap resolver → snapped
- *       pose or null. `aimYAt(x, z)` = aim-ray height over that XZ point
- *       (gates wall stacking at 3/4 of the neighbor's height). RETURNS A
- *       REUSED MODULE OBJECT — copy fields before the next call if you
- *       keep them.
+ *   turboStamp(cooldownLeft, freshPress, valid, attempted, locked)   pure
+ *       slot-locked hold-to-place decision → cooldown to arm, or null.
  *   isOccupied(placed, piece, x, y, z, yaw)   identical-pose test, yaw
  *       compared modulo the piece's symmetry (wall π, floor π/2, roof 2π).
+ *       Edit-exit transforms still guard on it; SLOT occupancy is
+ *       piece-slots.ts's job now.
  *   rotatedYaw(autoYaw, quarterTurns)   pure R-rotate math: auto-facing yaw
  *       + quarter turns, wrapped to [−π, π) so poses stay comparable.
  *   builderDebug (dev, `globalThis.__bootsBuilder` in-game)   holdFire
  *       stands in for the held LMB in headless E2E; ghost() snapshots the
- *       resolved ghost pose.
+ *       resolved slot ghost (slotId, pose, valid, reason).
  * ──────────────────────────────────────────────────────────────────────────
  */
 
-const GRID = 1.5
 const WALL_H = 2.8
-const LEVEL_STEP = 1.4
-/** Raw-ghost distance from the eye when looking level (shortens with pitch). */
-const REACH = 3.2
-/** Raw ghost must land this close (XZ) to a candidate for the snap to win. */
-const SNAP_RANGE = 1.1
 /** Turbo hold-to-place cadence: the fresh-press stamp arms the longer
- * lockout, held pose-change re-stamps run at the fast one. */
+ * lockout, held new-slot re-stamps run at the fast one (≥0.05 s apart). */
 export const TURBO_FIRST = 0.15
 export const TURBO_NEXT = 0.05
-/** Wall stacking wants the aim ray above this fraction of the neighbor's
- * height at its XZ — a real upward tilt (a level gaze at eye height 1.58
- * already clears a ground wall's midpoint, so 0.5 auto-towered). */
-const STACK_GATE = 0.75
 
 export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   wall: [3, WALL_H, 0.12],
   floor: [3, 0.12, 3],
   roof: [3, 0.12, 4.1],
 }
-
-/** Horizontal footprint of a piece along its snap axis. The roof's 4.1 m
- * plank covers a 3 m run + WALL_H rise, so every piece tiles on 3 m. */
-const SPAN = 3
-const ROOF_HALF_RUN = SPAN / 2
-/** Floor-center offset from the wall plane when capping a wall top — half
- * the floor's span, so the floor's edge sits flush on the wall line. */
-const CAP_OFFSET = SPAN / 2
 
 const ROOF_TILT = -Math.atan2(WALL_H, 3)
 
@@ -249,154 +247,26 @@ export function isOccupied(
 // --- Turbo hold-to-place cadence -------------------------------------------
 
 /**
- * Pure hold-to-place decision for one frame: a stamp happens on the press
- * edge or, while held, whenever the ghost pose changed — never while the
- * cooldown is running or over an occupied pose. Returns the cooldown to arm
- * for the NEXT stamp (TURBO_FIRST after a fresh press, TURBO_NEXT for held
- * re-stamps), or null when no stamp should happen this frame.
+ * Pure slot-locked hold-to-place decision for one frame: a stamp happens on
+ * the press edge or, while held, whenever the target slot is NEW for this
+ * hold — never while the cooldown is running, never twice into the same
+ * slot per hold (`attempted`, the caller's per-hold dedupe Set), never into
+ * a slot whose piece died < 0.15 s ago (`locked`,
+ * piece-slots.isDeathLocked), and never over an invalid target (occupied /
+ * unsupported / out of reach — grid.TargetResult.valid). Returns the
+ * cooldown to arm for the NEXT stamp (TURBO_FIRST after a fresh press,
+ * TURBO_NEXT for held re-stamps), or null when no stamp happens.
  */
 export function turboStamp(
   cooldownLeft: number,
   freshPress: boolean,
-  moved: boolean,
-  occupied: boolean,
+  valid: boolean,
+  attempted: boolean,
+  locked: boolean,
 ): number | null {
   if (cooldownLeft > 0) return null
-  if (!freshPress && !moved) return null
-  if (occupied) return null
+  if (!valid || attempted || locked) return null
   return freshPress ? TURBO_FIRST : TURBO_NEXT
-}
-
-// --- Adjacency snap -------------------------------------------------------
-
-export type RawGhost = { x: number; y: number; z: number; yaw: number }
-type SnapPose = { x: number; y: number; z: number; yaw: number }
-
-// Module temps — the snap resolver runs every frame (rule: no per-frame
-// allocations). _best is the object resolveSnap returns; copy to keep.
-const _best: SnapPose & { d2: number; found: boolean } = {
-  x: 0,
-  y: 0,
-  z: 0,
-  yaw: 0,
-  d2: Infinity,
-  found: false,
-}
-let _rawX = 0
-let _rawY = 0
-let _rawZ = 0
-
-function consider(x: number, y: number, z: number, yaw: number): void {
-  const dx = x - _rawX
-  const dz = z - _rawZ
-  const dxz2 = dx * dx + dz * dz
-  if (dxz2 > SNAP_RANGE * SNAP_RANGE) return
-  // Mild Y weight: same-level candidates win ties against stacked ones.
-  const dy = y - _rawY
-  const d2 = dxz2 + dy * dy * 0.1
-  if (d2 >= _best.d2) return
-  _best.x = x
-  _best.y = y
-  _best.z = z
-  _best.yaw = yaw
-  _best.d2 = d2
-  _best.found = true
-}
-
-/**
- * Candidate poses from nearby placed pieces; nearest one within SNAP_RANGE
- * of the raw ghost wins, null means "use the plain grid". Pure — pass
- * `aimYAt(x, z)` = height of the aim ray above that XZ point (gates wall
- * stacking at 3/4 of the neighbor's height). Returned object is REUSED.
- */
-export function resolveSnap(
-  piece: BuildPiece,
-  placed: readonly PlacedPiece[],
-  raw: RawGhost,
-  aimYAt: (x: number, z: number) => number,
-): SnapPose | null {
-  _rawX = raw.x
-  _rawY = raw.y
-  _rawZ = raw.z
-  _best.d2 = Infinity
-  _best.found = false
-
-  for (const p of placed) {
-    const px = p.position[0]
-    const py = p.position[1]
-    const pz = p.position[2]
-    // Cheap cull: candidates sit ≤ SPAN from the neighbor center, plus the
-    // snap window.
-    if (Math.abs(px - _rawX) > SPAN + SNAP_RANGE || Math.abs(pz - _rawZ) > SPAN + SNAP_RANGE) {
-      continue
-    }
-
-    if (piece === 'wall' && p.piece === 'wall') {
-      // Chain end-to-end along the neighbor's axis — only when the player's
-      // snapped yaw is parallel, so corner walls stay on the plain grid.
-      const ax = Math.cos(p.yaw)
-      const az = -Math.sin(p.yaw)
-      if (sameYaw(raw.yaw, p.yaw, Math.PI)) {
-        consider(px + ax * SPAN, py, pz + az * SPAN, p.yaw)
-        consider(px - ax * SPAN, py, pz - az * SPAN, p.yaw)
-      }
-      // Stack on top when the aim ray passes above 3/4 of the neighbor's
-      // height. Mid-height was too lenient: a LEVEL gaze (eye 1.58) already
-      // clears a ground wall's midpoint (1.4), so holding fire auto-towered
-      // without ever looking up (live QA find). 0.75·H (2.1) demands a real
-      // upward tilt while staying reachable for 3-high stacks from the
-      // ground (see builder.test.ts stacking-reach cases).
-      if (aimYAt(px, pz) > py + WALL_H * STACK_GATE) consider(px, py + WALL_H, pz, p.yaw)
-    } else if (piece === 'floor' && p.piece === 'floor') {
-      // Tile edge-to-edge on the same plane, 4 sides, neighbor's yaw.
-      const ax = Math.cos(p.yaw)
-      const az = -Math.sin(p.yaw)
-      consider(px + ax * SPAN, py, pz + az * SPAN, p.yaw)
-      consider(px - ax * SPAN, py, pz - az * SPAN, p.yaw)
-      const nx = Math.sin(p.yaw)
-      const nz = Math.cos(p.yaw)
-      consider(px + nx * SPAN, py, pz + nz * SPAN, p.yaw)
-      consider(px - nx * SPAN, py, pz - nz * SPAN, p.yaw)
-    } else if (piece === 'floor' && p.piece === 'wall') {
-      // Roof a wall: the floor lands at the wall's top (py + WALL_H) with
-      // its edge flush on the wall line — center offset half a floor along
-      // the wall normal, one candidate each side of the wall plane. The
-      // floor adopts the wall's yaw (its π/2 symmetry makes parallel and
-      // perpendicular identical anyway). Gated by the same 3/4-height aim
-      // test as wall stacking, evaluated at the wall's XZ, so ground-level
-      // floor tiling beside a wall never teleports to the roof.
-      if (aimYAt(px, pz) > py + WALL_H * STACK_GATE) {
-        const nx = Math.sin(p.yaw)
-        const nz = Math.cos(p.yaw)
-        const topY = py + WALL_H
-        consider(px + nx * CAP_OFFSET, topY, pz + nz * CAP_OFFSET, p.yaw)
-        consider(px - nx * CAP_OFFSET, topY, pz - nz * CAP_OFFSET, p.yaw)
-      }
-    } else if (piece === 'roof' && p.piece === 'floor') {
-      // Low edge on a floor edge, rising away from the floor. With the roof's
-      // low-edge direction L = (-sin yaw, -cos yaw), edge direction d needs
-      // L = -d and center = floor + 3d → yaw = atan2(d.x, d.z).
-      const ax = Math.cos(p.yaw)
-      const az = -Math.sin(p.yaw)
-      const nx = Math.sin(p.yaw)
-      const nz = Math.cos(p.yaw)
-      consider(px + ax * SPAN, py, pz + az * SPAN, Math.atan2(ax, az))
-      consider(px - ax * SPAN, py, pz - az * SPAN, Math.atan2(-ax, -az))
-      consider(px + nx * SPAN, py, pz + nz * SPAN, Math.atan2(nx, nz))
-      consider(px - nx * SPAN, py, pz - nz * SPAN, Math.atan2(-nx, -nz))
-    } else if (piece === 'roof' && p.piece === 'wall') {
-      // Low edge at the wall base, high edge kissing the wall (the roof
-      // rises exactly WALL_H, so it tops out at the wall top). For face
-      // normal n: center = wall + 1.5n, low-edge dir L = n →
-      // yaw = atan2(-n.x, -n.z).
-      const nx = Math.sin(p.yaw)
-      const nz = Math.cos(p.yaw)
-      consider(px + nx * ROOF_HALF_RUN, py, pz + nz * ROOF_HALF_RUN, Math.atan2(-nx, -nz))
-      consider(px - nx * ROOF_HALF_RUN, py, pz - nz * ROOF_HALF_RUN, Math.atan2(nx, nz))
-    }
-  }
-
-  return _best.found ? _best : null
 }
 
 // --- Edit-mode cell picking -------------------------------------------------
@@ -677,26 +547,43 @@ export function planEditExitTransform(
   return transform
 }
 
-// --- Ghost ----------------------------------------------------------------
+// --- Ghost (slot-locked) ----------------------------------------------------
 
 type GhostState = {
+  /** Resolved grid slot (grid.ts codec) — the ghost NEVER leaves the set. */
+  slotId: string
+  /** Slot pose, PlacedPiece semantics: x/z center, y = base elevation. */
   x: number
   y: number
   z: number
   yaw: number
   piece: BuildPiece
+  valid: boolean
+  reason: TargetResult['reason']
+  /** Legacy mirror for older E2E scripts: reason === 'occupied'. */
   occupied: boolean
 }
 
 /** Per-frame mirror of the resolved ghost for the dev handle (no allocs). */
-const _debugGhost: GhostState = { x: 0, y: 0, z: 0, yaw: 0, piece: 'wall', occupied: false }
+const _debugGhost: GhostState = {
+  slotId: '',
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  piece: 'wall',
+  valid: false,
+  reason: 'unsupported',
+  occupied: false,
+}
 
 /**
  * Dev-only handle (published as `globalThis.__bootsBuilder` while the game
  * runs — same pattern as `__bootsPlayer`): headless E2E can't engage pointer
  * lock, so `holdFire` stands in for the held LMB (it is OR-ed with the real
- * input each frame). `ghost()` snapshots the currently resolved ghost pose.
- * `isEditing` mirrors the F edit mode each frame — viewmodel.tsx
+ * input each frame). `ghost()` snapshots the currently resolved slot ghost
+ * (slotId + pose + valid + reason — QA asserts the pose is ∈ the discrete
+ * slot set). `isEditing` mirrors the F edit mode each frame — viewmodel.tsx
  * feature-detects it to keep Q piece-cycling out of an open edit.
  */
 export const builderDebug: { holdFire: boolean; isEditing: boolean; ghost: () => GhostState } = {
@@ -704,8 +591,6 @@ export const builderDebug: { holdFire: boolean; isEditing: boolean; ghost: () =>
   isEditing: false,
   ghost: () => ({ ..._debugGhost }),
 }
-
-const _raw: RawGhost = { x: 0, y: 0, z: 0, yaw: 0 }
 
 /**
  * Pure R-rotate math: the ghost's auto-facing yaw plus `quarterTurns` manual
@@ -718,26 +603,99 @@ export function rotatedYaw(autoYaw: number, quarterTurns: number): number {
   return ((((yaw + Math.PI) % TWO_PI) + TWO_PI) % TWO_PI) - Math.PI
 }
 
-/** Raw grid ghost: reach shortens as you pitch away from level so the ghost
- * tracks your aim (stacking a wall means looking UP at it). `quarterTurns`
- * is the manual R-rotate offset over the auto-facing yaw. */
-function rawGhost(quarterTurns: number): RawGhost {
-  const reach = REACH * Math.max(0.35, Math.cos(playerRig.pitch))
-  const tx = playerRig.position.x - Math.sin(playerRig.yaw) * reach
-  const tz = playerRig.position.z - Math.cos(playerRig.yaw) * reach
-  const feetY = playerRig.position.y - EYE_HEIGHT
-  _raw.x = Math.round(tx / GRID) * GRID
-  _raw.y = Math.max(0, Math.round(feetY / LEVEL_STEP) * LEVEL_STEP)
-  _raw.z = Math.round(tz / GRID) * GRID
-  _raw.yaw = rotatedYaw((Math.round(playerRig.yaw / (Math.PI / 2)) * Math.PI) / 2, quarterTurns)
-  return _raw
+/** Reused per-frame input for grid.resolveTargetSlot (no hot-loop allocs). */
+const _targetInput: TargetInput = {
+  position: [0, 0, 0],
+  yaw: 0,
+  pitch: 0,
+  piece: 'wall',
+  rotState: 0,
 }
 
-/** Height of the aim ray above (x, z) — flat-distance projection. */
-function aimHeightAt(x: number, z: number): number {
-  const hd = Math.hypot(x - playerRig.position.x, z - playerRig.position.z)
-  return playerRig.position.y + Math.tan(playerRig.pitch) * hd
+/** grid.resolveTargetSlot's world probe — piece-slots.ts is the single
+ * occupancy/support authority (registry + support graph + scene probe). */
+const slotWorldProbe = { isOccupied: slotIsOccupied, isSupported: slotIsSupported }
+
+// --- Scene-support probe + collapse wiring ----------------------------------
+
+/** Collider nodeId prefix for placed pieces (PlacedPieceMesh entries). */
+const PIECE_NODE_PREFIX = '__boots-piece-'
+/** Contact margin around a slot's volume for the scene-support test. */
+const PROBE_MARGIN = 0.35
+const _probeBox = new Box3()
+
+/** AABB of the piece volume a slot holds (walls are planes, floors faces,
+ * roofs the whole cell) — the box scene geometry must touch to prop it. */
+function setSlotBox(slot: Slot, box: Box3): void {
+  const x0 = slot.i * CELL
+  const z0 = slot.k * CELL
+  const y0 = slot.s * STOREY
+  switch (slot.kind) {
+    case 'Wx':
+      box.min.set(x0, y0, z0)
+      box.max.set(x0, y0 + STOREY, z0 + CELL)
+      break
+    case 'Wz':
+      box.min.set(x0, y0, z0)
+      box.max.set(x0 + CELL, y0 + STOREY, z0)
+      break
+    case 'F':
+      box.min.set(x0, y0, z0)
+      box.max.set(x0 + CELL, y0, z0 + CELL)
+      break
+    case 'R':
+      box.min.set(x0, y0, z0)
+      box.max.set(x0 + CELL, y0 + STOREY, z0 + CELL)
+      break
+  }
+  box.expandByScalar(PROBE_MARGIN)
 }
+
+/**
+ * Scene-support probe for piece-slots.setSceneSupportProbe: true while LIVE
+ * scene geometry touches the slot's volume. Placed-piece colliders are
+ * skipped (they support each other through the graph — counting them here
+ * would prop every orphan). Disabled colliders defer to their voxel
+ * replica's liveness: at least one alive voxel inside the box (REVIEW risk
+ * note — a demolished scene wall must drop its dependents). Answers are
+ * cached per slot by piece-slots; destruction hooks invalidate via
+ * notifySceneSupportChanged.
+ */
+function makeSceneSupportProbe(world: GameWorld): SceneSupportProbe {
+  return (id) => {
+    const slot = parseSlotId(id)
+    if (!slot) return false
+    setSlotBox(slot, _probeBox)
+    for (const entry of world.colliders) {
+      if (entry.nodeId.startsWith(PIECE_NODE_PREFIX)) continue
+      if (!entry.worldBox.intersectsBox(_probeBox)) continue
+      if (!entry.disabled) return true
+      const target = useDestruction.getState().targets.get(entry.nodeId)
+      if (!target) continue
+      const { centers, alive, count } = target.grid
+      for (let v = 0; v < count; v++) {
+        if (alive[v] === 0) continue
+        const c = v * 3
+        if (
+          centers[c]! >= _probeBox.min.x &&
+          centers[c]! <= _probeBox.max.x &&
+          centers[c + 1]! >= _probeBox.min.y &&
+          centers[c + 1]! <= _probeBox.max.y &&
+          centers[c + 2]! >= _probeBox.min.z &&
+          centers[c + 2]! <= _probeBox.max.z
+        ) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+}
+
+const PIECE_DEBRIS_COLOR = new Color('#9aa8b5')
+/** Debris chunks per collapsed piece — a visible burst, not a particle storm
+ * (cascades can evict dozens of pieces back-to-back). */
+const COLLAPSE_DEBRIS = 7
 
 /** One placed piece: the RENDERED merged-cell mesh doubles as its collider,
  * and the piece is voxel-clad THE MOMENT it lands — the layout effect
@@ -770,7 +728,7 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
       inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
       worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
       root: mesh,
-      nodeId: `__boots-piece-${piece.id}`,
+      nodeId: `${PIECE_NODE_PREFIX}${piece.id}`,
       nodeType: 'block',
     }
     world.colliders.push(entry)
@@ -803,9 +761,42 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
   )
 }
 
-/** Solid, collidable render of everything placed this session. */
+/** Solid, collidable render of everything placed this session — and the
+ * session wiring for the slot registry: installs the scene-support probe,
+ * re-registers any stored pieces (re-entry with a pending Keep/Discard),
+ * and owns the collapse listener (store removal + debris burst; the
+ * piece's unmount then runs the exact undo cleanup: collider splice +
+ * voxel dropTarget). Unmount = session teardown → resetPieceSlots(). */
 export function PlacedPieces({ world }: { world: GameWorld }) {
   const placed = useBoots((s) => s.placed)
+
+  useEffect(() => {
+    setSceneSupportProbe(makeSceneSupportProbe(world))
+    for (const p of useBoots.getState().placed) {
+      if (p.slotId) registerPlacement(p.slotId, p.id)
+    }
+    const off = onCollapse((pieceId) => {
+      const piece = useBoots.getState().removePlaced(pieceId)
+      if (!piece) return
+      const pose = piecePose(piece.piece, piece.position[1])
+      for (let n = 0; n < COLLAPSE_DEBRIS; n++) {
+        spawnDebris(
+          piece.position[0] + (Math.random() - 0.5) * 2.4,
+          pose.y + (Math.random() - 0.5) * 1.6,
+          piece.position[2] + (Math.random() - 0.5) * 2.4,
+          0.14,
+          PIECE_DEBRIS_COLOR,
+          2.5,
+        )
+      }
+      sfx.crumble(10) // ~voxel-count scale (destruction.ts convention): one mid-weight fall
+    })
+    return () => {
+      off()
+      resetPieceSlots() // cancels pending rings; probe + registry die with the session
+    }
+  }, [world])
+
   return (
     <group userData={{ __boots: true }}>
       {placed.map((piece) => (
@@ -858,13 +849,15 @@ export function Builder() {
   const prevUndo = useRef(false)
   const prevEditKey = useRef(false)
   const prevRotate = useRef(false)
-  /** Manual R-rotate quarter turns over the auto-facing yaw (0..3). Resets
-   * when the piece type changes or edit mode toggles. */
+  /** R rotState (0..3) — grid semantics: wall far-edge flip (parity), roof
+   * ascent quarter. Persists across placements and holsters; resets on
+   * piece-TYPE switch ONLY (REVIEW contract). */
   const rotateTurns = useRef(0)
   const rotatePiece = useRef<BuildPiece>('wall')
   const placeCooldown = useRef(0)
-  /** Pose of the last stamp — hold-to-place fires again once it changes. */
-  const lastPlaced = useRef({ has: false, piece: 'wall' as BuildPiece, x: 0, y: 0, z: 0, yaw: 0 })
+  /** Slots already stamped during the CURRENT hold — one attempt per slot
+   * per hold (turbo dedupe); cleared on release. */
+  const holdAttempted = useRef<Set<string>>(new Set())
 
   const weapon = useBoots((s) => s.weapon)
   const buildPiece = useBoots((s) => s.buildPiece)
@@ -875,6 +868,7 @@ export function Builder() {
     return () => {
       builderDebug.holdFire = false
       builderDebug.isEditing = false
+      getSession()?.hud.ghostStatus?.(null, 'builder')
       delete (globalThis as Record<string, unknown>).__bootsBuilder
     }
   }, [])
@@ -903,9 +897,9 @@ export function Builder() {
         applyEditExitTransform(edit.id)
         setEdit(null)
       }
+      session.hud.ghostStatus?.(null, 'builder')
       builderDebug.isEditing = false
-      lastPlaced.current.has = false
-      rotateTurns.current = 0
+      holdAttempted.current.clear()
       prevFire.current = session.input.state.firing || builderDebug.holdFire
       prevAltFire.current = session.input.state.altFiring
       prevEditKey.current = session.input.state.keys.has('KeyF')
@@ -933,12 +927,12 @@ export function Builder() {
     if (edit) {
       builderDebug.isEditing = true
       if (ghost) setGhost(null)
+      session.hud.ghostStatus?.(null, 'builder') // no ghost while editing cells
       // Z undo is paused while editing, but keep its edge tracker warm so
-      // holding Z across the exit never fires a stale undo. Edit mode also
-      // resets the manual R-rotate offset (contract: edit toggle resets it)
-      // and keeps R's edge tracker warm.
+      // holding Z across the exit never fires a stale undo. R's rotState
+      // survives an edit (REVIEW: it resets on piece-type switch ONLY);
+      // keep its edge tracker warm too.
       prevUndo.current = session.input.state.keys.has('KeyZ')
-      rotateTurns.current = 0
       prevRotate.current = session.input.state.keys.has('KeyR')
       const altFiringNow = session.input.state.altFiring
       const piece = useBoots.getState().placed.find((p) => p.id === edit.id)
@@ -1006,87 +1000,124 @@ export function Builder() {
       }
     }
 
-    // R ROTATE: a quarter turn per press over the auto-facing yaw. The
-    // offset resets when the piece TYPE changes (a wall's turn shouldn't
-    // secretly re-aim your next roof) — for roofs the same turns cycle the
-    // 4 ascent orientations (2π symmetry makes each press distinct).
+    // R ROTATE (grid semantics): wall = far-edge flip of the target cell
+    // (parity — beats the ray), roof = ascent quarter-turn cycle, floor =
+    // no-op (the key is ignored, no detent). rotState persists across
+    // placements; it resets when the piece TYPE changes only (a wall's
+    // flip shouldn't secretly re-aim your next roof).
     if (buildPiece !== rotatePiece.current) {
       rotatePiece.current = buildPiece
       rotateTurns.current = 0
     }
     const rotateDown = session.input.state.keys.has('KeyR')
-    if (rotateDown && !prevRotate.current) {
+    if (rotateDown && !prevRotate.current && buildPiece !== 'floor') {
       rotateTurns.current = (rotateTurns.current + 1) % 4
       sfx.weaponSwitch() // audible detent per accepted quarter turn
     }
     prevRotate.current = rotateDown
 
-    // Resolve this frame's ghost: raw grid pose (with the manual rotate
-    // offset), then adjacency snap.
-    const placed = useBoots.getState().placed
-    const raw = rawGhost(rotateTurns.current)
-    const snap = resolveSnap(buildPiece, placed, raw, aimHeightAt)
-    const gx = snap ? snap.x : raw.x
-    const gy = snap ? snap.y : raw.y
-    const gz = snap ? snap.z : raw.z
-    const gyaw = snap ? snap.yaw : raw.yaw
-    const occupied = isOccupied(placed, buildPiece, gx, gy, gz, gyaw)
+    // GRID-LOCKED TARGET: the ghost only ever occupies a discrete slot.
+    // resolveTargetSlot wants FEET; playerRig.position is the eye. The
+    // world probe is piece-slots.ts — the single occupancy/support
+    // authority (registry + support graph + scene probe + terrain rule).
+    _targetInput.position[0] = playerRig.position.x
+    _targetInput.position[1] = playerRig.position.y - EYE_HEIGHT
+    _targetInput.position[2] = playerRig.position.z
+    _targetInput.yaw = playerRig.yaw
+    _targetInput.pitch = playerRig.pitch
+    _targetInput.piece = buildPiece
+    _targetInput.rotState = rotateTurns.current
+    const target = resolveTargetSlot(_targetInput, slotWorldProbe)
+    const pose = target.pose
+    const occupied = target.reason === 'occupied'
 
     if (
       !ghost ||
-      ghost.x !== gx ||
-      ghost.y !== gy ||
-      ghost.z !== gz ||
-      ghost.yaw !== gyaw ||
+      ghost.slotId !== target.slotId ||
       ghost.piece !== buildPiece ||
-      ghost.occupied !== occupied
+      ghost.yaw !== pose.yaw ||
+      ghost.valid !== target.valid ||
+      ghost.reason !== target.reason
     ) {
-      setGhost({ x: gx, y: gy, z: gz, yaw: gyaw, piece: buildPiece, occupied })
+      setGhost({
+        slotId: target.slotId,
+        x: pose.position[0],
+        y: pose.position[1],
+        z: pose.position[2],
+        yaw: pose.yaw,
+        piece: buildPiece,
+        valid: target.valid,
+        reason: target.reason,
+        occupied,
+      })
     }
-    _debugGhost.x = gx
-    _debugGhost.y = gy
-    _debugGhost.z = gz
-    _debugGhost.yaw = gyaw
+    _debugGhost.slotId = target.slotId
+    _debugGhost.x = pose.position[0]
+    _debugGhost.y = pose.position[1]
+    _debugGhost.z = pose.position[2]
+    _debugGhost.yaw = pose.yaw
     _debugGhost.piece = buildPiece
+    _debugGhost.valid = target.valid
+    _debugGhost.reason = target.reason
     _debugGhost.occupied = occupied
 
-    // Place: on press, and while held whenever the ghost pose changes —
-    // turbo cadence: the fresh-press stamp arms TURBO_FIRST, held
-    // re-stamps run at TURBO_NEXT (see turboStamp). Occupied poses are
-    // skipped, no sound. Staggered hands can't stamp (matches the
-    // viewmodel's fire block); prevFire still tracks the raw button so
-    // recovery doesn't edge-place.
+    // Failing reason drives the tiny status line under the crosshair
+    // (hud.ts:ghostStatus, the documented caller). Change-gated in the
+    // HUD; free per frame.
+    session.hud.ghostStatus?.(target.valid ? null : target.reason, 'builder')
+
+    // TURBO hold-to-place: press edge stamps and arms TURBO_FIRST; while
+    // held, every NEW slot this hold stamps at TURBO_NEXT cadence. Dedupe:
+    // one attempt per slotId per hold; died slots are locked out 0.15 s
+    // (piece-slots stamps them on ANY removal — undo, cascade, weapon).
+    // Invalid targets are skipped silently. Staggered hands can't stamp
+    // (matches the viewmodel's fire block); prevFire still tracks the raw
+    // button so recovery doesn't edge-place.
     const firing = session.input.state.firing || builderDebug.holdFire
     if (firing && !useBoots.getState().staggered) {
-      const last = lastPlaced.current
-      const moved =
-        !last.has ||
-        last.piece !== buildPiece ||
-        last.x !== gx ||
-        last.y !== gy ||
-        last.z !== gz ||
-        last.yaw !== gyaw
-      const arm = turboStamp(placeCooldown.current, !prevFire.current, moved, occupied)
+      const freshPress = !prevFire.current
+      if (freshPress) holdAttempted.current.clear()
+      const arm = turboStamp(
+        placeCooldown.current,
+        freshPress,
+        target.valid,
+        holdAttempted.current.has(target.slotId),
+        isDeathLocked(target.slotId),
+      )
       if (arm !== null) {
         placeCooldown.current = arm
-        useBoots.getState().addPlaced({ piece: buildPiece, position: [gx, gy, gz], yaw: gyaw })
-        sfx.place()
-        last.has = true
-        last.piece = buildPiece
-        last.x = gx
-        last.y = gy
-        last.z = gz
-        last.yaw = gyaw
+        const stored = useBoots.getState().addPlaced({
+          piece: buildPiece,
+          position: [pose.position[0], pose.position[1], pose.position[2]],
+          yaw: pose.yaw,
+          slotId: target.slotId,
+        })
+        if (registerPlacement(target.slotId, stored.id)) {
+          holdAttempted.current.add(target.slotId)
+          sfx.place()
+        } else {
+          // The registry refused (two authorities disagreed — must not
+          // happen, but the registry wins): roll the store append back.
+          useBoots.getState().removePlaced(stored.id)
+        }
       }
+    } else if (holdAttempted.current.size > 0) {
+      holdAttempted.current.clear() // hold released — dedupe set is per-hold
     }
     prevFire.current = firing
     prevAltFire.current = session.input.state.altFiring
 
-    // UNDO on KeyZ (G is the grenade everywhere now).
+    // UNDO on KeyZ (G is the grenade everywhere now). onPieceRemoved is the
+    // ONE removal entry point: it stamps the died-slot lockout and cascades
+    // anything the removal orphaned (the collapse listener in PlacedPieces
+    // evicts those pieces through the same store path).
     const undoDown = session.input.state.keys.has('KeyZ')
     if (undoDown && !prevUndo.current) {
       const removed = useBoots.getState().removeLastPlaced()
-      if (removed) sfx.weaponSwitch()
+      if (removed) {
+        if (removed.slotId) onPieceRemoved(removed.slotId)
+        sfx.weaponSwitch()
+      }
     }
     prevUndo.current = undoDown
   })
@@ -1138,7 +1169,7 @@ export function Builder() {
       >
         <boxGeometry args={[ghostDims[0] * 1.03, ghostDims[1] * 1.03, ghostDims[2] * 1.03]} />
         <meshBasicMaterial
-          color={ghost.occupied ? '#ff5a4d' : '#59a7ff'}
+          color={ghost.valid ? '#59a7ff' : '#ff5a4d'}
           depthWrite={false}
           opacity={0.38}
           transparent

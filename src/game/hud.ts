@@ -1,5 +1,6 @@
 import { useBoots } from '../store'
 import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
+import type { TargetResult } from './grid'
 
 /**
  * DOM HUD, mounted INSIDE the fullscreen element (the canvas' parent) so it
@@ -29,6 +30,17 @@ import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
  *   edit mode ('F done · LMB carve · RMB reset'), on its OWN element above
  *   the shared prompt() line so door/table prompts never clobber it. Last
  *   write wins; null hides it. Cleared automatically on unmount.
+ * - ghostStatus(reason | null, owner?) — tiny build-ghost status line just
+ *   under the crosshair while the builder is active. Feed it the failing
+ *   `TargetResult.reason` from grid.ts's resolveTargetSlot each frame
+ *   ('unsupported' → 'needs support', 'occupied' → 'occupied',
+ *   'out-of-reach' → 'too far'); 'ok' or null blanks it. Owner-keyed like
+ *   prompt() (show = last-writer-wins, clear only while that owner holds
+ *   the line) and change-gated, so per-frame calls are free while the
+ *   reason holds. Wired caller: builder.tsx's ghost frame loop —
+ *   `hud.ghostStatus?.(occupied ? 'occupied' : null, 'builder')` (its
+ *   snap/raw poses are always reachable + self-supporting, so 'occupied'
+ *   is the only reason today; the vocabulary stays the grid.ts alias).
  * - grenadePip(readyFraction) — bottom-right dot + 'G' label above the
  *   weapon line. 0 = just thrown (dim), ramps brighter across the 5s
  *   cooldown, ≥1 = ready (full bright, dot turns green). grenade.tsx
@@ -46,6 +58,15 @@ const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
 /** Screen angles of the four edge-glow strips: top, right, bottom, left. */
 const EDGE_ANGLES = [0, Math.PI / 2, Math.PI, -Math.PI / 2] as const
 
+/** Build-ghost reason, aliased from grid.ts so the two can never drift. */
+export type GhostReason = TargetResult['reason']
+
+const GHOST_REASON_LABEL: Record<Exclude<GhostReason, 'ok'>, string> = {
+  unsupported: 'needs support',
+  occupied: 'occupied',
+  'out-of-reach': 'too far',
+}
+
 const WEAPON_LABEL: Record<string, string> = {
   knife: 'KNIFE',
   pistol: 'PISTOL',
@@ -61,6 +82,7 @@ export class Hud {
   private healthEl: HTMLDivElement | null = null
   private promptEl: HTMLDivElement | null = null
   private editHintEl: HTMLDivElement | null = null
+  private ghostStatusEl: HTMLDivElement | null = null
   private hitmarkerEl: HTMLDivElement | null = null
   private edgeEls: HTMLDivElement[] | null = null
   private lowHpEl: HTMLDivElement | null = null
@@ -81,6 +103,10 @@ export class Hud {
   private health = 100
   /** Which system's text the prompt line currently shows (see prompt()). */
   private promptOwner: string | null = null
+  /** Which system's reason the ghost-status line shows (see ghostStatus()). */
+  private ghostOwner: string | null = null
+  /** Last ghostStatus() reason written (change gate; per-frame calls are free). */
+  private lastGhostReason: GhostReason | null = null
   /** Last grenadePip() fraction written (change gate; -1 = never). */
   private pipF = -1
   /** Last setAds() value written (change gate; -1 = never). */
@@ -118,6 +144,12 @@ export class Hud {
     // ADS center dot — sibling of the tick group so the two fade freely.
     this.crossDotEl = el(
       'position:absolute;left:50%;top:50%;width:3px;height:3px;margin:-1.5px 0 0 -1.5px;border-radius:50%;background:rgba(80,255,120,0.95);box-shadow:0 0 2px rgba(0,0,0,0.8);opacity:0',
+    )
+    // Build-ghost status — a tiny line just under the crosshair, only shown
+    // while the builder's ghost is red ('needs support' / 'occupied' /
+    // 'too far'). Red-tinted to match the invalid ghost.
+    this.ghostStatusEl = el(
+      `position:absolute;left:50%;top:50%;transform:translate(-50%,16px);color:rgba(255,120,120,0.95);font:${FONT};font-size:11px;letter-spacing:0.1em;text-shadow:0 1px 3px rgba(0,0,0,0.85);white-space:nowrap;opacity:0;transition:opacity 0.1s`,
     )
 
     this.hitmarkerEl = el(
@@ -360,6 +392,32 @@ export class Hud {
     this.editHintEl.style.opacity = text ? '1' : '0'
   }
 
+  /**
+   * Build-ghost status line under the crosshair. Pass the ghost's failing
+   * reason (grid.ts TargetResult.reason) while the builder is active;
+   * 'ok'/null blanks the line. Owner-keyed exactly like prompt(): showing
+   * records `owner` (last writer wins), clearing only takes effect while
+   * that same owner still holds the line. Change-gated — safe per frame.
+   */
+  ghostStatus(reason: GhostReason | null, owner = 'default'): void {
+    if (!this.ghostStatusEl) return
+    const failing = reason !== null && reason !== 'ok' ? reason : null
+    if (failing) {
+      if (this.ghostOwner === owner && this.lastGhostReason === failing) return
+      this.ghostOwner = owner
+      this.lastGhostReason = failing
+      this.ghostStatusEl.textContent = GHOST_REASON_LABEL[failing]
+      this.ghostStatusEl.style.opacity = '1'
+      return
+    }
+    if (this.ghostOwner !== null && this.ghostOwner !== owner) return
+    if (this.ghostOwner === null && this.lastGhostReason === null) return
+    this.ghostOwner = null
+    this.lastGhostReason = null
+    this.ghostStatusEl.textContent = ''
+    this.ghostStatusEl.style.opacity = '0'
+  }
+
   hitmarker(): void {
     if (!this.hitmarkerEl) return
     this.hitmarkerEl.style.opacity = '1'
@@ -406,6 +464,8 @@ export class Hud {
     this.unsub?.()
     this.unsub = null
     this.promptOwner = null
+    this.ghostOwner = null
+    this.lastGhostReason = null
     this.lowHp = 0
     this.health = 100
     if (this.hitTimer) clearTimeout(this.hitTimer)
@@ -416,6 +476,7 @@ export class Hud {
     this.root?.remove()
     this.root = null
     this.editHintEl = null
+    this.ghostStatusEl = null
     this.edgeEls = null
     this.lowHpEl = null
     this.staggerEl = null

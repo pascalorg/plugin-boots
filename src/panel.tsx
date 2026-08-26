@@ -101,10 +101,13 @@ export default function BootsPanel() {
         <p>Mouse shoot · E gear up at the table</p>
         <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer</p>
-        <p>RMB aim (pistol/rifle) · G grenade</p>
-        <p>Q cycle piece · R rotate · hold click to place a run · Z undo · Esc exit</p>
+        <p>RMB aim (pistol/rifle) · Q cycle piece · Esc exit</p>
+        <p>
+          Pieces lock to the grid — look up to build the ceiling above you, R rotates (walls flip
+          sides, roofs turn), run up your ramps while holding click to chain them, Z undo, G
+          grenade.
+        </p>
         <p>F edits a placed piece's 3×3 cells — pocket the middle for a window.</p>
-        <p>Pieces snap to what you've placed — look up to stack walls, cap them with floors.</p>
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
       </section>
     </div>
