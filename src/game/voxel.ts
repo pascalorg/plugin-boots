@@ -1,4 +1,4 @@
-import { Box3, Matrix4, Ray, Vector3 } from 'three'
+import { Box3, Matrix4, Quaternion, Ray, Vector3 } from 'three'
 import type { MeshBVH } from 'three-mesh-bvh'
 
 /**
@@ -9,16 +9,84 @@ import type { MeshBVH } from 'three-mesh-bvh'
  * cells via the backface-raycast trick), then rendered elsewhere as one
  * InstancedMesh. Grids are world-axis-aligned by default; a grid built with
  * a `yaw` is axis-aligned in a Y-rotated LOCAL frame instead (diagonal
- * walls), with queries rotating into that frame and `centers` staying
- * world-space. This module is renderer-free math: build, radius removal,
- * DDA ray-walk, and the flood-fill that finds disconnected islands so they
- * can crumble.
+ * walls), and a grid built with a full `basis` quaternion is axis-aligned
+ * in an arbitrarily rotated frame (sloped roof planes). Queries rotate
+ * world coordinates into that frame while `centers` stay world-space. This
+ * module is renderer-free math: build, radius removal, DDA ray-walk, and
+ * the flood-fill that finds disconnected islands so they can crumble.
  */
 
 export type VoxelSource = {
   bvh: MeshBVH
   /** Mesh local → world. */
   matrixWorld: Matrix4
+}
+
+/**
+ * Unit quaternion giving the grid's orthonormal basis as the WORLD → GRID
+ * rotation (apply it to a world vector to land in grid coordinates; its
+ * conjugate maps grid → world). The scalar-yaw compatibility case is
+ * q = Qy(yaw): x = z = 0, y = sin(yaw/2), w = cos(yaw/2) — exactly the
+ * world→local rotation the yaw convention already uses (local→world renders
+ * as rotation [0, −yaw, 0]).
+ *
+ * Roof-plane plan (docs/MULTILEVEL-PLAN.md Phase C): destruction.ts will
+ * later build a pitched grid by passing basis = Qy(yaw) · Qx(pitch) so the
+ * roof slab is axis-aligned in the grid frame (thickness along grid Z, run
+ * along grid X, slope along grid Y). Bounds are then the slab's AABB in
+ * that frame, removeSphere/raycastVoxels keep taking WORLD coordinates
+ * unchanged, and findUnsupportedIslands' iy === 0 base layer becomes the
+ * plane's low (eave-side) row — "down" rotates with the basis for free.
+ */
+export type VoxelBasis = { x: number; y: number; z: number; w: number }
+
+/** The compatibility basis: q = Qy(yaw), i.e. world→grid for a yaw grid. */
+export const yawBasis = (yaw: number): VoxelBasis => ({
+  x: 0,
+  y: Math.sin(yaw / 2),
+  z: 0,
+  w: Math.cos(yaw / 2),
+})
+
+/** True when the basis is a pure Y rotation (incl. identity) — the legacy
+ * scalar-yaw fast path applies and stays BIT-identical to the pre-basis
+ * code (it keeps using cos/sin of `yaw` directly, never the quaternion). */
+const basisIsYawOnly = (q: VoxelBasis) => q.x === 0 && q.z === 0
+
+/** Yaw of a yaw-only basis (2·atan2 keeps the full ±π range). */
+const yawOfBasis = (q: VoxelBasis) => 2 * Math.atan2(q.y, q.w)
+
+/** out = q ⊗ v ⊗ q⁻¹ — rotate a world vector into the grid frame when q is
+ * a VoxelGridData basis. Allocation-free (writes into `out`). */
+const rotateByBasis = (
+  q: VoxelBasis,
+  x: number,
+  y: number,
+  z: number,
+  out: { x: number; y: number; z: number },
+) => {
+  const tx = 2 * (q.y * z - q.z * y)
+  const ty = 2 * (q.z * x - q.x * z)
+  const tz = 2 * (q.x * y - q.y * x)
+  out.x = x + q.w * tx + (q.y * tz - q.z * ty)
+  out.y = y + q.w * ty + (q.z * tx - q.x * tz)
+  out.z = z + q.w * tz + (q.x * ty - q.y * tx)
+}
+
+/** Rotate by the conjugate (grid → world) — see rotateByBasis. */
+const rotateByBasisInverse = (
+  q: VoxelBasis,
+  x: number,
+  y: number,
+  z: number,
+  out: { x: number; y: number; z: number },
+) => {
+  const tx = 2 * (-q.y * z + q.z * y)
+  const ty = 2 * (-q.z * x + q.x * z)
+  const tz = 2 * (-q.x * y + q.y * x)
+  out.x = x + q.w * tx + (-q.y * tz + q.z * ty)
+  out.y = y + q.w * ty + (-q.z * tx + q.x * tz)
+  out.z = z + q.w * tz + (-q.x * ty + q.y * tx)
 }
 
 export type VoxelGridData = {
@@ -36,9 +104,16 @@ export type VoxelGridData = {
    * set, `origin` and cell indexing live in the yaw-local frame (world
    * rotated by +yaw about the Y axis through the world origin) while
    * `centers` stay world-space. Same convention as the studs: local→world
-   * renders as rotation [0, −yaw, 0]. */
+   * renders as rotation [0, −yaw, 0]. Kept in sync with `q`: authoritative
+   * only while `q` is yaw-only (q.x === q.z === 0) — a general basis has no
+   * scalar-yaw equivalent, so such grids report yaw 0 and consumers must
+   * read `q` instead. */
   yaw: number
-  /** Min corner of cell (0,0,0) — world-space, or yaw-local when yaw ≠ 0. */
+  /** Full orthonormal basis, WORLD → GRID (see VoxelBasis). Equals
+   * yawBasis(yaw) for every grid built without an explicit basis. */
+  q: VoxelBasis
+  /** Min corner of cell (0,0,0) — world-space, or in the grid frame when
+   * the basis is non-identity (yaw ≠ 0 / rotated q). */
   origin: { x: number; y: number; z: number }
   count: number
   /** Grid coords, 3 per voxel. */
@@ -56,6 +131,8 @@ const _mat = new Matrix4()
 const _yawMat = new Matrix4()
 const _ray = new Ray()
 const _p = new Vector3()
+const _quat = new Quaternion()
+const _v = { x: 0, y: 0, z: 0 }
 
 const gridKey = (ix: number, iy: number, iz: number, nx: number, ny: number) =>
   ix + nx * (iy + ny * iz)
@@ -73,7 +150,8 @@ const spanOf = (extent: number, cell: number) =>
 
 export function buildVoxelGrid(
   sources: VoxelSource[],
-  /** Sources' AABB — world-space, or in the yaw-local frame when yaw ≠ 0. */
+  /** Sources' AABB — world-space, or in the grid frame when the grid is
+   * rotated (yaw ≠ 0 or an explicit basis). */
   worldBounds: Box3,
   preferredCell = 0.15,
   /** True for chunky volumes (doors, slabs, furniture): sizes the cell so
@@ -84,6 +162,10 @@ export function buildVoxelGrid(
   /** Rotate the grid axes about world Y — diagonal walls build in their
    * own frame so the thickness axis is thin again (see VoxelGridData.yaw). */
   yaw = 0,
+  /** Full orthonormal basis (WORLD → GRID, see VoxelBasis) — overrides
+   * `yaw`. This is how destruction.ts will later hand in a roof-plane
+   * frame (Qy(yaw)·Qx(pitch)) so a pitched slab voxelizes plane-aligned. */
+  basis?: VoxelBasis,
 ): VoxelGridData {
   const size = new Vector3()
   worldBounds.getSize(size)
@@ -109,13 +191,23 @@ export function buildVoxelGrid(
   const nz = spanOf(size.z, cellZ)
   const origin = worldBounds.min
 
-  // Yaw grids sample cells that are axis-aligned in the LOCAL frame — fold
-  // the local→world rotation into each mesh inverse so the OBB shell test
-  // and the interior backface ray consume local-frame coordinates directly.
-  if (yaw !== 0) _yawMat.makeRotationY(-yaw)
+  // Resolve the grid basis. An explicit yaw-only basis routes through the
+  // legacy scalar-yaw path (bit-identical trig); anything else is general.
+  const q = basis ?? yawBasis(yaw)
+  const pureYaw = basisIsYawOnly(q)
+  if (basis) yaw = pureYaw ? yawOfBasis(basis) : 0
+
+  // Rotated grids sample cells that are axis-aligned in the GRID frame —
+  // fold the grid→world rotation into each mesh inverse so the OBB shell
+  // test and the interior backface ray consume grid-frame coords directly.
+  const rotated = pureYaw ? yaw !== 0 : true
+  if (rotated) {
+    if (pureYaw) _yawMat.makeRotationY(-yaw)
+    else _yawMat.makeRotationFromQuaternion(_quat.set(-q.x, -q.y, -q.z, q.w))
+  }
   const inverses = sources.map((s) => {
     const inverse = _mat.clone().copy(s.matrixWorld).invert()
-    if (yaw !== 0) inverse.multiply(_yawMat)
+    if (rotated) inverse.multiply(_yawMat)
     return inverse
   })
   const cosYaw = Math.cos(yaw)
@@ -159,8 +251,11 @@ export function buildVoxelGrid(
         index.set(gridKey(ix, iy, iz, nx, ny), coords.length / 3)
         coords.push(ix, iy, iz)
         // Centers are ALWAYS world-space — rendering, debris, and distance
-        // checks never need to know about the yaw frame.
-        if (yaw === 0) centers.push(cx, cy, cz)
+        // checks never need to know about the grid frame.
+        if (!pureYaw) {
+          rotateByBasisInverse(q, cx, cy, cz, _v)
+          centers.push(_v.x, _v.y, _v.z)
+        } else if (yaw === 0) centers.push(cx, cy, cz)
         else centers.push(cx * cosYaw - cz * sinYaw, cy, cx * sinYaw + cz * cosYaw)
       }
     }
@@ -176,6 +271,7 @@ export function buildVoxelGrid(
     ny,
     nz,
     yaw,
+    q,
     origin: { x: origin.x, y: origin.y, z: origin.z },
     count,
     coords: Int16Array.from(coords),
@@ -241,6 +337,7 @@ export function dropInteriorCells(grid: VoxelGridData, maxThickness = Infinity):
     ny: grid.ny,
     nz: grid.nz,
     yaw: grid.yaw,
+    q: grid.q,
     origin: grid.origin,
     count: coords.length / 3,
     coords: Int16Array.from(coords),
@@ -285,7 +382,53 @@ export function raycastYawObb(
   const ldx = dx * cos + dz * sin
   const ldy = dy
   const ldz = -dx * sin + dz * cos
+  return slabEntry(lox, loy, loz, ldx, ldy, ldz, halfX, halfY, halfZ, maxDist)
+}
 
+/**
+ * General-basis twin of raycastYawObb: ray vs an OBB whose orientation is
+ * a full quaternion basis (WORLD → BOX-LOCAL, same convention as
+ * VoxelGridData.q — raycastObb(..., yawBasis(yaw), d) matches
+ * raycastYawObb(..., yaw, d) up to rounding). This is the roof-plane hook:
+ * pitched stud/sheet segments will pass Qy(yaw)·Qx(pitch) here.
+ */
+export function raycastObb(
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  cx: number,
+  cy: number,
+  cz: number,
+  halfX: number,
+  halfY: number,
+  halfZ: number,
+  basis: VoxelBasis,
+  maxDist: number,
+): number | null {
+  rotateByBasis(basis, ox - cx, oy - cy, oz - cz, _v)
+  const lox = _v.x
+  const loy = _v.y
+  const loz = _v.z
+  rotateByBasis(basis, dx, dy, dz, _v)
+  return slabEntry(lox, loy, loz, _v.x, _v.y, _v.z, halfX, halfY, halfZ, maxDist)
+}
+
+/** Shared slab test in the box's local frame (see raycastYawObb). */
+function slabEntry(
+  lox: number,
+  loy: number,
+  loz: number,
+  ldx: number,
+  ldy: number,
+  ldz: number,
+  halfX: number,
+  halfY: number,
+  halfZ: number,
+  maxDist: number,
+): number | null {
   let tMin = 0
   let tMax = maxDist
   // X slab
@@ -355,11 +498,18 @@ export function removeSphere(
 ): number[] {
   const removed: number[] = []
   const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
-  // Yaw grids index cells in their local frame — rotate the query point for
-  // the cell-range bounds (the r² check below stays world vs world centers).
+  // Rotated grids index cells in their own frame — rotate the query point
+  // for the cell-range bounds (the r² check below stays world vs world
+  // centers, so the carve is exact in any basis).
   let lx = x
+  let ly = y
   let lz = z
-  if (yaw !== 0) {
+  if (!basisIsYawOnly(grid.q)) {
+    rotateByBasis(grid.q, x, y, z, _v)
+    lx = _v.x
+    ly = _v.y
+    lz = _v.z
+  } else if (yaw !== 0) {
     const cos = Math.cos(yaw)
     const sin = Math.sin(yaw)
     lx = x * cos + z * sin
@@ -367,8 +517,8 @@ export function removeSphere(
   }
   const minX = Math.max(0, Math.floor((lx - radius - origin.x) / cellX))
   const maxX = Math.min(nx - 1, Math.floor((lx + radius - origin.x) / cellX))
-  const minY = Math.max(0, Math.floor((y - radius - origin.y) / cellY))
-  const maxY = Math.min(ny - 1, Math.floor((y + radius - origin.y) / cellY))
+  const minY = Math.max(0, Math.floor((ly - radius - origin.y) / cellY))
+  const maxY = Math.min(ny - 1, Math.floor((ly + radius - origin.y) / cellY))
   const minZ = Math.max(0, Math.floor((lz - radius - origin.z) / cellZ))
   const maxZ = Math.min(nz - 1, Math.floor((lz + radius - origin.z) / cellZ))
   const r2 = radius * radius
@@ -404,8 +554,8 @@ export type VoxelRayHit = { index: number; distance: number }
 /**
  * Amanatides–Woo DDA walk through the grid; returns the first LIVE voxel the
  * ray crosses, or null. The grid is axis-aligned in its own frame so this is
- * exact and far cheaper than any mesh raycast — yaw grids just rotate the
- * WORLD ray into the local frame first (Y rotations preserve distances, so
+ * exact and far cheaper than any mesh raycast — rotated grids just rotate
+ * the WORLD ray into the grid frame first (rotations preserve distances, so
  * the returned distance is valid in world space as-is).
  */
 export function raycastVoxels(
@@ -419,7 +569,16 @@ export function raycastVoxels(
   maxDist: number,
 ): VoxelRayHit | null {
   const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
-  if (yaw !== 0) {
+  if (!basisIsYawOnly(grid.q)) {
+    rotateByBasis(grid.q, ox, oy, oz, _v)
+    ox = _v.x
+    oy = _v.y
+    oz = _v.z
+    rotateByBasis(grid.q, dx, dy, dz, _v)
+    dx = _v.x
+    dy = _v.y
+    dz = _v.z
+  } else if (yaw !== 0) {
     const cos = Math.cos(yaw)
     const sin = Math.sin(yaw)
     const lox = ox * cos + oz * sin
@@ -503,7 +662,10 @@ export function raycastVoxels(
 /**
  * 6-connected flood fill from the wall's base layer (iy === 0). Every live
  * voxel NOT reached is part of an unsupported island — returned grouped so
- * the caller can crumble them into debris.
+ * the caller can crumble them into debris. Purely grid-space, so the basis
+ * never enters: on a rotated grid "supported from iy === 0" means supported
+ * from whatever world direction grid −Y points at (for a roof-plane basis,
+ * the eave-side row — a pitched slab sheds its uphill half when severed).
  */
 export function findUnsupportedIslands(grid: VoxelGridData): number[][] {
   const { count, coords, nx, ny, nz, index } = grid
