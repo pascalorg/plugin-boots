@@ -85,6 +85,21 @@ import { bvhFor, type GameWorld } from './world'
  *                             like charcoal — 2-3 tumbling pieces along its
  *                             long axis + snap sfx. Returns true if damage
  *                             applied. `damageStud` is a legacy alias.
+ *   damageExplosion(world, center, radius)   one blast: every destructible
+ *                             collider group whose bounds touch the radius
+ *                             takes the full-depth center carve plus ragged
+ *                             rim nibbles, and framing segments inside the
+ *                             radius snap (cap 48). Returns total voxels
+ *                             removed. grenade.tsx's detonation routes here.
+ * Structural rules (automatic — no caller wiring)
+ *   30%-support: when under 30% of a wall's stud CHAINS still connect the
+ *                             wall to the floor, everything above the
+ *                             support ceiling avalanches (staggered voxel
+ *                             layers, sheets fly, sticks snap). Checked
+ *                             (debounced 160 ms) after every segment break.
+ *   skeleton snap: a wall whose cladding hits ZERO live voxels can't keep
+ *                             its bare frame standing — every remaining
+ *                             segment snaps top-down across ~1.5 s.
  * Queries
  *   raycastVoxelTargets(origin, direction, maxDist)   first live voxel of
  *                             any target along the ray → { nodeId,
@@ -723,6 +738,8 @@ function crumbleIslands(target: VoxelTarget): void {
   }
   if (framingGone) sfx.woodCrumble(total)
   else sfx.crumble(total)
+  // An island crumble can take the LAST cladding cells with it.
+  maybeSkeletonSnap(target)
 }
 
 const _sheetCenter = new Vector3()
@@ -787,6 +804,8 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
   })
   sfx.paperTear()
   sfx.crumble(freed)
+  // A whole board leaving can take the LAST cladding cells with it.
+  maybeSkeletonSnap(target)
 }
 
 /**
@@ -953,6 +972,8 @@ export function damageTarget(
       crumbleIslands(target)
     }, 140),
   )
+  // Cladding all gone? The bare frame can't stand — skeleton snap.
+  maybeSkeletonSnap(target)
   return removed.length
 }
 
@@ -1139,6 +1160,8 @@ function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
         }
         live.revision++
         useDestruction.getState().bump()
+        // The avalanche can strip the LAST cladding cells — skeleton snap.
+        maybeSkeletonSnap(live)
       }, 60 * band)
     }
     // …remaining sheets above fly, remaining segments above snap.
@@ -1158,6 +1181,156 @@ function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
     target.revision++
     useDestruction.getState().bump()
   }
+}
+
+// ── Skeleton snap (QA p4r1 gate f) ──────────────────────────────────────────
+// A wall whose cladding is entirely gone (grid.aliveCount 0) cannot keep its
+// bare frame standing — the leftover charcoal sticks snap top-down across
+// ~1.5 s instead of floating in midair forever.
+
+const SKELETON_SNAP_SPAN_MS = 1500
+/** Walls whose skeleton snap already fired (never re-armed per session). */
+const skeletonSnapped = new Set<string>()
+const skeletonTimers: ReturnType<typeof setTimeout>[] = []
+
+function maybeSkeletonSnap(target: VoxelTarget): void {
+  if (target.grid.aliveCount > 0 || skeletonSnapped.has(target.nodeId)) return
+  const remaining: SegmentMember[] = []
+  for (const segment of target.segments) if (!segment.broken) remaining.push(segment)
+  if (remaining.length === 0) return
+  skeletonSnapped.add(target.nodeId)
+  // Top plates first — the frame reads as raining down, not popping at once.
+  remaining.sort((a, b) => b.center[1] - a.center[1])
+  const count = remaining.length
+  sfx.woodCrumble(Math.min(24, count))
+  for (let i = 0; i < count; i++) {
+    const segment = remaining[i]!
+    skeletonTimers.push(
+      setTimeout(
+        () => {
+          const live = useDestruction.getState().targets.get(target.nodeId)
+          if (!live || segment.broken) return
+          breakSegmentQuiet(live, segment)
+          if (i % 4 === 0) sfx.studSnap() // voice every few snaps, not all 60
+          live.revision++
+          useDestruction.getState().bump()
+        },
+        Math.round((i / count) * SKELETON_SNAP_SPAN_MS),
+      ),
+    )
+  }
+}
+
+// ── Explosion carve (grenade detonation) ─────────────────────────────────────
+
+/** Node types a blast will voxelize + carve — mirror of shooting.ts's
+ * DESTRUCTIBLE routing set (terrain/fixtures just take the dust). */
+const EXPLODABLE = new Set([
+  'wall',
+  'door',
+  'window',
+  'slab',
+  'floor',
+  'ceiling',
+  'roof',
+  'roof-segment',
+  'item',
+  'shelf',
+  'cabinet',
+  'cabinet-module',
+  'block',
+  'column',
+  'stair',
+  'stair-segment',
+  'counter',
+  'kitchen-unit',
+])
+
+/** Ragged-edge nibble carves per node around the main sphere. */
+const EXPLOSION_NIBBLES = 5
+/** Cap on framing segments snapped per blast. */
+const EXPLOSION_SEGMENT_CAP = 48
+
+const _boomPoint = new Vector3()
+const _boomSeg = new Vector3()
+
+/**
+ * One explosion: every destructible collider group whose bounds touch the
+ * radius takes the full-depth center carve (radius ≥ WALL_PIERCE_RADIUS, so
+ * both drywall skins go in one hit) plus EXPLOSION_NIBBLES ragged rim
+ * nibbles, then framing segments inside the radius snap (which arms the
+ * 30%-support check). Returns the total voxels removed.
+ */
+/** One expanding ring of the blast: carve every explodable node whose
+ * bounds sit within `ring`; nibbles only on the outermost pass. removeSphere
+ * is idempotent, so each ring only pays for its own shell. */
+function explosionRing(
+  world: GameWorld,
+  center: Vector3,
+  ring: number,
+  withNibbles: boolean,
+): number {
+  let total = 0
+  const seen = new Set<string>()
+  for (const collider of world.colliders) {
+    if (seen.has(collider.nodeId)) continue
+    if (!EXPLODABLE.has(collider.nodeType)) continue
+    if (collider.worldBox.distanceToPoint(center) > ring) continue
+    seen.add(collider.nodeId)
+    total += damageTarget(world, collider.nodeId, center, ring)
+    if (!withNibbles) continue
+    for (let i = 0; i < EXPLOSION_NIBBLES; i++) {
+      _boomPoint
+        .set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize()
+        .multiplyScalar(ring * (0.75 + Math.random() * 0.3))
+        .add(center)
+      total += damageTarget(world, collider.nodeId, _boomPoint, 0.3 + Math.random() * 0.2)
+    }
+  }
+  return total
+}
+
+function explosionSegments(world: GameWorld, center: Vector3, radius: number): void {
+  const radiusSq = radius * radius
+  let snapped = 0
+  outer: for (const target of useDestruction.getState().targets.values()) {
+    for (const segment of target.segments) {
+      if (segment.broken) continue
+      _boomSeg.set(segment.center[0], segment.center[1], segment.center[2])
+      if (_boomSeg.distanceToSquared(center) > radiusSq) continue
+      damageSegment(world, target.nodeId, segment.id, 999, _boomSeg)
+      if (++snapped >= EXPLOSION_SEGMENT_CAP) break outer
+    }
+  }
+}
+
+/**
+ * STAGGERED detonation (the "short lag when they detonate" fix): the frame
+ * of the boom only carves the inner core — instant feedback — and the outer
+ * rings land 30/70 ms later, which spreads the carve + voxelize-on-first-hit
+ * cost across frames AND reads as a shockwave expanding outward. Framing
+ * snaps with the last ring. Returns the core count (rings add later).
+ */
+export function damageExplosion(
+  world: GameWorld,
+  center: Vector3,
+  radius: number,
+  opts?: { immediate?: boolean },
+): number {
+  if (opts?.immediate) {
+    let total = explosionRing(world, center, radius, true)
+    explosionSegments(world, center, radius)
+    return total
+  }
+  const total = explosionRing(world, center, radius * 0.5, false)
+  const frozen = center.clone()
+  setTimeout(() => explosionRing(world, frozen, radius * 0.8, false), 30)
+  setTimeout(() => {
+    explosionRing(world, frozen, radius, true)
+    explosionSegments(world, frozen, radius)
+  }, 70)
+  return total
 }
 
 export function damageSegment(
@@ -1348,6 +1521,9 @@ export function resetDestruction(): void {
   islandTimers.clear()
   for (const timer of structTimers.values()) clearTimeout(timer)
   structTimers.clear()
+  for (const timer of skeletonTimers) clearTimeout(timer)
+  skeletonTimers.length = 0
+  skeletonSnapped.clear()
   prevoxelizeSkip.clear()
   useDestruction.getState().reset()
 }

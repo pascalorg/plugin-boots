@@ -90,7 +90,18 @@ export function GunTable({ world }: { world: GameWorld }) {
           s.giveWeapon('rifle')
           s.setWeapon('rifle')
         }}
-        fixtures={<SirenBeacon />}
+        fixtures={
+          <>
+            <SirenBeacon />
+            {/* The placard is a FIXTURE: it outlives the pickup (and flips
+             * to the taunt once you're geared). */}
+            <TableSign
+              position={[0, TABLE_TOP, -0.28]}
+              rotation={[0, 0, 0]}
+              text={geared ? 'YOU ARE COOKED' : 'PUT YOUR BOOTS ON'}
+            />
+          </>
+        }
       >
         {/* pistol on display — lying flat on the tabletop (owner call) */}
         <group position={[-0.4, TABLE_TOP + 0.03, 0.05]} rotation={[0, 0.45, 0]}>
@@ -110,11 +121,6 @@ export function GunTable({ world }: { world: GameWorld }) {
         <group position={[-0.68, TABLE_TOP, 0.12]} rotation={[0, Math.PI + 0.35, 0]}>
           <BootsPair />
         </group>
-        <TableSign
-          position={[0, TABLE_TOP, -0.28]}
-          rotation={[0, 0, 0]}
-          text={geared ? 'YOU ARE COOKED' : 'PUT YOUR BOOTS ON'}
-        />
       </WeaponTable>
       <WeaponTable
         world={world}
@@ -139,18 +145,20 @@ export function GunTable({ world }: { world: GameWorld }) {
             </group>
           </group>
         </Spin>
-        {/* the warhammer, lying on its side along the table's front edge —
-            the rear-table pickup grants both. Model space: haft +Y, so the
-            Euler XYZ z-roll (applied first) lays it head-toward-+X, then the
-            small y-yaw skews it naturally on the tabletop. Scaled to fit the
-            1.7 m top (the haft alone is ~1.05 m). */}
-        <group position={[0.08, TABLE_TOP + 0.05, 0.26]} rotation={[0, 0.12, -Math.PI / 2]}>
+        {/* the warhammer, LEANING against the table's right end — flat on
+            the tabletop it vanished behind the minigun from the spawn side
+            (QA p4r1). Pommel on the floor just past the top's +x edge, the
+            haft rests on the table-edge corner (z-roll 0.25 leans it toward
+            -x; the pommel sits 0.18·cos(0.25) below the group origin), and
+            the big steel head crowns ~4 cm above the tabletop where the
+            approach sightline can't miss it. Pickup grants both weapons. */}
+        <group position={[1.03, 0.18, 0.18]} rotation={[0, 0.15, 0.25]}>
           {ExternalWarhammer ? (
             <group scale={0.8}>
               <ExternalWarhammer />
             </group>
           ) : (
-            <group scale={1.4}>
+            <group scale={0.8}>
               <HammerModel />
             </group>
           )}

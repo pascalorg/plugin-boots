@@ -1,5 +1,6 @@
 'use client'
 
+import { sceneRegistry } from '@pascal-app/core'
 import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import { type Object3D, Raycaster, Vector3 } from 'three'
@@ -43,6 +44,35 @@ import {
  * slot (so it exists whenever Boots is installed in the scene) and inert
  * until the panel flips the store into game phase.
  */
+
+/**
+ * Resurrection sweep — the "drywall that can't be damaged" fix: the host's
+ * wall system rebuilds its meshes asynchronously (geometry bundles), so a
+ * wall voxelized 10 minutes ago can sprout FRESH host meshes mid-session —
+ * visible, absent from our colliders, untouchable by bullets or grenades.
+ * Every ~0.5s, re-walk each voxelized node's registry root and hide any
+ * visible mesh through the session ledger (restored on exit as always).
+ */
+function ResurrectionSweep() {
+  const frame = useRef(0)
+  useFrame(() => {
+    frame.current++
+    if (frame.current % 30 !== 0) return
+    const targets = useDestruction.getState().targets
+    if (targets.size === 0) return
+    for (const nodeId of targets.keys()) {
+      const root = sceneRegistry.nodes.get(nodeId as never)
+      if (!root) continue
+      root.traverse((obj: Object3D) => {
+        const mesh = obj as Object3D & { isMesh?: boolean; userData: { __boots?: boolean } }
+        if (!mesh.isMesh || !mesh.visible || mesh.userData.__boots) return
+        hideForGame(obj)
+      })
+    }
+  })
+  return null
+}
+
 export function GameRoot() {
   const phase = useBoots((s) => s.phase)
   if (phase !== 'game') return null
@@ -457,6 +487,7 @@ function ActiveGame() {
       <Enemies world={world} />
       <Nature world={world} />
       <PipelineWarmup />
+      <ResurrectionSweep />
       <TreesDestruct world={world} />
     </>
   )

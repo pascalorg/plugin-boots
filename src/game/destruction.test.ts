@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import {
+  damageExplosion,
   damageSegment,
   damageTarget,
   ensureVoxelTarget,
@@ -325,5 +326,45 @@ describe('drywall sheets', () => {
     expect(flown.hits).toBe(frozen.hits)
     expect(flown.torn).toBe(frozen.torn)
     expect(flown.torn).toBe(flown.cellCount)
+  })
+})
+
+describe('damageExplosion (grenade detonation carve)', () => {
+  test('one blast guts every destructible in range and snaps its framing', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    const before = wall.grid.aliveCount
+    const removed = damageExplosion(world, new Vector3(0, 1.2, 0.5), 3.2, { immediate: true })
+    expect(removed).toBeGreaterThan(0)
+    // The 3.2 m sphere dwarfs the 2 × 2.7 wall — most of it is gone…
+    expect(wall.grid.aliveCount).toBeLessThan(before * 0.5)
+    // …and the framing inside the radius snapped with it (cap 48).
+    const broken = wall.segments.filter((s) => s.broken).length
+    expect(broken).toBeGreaterThan(0)
+    expect(broken).toBeLessThanOrEqual(48)
+  })
+
+  test('far targets and non-destructibles are untouched', () => {
+    const world = makeWorld()
+    // Blast at wall-1; wall-2 (5 m away, bounds > 3.2 m out) never voxelizes.
+    damageExplosion(world, new Vector3(0, 1.2, 0.5), 3.2, { immediate: true })
+    const targets = useDestruction.getState().targets
+    expect(targets.has('wall-2')).toBe(false)
+    expect(targets.has('slab-1')).toBe(false)
+  })
+})
+
+describe('skeleton snap (cladding gone → bare frame falls)', () => {
+  test('a wall carved to zero live voxels snaps every segment within ~1.5 s', async () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    expect(wall.segments.some((s) => !s.broken)).toBe(true)
+    // One giant full-depth carve (radius >= pierce gate) strips ALL cladding.
+    damageTarget(world, 'wall-1', new Vector3(0, 1.35, 0), 4)
+    expect(wall.grid.aliveCount).toBe(0)
+    // Immediately after: the snap is STAGGERED, not instantaneous.
+    // After the 1.5 s span (+ buffer): the whole skeleton is down.
+    await new Promise((resolve) => setTimeout(resolve, 1800))
+    expect(wall.segments.every((s) => s.broken)).toBe(true)
   })
 })
