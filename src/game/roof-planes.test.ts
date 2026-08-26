@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Box3, BufferAttribute, BufferGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import { Box3, BoxGeometry, BufferAttribute, BufferGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { clearDebris } from './debris'
 import {
   damageTarget,
   ensureVoxelTarget,
   raycastSegments,
   resetDestruction,
+  useDestruction,
 } from './destruction'
 import { RAFTER_D, roofPlaneFrame } from './roof-framing'
 import { enumerateRoofPlanes } from './roof-planes'
@@ -13,12 +14,17 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
  * Roof-plane enumeration (Phase C2 fallback: cluster merged-mesh face
- * normals) + the roof target lane it feeds: a gable SHELL mesh — two
- * sloped outer faces and their interior undersides, exactly the shape the
- * host's merged CSG roof exposes — must come back as two RoofPlaneBasis
- * records whose yaw/pitch/extents/eaveCenter match the constructed
- * geometry, and a roof-kind collider must voxelize into a target that
- * frames pitched rafters the segment raycast can hit.
+ * normals) + the per-plane roof target lane it feeds: a gable SHELL mesh —
+ * two sloped outer faces and their interior undersides, exactly the shape
+ * the host's merged CSG roof exposes — must come back as two RoofPlane
+ * records whose yaw/pitch/extents/eaveCenter/thickness match the
+ * constructed geometry, and a roof-kind collider must voxelize into ONE
+ * THIN PITCHED TARGET PER PLANE (kind 'roof', full-quaternion grid basis,
+ * shingle sheets on the outer skin, that plane's rafters as segments) that
+ * the segment raycast, the tear lane, and the eave-seeded island pass all
+ * agree on. Also the home of the BULLETPROOF regression: no roof/volume
+ * carve may ever remove zero voxels because adaptive cells outgrew the
+ * weapon's holeRadius.
  */
 
 const wrap = (a: number): number => {
@@ -197,27 +203,51 @@ describe('enumerateRoofPlanes', () => {
   })
 })
 
-describe('roof target lane', () => {
-  test('a roof collider voxelizes with pitched rafters + a ridge board', () => {
+describe('roof target lane (per-plane pitched grids, Phase C2)', () => {
+  test('a roof collider voxelizes into one thin pitched target per plane', () => {
     const world = roofWorld(gableShellMesh())
-    const target = ensureVoxelTarget(world, 'roof-1')!
-    expect(target).toBeTruthy()
-    expect(target.roof).toBe(true)
-    expect(target.kind).toBe('volume')
-    expect(target.grid.aliveCount).toBeGreaterThan(0)
-    const rafters = target.segments.filter((s) => s.role === 'rafter')
-    expect(rafters.length).toBeGreaterThan(0)
-    for (const rafter of rafters) expect(rafter.pitch).toBeCloseTo(GABLE.pitch, 3)
-    expect(target.segments.some((s) => s.role === 'ridge')).toBe(true)
-    // Ids are target-unique (the flat buildRafters array IS segments).
-    const ids = new Set(target.segments.map((s) => s.id))
-    expect(ids.size).toBe(target.segments.length)
+    const primary = ensureVoxelTarget(world, 'roof-1')!
+    expect(primary).toBeTruthy()
+    const targets = Array.from(useDestruction.getState().targets.values())
+    expect(targets.length).toBe(2)
+    for (const target of targets) {
+      expect(target.nodeId.startsWith('roof-1#p')).toBe(true)
+      expect(target.kind).toBe('roof')
+      expect(target.roof).toBe(true)
+      expect(target.grid.aliveCount).toBeGreaterThan(0)
+      // FULL-quaternion plane basis, not a yaw-only/axis-aligned grid.
+      expect(Math.abs(target.grid.q.x) + Math.abs(target.grid.q.z)).toBeGreaterThan(0.01)
+      // Thin pinned thickness axis (grid Z): the 0.12 m shell splits into
+      // 3 skin-size layers while in-plane cells stay near ROOF_PLANE_CELL —
+      // nothing like the old ~0.5 m adaptive volume cubes.
+      expect(target.grid.cellZ).toBeLessThan(0.06)
+      expect(target.grid.cellX).toBeLessThan(0.3)
+      expect(target.grid.cellX).toBeCloseTo(target.grid.cellY, 6)
+      // Skinned sandwich: outer + inner skins only, cavity dropped.
+      for (let i = 0; i < target.grid.count; i++) {
+        const iz = target.grid.coords[i * 3 + 2]!
+        expect(iz === 0 || iz === target.grid.nz - 1).toBe(true)
+      }
+      // Outer-skin shingle sheets tile the min-z face (side 0).
+      expect(target.sheets.some((sheet) => sheet.side === 0)).toBe(true)
+      // The plane's own rafters ride along, ids re-based per target.
+      const rafters = target.segments.filter((s) => s.role === 'rafter')
+      expect(rafters.length).toBeGreaterThan(0)
+      for (const rafter of rafters) expect(rafter.pitch).toBeCloseTo(GABLE.pitch, 3)
+      const ids = new Set(target.segments.map((s) => s.id))
+      expect(ids.size).toBe(target.segments.length)
+    }
+    // Exactly one plane pair shares the ridge board.
+    const ridges = targets.flatMap((t) => t.segments.filter((s) => s.role === 'ridge'))
+    expect(ridges.length).toBeGreaterThan(0)
   })
 
   test('raycastSegments hits a pitched rafter through the quaternion OBB', () => {
     const world = roofWorld(gableShellMesh())
-    const target = ensureVoxelTarget(world, 'roof-1')!
-    const rafter = target.segments.find((s) => s.role === 'rafter' && (s.pitch ?? 0) > 0)!
+    ensureVoxelTarget(world, 'roof-1')
+    const targets = Array.from(useDestruction.getState().targets.values())
+    const owner = targets.find((t) => t.segments.some((s) => s.role === 'rafter'))!
+    const rafter = owner.segments.find((s) => s.role === 'rafter' && (s.pitch ?? 0) > 0)!
     // The rafter's local Y is its plane's outward normal — a normal-
     // incidence ray from 2 m out enters at exactly half the 2×6 depth.
     const f = roofPlaneFrame(rafter.yaw - Math.PI / 2, rafter.pitch!)
@@ -225,18 +255,109 @@ describe('roof target lane', () => {
     const origin = new Vector3(...rafter.center).addScaledVector(N, 2)
     const hit = raycastSegments(origin, N.clone().negate(), 5)
     expect(hit).toBeTruthy()
-    expect(hit!.nodeId).toBe('roof-1')
+    expect(hit!.nodeId).toBe(owner.nodeId)
     expect(hit!.segmentId).toBe(rafter.id)
     expect(hit!.distance).toBeCloseTo(2 - RAFTER_D / 2, 3)
   })
 
-  test('carving a roof volume tears cells and stays on the roof debris lane', () => {
+  test('a pistol-size carve through the real node id always bites (safety floor)', () => {
     const world = roofWorld(gableShellMesh())
     const f = roofPlaneFrame(GABLE.yaw, GABLE.pitch)
     const point = GABLE.ridge
       .clone()
       .addScaledVector(new Vector3(...f.upSlope), -GABLE.slopeLength / 2)
-    const removed = damageTarget(world, 'roof-1', point, 0.5)
+    // 0.11 m = pistol holeRadius — the exact radius the QA round fired 32
+    // times into the old volume grid without removing a single voxel.
+    const removed = damageTarget(world, 'roof-1', point, 0.11)
+    expect(removed).toBeGreaterThan(0)
+  })
+
+  test('carves respect the entry skin: an outer-face shot keeps the underside', () => {
+    const world = roofWorld(gableShellMesh())
+    ensureVoxelTarget(world, 'roof-1')
+    const f = roofPlaneFrame(GABLE.yaw, GABLE.pitch)
+    const point = GABLE.ridge
+      .clone()
+      .addScaledVector(new Vector3(...f.upSlope), -GABLE.slopeLength / 2)
+    const targets = Array.from(useDestruction.getState().targets.values())
+    const before = targets.map((t) => t.grid.aliveCount)
+    damageTarget(world, 'roof-1', point, 0.45) // rifle tearRadius < pierce gate
+    // Some outer-skin cells died, but every removed cell sits on the OUTER
+    // layer (iz 0) — the inner skin survives the first shot.
+    let removedTotal = 0
+    for (let t = 0; t < targets.length; t++) {
+      const target = targets[t]!
+      removedTotal += before[t]! - target.grid.aliveCount
+      for (let i = 0; i < target.grid.count; i++) {
+        if (target.grid.alive[i]) continue
+        expect(target.grid.coords[i * 3 + 2]).toBe(0)
+      }
+    }
+    expect(removedTotal).toBeGreaterThan(0)
+  })
+
+  test('severing a plane full-depth sheds the uphill block from the eave seed', async () => {
+    const world = roofWorld(gableShellMesh())
+    ensureVoxelTarget(world, 'roof-1')
+    const targets = Array.from(useDestruction.getState().targets.values())
+    const plane = targets.find((t) => Math.abs(wrap(t.grid.yaw)) >= 0)! // any member
+    const f = roofPlaneFrame(GABLE.yaw, GABLE.pitch)
+    const across = new Vector3(...f.across)
+    const mid = GABLE.ridge
+      .clone()
+      .addScaledVector(new Vector3(...f.upSlope), -GABLE.slopeLength / 2)
+    const totalBefore = plane.grid.aliveCount
+    // March a full-depth cut (radius > the 0.6 pierce gate) across the
+    // plane at mid-slope — both skins go, the plane is severed.
+    for (let s = -GABLE.eaveLength / 2; s <= GABLE.eaveLength / 2; s += 0.5) {
+      damageTarget(world, 'roof-1', mid.clone().addScaledVector(across, s), 0.65)
+    }
+    // The island pass (140 ms debounce) finds everything uphill of the cut
+    // unseeded — no eave row below it, no wall underneath in this world.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(plane.grid.aliveCount).toBeLessThan(totalBefore * 0.55)
+    // …and at least one shingle sheet tore off wholesale along the way.
+    const anySheetFlew = targets.some((t) => t.sheets.some((sheet) => sheet.flownOff))
+    expect(anySheetFlew).toBe(true)
+  })
+})
+
+describe('bulletproof safety floor (volume targets)', () => {
+  test('adaptive volume cells can never outgrow the carve radius', () => {
+    // A chunky 6 m cube ('block') voxelizes as a plain volume whose
+    // adaptive cell grows far past every weapon's holeRadius…
+    const mesh = new Mesh(new BoxGeometry(6, 6, 6))
+    mesh.position.set(0, 3, 0)
+    mesh.updateMatrixWorld(true)
+    mesh.geometry.computeBoundingBox()
+    const worldBox = mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld)
+    const collider: ColliderEntry = {
+      mesh,
+      bvh: bvhFor(mesh),
+      inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+      worldBox,
+      root: mesh,
+      nodeId: 'block-1',
+      nodeType: 'block',
+    }
+    const world = {
+      colliders: [collider],
+      walls: new Map(),
+      glass: [],
+      doors: [],
+      overlayRoots: [],
+      buildingAabb: worldBox.clone(),
+      spawn: new Vector3(6, 0, 6),
+      spawnYaw: 0,
+      levelId: null,
+    } as unknown as GameWorld
+    const target = ensureVoxelTarget(world, 'block-1')!
+    expect(target.kind).toBe('volume')
+    const cellMax = Math.max(target.grid.cellX, target.grid.cellY, target.grid.cellZ)
+    expect(cellMax).toBeGreaterThan(0.3)
+    // …but a pistol-size carve at the surface still bites: the safety floor
+    // clamps the radius to 0.75 × the largest cell.
+    const removed = damageTarget(world, 'block-1', new Vector3(0, 3, -3), 0.11)
     expect(removed).toBeGreaterThan(0)
   })
 })

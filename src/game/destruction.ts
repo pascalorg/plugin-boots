@@ -1,12 +1,12 @@
-import { Box3, Color, Matrix4, type Mesh, Vector3 } from 'three'
+import { Box3, Color, Matrix4, type Mesh, type Object3D, Quaternion, Vector3 } from 'three'
 import { create } from 'zustand'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
-import { buildRafters, rafterObbBasis } from './roof-framing'
-import { enumerateRoofPlanes } from './roof-planes'
+import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
+import { enumerateRoofPlanes, roofSurfaceColor } from './roof-planes'
 import { hideForGameKeepingRoots } from './session'
 import {
   dropStructureTarget,
@@ -23,12 +23,14 @@ import {
   raycastVoxels,
   raycastYawObb,
   removeSphere,
+  rotateByBasis,
+  rotateByBasisInverse,
   type SkinLimit,
   type VoxelBasis,
   type VoxelGridData,
   type VoxelSource,
 } from './voxel'
-import { bvhFor, type GameWorld } from './world'
+import { bvhFor, type GameWorld, ITEM_FAMILY_KINDS } from './world'
 
 /**
  * Voxel destruction manager — "everything should be able to break apart".
@@ -62,13 +64,27 @@ import { bvhFor, type GameWorld } from './world'
  * ceiling skin), so unsupported regions are found by probing live
  * colliders / voxel targets beneath each cell column (slabSeedPredicate).
  *
+ * ROOF PLANES (MULTILEVEL-PLAN Phase C2): a pitched roof shell becomes the
+ * SAME anatomy laid on each slope — one target PER PLANE (ids
+ * `<nodeId>#p<n>`, kind 'roof'), each a thin pinned grid axis-aligned in
+ * its plane frame via a full quaternion basis (grid X = across the eave,
+ * Y = up the slope, Z = through the assembly; outer/shingle surface = the
+ * min-z face). dropInteriorCells leaves the shingle skin + underside deck,
+ * ~1.2 m plane-space shingle sheets tile the faces, the plane's rafters
+ * (roof-framing.ts) ride as segments, and islands seed from the EAVE row
+ * (grid iy 0) plus cells standing over live walls (roofSeedPredicate).
+ * Damage through the real node id or any member fans out to every sibling
+ * plane (roofGroups). Roof/volume carves clamp their radius to
+ * CARVE_CELL_FLOOR × the largest cell so no target is ever bulletproof.
+ *
  * ── API (build against this) ──────────────────────────────────────────
  * State
  *   useDestruction            zustand store. `targets` (and its legacy
  *                             alias `walls` — the SAME Map instance) maps
  *                             nodeId → VoxelTarget. `version` bumps on any
  *                             change; re-read the map when it does.
- *   VoxelTarget               { nodeId, kind: 'wall' | 'slab' | 'volume', grid,
+ *   VoxelTarget               { nodeId, kind: 'wall' | 'slab' | 'roof' |
+ *                             'volume', grid,
  *                             baseColor, segments: SegmentMember[],
  *                             studs (legacy — SAME array as segments),
  *                             sheets: SheetMember[], sheetByCell,
@@ -91,8 +107,12 @@ import { bvhFor, type GameWorld } from './world'
  *   ensureVoxelTarget(world, nodeId)   voxelize ANY collider group (walls,
  *                             doors, slabs, roofs, items…). Walls get the
  *                             skins + studs anatomy, horizontal slabs the
- *                             sandwich (skins + joists); everything else is
- *                             a plain adaptive volume (≤ 1600 voxels).
+ *                             sandwich (skins + joists); ITEM_FAMILY_KINDS
+ *                             (item/shelf/cabinet/counter…) get SILHOUETTE
+ *                             cells — clamp(minDim/3, 0.055, 0.11) m under a
+ *                             raised budget, so a toilet breaks as a toilet
+ *                             (phase 6); everything else is a plain adaptive
+ *                             volume (≤ 1600 voxels).
  *                             `ensureVoxelWall` is a legacy alias.
  *   prevoxelizeTick(world, budgetMs?)   voxelize the scene's remaining
  *                             walls a few per tick (host meshes hide in the
@@ -218,8 +238,11 @@ export type VoxelTarget = {
   nodeId: string
   /** 'wall' and 'slab' targets carry the skins + framing anatomy ('slab' =
    * the horizontal sandwich: thickness axis Y, joists in the cavity);
-   * 'volume' is plain. */
-  kind: 'wall' | 'slab' | 'volume'
+   * 'roof' is one PITCHED plane of a roof shell (Phase C2: thin pinned grid
+   * in the slope frame — thickness along grid Z, upSlope along grid Y —
+   * with shingle sheets on the outer skin and that plane's rafters as
+   * segments); 'volume' is plain. */
+  kind: 'wall' | 'slab' | 'volume' | 'roof'
   grid: VoxelGridData
   baseColor: Color
   /** Breakable framing sticks (walls only). voxel-walls.tsx renders these
@@ -240,6 +263,10 @@ export type VoxelTarget = {
    * studs/joists, sheet fly-offs voice shingleRip, and torn shards wear the
    * shingle debris tone. */
   roof?: boolean
+  /** True for ITEM_FAMILY_KINDS targets (phase 6 silhouette lane): fine
+   * shape-preserving cells, carve dust voiced 'concrete'-lite (the
+   * porcelain read — see damageTarget). */
+  item?: boolean
   /** True for plates SYNTHESIZED under zero-extent ceiling planes: their
    * cells hold another target up only by direct contact (structure.ts
    * PLATE_CONTACT_SLACK), never across the general SUPPORT_GAP band — a
@@ -686,6 +713,61 @@ const SLAB_KINDS = new Set(['slab', 'ceiling', 'floor'])
  * ridge boards from roof-framing.ts, revealed exactly like wall studs. */
 const ROOF_KINDS = new Set(['roof', 'roof-segment'])
 
+// ── Item silhouette lane (phase 6 — items keep their SHAPE) ─────────────────
+// Owner call: a toilet or shower must NOT collapse into chunky generic
+// blocks. ITEM_FAMILY_KINDS targets (world.ts owns the set — the same one
+// whose glass-like sub-meshes shatter instead of voxelizing) grid at FINE
+// cells traced from their own bounds, staying kind 'volume' (no skins, no
+// framing — the shape IS the anatomy).
+
+/** Silhouette cell: a third of the item's SMALLEST extent, clamped to
+ * [0.055, 0.11] m — a 0.4 m-deep toilet grids at 0.11 m cells (hundreds of
+ * voxels tracing the bowl) instead of the generic 0.15 m volume cell
+ * (3 fat cubes). */
+const ITEM_CELL_MIN = 0.055
+const ITEM_CELL_MAX = 0.11
+/** Raw-grid budget for the silhouette lane — raised over the generic
+ * volume budget so mid-size fixtures keep their fine cells; larger items
+ * grow the cell in the same ×1.35 steps buildVoxelGrid uses. */
+const ITEM_VOXEL_BUDGET = 2600
+/** voxel.ts's hard fill cap (MAX_VOXELS — module-private there): a grid
+ * stops ADDING occupied cells at this count, which would silently chop the
+ * TOP off a dense item. buildItemGrid detects the hit (count == cap) and
+ * rebuilds one step coarser; raising the cap itself belongs to voxel.ts's
+ * owner. */
+const VOXEL_FILL_CEILING = 1600
+/** Item carve dust intensity cap — the 'concrete'-lite voice (see
+ * damageTarget's porcelain note). */
+const ITEM_DUST_MAX = 0.55
+
+const _itemSize = new Vector3()
+
+/**
+ * SILHOUETTE grid for an item-family target. Budgeted in TWO stages: the
+ * raw AABB grid is pre-grown to fit ITEM_VOXEL_BUDGET (hollow shells get to
+ * exploit the raised budget — occupancy runs far under raw), and a build
+ * that lands exactly on voxel.ts's fill ceiling (= possibly truncated
+ * top-off) rebuilds coarser until it fits whole. solid=false keeps
+ * buildVoxelGrid's own adaptive loop out of the way (its raw budget is far
+ * above ITEM_VOXEL_BUDGET); the sizing here is the only authority.
+ */
+function buildItemGrid(sources: VoxelSource[], bounds: Box3): VoxelGridData {
+  bounds.getSize(_itemSize)
+  const minDim = Math.min(_itemSize.x, _itemSize.y, _itemSize.z)
+  let cell = Math.min(ITEM_CELL_MAX, Math.max(ITEM_CELL_MIN, minDim / 3))
+  const rawCount = () =>
+    Math.max(1, Math.ceil(_itemSize.x / cell - 1e-6)) *
+    Math.max(1, Math.ceil(_itemSize.y / cell - 1e-6)) *
+    Math.max(1, Math.ceil(_itemSize.z / cell - 1e-6))
+  for (let guard = 0; guard < 12 && rawCount() > ITEM_VOXEL_BUDGET; guard++) cell *= 1.35
+  let grid = buildVoxelGrid(sources, bounds.clone(), cell, false)
+  for (let guard = 0; guard < 4 && grid.count >= VOXEL_FILL_CEILING; guard++) {
+    cell *= 1.35
+    grid = buildVoxelGrid(sources, bounds.clone(), cell, false)
+  }
+  return grid
+}
+
 /** Synthesized plate thickness for ZERO-extent horizontals. Host ceiling
  * planes are 0 m thick; gridded isotropically they produce ~0.15 m cells
  * that interpenetrate the base row of any wall standing ON the plane, and
@@ -805,11 +887,19 @@ function thicknessAxisOf(grid: VoxelGridData): 0 | 1 | 2 {
  * Group a wall grid's skin voxels into logical drywall sheets: split by
  * face (side of the thickness axis — the axis with the smallest physical
  * extent, same rule as dropInteriorCells), then tile ~1.2 m along the wall
- * run and ~2.4 m up. Remainder tiles merge into their neighbor so no sliver
- * sheets exist. Works on yaw-local grids too — tiling runs on grid coords,
- * centers/normals come out world-space.
+ * run and ~2.4 m up (roof planes pass ~1.2 m square shingle-course tiles).
+ * Remainder tiles merge into their neighbor so no sliver sheets exist.
+ * Works on yaw-local AND full-basis (pitched roof-plane) grids — tiling
+ * runs on grid coords, centers/normals come out world-space.
  */
-function buildSheets(grid: VoxelGridData): { sheets: SheetMember[]; sheetByCell: Int32Array } {
+/** Scratch for buildSheets' basis-rotated outward normals. */
+const _sheetNormalScratch = { x: 0, y: 0, z: 0 }
+
+function buildSheets(
+  grid: VoxelGridData,
+  tileW = SHEET_W,
+  tileH = SHEET_H,
+): { sheets: SheetMember[]; sheetByCell: Int32Array } {
   const sheets: SheetMember[] = []
   const sheetByCell = new Int32Array(grid.count).fill(-1)
   if (grid.count === 0) return { sheets, sheetByCell }
@@ -820,8 +910,8 @@ function buildSheets(grid: VoxelGridData): { sheets: SheetMember[]; sheetByCell:
   const t = thicknessAxisOf(grid)
   const u = t === 0 ? 2 : 0
   const v = t === 1 ? 2 : 1
-  const tileU = Math.max(1, Math.round(SHEET_W / cells[u]!))
-  const tileV = Math.max(1, Math.round(SHEET_H / cells[v]!))
+  const tileU = Math.max(1, Math.round(tileW / cells[u]!))
+  const tileV = Math.max(1, Math.round(tileH / cells[v]!))
   const nTilesU = Math.max(1, Math.round(spans[u]! / tileU))
   const nTilesV = Math.max(1, Math.round(spans[v]! / tileV))
 
@@ -857,11 +947,24 @@ function buildSheets(grid: VoxelGridData): { sheets: SheetMember[]; sheetByCell:
     }
     // Outward face normal: the ± thickness axis in the grid's local frame,
     // rotated out to world (same local→world convention as grid centers).
+    // Full-basis grids (pitched roof planes) rotate through the quaternion
+    // conjugate — the yaw trig below only knows Y rotations.
     const sign = side === 0 ? -1 : 1
     let nX = 0
     let nY = 0
     let nZ = 0
-    if (t === 0) {
+    if (grid.q.x !== 0 || grid.q.z !== 0) {
+      rotateByBasisInverse(
+        grid.q,
+        t === 0 ? sign : 0,
+        t === 1 ? sign : 0,
+        t === 2 ? sign : 0,
+        _sheetNormalScratch,
+      )
+      nX = _sheetNormalScratch.x
+      nY = _sheetNormalScratch.y
+      nZ = _sheetNormalScratch.z
+    } else if (t === 0) {
       nX = cos * sign
       nZ = sin * sign
     } else if (t === 1) {
@@ -903,15 +1006,191 @@ function targetBaseColor(meshes: Mesh[]): Color {
 }
 
 /**
+ * Hide a node's host meshes (session ledger — the editor gets them back
+ * untouched) and hand its colliders over to the voxel replica. A wall's
+ * render mesh is the scene-graph PARENT of its hosted door/window/item
+ * roots (the host's WallRenderer nests them), so a plain `visible = false`
+ * would cull live doors and windows along with the wall — masking keeps
+ * them rendering; every other node's own root is fenced the same way the
+ * collect-time mesh sweep fences (world.solidRoots). The node's OWN root
+ * must not fence its own hide.
+ */
+function hideHostNode(
+  world: GameWorld,
+  nodeId: string,
+  meshes: readonly Mesh[],
+  wallRoot?: Object3D,
+): void {
+  const keepRoots = new Set(world.solidRoots ?? [])
+  if (wallRoot) keepRoots.delete(wallRoot)
+  for (const collider of world.colliders) {
+    if (collider.nodeId === nodeId) keepRoots.delete(collider.root)
+  }
+  for (const mesh of meshes) hideForGameKeepingRoots(mesh, keepRoots)
+  for (const collider of world.colliders) {
+    if (collider.nodeId === nodeId) collider.disabled = true
+  }
+}
+
+// ── Roof plane lane (MULTILEVEL-PLAN Phase C2) ──────────────────────────────
+// A pitched roof shell voxelizes as ONE THIN PINNED GRID PER PLANE, each
+// axis-aligned in its slope frame (grid X = across the eave, grid Y = up
+// the slope, grid Z = through the assembly — the outer/shingle surface is
+// the MIN-z face), instead of the old single axis-aligned volume whose
+// adaptive cells stair-stepped the silhouette and could grow past every
+// weapon's holeRadius (the QA "bulletproof roof"). Member targets live in
+// the normal target map under `<nodeId>#p<n>` ids; the real node id keeps a
+// group record so damage through EITHER id fans out to every sibling plane
+// (the planes overlap a hair at ridges/hips — a seam shot must open both).
+// Roof targets register with structure.ts as SUPPORTERS only (kind 'roof'
+// is never a crumble candidate, matching the V1 pitched-grid rule).
+
+/** In-plane preferred cell for roof plane grids (QA C2: ~0.18 m; large
+ * planes grow adaptively in buildVoxelGrid's ×1.35 steps). */
+const ROOF_PLANE_CELL = 0.18
+/** Outer-skin shingle sheets tile ~1.2 m squares in plane space. */
+const ROOF_SHEET_TILE = 1.2
+/** Carve-radius safety floor for roof/volume targets, as a fraction of the
+ * largest cell dimension — no target can ever be bulletproof again (QA C2
+ * defect b: 0.5 m adaptive cells vs 0.11 m pistol holeRadius). */
+const CARVE_CELL_FLOOR = 0.75
+/** Slack the plane grid's bounds add through the thickness so the outer
+ * and inner surfaces sit strictly inside the first/last cell layer (a face
+ * exactly on a cell boundary voxelizes flakily — see PLATE_SYNTH_T). */
+const ROOF_Z_PAD = 0.004
+
+/** Real roof nodeId → its per-plane member target ids. */
+const roofGroups = new Map<string, string[]>()
+/** Member target id → its group's real nodeId. */
+const roofMemberOf = new Map<string, string>()
+
+const _planeBasisMat = new Matrix4()
+const _planeQuat = new Quaternion()
+const _planeAcross = new Vector3()
+const _planeUp = new Vector3()
+const _planeIn = new Vector3()
+const _planeBounds = new Box3()
+
+/**
+ * Build one pitched VoxelTarget per enumerated roof plane; returns the
+ * first member (ensureVoxelTarget's return for the real node id) or null
+ * when the shell exposes no usable plane — the caller keeps the legacy
+ * volume lane then (flat roofs frame nothing and stay chunky, as before).
+ * All planes build in the SAME tick, so the merged host mesh hides exactly
+ * once, after every replica is ready.
+ */
+function buildRoofPlaneTargets(
+  world: GameWorld,
+  nodeId: string,
+  meshes: Mesh[],
+  sources: VoxelSource[],
+): VoxelTarget | null {
+  const planes = enumerateRoofPlanes(meshes)
+  if (planes.length === 0) return null
+  // One flat rafter layout over all planes, split per plane (ids re-based
+  // 0..n−1 within each group — the SegmentMember contract per target).
+  const rafterGroups = splitRaftersByPlane(buildRafters(null, null, planes), planes.length)
+  // Skin tone: the roof SURFACE material (dominant sloped-face area), not
+  // whatever material slot happens to come first on the merged mesh (QA c:
+  // roofs rendered in the white Wall/Trim tone).
+  const baseColor = roofSurfaceColor(meshes) ?? targetBaseColor(meshes)
+  const built: VoxelTarget[] = []
+  for (let p = 0; p < planes.length; p++) {
+    const plane = planes[p]!
+    const { across, normal, upSlope } = roofPlaneFrame(plane.yaw, plane.pitch)
+    // GRID frame: X = across, Y = upSlope, Z = −normal. Right-handed
+    // (across × upSlope = −normal), and the OUTER surface lands on the
+    // grid's MIN-z face so sheet/skin side 0 is always the shingle side.
+    _planeBasisMat.makeBasis(
+      _planeAcross.set(across[0], across[1], across[2]),
+      _planeUp.set(upSlope[0], upSlope[1], upSlope[2]),
+      _planeIn.set(-normal[0], -normal[1], -normal[2]),
+    )
+    // makeBasis columns are GRID → WORLD; VoxelBasis wants WORLD → GRID.
+    _planeQuat.setFromRotationMatrix(_planeBasisMat).invert()
+    const q: VoxelBasis = { x: _planeQuat.x, y: _planeQuat.y, z: _planeQuat.z, w: _planeQuat.w }
+    // The eave center in grid coordinates (projections onto the frame).
+    const [ex, ey, ez] = plane.eaveCenter
+    const eA = ex * across[0] + ey * across[1] + ez * across[2]
+    const eU = ex * upSlope[0] + ey * upSlope[1] + ez * upSlope[2]
+    const eN = ex * normal[0] + ey * normal[1] + ez * normal[2] // inner surface
+    const t = Math.max(0.02, plane.thickness)
+    // Pin the thickness axis to ≥ 3 layers (two skins + cavity, exactly the
+    // wall anatomy turned onto the slope); in-plane cells stay ~0.18 m.
+    const layers = Math.max(3, Math.ceil((t + 2 * ROOF_Z_PAD) / 0.15 - 1e-6))
+    const thicknessCell = (t + 2 * ROOF_Z_PAD) / layers
+    _planeBounds.min.set(eA - plane.eaveLength / 2 - 0.01, eU - 0.01, -eN - t - ROOF_Z_PAD)
+    _planeBounds.max.set(eA + plane.eaveLength / 2 + 0.01, eU + plane.slopeLength + 0.01, -eN + ROOF_Z_PAD)
+    const grid = dropInteriorCells(
+      buildVoxelGrid(
+        sources,
+        _planeBounds.clone(),
+        ROOF_PLANE_CELL,
+        false,
+        { z: thicknessCell },
+        0,
+        q,
+      ),
+      MAX_ANATOMY_THICKNESS,
+    )
+    if (grid.count === 0) continue
+    const sheetInfo = buildSheets(grid, ROOF_SHEET_TILE, ROOF_SHEET_TILE)
+    const segments = rafterGroups[p] ?? []
+    built.push({
+      nodeId: `${nodeId}#p${p}`,
+      kind: 'roof',
+      roof: true,
+      grid,
+      baseColor: baseColor.clone(),
+      segments,
+      studs: segments,
+      sheets: sheetInfo.sheets,
+      sheetByCell: sheetInfo.sheetByCell,
+      removedQueue: [],
+      revision: 0,
+    })
+  }
+  if (built.length === 0) return null
+
+  // Every plane replica is ready — hide the merged host mesh ONCE, in the
+  // same tick, and hand the node's colliders over.
+  hideHostNode(world, nodeId, meshes)
+  const state = useDestruction.getState()
+  const ids: string[] = []
+  for (const target of built) {
+    state.targets.set(target.nodeId, target)
+    ids.push(target.nodeId)
+    roofMemberOf.set(target.nodeId, nodeId)
+    // SUPPORTERS only: kind 'roof' is never a structure crumble candidate.
+    registerStructureTarget(target, 'roof')
+  }
+  roofGroups.set(nodeId, ids)
+  state.bump()
+  return built[0]!
+}
+
+/**
  * Voxelize ANY collider group on first damage; hides the host meshes via
  * the session ledger. Walls (world.walls) become two drywall skins with
- * breakable studs in the cavity; every other node type (doors, slabs,
- * roofs, items…) becomes a plain adaptive volume capped at 1600 voxels.
+ * breakable studs in the cavity; item-family nodes take the SILHOUETTE lane
+ * (buildItemGrid — fine shape-preserving cells); every other node type
+ * (doors, roofs…) becomes a plain adaptive volume capped at 1600 voxels.
  */
 export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget | null {
   const state = useDestruction.getState()
   const existing = state.targets.get(nodeId)
   if (existing) return existing
+  // A roof node that already decomposed into per-plane targets must never
+  // rebuild from its (hidden, disabled) host meshes — hand back the first
+  // live member instead.
+  const roofGroup = roofGroups.get(nodeId)
+  if (roofGroup) {
+    for (const id of roofGroup) {
+      const member = state.targets.get(id)
+      if (member) return member
+    }
+    return null
+  }
 
   const wall = world.walls.get(nodeId)
   const meshes: Mesh[] = []
@@ -935,6 +1214,14 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     return { bvh: bvhFor(mesh), matrixWorld: mesh.matrixWorld }
   })
   if (_bounds.isEmpty()) return null
+
+  // ROOF PLANE LANE (Phase C2): pitched roof shells decompose into one
+  // thin plane-aligned target per slope — see buildRoofPlaneTargets. Flat
+  // or degenerate shells return null here and keep the volume lane below.
+  if (!wall && nodeType !== null && ROOF_KINDS.has(nodeType)) {
+    const primary = buildRoofPlaneTargets(world, nodeId, meshes, sources)
+    if (primary) return primary
+  }
 
   let grid: ReturnType<typeof buildVoxelGrid>
   let kind: VoxelTarget['kind'] = wall ? 'wall' : 'volume'
@@ -1016,6 +1303,12 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     } else {
       grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
     }
+  } else if (nodeType !== null && ITEM_FAMILY_KINDS.has(nodeType)) {
+    // ITEM SILHOUETTE (phase 6): fine cells traced from the item's own
+    // bounds — a toilet reads as a toilet in voxels, never 3 fat cubes.
+    // Glass-like sub-meshes never reach here: collectWorld routed them to
+    // world.glass, so they are not collider sources for this node.
+    grid = buildItemGrid(sources, _bounds)
   } else {
     grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
   }
@@ -1025,10 +1318,11 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   // The stud-line layout is scaffolding only — the real members are the
   // stick segments split from it. `studs` aliases the SAME array. Slabs
   // frame with joists generated from their world box (mirror of the studs).
-  // Roof shells frame with pitched rafters laid out over the planes the
-  // merged mesh's sloped faces enumerate (single roof target — the flat
-  // buildRafters array IS the segments array, ids already 0..n−1).
+  // Roof nodes reaching THIS point are the plane-less fallback (flat /
+  // degenerate shells — buildRoofPlaneTargets above owns pitched roofs);
+  // they enumerate zero planes and frame nothing.
   const roof = nodeType !== null && ROOF_KINDS.has(nodeType)
+  const item = nodeType !== null && ITEM_FAMILY_KINDS.has(nodeType)
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -1040,6 +1334,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     nodeId,
     kind,
     roof,
+    item,
     grid,
     baseColor: targetBaseColor(meshes),
     segments,
@@ -1051,22 +1346,9 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     contactOnlySupport,
   }
 
-  // Hide the host meshes through the keep-aware path: a wall's render mesh
-  // is the scene-graph PARENT of its hosted door/window/item roots (the
-  // host's WallRenderer nests them), so a plain `visible = false` would
-  // cull live doors and windows along with the wall. Masking keeps them
-  // rendering; every other node's own root is fenced the same way the
-  // collect-time mesh sweep fences (world.solidRoots). The node's OWN root
-  // must not fence its own hide.
-  const keepRoots = new Set(world.solidRoots ?? [])
-  if (wall) keepRoots.delete(wall.root)
-  for (const collider of world.colliders) {
-    if (collider.nodeId === nodeId) keepRoots.delete(collider.root)
-  }
-  for (const mesh of meshes) hideForGameKeepingRoots(mesh, keepRoots)
-  for (const collider of world.colliders) {
-    if (collider.nodeId === nodeId) collider.disabled = true
-  }
+  // Hide the host meshes + hand the colliders over (keep-aware — see
+  // hideHostNode for the hosted-children fencing rules).
+  hideHostNode(world, nodeId, meshes, wall?.root)
 
   state.targets.set(nodeId, target)
   state.bump()
@@ -1196,10 +1478,97 @@ export function slabSeedPredicate(world: GameWorld, target: VoxelTarget): (i: nu
   }
 }
 
+/** How far below a roof cell's center the under-support probe looks for a
+ * live wall/collider top (walls meet pitched planes at varying heights). */
+const ROOF_PROBE_DROP = 0.6
+/** Lateral tolerance of that probe (mirror of SLAB_PROBE_XZ). */
+const ROOF_PROBE_XZ = 0.3
+
+/**
+ * Island support seeds for a PITCHED roof plane (QA C2 defect f): the
+ * grid's iy = 0 row IS the eave row (grid Y = upSlope), so the default
+ * base-row rule already means "supported from the eave" — kept as seed #1.
+ * On top of it, any cell standing just above something live — a
+ * non-disabled collider top or a live voxel cell of a non-roof target
+ * within ROOF_PROBE_XZ laterally and ROOF_PROBE_DROP below — is seeded
+ * too, so a plane bearing on an interior wall doesn't shed everything
+ * uphill of a cut below that wall. Sibling roof planes never seed each
+ * other (the ridge overlap would make the two slopes prop each other).
+ */
+export function roofSeedPredicate(world: GameWorld, target: VoxelTarget): (i: number) => boolean {
+  const grid = target.grid
+  let minY = Number.POSITIVE_INFINITY
+  for (let i = 0; i < grid.count; i++) {
+    if (!grid.alive[i]) continue
+    const cy = grid.centers[i * 3 + 1]!
+    if (cy < minY) minY = cy
+  }
+  if (!Number.isFinite(minY)) return () => false
+
+  // Live collider tops that can reach ANY roof cell's support band.
+  const boxes: Array<{ minX: number; maxX: number; minZ: number; maxZ: number; top: number }> = []
+  for (const collider of world.colliders) {
+    if (collider.disabled) continue
+    const top = collider.worldBox.max.y
+    if (top < minY - ROOF_PROBE_DROP) continue
+    boxes.push({
+      minX: collider.worldBox.min.x - ROOF_PROBE_XZ,
+      maxX: collider.worldBox.max.x + ROOF_PROBE_XZ,
+      minZ: collider.worldBox.min.z - ROOF_PROBE_XZ,
+      maxZ: collider.worldBox.max.z + ROOF_PROBE_XZ,
+      top,
+    })
+  }
+
+  // Live voxel cells of other NON-ROOF targets → coarse XZ hash of the
+  // highest live cell top per bucket (a wall's bucket top = the wall top).
+  const h = ROOF_PROBE_XZ
+  const hashOf = (x: number, z: number) =>
+    Math.round(x / h) * 73856093 + Math.round(z / h) * 19349663
+  const topAt = new Map<number, number>()
+  for (const other of useDestruction.getState().targets.values()) {
+    if (other === target || other.kind === 'roof' || other.grid.aliveCount === 0) continue
+    const og = other.grid
+    for (let j = 0; j < og.count; j++) {
+      if (!og.alive[j]) continue
+      const cy = og.centers[j * 3 + 1]! + og.cell / 2
+      if (cy < minY - ROOF_PROBE_DROP) continue
+      const key = hashOf(og.centers[j * 3]!, og.centers[j * 3 + 2]!)
+      const prior = topAt.get(key)
+      if (prior === undefined || cy > prior) topAt.set(key, cy)
+    }
+  }
+
+  return (i: number) => {
+    if (grid.coords[i * 3 + 1] === 0) return true // eave row
+    const x = grid.centers[i * 3]!
+    const y = grid.centers[i * 3 + 1]!
+    const z = grid.centers[i * 3 + 2]!
+    for (const box of boxes) {
+      if (box.top < y - ROOF_PROBE_DROP || box.top > y + 0.3) continue
+      if (x >= box.minX && x <= box.maxX && z >= box.minZ && z <= box.maxZ) return true
+    }
+    if (topAt.size === 0) return false
+    const bx = Math.round(x / h)
+    const bz = Math.round(z / h)
+    for (let ax = -1; ax <= 1; ax++) {
+      for (let az = -1; az <= 1; az++) {
+        const top = topAt.get((bx + ax) * 73856093 + (bz + az) * 19349663)
+        if (top !== undefined && top >= y - ROOF_PROBE_DROP && top <= y + 0.3) return true
+      }
+    }
+    return false
+  }
+}
+
 function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
   const islands = findUnsupportedIslands(
     target.grid,
-    target.kind === 'slab' ? slabSeedPredicate(world, target) : undefined,
+    target.kind === 'slab'
+      ? slabSeedPredicate(world, target)
+      : target.kind === 'roof'
+        ? roofSeedPredicate(world, target)
+        : undefined,
   )
   if (islands.length === 0) return
   let total = 0
@@ -1348,8 +1717,10 @@ wireStructureDriver({
 })
 
 const _sheetCenter = new Vector3()
-/** Scratch launch direction for fly-off shards (the sheet's outward normal). */
+/** Scratch launch direction for fly-off shards (the sheet's outward normal,
+ * biased down-slope on roof planes). */
 const _shardDir = { x: 0, y: 0, z: 0 }
+const _slideDir = { x: 0, y: 0, z: 0 }
 const _sheetNormal = new Vector3()
 
 /**
@@ -1380,6 +1751,15 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
     _shardDir.x = sheet.normal[0]
     _shardDir.y = sheet.normal[1]
     _shardDir.z = sheet.normal[2]
+    if (target.roof && (target.grid.q.x !== 0 || target.grid.q.z !== 0)) {
+      // Shingle sheets shear OUTWARD + DOWN-SLOPE — grid +Y is the plane's
+      // upSlope direction (rotate it out through the basis conjugate), so
+      // torn courses slide off the eave instead of popping straight up.
+      rotateByBasisInverse(target.grid.q, 0, 1, 0, _slideDir)
+      _shardDir.x -= _slideDir.x * 0.7
+      _shardDir.y -= _slideDir.y * 0.7
+      _shardDir.z -= _slideDir.z * 0.7
+    }
     const plates = Math.min(12, 5 + Math.round(freed / 10))
     for (let n = 0; n < plates; n++) {
       const idx = sheet.cells[Math.floor(Math.random() * sheet.cells.length)]!
@@ -1472,20 +1852,30 @@ const WALL_PIERCE_RADIUS = 0.6
  * and carve the full volume as before.
  */
 const _skin: SkinLimit = { axis: 0, side: 0 }
+/** Scratch for entrySkin's basis-rotated query point. */
+const _skinPoint = { x: 0, y: 0, z: 0 }
 
 function entrySkin(grid: VoxelGridData, x: number, y: number, z: number): SkinLimit | null {
   if (grid.cellX === grid.cellZ && grid.cellY === grid.cellX) return null
   const axis = thicknessAxisOf(grid)
-  // Yaw grids index in their local frame — rotate the query point in.
+  // Rotated grids index in their local frame — rotate the query point in.
+  // Pitched roof-plane grids carry a full basis (yaw parks at 0 there), so
+  // the quaternion path must run BEFORE the yaw shortcut.
   let px = x
+  let py = y
   let pz = z
-  if (grid.yaw !== 0) {
+  if (grid.q.x !== 0 || grid.q.z !== 0) {
+    rotateByBasis(grid.q, x, y, z, _skinPoint)
+    px = _skinPoint.x
+    py = _skinPoint.y
+    pz = _skinPoint.z
+  } else if (grid.yaw !== 0) {
     const cos = Math.cos(grid.yaw)
     const sin = Math.sin(grid.yaw)
     px = x * cos + z * sin
     pz = -x * sin + z * cos
   }
-  const p = axis === 0 ? px : axis === 1 ? y : pz
+  const p = axis === 0 ? px : axis === 1 ? py : pz
   const origin = axis === 0 ? grid.origin.x : axis === 1 ? grid.origin.y : grid.origin.z
   const cell = axis === 0 ? grid.cellX : axis === 1 ? grid.cellY : grid.cellZ
   const span = axis === 0 ? grid.nx : axis === 1 ? grid.ny : grid.nz
@@ -1614,6 +2004,43 @@ export function damageTarget(
 ): number {
   const target = ensureVoxelTarget(world, nodeId)
   if (!target) return 0
+  // Per-plane roofs: a carve through EITHER the real node id or one plane's
+  // member id fans out to every sibling plane — the planes overlap a hair
+  // at ridges/hips, so a seam shot must open both grids (removeSphere is a
+  // no-op on planes the sphere never reaches, so this costs nothing else).
+  const groupId = roofGroups.has(nodeId) ? nodeId : roofMemberOf.get(nodeId)
+  const group = groupId !== undefined ? roofGroups.get(groupId) : undefined
+  if (group) {
+    let total = 0
+    const targets = useDestruction.getState().targets
+    for (const id of group) {
+      const member = targets.get(id)
+      if (member) total += damageTargetOne(world, member, point, radius, direction)
+    }
+    return total
+  }
+  return damageTargetOne(world, target, point, radius, direction)
+}
+
+/** The single-target carve body damageTarget dispatches to (roof groups
+ * call it once per plane). */
+function damageTargetOne(
+  world: GameWorld,
+  target: VoxelTarget,
+  point: Vector3,
+  radius: number,
+  direction?: Vector3,
+): number {
+  const nodeId = target.nodeId
+  // BULLETPROOF safety floor (QA C2 defect b): a carve on a roof/volume
+  // target can never be smaller than the grid's own cells — adaptive volume
+  // cells grow with node size (0.5 m on big roofs) while pistol/rifle
+  // holeRadius is 0.11/0.16, which once made 32 shots remove ZERO voxels.
+  if (target.roof || target.kind === 'volume') {
+    const cellMax = Math.max(target.grid.cellX, target.grid.cellY, target.grid.cellZ)
+    const floor = cellMax * CARVE_CELL_FLOOR
+    if (radius < floor) radius = floor
+  }
   // Slabs ride the whole wall lane: skin-respecting pierce gate, drywall
   // dust + paper shards, sheet fly-offs, framing splash-chips.
   const layered = target.kind !== 'volume'
@@ -1681,11 +2108,23 @@ export function damageTarget(
     chipSegmentSplash(target, point, radius)
   } else {
     // Material tag (phase 4): plain volumes voice as CONCRETE — small,
-    // short-lived, grayer puffs (dust.tsx owns the styling).
-    spawnDust(point, Math.min(1, 0.25 + removed.length / 30), {
-      kind: 'concrete',
-      direction: direction ? _plumeDir.copy(direction) : undefined,
-    })
+    // short-lived, grayer puffs (dust.tsx owns the styling). ITEM targets
+    // (phase 6 silhouette lane) would ideally voice 'porcelain', but
+    // dust.tsx's DustMaterial union has no such kind — and an unknown
+    // string would fall into spawnDust's plume-shaped else — so the tag is
+    // GUARDED down to 'concrete'-LITE: same gray family, intensity capped
+    // at ITEM_DUST_MAX, ceramic chips off a toilet rim rather than a
+    // wall-sized cloud. Flip this if dust.tsx grows a real 'porcelain'.
+    spawnDust(
+      point,
+      target.item
+        ? Math.min(ITEM_DUST_MAX, 0.2 + removed.length / 40)
+        : Math.min(1, 0.25 + removed.length / 30),
+      {
+        kind: 'concrete',
+        direction: direction ? _plumeDir.copy(direction) : undefined,
+      },
+    )
     if (target.roof) {
       // Roof shells are volume grids (until the plane-grid lane lands) but
       // must still READ as roofing: a couple of torn shingle plates flutter
@@ -1736,13 +2175,16 @@ export const damageWall = damageTarget
 /** True when a node carves through the WALL/SLAB tear lane — shooting.ts
  * resolves `weapon.tearRadius` (and voices the drywall crunch) off this:
  * an existing layered target, a scene wall, or a not-yet-voxelized
- * slab-kind collider (first shot must already tear at full width). */
+ * slab-kind OR roof-kind collider (first shot must already tear at full
+ * width — roofs joined the tear lane with the Phase C2 plane grids). */
 export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
   const target = useDestruction.getState().targets.get(nodeId)
   if (target) return target.kind !== 'volume'
   if (world.walls.has(nodeId)) return true
   for (const collider of world.colliders) {
-    if (collider.nodeId === nodeId) return SLAB_KINDS.has(collider.nodeType)
+    if (collider.nodeId === nodeId) {
+      return SLAB_KINDS.has(collider.nodeType) || ROOF_KINDS.has(collider.nodeType)
+    }
   }
   return false
 }
@@ -2266,6 +2708,8 @@ export function raycastVoxelTargets(
 export const raycastVoxelWalls = raycastVoxelTargets
 
 const _voxelCenter = new Vector3()
+/** Scratch for collideVoxelTargets' basis-rotated capsule center. */
+const _capsuleLocal = { x: 0, y: 0, z: 0 }
 
 /** Capsule push-out against live voxels of every target (voxels ≈ spheres
  * of r=0.55·cell — close enough at 15 cm cells, and far cheaper than box
@@ -2277,23 +2721,41 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
     // Sphere radius keys off the LARGEST cell — any smaller and the capsule
     // could slip between skin voxels spaced a full length-cell apart.
     const r = grid.cell * 0.55
-    // Yaw grids index cells in their local frame; a vertical capsule stays
-    // a vertical capsule under a Y rotation, so only its XZ center moves.
-    // The push-out below runs on world centers and needs no rotation.
+    // Rotated grids index cells in their local frame. Yaw grids keep a
+    // vertical capsule vertical (only its XZ center moves); a FULL-basis
+    // grid (pitched roof plane) tilts the capsule in grid space, so its
+    // cell range is taken conservatively from the capsule's bounding
+    // sphere around its mid-height. The push-out below runs on world
+    // centers and needs no rotation either way.
     let px = pos.x
+    let py = pos.y
     let pz = pos.z
-    if (grid.yaw !== 0) {
+    let reachX = radius + r
+    let reachDown = r
+    let reachUp = height + r
+    let reachZ = radius + r
+    if (grid.q.x !== 0 || grid.q.z !== 0) {
+      rotateByBasis(grid.q, pos.x, pos.y + height / 2, pos.z, _capsuleLocal)
+      px = _capsuleLocal.x
+      py = _capsuleLocal.y
+      pz = _capsuleLocal.z
+      const reach = height / 2 + radius + r
+      reachX = reach
+      reachDown = reach
+      reachUp = reach
+      reachZ = reach
+    } else if (grid.yaw !== 0) {
       const cos = Math.cos(grid.yaw)
       const sin = Math.sin(grid.yaw)
       px = pos.x * cos + pos.z * sin
       pz = -pos.x * sin + pos.z * cos
     }
-    const minX = Math.floor((px - radius - r - grid.origin.x) / grid.cellX)
-    const maxX = Math.floor((px + radius + r - grid.origin.x) / grid.cellX)
-    const minY = Math.floor((pos.y - r - grid.origin.y) / grid.cellY)
-    const maxY = Math.floor((pos.y + height + r - grid.origin.y) / grid.cellY)
-    const minZ = Math.floor((pz - radius - r - grid.origin.z) / grid.cellZ)
-    const maxZ = Math.floor((pz + radius + r - grid.origin.z) / grid.cellZ)
+    const minX = Math.floor((px - reachX - grid.origin.x) / grid.cellX)
+    const maxX = Math.floor((px + reachX - grid.origin.x) / grid.cellX)
+    const minY = Math.floor((py - reachDown - grid.origin.y) / grid.cellY)
+    const maxY = Math.floor((py + reachUp - grid.origin.y) / grid.cellY)
+    const minZ = Math.floor((pz - reachZ - grid.origin.z) / grid.cellZ)
+    const maxZ = Math.floor((pz + reachZ - grid.origin.z) / grid.cellZ)
     if (maxX < 0 || maxY < 0 || maxZ < 0) continue
     for (let iz = Math.max(0, minZ); iz <= Math.min(grid.nz - 1, maxZ); iz++) {
       for (let iy = Math.max(0, minY); iy <= Math.min(grid.ny - 1, maxY); iy++) {
@@ -2341,6 +2803,17 @@ export const collideVoxelWalls = collideVoxelTargets
  * replica unmounts and any pending island collapse for it is cancelled.
  * No-op if the node never voxelized. */
 export function dropTarget(nodeId: string): void {
+  // A roof node id fans out to its per-plane member targets.
+  const group = roofGroups.get(nodeId)
+  if (group) {
+    roofGroups.delete(nodeId)
+    for (const id of group) {
+      roofMemberOf.delete(id)
+      dropTarget(id)
+    }
+    return
+  }
+  roofMemberOf.delete(nodeId)
   const timer = islandTimers.get(nodeId)
   if (timer !== undefined) {
     clearTimeout(timer)
@@ -2371,6 +2844,8 @@ export function resetDestruction(): void {
   skeletonTimers.length = 0
   skeletonSnapped.clear()
   prevoxelizeSkip.clear()
+  roofGroups.clear()
+  roofMemberOf.clear()
   resetStructure()
   useDestruction.getState().reset()
 }

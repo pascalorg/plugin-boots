@@ -129,6 +129,9 @@ export type GameWorld = {
   colliders: ColliderEntry[]
   /** wall nodeId → its colliders' indices + node data (for stud generation). */
   walls: Map<string, { node: WallNodeLike; root: Object3D; meshes: Mesh[] }>
+  /** Shatterable panes: window glass plus glass-like sub-meshes of
+   * ITEM_FAMILY_KINDS nodes (shower doors, glass cabinet fronts). Never
+   * colliders, never voxel sources — glass.tsx owns their break. */
   glass: GlassPane[]
   doors: DoorEntry[]
   /** Non-door operables (window / cabinet / cabinet-module) for the E-interact
@@ -189,6 +192,21 @@ const SOLID_KINDS = [
   'dormer',
   'elevator',
 ]
+
+/** Item-family kinds (all in SOLID_KINDS) whose GLASS-LIKE sub-meshes route
+ * to `world.glass` instead of the solid collider list — phase 6 owner call:
+ * a shower door SHATTERS like a window pane, it never voxelizes into chunky
+ * blocks. Solid siblings (tray, frame, bowl…) keep colliding/voxelizing
+ * exactly as before. Exported so destruction.ts's silhouette-cell lane and
+ * QA assert the same set. */
+export const ITEM_FAMILY_KINDS = new Set([
+  'item',
+  'shelf',
+  'cabinet',
+  'cabinet-module',
+  'counter',
+  'kitchen-unit',
+])
 
 /** Registry kinds the Bones plugin registers for its overlay renderers
  * (framing/CMU X-ray, lumber, service runs, devices). They draw members
@@ -294,7 +312,16 @@ export function bvhFor(mesh: Mesh): MeshBVH {
   return bvh
 }
 
-function isGlassMesh(mesh: Mesh): boolean {
+/** Is this mesh's material glass-like? transparent with opacity < 0.95, or
+ * physical transmission > 0.2 (array materials key off slot 0). Applied to
+ * 'window' kinds and to ITEM_FAMILY_KINDS sub-meshes in collectWorld — a
+ * glass-like mesh routes to world.glass (shatter lane), never colliders.
+ * EXPORTED for the ResurrectionSweep lane (game-root.tsx): a voxelized
+ * window/item node's un-shattered panes belong to the glass system, so a
+ * sweep that ledger-hides `collectMeshes(root, fence)` wholesale must skip
+ * the meshes this predicate matches or live shower doors / window panes
+ * vanish ~1 s after their host node voxelizes. */
+export function isGlassLikeMesh(mesh: Mesh): boolean {
   const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
   if (!material) return false
   const m = material as { transparent?: boolean; opacity?: number; transmission?: number }
@@ -882,9 +909,16 @@ export function collectWorld(): GameWorld {
       const meshes = collectMeshes(root, solidRoots)
       if (meshes.length === 0) continue
 
+      // Glass split: window panes AND glass-like sub-meshes of item-family
+      // nodes (shower doors, cabinet fronts, counter splash panels…) join
+      // the glass shatter lane — they never become colliders and never
+      // voxelize. Runs AFTER the hosted-children fence above, so a wall
+      // never sees a hosted item's pane and an item never donates glass to
+      // its host.
       const solidMeshes: Mesh[] = []
+      const glassEligible = kind === 'window' || ITEM_FAMILY_KINDS.has(kind)
       for (const mesh of meshes) {
-        if (kind === 'window' && isGlassMesh(mesh)) {
+        if (glassEligible && isGlassLikeMesh(mesh)) {
           glass.push({ mesh, root, nodeId: id })
           continue
         }

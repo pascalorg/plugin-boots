@@ -5,8 +5,10 @@ import {
   BURN_SECONDS,
   buildTreesFrom,
   CHAR_HITS,
+  charBurstDir,
   COMBAT_TREE_APEX,
   type CombatTree,
+  CRACKLE_FADE_S,
   damageTree,
   HOST_TREE_CLEARANCE,
   hostTreePlacements,
@@ -164,6 +166,47 @@ describe('damageTree state machine', () => {
     expect(finished).toEqual([])
     expect(healthy.state).toBe('healthy')
     expect(charred.state).toBe('charred')
+  })
+})
+
+// ── Char-collapse burst feel (phase 6) ──────────────────────────────────────
+
+describe('charBurstDir (outward-down leaf-shower launch)', () => {
+  test('always unit length, always falling, steeper as down rises', () => {
+    const out = { x: 0, y: 0, z: 0 }
+    for (const theta of [0, 1.1, Math.PI, 5.2]) {
+      for (const down of [0, 0.5, 1]) {
+        charBurstDir(theta, down, out)
+        expect(Math.hypot(out.x, out.y, out.z)).toBeCloseTo(1, 6)
+        expect(out.y).toBeLessThanOrEqual(-0.45 + 1e-9)
+        expect(out.y).toBeGreaterThanOrEqual(-0.85 - 1e-9)
+      }
+    }
+    // down clamps: silly inputs still fall inside the band.
+    expect(charBurstDir(0, -3, out).y).toBeCloseTo(-0.45, 6)
+    expect(charBurstDir(0, 9, out).y).toBeCloseTo(-0.85, 6)
+  })
+
+  test('horizontal component points OUTWARD along the voxel bearing', () => {
+    const out = { x: 0, y: 0, z: 0 }
+    for (const theta of [0, Math.PI / 3, 2.4, 4.9]) {
+      charBurstDir(theta, 0.5, out)
+      // dot of (x,z) with the radial (cosθ, sinθ) = full horizontal length.
+      const radial = out.x * Math.cos(theta) + out.z * Math.sin(theta)
+      expect(radial).toBeCloseTo(Math.hypot(out.x, out.z), 6)
+      expect(radial).toBeGreaterThan(0.4) // never a straight plummet
+    }
+  })
+
+  test('returns its out-object (allocation-free contract)', () => {
+    const out = { x: 0, y: 0, z: 0 }
+    expect(charBurstDir(1, 1, out)).toBe(out)
+  })
+})
+
+describe('crackle fade contract', () => {
+  test('fade window is the mandated ~0.6s (a cut is 0; a drone is >1)', () => {
+    expect(CRACKLE_FADE_S).toBeCloseTo(0.6, 6)
   })
 })
 

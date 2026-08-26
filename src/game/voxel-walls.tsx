@@ -217,6 +217,12 @@ function MemberLayer({
 /** Bottom-skin tone for slab sandwiches — the ceiling face reads as
  * drywall, slightly lighter/greyer than the floor sheathing above it. */
 const _ceilingTone = new Color()
+/** Roof-plane tones (kind 'roof', Phase C2): every ~3rd up-slope row of
+ * the outer skin darkens a touch (shingle course striping), and the inner
+ * skin — the underside a player sees from inside the attic — lightens
+ * toward bare deck. */
+const _courseTone = new Color()
+const _underTone = new Color()
 
 function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
@@ -238,16 +244,29 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
     // merging with its neighbors — the clean "block" read walls now wear
     // from session start.
     _scale.set(grid.cellX * 0.985, grid.cellY * 0.985, grid.cellZ * 0.985)
-    // Yaw-local grids (diagonal walls): cells are axis-aligned in the grid's
-    // rotated frame — rotate each instance out to world (matches the member
-    // layers' per-member yaw). World-aligned grids keep identity.
-    if (grid.yaw === 0) _quat.identity()
+    // Rotated grids: cells are axis-aligned in the grid's own frame —
+    // rotate each instance out to world. Yaw-local grids (diagonal walls)
+    // keep the legacy Y axis-angle; FULL-basis grids (pitched roof planes,
+    // Phase C2 — grid.yaw parks at 0 there) use the quaternion conjugate
+    // (grid → world), which is what fixes the stair-stepped roof
+    // silhouette: the cubes lie IN the slope plane instead of climbing it
+    // in axis-aligned steps. World-aligned grids keep identity.
+    if (grid.q.x !== 0 || grid.q.z !== 0) {
+      _quat.set(-grid.q.x, -grid.q.y, -grid.q.z, grid.q.w)
+    } else if (grid.yaw === 0) _quat.identity()
     else _quat.setFromAxisAngle(UP, -grid.yaw)
     // Slab sandwiches wear TWO tones: the top skin keeps the host's floor
     // tone (baseColor) while the bottom skin — the ceiling face a player
     // looks up at — renders as slightly lighter, desaturated drywall.
     const isSlab = wall.kind === 'slab'
     if (isSlab) _ceilingTone.copy(wall.baseColor).offsetHSL(0, -0.06, 0.14)
+    // Roof planes wear the shingle read: outer skin (min-z layer) in the
+    // roof surface tone with course striping, inner skin as pale deck.
+    const isRoof = wall.kind === 'roof'
+    if (isRoof) {
+      _courseTone.copy(wall.baseColor).offsetHSL(0, 0, -0.055)
+      _underTone.copy(wall.baseColor).offsetHSL(0, -0.08, 0.16)
+    }
     for (let i = 0; i < grid.count; i++) {
       if (grid.alive[i]) {
         _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
@@ -258,11 +277,23 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
       }
       // Per-voxel shade jitter — the "block" read. Two independent hashes:
       // a value spread plus a whisper of saturation drift so runs of voxels
-      // never band into flat stripes.
+      // never band into flat stripes. Roof outer skins push the value
+      // spread harder — per-shingle tonal scatter.
       const j1 = ((i * 2654435761) % 97) / 97
       const j2 = ((i * 1597334677) % 89) / 89
-      const base = isSlab && grid.coords[i * 3 + 1] === 0 ? _ceilingTone : wall.baseColor
-      _color.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+      let base = wall.baseColor
+      let jitter = 0.1
+      if (isSlab && grid.coords[i * 3 + 1] === 0) base = _ceilingTone
+      else if (isRoof) {
+        if (grid.coords[i * 3 + 2] !== 0) base = _underTone
+        else {
+          // Outer skin: every ~3rd in-plane row (grid Y = up the slope)
+          // darkens slightly — the shingle course striping.
+          base = grid.coords[i * 3 + 1]! % 3 === 2 ? _courseTone : wall.baseColor
+          jitter = 0.16
+        }
+      }
+      _color.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * jitter)
       mesh.setColorAt(i, _color)
     }
     mesh.instanceMatrix.needsUpdate = true

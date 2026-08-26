@@ -82,6 +82,13 @@ function makeBot(kind: BotKind, x: number, y: number, z: number): Bot {
     climb: 0,
     groundY: 0,
     groundT: 0,
+    stuckT: 0,
+    doorScanT: 0,
+    doorId: null,
+    doorX: 0,
+    doorZ: 0,
+    doorFumbleT: 0,
+    doorT: 0,
   }
 }
 

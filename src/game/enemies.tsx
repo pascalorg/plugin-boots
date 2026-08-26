@@ -7,14 +7,24 @@ import { useBoots } from '../store'
 import { HEARTBEAT_HP, type HeartbeatHandle, heartbeatBpm, lowHpSeverity, sfx } from './audio'
 import { collideCapsule } from './collision'
 import { collideVoxelTargets, raycastVoxelTargets } from './destruction'
+import { doorsDebug } from './doors'
 import {
+  accrueDoorStuck,
   ALERT_SECONDS,
   BOT_STATS,
   type Bot,
   bots,
   debugFlags,
+  DOOR_FUMBLE_RANGE,
+  DOOR_FUMBLE_SECONDS,
+  DOOR_MISSION_TTL,
+  DOOR_SCAN_RANGE,
+  doorIsClosed,
+  doorScanDue,
   GROUND_BOT_CAPSULE,
+  pickDoorCandidate,
   resetBots,
+  setDoorApproach,
   settleGroundBot,
   spawnBot,
   waveState,
@@ -37,6 +47,17 @@ import type { GameWorld } from './world'
  *   obstacle tangent (side seeded from whichever way the wall already let
  *   it slide) for up to 1.2s, then re-seeks — so they round corners and
  *   pour through door openings and breaches instead of grinding on drywall.
+ * - DOOR FUMBLE (bots learn doorways): a droid/dog hindered (blocked or
+ *   wall-following) past DOOR_STUCK_TIME scans for the nearest still-closed
+ *   door within DOOR_SCAN_RANGE — at most once per DOOR_SCAN_PERIOD, and
+ *   ONLY while stuck (budget). On a hit it walks to the approach point,
+ *   pauses DOOR_FUMBLE_SECONDS at the leaf (legs freeze + sfx.doorLatch —
+ *   the tell), then flips the door through the doors module's public
+ *   doorsDebug.toggle — the same interact path E uses, so the creak, the
+ *   swing and the collider drop all come from there — and paths through.
+ *   Missions abort after DOOR_MISSION_TTL; a door the player opened
+ *   mid-fumble is left alone (doorIsClosed re-check). Drones ignore all of
+ *   this — they climb. Pure clocks + candidate pick live in enemies-state.
  * - MELEE LOS: an attack only lands if raycastVoxelTargets + a collider-box
  *   midpoint probe show clear air to the player — no punching through a
  *   sheet of drywall; a blocked attack triggers wall-follow instead.
@@ -96,6 +117,7 @@ const _botVel = new Vector3()
 const _probe = new Vector3()
 const _chest = new Vector3()
 const _meleeDir = new Vector3()
+const _doorCenter = new Vector3()
 
 /** Spawn the next wave in a ring around the building. */
 function spawnWave(world: GameWorld): void {
@@ -273,7 +295,9 @@ export function Enemies({ world }: { world: GameWorld }) {
         continue
       }
       bot.attackCooldown -= dt
-      bot.phase += dt * (bot.kind === 'dog' ? 11 : 6)
+      // Legs freeze while a hand fumbles at a door handle — part of the tell.
+      const fumbling = bot.doorId !== null && bot.doorFumbleT > 0
+      if (!fumbling) bot.phase += dt * (bot.kind === 'dog' ? 11 : 6)
 
       _toPlayer.set(
         playerRig.position.x - bot.position.x,
@@ -331,6 +355,36 @@ export function Enemies({ world }: { world: GameWorld }) {
           const sign = dist < MERCY_MIN ? -1 : 1
           moveX = dirX * stats.speed * sign
           moveZ = dirZ * stats.speed * sign
+        }
+      } else if (grounded && bot.doorId !== null) {
+        // DOOR FUMBLE mission (see header): walk to the approach point,
+        // pause at the leaf, toggle through the interact system, path
+        // through. Overrides wall-follow and pursuit until it resolves.
+        bot.doorT += dt
+        const dx = bot.doorX - bot.position.x
+        const dz = bot.doorZ - bot.position.z
+        const dDoor = Math.hypot(dx, dz)
+        if (bot.doorFumbleT > 0) {
+          // The pause: hand on the handle. No steering, no attacks.
+          bot.doorFumbleT -= dt
+          if (bot.doorFumbleT <= 0) {
+            // Re-check the leaf still blocks (the player may have opened it
+            // mid-fumble), then flip it through the doors module's public
+            // path — guarded existence; it no-ops on voxelized doors itself.
+            // The creak + collider drop come from the toggle, not from here.
+            if (doorIsClosed(world, bot.doorId)) doorsDebug?.toggle?.(bot.doorId)
+            bot.doorId = null
+            bot.stuckT = 0
+            bot.followT = 0 // path straight through the fresh opening
+          }
+        } else if (dDoor < DOOR_FUMBLE_RANGE) {
+          bot.doorFumbleT = DOOR_FUMBLE_SECONDS
+          sfx.doorLatch?.() // the tell: a hand rattling the latch
+        } else if (bot.doorT > DOOR_MISSION_TTL) {
+          bot.doorId = null // can't reach it — back to the wall rules
+        } else {
+          moveX = (dx / dDoor) * stats.speed
+          moveZ = (dz / dDoor) * stats.speed
         }
       } else if (grounded && bot.followT > 0) {
         // WALL-FOLLOW: strafe the obstacle tangent (⊥ to-player) on the side
@@ -395,10 +449,12 @@ export function Enemies({ world }: { world: GameWorld }) {
         )
         // Blocked-progress bookkeeping → wall-follow trigger.
         const intended = Math.hypot(moveX, moveZ) * dt
+        let blockedNow = false
         if (intended > 1e-5) {
           const ax = bot.position.x - prevX
           const az = bot.position.z - prevZ
-          if (1 - Math.hypot(ax, az) / intended > BLOCKED_RATIO) {
+          blockedNow = 1 - Math.hypot(ax, az) / intended > BLOCKED_RATIO
+          if (blockedNow) {
             bot.blockedT += dt
             if (bot.followT <= 0 && bot.blockedT >= BLOCKED_TIME) {
               bot.blockedT = 0
@@ -412,6 +468,22 @@ export function Enemies({ world }: { world: GameWorld }) {
           } else {
             bot.blockedT = 0
           }
+        }
+        // DOORWAY HUNT: the stuck clock runs while hindered (grinding a
+        // solid, or mid wall-follow — a stint that itself means pursuit
+        // failed). Past DOOR_STUCK_TIME the budgeted scan (≤1 per bot per
+        // DOOR_SCAN_PERIOD, blocked bots only) looks for a closed door
+        // within DOOR_SCAN_RANGE and arms the fumble mission.
+        accrueDoorStuck(bot, blockedNow || bot.followT > 0, dt)
+        if (doorScanDue(bot, dt)) {
+          const doorId = pickDoorCandidate(
+            world,
+            bot.position.x,
+            bot.position.z,
+            DOOR_SCAN_RANGE,
+            _doorCenter,
+          )
+          if (doorId !== null) setDoorApproach(bot, doorId, _doorCenter.x, _doorCenter.z)
         }
       }
     }

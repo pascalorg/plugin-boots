@@ -1,8 +1,8 @@
-import { Color, Vector3 } from 'three'
+import { Box3, Color, Vector3 } from 'three'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
 import { probeLandingY } from './destruction'
-import type { GameWorld } from './world'
+import type { DoorEntry, GameWorld } from './world'
 
 /**
  * The horde, as data: humanoid droids that march, robot dogs that lope,
@@ -23,6 +23,9 @@ import type { GameWorld } from './world'
  *   resetBots() re-arms the whole grace→alert cycle.
  * - MERCY: while the player is staggered bots never attack — ground bots
  *   hold a 4–6 m ring, drones climb +1 m and hover (see enemies.tsx).
+ * - DOORWAYS: ground bots stuck against a facade hunt the nearest closed
+ *   door and fumble it open (pure clocks + candidate pick down below; the
+ *   walk/pause/toggle state machine is in enemies.tsx). Drones never do.
  *
  * DEV/E2E: `debugFlags.botsFrozen` — while true the enemies frame loop
  * skips ALL bot steering and attacks (pursuit, mercy-ring standoff, drone
@@ -59,6 +62,23 @@ export type Bot = {
   groundY: number
   /** Ground bots: seconds until the landing plane re-probes. */
   groundT: number
+  /** Ground bots: seconds spent hindered (blocked OR wall-following) — the
+   * doorway-hunt clock. Unlike blockedT it survives wall-follow stints, so
+   * a bot grinding the same facade keeps accruing (accrueDoorStuck). */
+  stuckT: number
+  /** Ground bots: seconds until the next door-candidate scan while stuck
+   * (doorScanDue — the ≤1-check-per-0.5s budget). */
+  doorScanT: number
+  /** Ground bots: nodeId of the door being approached/fumbled (null = none). */
+  doorId: string | null
+  /** Ground bots: door approach point, world XZ (setDoorApproach). */
+  doorX: number
+  doorZ: number
+  /** Ground bots: remaining fumble pause at the leaf before the toggle
+   * (0 = not fumbling yet). */
+  doorFumbleT: number
+  /** Ground bots: seconds on the current door mission (TTL abort). */
+  doorT: number
 }
 
 /** Ground-bot (droid/dog) capsule for wall push-out — see BOT WALL RULE in
@@ -132,7 +152,135 @@ export function spawnBot(kind: BotKind, x: number, z: number): void {
     // Stagger the probe cadence so a whole wave never re-probes on the
     // same frame (settleGroundBot probes as soon as this hits 0).
     groundT: Math.random() * GROUND_PROBE_PERIOD,
+    stuckT: 0,
+    doorScanT: 0,
+    doorId: null,
+    doorX: 0,
+    doorZ: 0,
+    doorFumbleT: 0,
+    doorT: 0,
   })
+}
+
+// --- BOTS LEARN DOORWAYS: pure bookkeeping + candidate selection ------------
+// Ground bots (droid/dog) that keep grinding a facade hunt for a nearby door
+// and fumble it open through the E-interact system's own toggle. Drones never
+// touch any of this — they climb. enemies.tsx owns the walk/pause/toggle
+// state machine; the clocks and the door pick live here so they unit-test
+// without React.
+
+/** Hindered this long (blocked or wall-following) before the door hunt starts (s). */
+export const DOOR_STUCK_TIME = 1.2
+/** Door-candidate scan cadence while stuck (s) — the per-bot budget. */
+export const DOOR_SCAN_PERIOD = 0.5
+/** A door only counts as a way in when it sits within this range (m). */
+export const DOOR_SCAN_RANGE = 3
+/** The fumble tell: seconds paused at the leaf before the toggle. */
+export const DOOR_FUMBLE_SECONDS = 0.6
+/** "At the door": XZ distance to the approach point that starts the fumble (m). */
+export const DOOR_FUMBLE_RANGE = 0.8
+/** Approach point offset from the door center toward the bot (m) — keeps the
+ * capsule off the leaf plane so the walk-up settles instead of grinding. */
+export const DOOR_APPROACH_OFFSET = 0.55
+/** A mission the capsule can't finish (furniture, bot pile-up) aborts (s). */
+export const DOOR_MISSION_TTL = 5
+
+/** Doorway-hunt clock: accrues while the bot is hindered (blocked against a
+ * solid or mid wall-follow — wall-follow itself means pursuit failed), resets
+ * the moment normal seek makes real progress. */
+export function accrueDoorStuck(bot: Bot, hindered: boolean, dt: number): void {
+  if (hindered) bot.stuckT += dt
+  else bot.stuckT = 0
+}
+
+/** The scan-budget gate: true at most once per DOOR_SCAN_PERIOD, and only
+ * while the bot has been stuck past DOOR_STUCK_TIME with no active mission. */
+export function doorScanDue(bot: Bot, dt: number): boolean {
+  if (bot.doorId !== null || bot.stuckT < DOOR_STUCK_TIME) return false
+  bot.doorScanT -= dt
+  if (bot.doorScanT > 0) return false
+  bot.doorScanT = DOOR_SCAN_PERIOD
+  return true
+}
+
+/** The slice of GameWorld the door hunt reads — structural so tests stub it
+ * with plain boxes (no meshes/BVHs needed). */
+export type DoorScanWorld = {
+  doors: readonly Pick<DoorEntry, 'nodeId' | 'colliderIndices' | 'node'>[]
+  colliders: readonly { worldBox: Box3; disabled?: boolean }[]
+}
+
+const _doorBounds = new Box3()
+
+/**
+ * Nearest fumble-worthy door within maxDist of (x, z): skips pure openings
+ * (openingKind 'opening' — no leaf to swing) and doors with no ENABLED
+ * collider left (already open and passable, or voxelized — destruction owns
+ * those and bots use the breach). Returns the winner's nodeId and writes its
+ * solid-collider bounds center into outCenter (y = 0). Pure, allocation-free.
+ */
+export function pickDoorCandidate(
+  world: DoorScanWorld,
+  x: number,
+  z: number,
+  maxDist: number,
+  outCenter: Vector3,
+): string | null {
+  let bestId: string | null = null
+  let bestSq = maxDist * maxDist
+  for (const door of world.doors) {
+    if (door.node?.openingKind === 'opening') continue
+    _doorBounds.makeEmpty()
+    for (const index of door.colliderIndices) {
+      const collider = world.colliders[index]
+      if (!collider || collider.disabled) continue
+      _doorBounds.union(collider.worldBox)
+    }
+    if (_doorBounds.isEmpty()) continue
+    const cx = (_doorBounds.min.x + _doorBounds.max.x) / 2
+    const cz = (_doorBounds.min.z + _doorBounds.max.z) / 2
+    const dSq = (cx - x) * (cx - x) + (cz - z) * (cz - z)
+    if (dSq < bestSq) {
+      bestSq = dSq
+      bestId = door.nodeId
+      outCenter.set(cx, 0, cz)
+    }
+  }
+  return bestId
+}
+
+/** Does this door still block (any enabled collider)? The fumble re-checks
+ * right before toggling so a door the player opened mid-fumble isn't slammed
+ * shut in their face. False for unknown ids. */
+export function doorIsClosed(world: DoorScanWorld, nodeId: string): boolean {
+  for (const door of world.doors) {
+    if (door.nodeId !== nodeId) continue
+    for (const index of door.colliderIndices) {
+      const collider = world.colliders[index]
+      if (collider && !collider.disabled) return true
+    }
+    return false
+  }
+  return false
+}
+
+/** Arm a door mission: target the approach point (door center pushed
+ * DOOR_APPROACH_OFFSET toward the bot — orientation-agnostic, works from
+ * either side) and reset the mission clocks. */
+export function setDoorApproach(bot: Bot, nodeId: string, centerX: number, centerZ: number): void {
+  bot.doorId = nodeId
+  bot.doorT = 0
+  bot.doorFumbleT = 0
+  const dx = bot.position.x - centerX
+  const dz = bot.position.z - centerZ
+  const d = Math.hypot(dx, dz)
+  if (d > 1e-4) {
+    bot.doorX = centerX + (dx / d) * DOOR_APPROACH_OFFSET
+    bot.doorZ = centerZ + (dz / d) * DOOR_APPROACH_OFFSET
+  } else {
+    bot.doorX = centerX
+    bot.doorZ = centerZ
+  }
 }
 
 // --- BOTS ON FLOORS: ground settle (droid/dog only, drones never call this) --

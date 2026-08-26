@@ -58,8 +58,19 @@ import { collectHostForestMeshes, type GameWorld, type HostTreeNode } from './wo
  *       { id, nodeId?, x, y, z, scale, state, hp, canopyDamage, burnT,
  *         charHits } — nodeId set exactly on host-tree replacements.
  *   Pure helpers exported for tests: buildTreesFrom, raycastTrees,
- *       damageTree, updateBurning, hostTreePlacements, withoutHostOverlap
- *       (no rendering/sfx inside — the component wraps them with effects).
+ *       damageTree, updateBurning, hostTreePlacements, withoutHostOverlap,
+ *       charBurstDir (no rendering/sfx inside — the component wraps them
+ *       with effects).
+ *
+ * Char-collapse feel (phase 6): when a burning crown finishes, the leaf
+ * shower launches OUTWARD-DOWN (charBurstDir — radial away from the trunk,
+ * always falling) in scorched leaf greens with 2–3 ember-orange chunks, a
+ * brief kind-guarded 'puff' of dust, sfx.emberCrackle soft pops — and the
+ * crackle loop FADES over CRACKLE_FADE_S instead of cutting (fade also
+ * stops the handle, freeing its timer; reignition mid-fade re-drives it).
+ * Char snaps deepen per successive break on the same tree:
+ * sfx.charSnap(CHAR_HITS - charHits - 1) — snap count is derived, no new
+ * per-tree state.
  * ───────────────────────────────────────────────────────────────────────
  */
 
@@ -349,6 +360,70 @@ const EMBER = new Color('#e8703a')
 const _burstColor = new Color()
 const _canopyColor = new Color()
 
+/** Seconds the burning-crackle loop fades once the last crown finishes. */
+export const CRACKLE_FADE_S = 0.6
+/** Ember-orange debris chunks mixed into each char-collapse leaf shower. */
+const CHAR_EMBER_MIN = 2 // + 0..1 more at random → 2–3
+
+/**
+ * Launch direction for one char-collapse leaf voxel: OUTWARD along the
+ * radial angle `theta` (the voxel's own bearing from the trunk) and DOWN.
+ * `down` 0..1 biases the fall steeper (y −0.45 → −0.85); the result is
+ * unit length by construction. Pure + exported for tests; the component
+ * feeds it a reused out-object (no hot-loop allocation).
+ */
+export function charBurstDir(
+  theta: number,
+  down: number,
+  out: { x: number; y: number; z: number },
+): { x: number; y: number; z: number } {
+  const dy = -(0.45 + 0.4 * Math.min(1, Math.max(0, down)))
+  const h = Math.sqrt(1 - dy * dy)
+  out.x = Math.cos(theta) * h
+  out.y = dy
+  out.z = Math.sin(theta) * h
+  return out
+}
+
+const _charDir = { x: 0, y: 0, z: 0 }
+
+/**
+ * Char-collapse shower — the burnt crown lets go. Unlike burstCanopy's
+ * omni fell burst, every voxel launches outward-down along its own radial
+ * bearing (charBurstDir), so the crown visibly SHEDS. Colors are the
+ * tree's leaf green scorched partway to charcoal, with 2–3 ember-orange
+ * chunks glowing in the fall.
+ */
+function burstCanopyChar(tree: CombatTree): void {
+  const s = tree.scale
+  const n = 26
+  const embers = CHAR_EMBER_MIN + (Math.random() < 0.5 ? 1 : 0)
+  for (let i = 0; i < n; i++) {
+    // Positions are random, so ember slots can be the first indices.
+    if (i < embers) _burstColor.copy(EMBER)
+    else {
+      _burstColor
+        .setRGB(tree.color[0], tree.color[1], tree.color[2])
+        .lerp(CHARCOAL, 0.2 + Math.random() * 0.3)
+    }
+    const r = CANOPY_R * s * Math.cbrt(Math.random())
+    const theta = Math.random() * Math.PI * 2
+    const u = Math.random() * 2 - 1
+    const h = Math.sqrt(1 - u * u)
+    charBurstDir(theta, Math.random(), _charDir)
+    spawnDebris(
+      tree.x + Math.cos(theta) * h * r,
+      tree.y + CANOPY_CY * s + u * r,
+      tree.z + Math.sin(theta) * h * r,
+      (0.1 + Math.random() * 0.07) * s,
+      _burstColor,
+      1.6,
+      2.2,
+      _charDir,
+    )
+  }
+}
+
 /** Voxel burst filling the canopy sphere — the "becomes voxels" collapse. */
 function burstCanopy(tree: CombatTree, charcoal: boolean): void {
   const s = tree.scale
@@ -432,7 +507,9 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
       for (let i = 0; i < 4; i++) {
         spawnDebris(hit.point.x, hit.point.y, hit.point.z, 0.07, CHARCOAL, 1.5, 1.6)
       }
-      sfx.charSnap()
+      // Successive snaps on the SAME tree land deeper: prior snap count is
+      // derived from charHits (post-decrement) — 0 on the first break.
+      sfx.charSnap(CHAR_HITS - tree.charHits - 1)
       revision++
       break
     }
@@ -440,7 +517,8 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
       burstTrunk(tree, true)
       _dustPos.set(tree.x, tree.y + 1 * tree.scale, tree.z)
       spawnDust(_dustPos, 0.7, PUFF)
-      sfx.charSnap()
+      // charHits is 0 here — the deepest snap in the tree's run.
+      sfx.charSnap(CHAR_HITS - 1)
       sfx.woodCrumble(0.5)
       revision++
       break
@@ -569,6 +647,10 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
   const stumpsRef = useRef<InstancedMesh>(null)
   const seenRevision = useRef(-1)
   const crackle = useRef<TreeCrackleHandle | null>(null)
+  /** Intensity the crackle held while fires burned — the fade's start level. */
+  const crackleLevel = useRef(0)
+  /** Seconds left of the post-fire crackle fade (CRACKLE_FADE_S → 0). */
+  const crackleFade = useRef(0)
   const smokeClock = useRef(0)
 
   useEffect(() => {
@@ -606,16 +688,33 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
     const burningCount = updateBurning(trees, dt, _finishedBurning)
     for (const id of _finishedBurning) {
       const tree = trees[id]!
-      burstCanopy(tree, true)
+      // The crown SHEDS: outward-down leaf shower with ember chunks, one
+      // brief kind-guarded dust puff, and soft ember pops under the snap.
+      burstCanopyChar(tree)
       _dustPos.set(tree.x, tree.y + CANOPY_CY * tree.scale, tree.z)
-      spawnDust(_dustPos, 0.8, PUFF)
+      spawnDust(_dustPos, 0.55, PUFF)
       sfx.charSnap()
+      sfx.emberCrackle()
       revision++
     }
 
-    // Crackle loop follows how much of the grove is on fire.
-    if (burningCount > 0 && !crackle.current) crackle.current = sfx.treeCrackle()
-    crackle.current?.setIntensity(Math.min(1, burningCount / 3))
+    // Crackle loop follows how much of the grove is on fire; when the last
+    // crown finishes it FADES over CRACKLE_FADE_S (then stops, freeing the
+    // handle's timer) instead of cutting. Reignition mid-fade re-drives it.
+    if (burningCount > 0) {
+      if (!crackle.current) crackle.current = sfx.treeCrackle()
+      crackleLevel.current = Math.min(1, burningCount / 3)
+      crackleFade.current = CRACKLE_FADE_S
+      crackle.current.setIntensity(crackleLevel.current)
+    } else if (crackle.current) {
+      crackleFade.current -= dt
+      if (crackleFade.current <= 0) {
+        crackle.current.stop()
+        crackle.current = null
+      } else {
+        crackle.current.setIntensity(crackleLevel.current * (crackleFade.current / CRACKLE_FADE_S))
+      }
+    }
 
     // Structural sync only when something changed.
     if (seenRevision.current !== revision) {

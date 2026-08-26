@@ -53,6 +53,15 @@
  * Phase-4 one-shots: hammerSmash() — the warhammer's deep thunder crack
  * (60–90Hz thump stack + masonry snap + long dust tail, loud but limited);
  * grenadeBeep() — short 900Hz arming blip for the fuse/HUD pip.
+ *
+ * Phase-6 char-feel: charSnap(depth) — depth = prior snaps on the SAME
+ * tree; each successive snap sits ~9% lower with a deeper, longer thunk
+ * (trees-destruct passes CHAR_HITS - charHits - 1). emberCrackle() — 2–3
+ * soft ember pops for the burnt-crown collapse moment (quiet, well under
+ * the limiter). sfx.spray() — { start(), stop() } paint-tool aerosol hiss:
+ * looped bandpass noise ~3kHz with a slow ~1.3Hz AM shimmer at level
+ * ~0.045; start idempotent while running (works again after stop), stop
+ * idempotent; ALWAYS returns a handle (silent no-op without WebAudio).
  */
 
 /** Health at/below which the low-HP heartbeat (audio + HUD pulse) engages. */
@@ -221,6 +230,12 @@ export type SirenLoopHandle = {
   stop: () => void
 }
 
+/** Handle returned by sfx.spray() — the paint-tool aerosol hiss loop. */
+export type SprayHandle = {
+  start: () => void
+  stop: () => void
+}
+
 export const sfx = {
   resume(): void {
     ensureContext()
@@ -385,17 +400,51 @@ export const sfx = {
    * Brittle charcoal crack — charred wood breaking like a stick of charcoal.
    * Higher and shorter than studSnap: a hot 2kHz-up snap, a small dry knock
    * (no meaty body), and one or two glassy shard ticks.
+   *
+   * `depth` = how many snaps this tree already took (0 = first): each
+   * successive break on the same trunk lands ~9% lower with a deeper,
+   * slightly longer knock — the sticks left standing are thicker, closer
+   * to the trunk. Clamped 0..4; round-robin variance still applies on top.
    */
-  charSnap(): void {
+  charSnap(depth = 0): void {
     const v = rr()
-    burst({ duration: 0.028, gain: 0.75, filterType: 'highpass', freq: 2100 * v, q: 0.8 })
-    thump(320 * v, 0.05, 0.28)
+    const d = Math.min(4, Math.max(0, depth))
+    const p = 1 - 0.09 * d // whole-voice pitch drop per prior snap
+    burst({ duration: 0.028 + 0.004 * d, gain: 0.75, filterType: 'highpass', freq: 2100 * v * p, q: 0.8 })
+    // The knock deepens fastest — successive breaks read as heavier wood.
+    thump(320 * v * p * p, 0.05 + 0.012 * d, 0.28 + 0.03 * d)
     const ticks = 1 + Math.floor(Math.random() * 2)
     let at = 0
     for (let i = 0; i < ticks; i++) {
       at += 0.02 + Math.random() * 0.03
-      burst({ duration: 0.018, gain: 0.16, freq: 3200 + Math.random() * 2600, q: 4 }, at)
+      burst({ duration: 0.018, gain: 0.16, freq: (3200 + Math.random() * 2600) * p, q: 4 }, at)
     }
+  },
+
+  /**
+   * Ember settle — 2–3 soft pops as a burnt crown lets go: tiny bandpassed
+   * ticks in the 1–2.6kHz coal band, staggered a few tens of ms apart, plus
+   * one faint low ember knock. QUIET by design (peak gain ~0.14, far under
+   * the one-shot palette) so a whole grove charring keeps limiter headroom.
+   * Round-robin detuned so back-to-back collapses never repeat.
+   */
+  emberCrackle(): void {
+    const v = rr()
+    const pops = 2 + Math.floor(Math.random() * 2)
+    let at = 0.01
+    for (let i = 0; i < pops; i++) {
+      burst(
+        {
+          duration: 0.02 + Math.random() * 0.03,
+          gain: 0.14 - i * 0.03,
+          freq: (1000 + Math.random() * 1600) * v,
+          q: 3,
+        },
+        at,
+      )
+      at += 0.045 + Math.random() * 0.07
+    }
+    thump(140 * v, 0.06, 0.08, 0.02)
   },
 
   /** Dull wood knock — the stud takes the hit but holds. */
@@ -878,6 +927,71 @@ export const sfx = {
         osc.stop(end)
         lfo?.stop(end)
         osc = null
+        lfo = null
+        gain = null
+      },
+    }
+  },
+
+  /**
+   * Soft aerosol hiss loop — the paint tool's spray-can voice. Looped noise
+   * through a bandpass parked near 3kHz (round-robin detuned per start so
+   * successive coats don't ring identical) with a slow ~1.3Hz AM shimmer —
+   * the can's pressure breathing — at level ~0.045: QUIET, it sits under
+   * footsteps and never leans on the limiter. start() is a no-op while
+   * running and works again after stop(); stop() ramps out over ~80ms and
+   * kills the source; both idempotent. ALWAYS returns a handle — silent
+   * no-op without WebAudio.
+   */
+  spray(): SprayHandle {
+    let src: AudioBufferSourceNode | null = null
+    let lfo: OscillatorNode | null = null
+    let gain: GainNode | null = null
+    return {
+      start: () => {
+        const c = ensureContext()
+        if (!c || !master || src) return
+        const v = rr()
+        const s = c.createBufferSource()
+        s.buffer = noise(c)
+        s.loop = true
+        const filter = c.createBiquadFilter()
+        filter.type = 'bandpass'
+        filter.frequency.value = 3000 * v
+        filter.Q.value = 0.9
+        // Slow AM — the can breathing as pressure ebbs and swells.
+        const am = c.createGain()
+        am.gain.value = 0.82
+        lfo = c.createOscillator()
+        lfo.type = 'sine'
+        lfo.frequency.value = 1.3
+        const lfoDepth = c.createGain()
+        lfoDepth.gain.value = 0.18
+        lfo.connect(lfoDepth)
+        lfoDepth.connect(am.gain)
+        const g = c.createGain()
+        g.gain.value = 0
+        s.connect(filter)
+        filter.connect(am)
+        am.connect(g)
+        g.connect(master)
+        s.start()
+        lfo.start()
+        s.onended = () => {
+          g.disconnect()
+          lfoDepth.disconnect()
+        }
+        g.gain.setTargetAtTime(0.045, c.currentTime, 0.04)
+        src = s
+        gain = g
+      },
+      stop: () => {
+        if (!src || !ctx) return
+        gain?.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.03)
+        const end = ctx.currentTime + 0.25
+        src.stop(end)
+        lfo?.stop(end)
+        src = null
         lfo = null
         gain = null
       },
