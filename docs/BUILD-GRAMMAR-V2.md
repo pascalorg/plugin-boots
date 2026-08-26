@@ -71,6 +71,24 @@ convention — verify against builder.tsx/keep.ts before implementing; the
 mask→node mapping in keep.ts is the source of truth). Add 4-bit 2×2 floor
 masks (quarter/half/L) and 4 corner-height nibbles for roofs.
 
+## The two flows players actually feel (spell them out in QA)
+
+**Ceilings are floors, one storey up.** There is no ceiling piece. Select
+the FLOOR piece and look up: past the +35° pitch band the target slot
+becomes the top face of your own cell (y = 2.8·(s+1)). Click — a ceiling.
+Look down past −35°: the floor lands under your feet. The grid decides,
+never the free ray. Support rule applies: a ceiling must touch a wall or
+existing piece, or it reads red.
+
+**Slopes chain as you climb them.** The ROOF piece fills the cell you face,
+rising 2.8 m over its 3 m run, ascent starting from YOUR side. R turns the
+ascent 90° per press (180° = a descent), and the chosen orientation
+persists until you switch piece type. The signature move: hold place and
+RUN UP your own ramps — every cell you enter lays the next ramp one storey
+higher (turbo: first piece 0.15 s, then one per new slot, ≥0.05 s apart).
+Later: pyramid-style 2×2 corner edits (ramp/shed/flat/pyramid) on the roof
+piece — deferred with the floor 2×2 masks.
+
 ## Open decisions for the implementing fleet
 - Reach: 6 m (~2 cells) chosen to match the genre's ~1-tile feel.
 - Whether scene walls count as "support" for s>0 placements (recommended:
