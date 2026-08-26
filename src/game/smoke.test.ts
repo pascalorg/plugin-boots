@@ -71,13 +71,13 @@ function boxCollider(
   }
 }
 
-/** A 2m × 2.7m × 0.12m wall at the origin (skins at z ≈ ±0.04), a slab-like
+/** A 2m × 2.7m × 0.12m wall at the origin (skins at z ≈ ±0.04), a crate-item
  * volume at x=10, and an indestructible prop at x=20 — all on the z=0 line. */
 function makeWorld(): GameWorld {
   const wall = boxCollider('wall-1', 'wall', [2, 2.7, 0.12], [0, 1.35, 0])
-  const slab = boxCollider('slab-1', 'slab', [1.2, 0.3, 1.2], [10, 1.35, 0])
+  const crate = boxCollider('crate-1', 'item', [1.2, 0.3, 1.2], [10, 1.35, 0])
   const prop = boxCollider('prop-1', 'prop', [1, 1, 1], [20, 1.35, 0])
-  const colliders = [wall, slab, prop]
+  const colliders = [wall, crate, prop]
   const buildingAabb = new Box3()
   for (const c of colliders) buildingAabb.union(c.worldBox)
   return {
@@ -235,25 +235,25 @@ describe('studs: expose, chip, snap', () => {
 })
 
 describe('(c) non-wall destructibles carve as plain volumes', () => {
-  test('slab voxelizes on first hit: kind volume, no studs, interior kept', () => {
+  test('item volume voxelizes on first hit: kind volume, no studs, interior kept', () => {
     const world = makeWorld()
     aimFrom(10, 1.35, 5)
     expect(fire(world, GUN)).toBe('wall') // outcome class for any carve
-    const target = useDestruction.getState().targets.get('slab-1')
+    const target = useDestruction.getState().targets.get('crate-1')
     expect(target).toBeDefined()
     expect(target!.kind).toBe('volume')
     expect(target!.studs).toHaveLength(0)
     expect(target!.grid.aliveCount).toBeLessThan(target!.grid.count)
     // Solid volumes keep their interior (8 × 2 × 8 full box at 0.15m).
     expect(target!.grid.count).toBe(target!.grid.nx * target!.grid.ny * target!.grid.nz)
-    expect(world.colliders.find((c) => c.nodeId === 'slab-1')!.disabled).toBe(true)
+    expect(world.colliders.find((c) => c.nodeId === 'crate-1')!.disabled).toBe(true)
   })
 
   test('direct damageTarget carve removes voxels without a shot', () => {
     const world = makeWorld()
-    const removed = damageTarget(world, 'slab-1', new Vector3(10, 1.35, 0.15), 0.3)
+    const removed = damageTarget(world, 'crate-1', new Vector3(10, 1.35, 0.15), 0.3)
     expect(removed).toBeGreaterThan(0)
-    expect(useDestruction.getState().targets.get('slab-1')!.kind).toBe('volume')
+    expect(useDestruction.getState().targets.get('crate-1')!.kind).toBe('volume')
   })
 
   test('non-destructible node types spark instead of voxelizing', () => {

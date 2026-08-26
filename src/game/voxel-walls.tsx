@@ -203,6 +203,10 @@ function MemberLayer({
   )
 }
 
+/** Bottom-skin tone for slab sandwiches — the ceiling face reads as
+ * drywall, slightly lighter/greyer than the floor sheathing above it. */
+const _ceilingTone = new Color()
+
 function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
   const revision = useRef(-1)
@@ -228,6 +232,11 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
     // layers' per-member yaw). World-aligned grids keep identity.
     if (grid.yaw === 0) _quat.identity()
     else _quat.setFromAxisAngle(UP, -grid.yaw)
+    // Slab sandwiches wear TWO tones: the top skin keeps the host's floor
+    // tone (baseColor) while the bottom skin — the ceiling face a player
+    // looks up at — renders as slightly lighter, desaturated drywall.
+    const isSlab = wall.kind === 'slab'
+    if (isSlab) _ceilingTone.copy(wall.baseColor).offsetHSL(0, -0.06, 0.14)
     for (let i = 0; i < grid.count; i++) {
       if (grid.alive[i]) {
         _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
@@ -241,7 +250,8 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
       // never band into flat stripes.
       const j1 = ((i * 2654435761) % 97) / 97
       const j2 = ((i * 1597334677) % 89) / 89
-      _color.copy(wall.baseColor).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+      const base = isSlab && grid.coords[i * 3 + 1] === 0 ? _ceilingTone : wall.baseColor
+      _color.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
       mesh.setColorAt(i, _color)
     }
     mesh.instanceMatrix.needsUpdate = true

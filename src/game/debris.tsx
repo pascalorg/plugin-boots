@@ -15,11 +15,16 @@ import { spawnDust } from './dust'
  * live pieces cost one draw call.
  *
  * API (callers may feature-check the named exports):
- *   spawnDebris(x, y, z, size, color, speed, ttl?)  — classic cube chunk.
- *   spawnFlatDebris(x, y, z, w, h, color)           — drywall/paper plate,
+ *   spawnDebris(x, y, z, size, color, speed, ttl?, dir?) — classic cube
+ *     chunk. `dir` (unit-ish vector) biases the launch velocity along it —
+ *     ceiling material pops DOWN through the hole, not up.
+ *   spawnFlatDebris(x, y, z, w, h, color, dir?)     — drywall/paper plate,
  *     w×h meters (torn-edge xy jitter), slow flutter, ~3s life, one tiny
  *     chip puff on its first ground slap. Live plates cap at 120 — the
- *     plate closest to expiry gets reused first.
+ *     plate closest to expiry gets reused first. `dir` as above (a torn
+ *     ceiling board leaves its face along −Y).
+ *   debrisCensus()                                  — headless test probe:
+ *     live slot count + flat count + mean launch vy of live pieces.
  *   clearDebris()                                   — session teardown.
  */
 
@@ -87,6 +92,7 @@ export function spawnDebris(
   color: Color,
   speed: number,
   ttl = 2.6,
+  dir?: { x: number; y: number; z: number },
 ): void {
   const slot = slots[cursor]!
   colors[cursor]!.copy(color).offsetHSL(0, 0, (Math.random() - 0.5) * 0.08)
@@ -97,11 +103,19 @@ export function spawnDebris(
   slot.px = x
   slot.py = y
   slot.pz = z
-  const theta = Math.random() * Math.PI * 2
-  const up = 0.5 + Math.random() * 1.6
-  slot.vx = Math.cos(theta) * speed * (0.3 + Math.random() * 0.7)
-  slot.vy = up * speed * 0.55
-  slot.vz = Math.sin(theta) * speed * (0.3 + Math.random() * 0.7)
+  if (dir) {
+    // Directional launch (sheet fly-offs): mostly along the face normal
+    // with a light random spray — a torn ceiling drops its chunks DOWN.
+    slot.vx = dir.x * speed + (Math.random() - 0.5) * speed * 0.5
+    slot.vy = dir.y * speed + (Math.random() - 0.5) * speed * 0.3
+    slot.vz = dir.z * speed + (Math.random() - 0.5) * speed * 0.5
+  } else {
+    const theta = Math.random() * Math.PI * 2
+    const up = 0.5 + Math.random() * 1.6
+    slot.vx = Math.cos(theta) * speed * (0.3 + Math.random() * 0.7)
+    slot.vy = up * speed * 0.55
+    slot.vz = Math.sin(theta) * speed * (0.3 + Math.random() * 0.7)
+  }
   slot.rx = Math.random() * Math.PI
   slot.ry = Math.random() * Math.PI
   slot.rz = Math.random() * Math.PI
@@ -127,7 +141,15 @@ const FLAT_CAP = 120
  * slow fluttery fall (air drag + tilt side-slip in the frame loop). Edges
  * read torn via independent non-uniform xy scale jitter.
  */
-export function spawnFlatDebris(x: number, y: number, z: number, w: number, h: number, color: Color): void {
+export function spawnFlatDebris(
+  x: number,
+  y: number,
+  z: number,
+  w: number,
+  h: number,
+  color: Color,
+  dir?: { x: number; y: number; z: number },
+): void {
   // Count live plates; under cap pressure, recycle the one closest to
   // expiry instead of burning a fresh ring slot.
   let flats = 0
@@ -159,9 +181,18 @@ export function spawnFlatDebris(x: number, y: number, z: number, w: number, h: n
   slot.pz = z
   const theta = Math.random() * Math.PI * 2
   const speed = 0.5 + Math.random() * 0.9
-  slot.vx = Math.cos(theta) * speed
-  slot.vy = 0.3 + Math.random() * 0.9
-  slot.vz = Math.sin(theta) * speed
+  if (dir) {
+    // Face-normal launch: a board torn off a ceiling flutters DOWNWARD
+    // through the hole, a wall board pops outward (spec: gravity direction
+    // on shards follows the sheet's outward normal).
+    slot.vx = dir.x * speed + (Math.random() - 0.5) * 0.4
+    slot.vy = dir.y * speed + (Math.random() - 0.5) * 0.25
+    slot.vz = dir.z * speed + (Math.random() - 0.5) * 0.4
+  } else {
+    slot.vx = Math.cos(theta) * speed
+    slot.vy = 0.3 + Math.random() * 0.9
+    slot.vz = Math.sin(theta) * speed
+  }
   slot.rx = Math.random() * Math.PI
   slot.ry = Math.random() * Math.PI
   slot.rz = Math.random() * Math.PI
@@ -183,6 +214,37 @@ export function spawnFlatDebris(x: number, y: number, z: number, w: number, h: n
 export function clearDebris(): void {
   for (const slot of slots) slot.alive = false
   liveCount = 0
+}
+
+/** Headless test probe — live piece count, flat-plate count, and the mean
+ * CURRENT vertical velocity across live pieces / live plates (fresh spawns:
+ * their launch vy). Destruction tests assert the crumble sampling cap and
+ * that ceiling sheet shards leave downward, without reaching into slots. */
+export function debrisCensus(): {
+  live: number
+  flats: number
+  meanVy: number
+  meanVyFlat: number
+} {
+  let live = 0
+  let flats = 0
+  let vy = 0
+  let vyFlat = 0
+  for (const slot of slots) {
+    if (!slot.alive) continue
+    live++
+    vy += slot.vy
+    if (slot.flat) {
+      flats++
+      vyFlat += slot.vy
+    }
+  }
+  return {
+    live,
+    flats,
+    meanVy: live > 0 ? vy / live : 0,
+    meanVyFlat: flats > 0 ? vyFlat / flats : 0,
+  }
 }
 
 const GRAVITY = 14

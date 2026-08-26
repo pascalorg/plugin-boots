@@ -5,9 +5,9 @@ import * as destruct from './destruction'
 import {
   damageStud,
   damageTarget,
+  isTearLaneNode,
   raycastStuds,
   raycastVoxelTargets,
-  useDestruction,
 } from './destruction'
 import { spawnDust } from './dust'
 import { bots, damageBot, raycastBots } from './enemies-state'
@@ -237,11 +237,12 @@ function heavyPuff(point: Vector3, direction: Vector3, removed: number): void {
   dust(_puffPoint, Math.min(1, 0.5 + removed / 30), { kind: 'puff', direction: direction.clone() })
 }
 
-/** Kind-'wall' predictor that works BEFORE first-blood voxelization too:
- * ensureVoxelTarget assigns kind 'wall' exactly when world.walls has the
- * node, so radius choice and emission policy agree with destruction.ts. */
+/** Tear-lane predictor that works BEFORE first-blood voxelization too:
+ * destruction.ts owns the rule (walls + slab sandwiches carve at
+ * tearRadius with the drywall voice; plain volumes at holeRadius), so
+ * radius choice and emission policy always agree with the target's kind. */
 function isWallTarget(world: GameWorld, nodeId: string): boolean {
-  return useDestruction.getState().targets.get(nodeId)?.kind === 'wall' || world.walls.has(nodeId)
+  return isTearLaneNode(world, nodeId)
 }
 
 /** SMASH nibble scratch (warhammer ragged rim) — module temps, no per-swing

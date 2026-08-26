@@ -666,13 +666,23 @@ export function raycastVoxels(
  * never enters: on a rotated grid "supported from iy === 0" means supported
  * from whatever world direction grid −Y points at (for a roof-plane basis,
  * the eave-side row — a pitched slab sheds its uphill half when severed).
+ *
+ * Pass `seeded` to replace the base-row rule with your own support seeds
+ * (index → true when that cell is externally held up). HORIZONTAL sandwich
+ * grids (slabs — thickness axis IS grid Y) need this: their iy === 0 row is
+ * the entire ceiling skin, so the default would declare every slab
+ * self-supporting forever. destruction.ts seeds slab cells from a probe
+ * against live walls/colliders beneath instead (MULTILEVEL-PLAN Phase B).
  */
-export function findUnsupportedIslands(grid: VoxelGridData): number[][] {
+export function findUnsupportedIslands(
+  grid: VoxelGridData,
+  seeded?: (index: number) => boolean,
+): number[][] {
   const { count, coords, nx, ny, nz, index } = grid
   const seen = new Uint8Array(count)
   const stack: number[] = []
   for (let i = 0; i < count; i++) {
-    if (grid.alive[i] && coords[i * 3 + 1] === 0) {
+    if (grid.alive[i] && (seeded ? seeded(i) : coords[i * 3 + 1] === 0)) {
       seen[i] = 1
       stack.push(i)
     }

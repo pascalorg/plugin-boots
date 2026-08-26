@@ -50,12 +50,12 @@ function boxCollider(
   }
 }
 
-/** A 2m × 2.7m × 0.12m wall at the origin and a slab-like volume at x=10,
+/** A 2m × 2.7m × 0.12m wall at the origin and a crate-item volume at x=10,
  * both facing the z=5 firing line — same layout as the smoke pass. */
 function makeWorld(): GameWorld {
   const wall = boxCollider('wall-1', 'wall', [2, 2.7, 0.12], [0, 1.35, 0])
-  const slab = boxCollider('slab-1', 'slab', [1.2, 0.3, 1.2], [10, 1.35, 0])
-  const colliders = [wall, slab]
+  const crate = boxCollider('crate-1', 'item', [1.2, 0.3, 1.2], [10, 1.35, 0])
+  const colliders = [wall, crate]
   const buildingAabb = new Box3()
   for (const c of colliders) buildingAabb.union(c.worldBox)
   return {
@@ -114,9 +114,9 @@ describe('tear routing: tearRadius rules walls, holeRadius rules volumes', () =>
   })
 
   test('tearRadius does NOT touch non-wall volumes (kind-wall targets only)', () => {
-    const plain = removedByOneShot(GUN, 'slab-1', 10)
-    const torn = removedByOneShot(TEAR_GUN, 'slab-1', 10)
-    expect(useDestruction.getState().targets.get('slab-1')!.kind).toBe('volume')
+    const plain = removedByOneShot(GUN, 'crate-1', 10)
+    const torn = removedByOneShot(TEAR_GUN, 'crate-1', 10)
+    expect(useDestruction.getState().targets.get('crate-1')!.kind).toBe('volume')
     expect(plain).toBeGreaterThan(0)
     expect(torn).toBe(plain)
   })

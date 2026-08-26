@@ -44,13 +44,13 @@ function boxCollider(
   }
 }
 
-/** Two walls facing the z+ firing line + one slab volume — the same layout
+/** Two walls facing the z+ firing line + one crate volume — the same layout
  * family as the shooting tests. */
 function makeWorld(): GameWorld {
   const wallA = boxCollider('wall-1', 'wall', [2, 2.7, 0.12], [0, 1.35, 0])
   const wallB = boxCollider('wall-2', 'wall', [3, 2.7, 0.12], [5, 1.35, 0])
-  const slab = boxCollider('slab-1', 'slab', [1.2, 0.3, 1.2], [10, 1.35, 0])
-  const colliders = [wallA, wallB, slab]
+  const crate = boxCollider('crate-1', 'item', [1.2, 0.3, 1.2], [10, 1.35, 0])
+  const colliders = [wallA, wallB, crate]
   const buildingAabb = new Box3()
   for (const c of colliders) buildingAabb.union(c.worldBox)
   const wallEntry = (c: ColliderEntry, start: [number, number], end: [number, number]) => ({
@@ -87,7 +87,7 @@ describe('prevoxelizeTick', () => {
     const targets = useDestruction.getState().targets
     expect(targets.get('wall-1')?.kind).toBe('wall')
     expect(targets.get('wall-2')?.kind).toBe('wall')
-    expect(targets.has('slab-1')).toBe(false)
+    expect(targets.has('crate-1')).toBe(false)
     // Host handover happened in the same path as first-hit voxelization.
     for (const collider of world.colliders) {
       expect(Boolean(collider.disabled)).toBe(collider.nodeType === 'wall')
@@ -171,7 +171,7 @@ describe('framing segments (charcoal sticks)', () => {
     // Ids are array indices (fixed-length member contract).
     wall.segments.forEach((seg, i) => expect(seg.id).toBe(i))
     // Volumes carry no framing.
-    expect(ensureVoxelTarget(world, 'slab-1')!.segments.length).toBe(0)
+    expect(ensureVoxelTarget(world, 'crate-1')!.segments.length).toBe(0)
   })
 
   test('raycastSegments finds the stick, damageSegment chips then snaps it', () => {
@@ -242,10 +242,10 @@ describe('carve splash chips the framing (gunfire chips neighbors)', () => {
 
   test('volume carves splash nothing (no framing)', () => {
     const world = makeWorld()
-    const slab = ensureVoxelTarget(world, 'slab-1')!
-    expect(slab.segments.length).toBe(0)
+    const crate = ensureVoxelTarget(world, 'crate-1')!
+    expect(crate.segments.length).toBe(0)
     expect(() =>
-      damageTarget(world, 'slab-1', new Vector3(10, 1.35, -0.5), 0.4),
+      damageTarget(world, 'crate-1', new Vector3(10, 1.35, -0.5), 0.4),
     ).not.toThrow()
   })
 })
@@ -308,9 +308,9 @@ describe('drywall sheets', () => {
       expect(Math.hypot(nx, ny, nz)).toBeCloseTo(1, 5)
       expect(ny).toBe(0)
     }
-    const slab = ensureVoxelTarget(world, 'slab-1')!
-    expect(slab.kind).toBe('volume')
-    expect(slab.sheets.length).toBe(0)
+    const crate = ensureVoxelTarget(world, 'crate-1')!
+    expect(crate.kind).toBe('volume')
+    expect(crate.sheets.length).toBe(0)
   })
 
   test('one big carve = one hit per touched sheet, torn matches removed cells', () => {
@@ -400,7 +400,7 @@ describe('damageExplosion (grenade detonation carve)', () => {
     damageExplosion(world, new Vector3(0, 1.2, 0.5), 3.2, { immediate: true })
     const targets = useDestruction.getState().targets
     expect(targets.has('wall-2')).toBe(false)
-    expect(targets.has('slab-1')).toBe(false)
+    expect(targets.has('crate-1')).toBe(false)
   })
 })
 

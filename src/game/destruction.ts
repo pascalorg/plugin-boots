@@ -7,6 +7,13 @@ import { spawnDust, spawnHaze } from './dust'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { hideForGameKeepingRoots } from './session'
 import {
+  dropStructureTarget,
+  noteStructureCarve,
+  registerStructureTarget,
+  resetStructure,
+  wireStructureDriver,
+} from './structure'
+import {
   buildVoxelGrid,
   dropInteriorCells,
   findUnsupportedIslands,
@@ -37,13 +44,27 @@ import { bvhFor, type GameWorld } from './world'
  * centers stay world-space); only degenerate segments fall back to the
  * plain isotropic volume.
  *
+ * SLAB SANDWICH (MULTILEVEL-PLAN Phase B): horizontal slab/ceiling/floor
+ * nodes get the SAME anatomy rotated onto its side — thickness axis is
+ * world Y (identity basis, `{ y: thickness/layers }` cell override), so
+ * dropInteriorCells leaves a TOP skin (floor sheathing tone) and a BOTTOM
+ * skin (ceiling drywall tone — voxel-walls.tsx lightens it), with JOISTS
+ * (16" o.c. sticks spanning the SHORT plan direction, tops 0.04 m below
+ * the slab top) breakable in the cavity. Sheets tile BOTH faces — a
+ * ceiling board torn from below flies off DOWNWARD in one piece — and
+ * kind-'slab' targets ride the whole wall lane: tearRadius carves,
+ * skin-respecting pierce gate, sheet fly-offs, framing splash-chips.
+ * Island support for slabs can't use the grid base row (iy 0 IS the
+ * ceiling skin), so unsupported regions are found by probing live
+ * colliders / voxel targets beneath each cell column (slabSeedPredicate).
+ *
  * ── API (build against this) ──────────────────────────────────────────
  * State
  *   useDestruction            zustand store. `targets` (and its legacy
  *                             alias `walls` — the SAME Map instance) maps
  *                             nodeId → VoxelTarget. `version` bumps on any
  *                             change; re-read the map when it does.
- *   VoxelTarget               { nodeId, kind: 'wall' | 'volume', grid,
+ *   VoxelTarget               { nodeId, kind: 'wall' | 'slab' | 'volume', grid,
  *                             baseColor, segments: SegmentMember[],
  *                             studs (legacy — SAME array as segments),
  *                             sheets: SheetMember[], sheetByCell,
@@ -65,8 +86,9 @@ import { bvhFor, type GameWorld } from './world'
  * Voxelize / damage
  *   ensureVoxelTarget(world, nodeId)   voxelize ANY collider group (walls,
  *                             doors, slabs, roofs, items…). Walls get the
- *                             skins + studs anatomy; everything else is a
- *                             plain adaptive volume (≤ 1600 voxels).
+ *                             skins + studs anatomy, horizontal slabs the
+ *                             sandwich (skins + joists); everything else is
+ *                             a plain adaptive volume (≤ 1600 voxels).
  *                             `ensureVoxelWall` is a legacy alias.
  *   prevoxelizeTick(world, budgetMs?)   voxelize the scene's remaining
  *                             walls a few per tick (host meshes hide in the
@@ -182,8 +204,10 @@ export type SheetMember = {
 
 export type VoxelTarget = {
   nodeId: string
-  /** 'wall' targets carry the skins + framing anatomy; 'volume' is plain. */
-  kind: 'wall' | 'volume'
+  /** 'wall' and 'slab' targets carry the skins + framing anatomy ('slab' =
+   * the horizontal sandwich: thickness axis Y, joists in the cavity);
+   * 'volume' is plain. */
+  kind: 'wall' | 'slab' | 'volume'
   grid: VoxelGridData
   baseColor: Color
   /** Breakable framing sticks (walls only). voxel-walls.tsx renders these
@@ -433,6 +457,62 @@ function buildSegments(wall: WallEntry, layout: StudMember[]): SegmentMember[] {
   return segments
 }
 
+// ── Slab sandwich (MULTILEVEL-PLAN Phase B) ─────────────────────────────────
+
+/** Node kinds that voxelize as the horizontal sandwich (thin axis = world
+ * Y). 'floor' is defensive — hosts register floors as slabs today. */
+const SLAB_KINDS = new Set(['slab', 'ceiling', 'floor'])
+
+/** Real joist lumber: 2×10 section (38 × 235 mm), 16" o.c. like the studs. */
+const JOIST_W = 0.038
+const JOIST_D = 0.235
+const JOIST_SPACING = 0.4064
+/** Joist tops sit this far below the slab's top surface (sheathing gap). */
+const JOIST_TOP_DROP = 0.04
+
+/**
+ * Generate the slab's joist layer from its world AABB — 16" o.c. members
+ * spanning the SHORT plan direction (real framing runs the short way), at
+ * the real 38 × 235 mm section with tops at slabTop − 0.04. Long runs split
+ * into ~1.2 m charcoal sticks exactly like wall plates, hp 2, so they chip,
+ * snap, and splash-chip through the same segment machinery as studs. Thin
+ * toppings (< 0.12 m) carry no framing, mirroring thin walls.
+ */
+function buildJoists(bounds: Box3, thickness: number): SegmentMember[] {
+  if (thickness < 0.12) return []
+  bounds.getSize(_size)
+  const alongX = _size.x <= _size.z // joists RUN along the short plan axis
+  const runLength = (alongX ? _size.x : _size.z) - 0.04
+  const spread = alongX ? _size.z : _size.x
+  if (runLength < 0.3 || spread < 0.1) return []
+  // Depth clamps just inside the sandwich (same spirit as wall segments) so
+  // lumber never pokes proud of the ceiling skin on thin slabs.
+  const depth = Math.min(JOIST_D, Math.max(0.06, thickness - JOIST_TOP_DROP - 0.01))
+  const centerY = bounds.max.y - JOIST_TOP_DROP - depth / 2
+  const yaw = alongX ? 0 : Math.PI / 2 // local +x maps to (cos yaw, sin yaw)
+  const midRun = alongX ? (bounds.min.x + bounds.max.x) / 2 : (bounds.min.z + bounds.max.z) / 2
+  const segments: SegmentMember[] = []
+  const count = Math.max(2, Math.floor(spread / JOIST_SPACING) + 1)
+  const pieces = Math.max(1, Math.round(runLength / SEGMENT_RUN))
+  const len = runLength / pieces
+  for (let i = 0; i < count; i++) {
+    const t = Math.min(1, (i * JOIST_SPACING) / spread)
+    const s = (alongX ? bounds.min.z : bounds.min.x) + spread * t
+    for (let p = 0; p < pieces; p++) {
+      const run = midRun + ((p + 0.5) / pieces - 0.5) * runLength
+      segments.push({
+        id: segments.length,
+        center: alongX ? [run, centerY, s] : [s, centerY, run],
+        size: [len - 0.012, depth, JOIST_W],
+        yaw,
+        hp: SEGMENT_HP,
+        broken: false,
+      })
+    }
+  }
+  return segments
+}
+
 /** Real-world drywall board footprint the logical sheets tile at. */
 const SHEET_W = 1.2
 const SHEET_H = 2.4
@@ -579,13 +659,14 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
 
   const wall = world.walls.get(nodeId)
   const meshes: Mesh[] = []
+  let nodeType: string | null = null
   if (wall) {
     meshes.push(...wall.meshes)
   } else {
     for (const collider of world.colliders) {
-      if (collider.nodeId === nodeId && !meshes.includes(collider.mesh)) {
-        meshes.push(collider.mesh)
-      }
+      if (collider.nodeId !== nodeId) continue
+      nodeType ??= collider.nodeType
+      if (!meshes.includes(collider.mesh)) meshes.push(collider.mesh)
     }
   }
   if (meshes.length === 0) return null
@@ -600,6 +681,8 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   if (_bounds.isEmpty()) return null
 
   let grid: ReturnType<typeof buildVoxelGrid>
+  let kind: VoxelTarget['kind'] = wall ? 'wall' : 'volume'
+  let slabThickness = 0
   if (wall) {
     // Wall anatomy needs ≥ 3 layers across the thickness so the two drywall
     // skins survive dropInteriorCells with a real cavity between them —
@@ -631,18 +714,52 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
       // degenerate segments keep the full isotropic volume.
       grid = buildDiagonalWallGrid(wall, sources) ?? buildVoxelGrid(sources, _bounds.clone(), 0.15, false)
     }
+  } else if (nodeType !== null && SLAB_KINDS.has(nodeType)) {
+    // SLAB SANDWICH — the wall anatomy rotated onto its side: the thickness
+    // axis is world Y (slabs are horizontal, thickness grows DOWNWARD from
+    // the level elevation), pinned to thickness/layers cells so
+    // dropInteriorCells leaves the top (sheathing) and bottom (ceiling)
+    // skins with the joist cavity between. Plan cells stay ~0.3 m. Thick or
+    // non-plate shapes (piers, ramps mis-kinded as slabs) keep the volume.
+    _bounds.getSize(_size)
+    const extent = _size.y
+    if (
+      extent > 0.001 &&
+      extent <= MAX_ANATOMY_THICKNESS &&
+      extent < Math.min(_size.x, _size.z)
+    ) {
+      const layers = Math.max(3, Math.ceil(extent / 0.15 - 1e-6))
+      const thicknessCell = Math.max(0.025, extent / layers)
+      grid = dropInteriorCells(
+        buildVoxelGrid(sources, _bounds.clone(), 0.3, false, { y: thicknessCell }),
+        MAX_ANATOMY_THICKNESS,
+      )
+      if (grid.count > 0) {
+        kind = 'slab'
+        slabThickness = extent
+      } else {
+        grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
+      }
+    } else {
+      grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
+    }
   } else {
     grid = buildVoxelGrid(sources, _bounds.clone(), 0.15, true)
   }
   if (grid.count === 0) return null
 
-  const sheetInfo = wall ? buildSheets(grid) : null
+  const sheetInfo = kind !== 'volume' ? buildSheets(grid) : null
   // The stud-line layout is scaffolding only — the real members are the
-  // stick segments split from it. `studs` aliases the SAME array.
-  const segments = wall ? buildSegments(wall, buildStuds(wall, grid)) : []
+  // stick segments split from it. `studs` aliases the SAME array. Slabs
+  // frame with joists generated from their world box (mirror of the studs).
+  const segments = wall
+    ? buildSegments(wall, buildStuds(wall, grid))
+    : kind === 'slab'
+      ? buildJoists(_bounds, slabThickness)
+      : []
   const target: VoxelTarget = {
     nodeId,
-    kind: wall ? 'wall' : 'volume',
+    kind,
     grid,
     baseColor: targetBaseColor(meshes),
     segments,
@@ -672,6 +789,9 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
 
   state.targets.set(nodeId, target)
   state.bump()
+  // Cross-target support (Phase B3): record the target's world AABB so
+  // carving it can wake the walls resting on it (structure.ts).
+  registerStructureTarget(target, kind)
   return target
 }
 
@@ -709,30 +829,141 @@ const prevoxelizeSkip = new Set<string>()
 
 const islandTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-function crumbleIslands(target: VoxelTarget): void {
-  const islands = findUnsupportedIslands(target.grid)
+/** Scratch for the crumble remainder dust burst. */
+const _crumbleDust = new Vector3()
+
+/** Ground height under which a slab counts as terrain-borne (every cell
+ * seeded — a patio slab never crumbles from carving its neighbors). */
+const SLAB_GROUND_Y = 0.08
+/** Lateral tolerance for the under-slab support probe: a cell column is
+ * held up while a live collider top / live voxel cell sits within this XZ
+ * distance just beneath the slab's underside. */
+const SLAB_PROBE_XZ = 0.3
+/** How far below the slab underside the probe looks for a bearing top. */
+const SLAB_PROBE_DROP = 0.4
+
+/** Debris pieces sampled per crumble EVENT — a slab region collapse can be
+ * 700+ voxels, which would evict the whole 768-slot debris ring in one
+ * frame. The rest of the material reads through one extra dust burst. */
+const CRUMBLE_DEBRIS_CAP = 120
+
+/**
+ * Island support seeds for a HORIZONTAL sandwich: the grid's own base row
+ * is the entire ceiling skin (thickness axis = Y), so "connected to iy 0"
+ * would hold a slab up forever. Instead a cell is seeded while something
+ * live stands just beneath its column: a non-disabled collider whose
+ * worldBox top reaches the slab underside (within SLAB_PROBE_XZ laterally),
+ * or a live voxel cell of another target up there (voxelized walls hand
+ * their colliders over disabled — their alive cells ARE the wall). Ground
+ * slabs are terrain-borne and fully seeded. Carve every wall away under a
+ * slab region and that region's columns lose their seeds → the island
+ * flood marks the region unsupported → it crumbles.
+ */
+export function slabSeedPredicate(world: GameWorld, target: VoxelTarget): (i: number) => boolean {
+  const grid = target.grid
+  const bottomY = grid.origin.y
+  if (bottomY <= SLAB_GROUND_Y) return () => true
+
+  // Live collider tops that reach the slab underside, XZ-expanded by the
+  // probe tolerance.
+  const boxes: Array<{ minX: number; maxX: number; minZ: number; maxZ: number }> = []
+  for (const collider of world.colliders) {
+    if (collider.disabled || collider.nodeId === target.nodeId) continue
+    const top = collider.worldBox.max.y
+    if (top < bottomY - SLAB_PROBE_DROP || top > bottomY + SLAB_PROBE_XZ) continue
+    if (collider.worldBox.min.y > bottomY) continue
+    boxes.push({
+      minX: collider.worldBox.min.x - SLAB_PROBE_XZ,
+      maxX: collider.worldBox.max.x + SLAB_PROBE_XZ,
+      minZ: collider.worldBox.min.z - SLAB_PROBE_XZ,
+      maxZ: collider.worldBox.max.z + SLAB_PROBE_XZ,
+    })
+  }
+
+  // Live voxel cells of OTHER targets near the underside → coarse XZ hash.
+  const supportCells = new Set<number>()
+  const h = SLAB_PROBE_XZ
+  const hashOf = (x: number, z: number) =>
+    Math.round(x / h) * 73856093 + Math.round(z / h) * 19349663
+  for (const other of useDestruction.getState().targets.values()) {
+    if (other === target || other.grid.aliveCount === 0) continue
+    const og = other.grid
+    for (let j = 0; j < og.count; j++) {
+      if (!og.alive[j]) continue
+      const cy = og.centers[j * 3 + 1]!
+      if (cy < bottomY - SLAB_PROBE_DROP || cy > bottomY + 0.05) continue
+      supportCells.add(hashOf(og.centers[j * 3]!, og.centers[j * 3 + 2]!))
+    }
+  }
+
+  return (i: number) => {
+    const x = grid.centers[i * 3]!
+    const z = grid.centers[i * 3 + 2]!
+    for (const box of boxes) {
+      if (x >= box.minX && x <= box.maxX && z >= box.minZ && z <= box.maxZ) return true
+    }
+    if (supportCells.size === 0) return false
+    // 3×3 hash neighborhood ≈ "within SLAB_PROBE_XZ of a live cell".
+    const bx = Math.round(x / h)
+    const bz = Math.round(z / h)
+    for (let ax = -1; ax <= 1; ax++) {
+      for (let az = -1; az <= 1; az++) {
+        if (supportCells.has((bx + ax) * 73856093 + (bz + az) * 19349663)) return true
+      }
+    }
+    return false
+  }
+}
+
+function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
+  const islands = findUnsupportedIslands(
+    target.grid,
+    target.kind === 'slab' ? slabSeedPredicate(world, target) : undefined,
+  )
   if (islands.length === 0) return
   let total = 0
+  const fallen: number[] = []
   for (const island of islands) {
-    total += island.length
     for (const idx of island) {
       if (!target.grid.alive[idx]) continue
+      total++
       target.grid.alive[idx] = 0
       target.grid.aliveCount--
       target.removedQueue.push(idx)
+      fallen.push(idx)
       // Sheet bookkeeping only (torn cells) — crumbles never count as hits
       // and never trigger a fly-off; the cells are already gone.
       const sheetId = target.sheetByCell[idx]
       if (sheetId !== undefined && sheetId >= 0) target.sheets[sheetId]!.torn++
-      spawnDebris(
-        target.grid.centers[idx * 3]!,
-        target.grid.centers[idx * 3 + 1]!,
-        target.grid.centers[idx * 3 + 2]!,
-        target.grid.cell,
-        target.baseColor,
-        1.6,
-      )
     }
+  }
+  // Debris SAMPLING (Phase B): a big region collapse must not flood the
+  // global ring 1-per-voxel — spawn at most CRUMBLE_DEBRIS_CAP pieces
+  // sampled uniformly across the fallen cells; the unsampled remainder
+  // reads through one extra dust burst below.
+  const spawnCount = Math.min(fallen.length, CRUMBLE_DEBRIS_CAP)
+  for (let n = 0; n < spawnCount; n++) {
+    const idx =
+      fallen.length <= CRUMBLE_DEBRIS_CAP
+        ? fallen[n]!
+        : fallen[Math.floor(Math.random() * fallen.length)]!
+    spawnDebris(
+      target.grid.centers[idx * 3]!,
+      target.grid.centers[idx * 3 + 1]!,
+      target.grid.centers[idx * 3 + 2]!,
+      target.grid.cell,
+      target.baseColor,
+      1.6,
+    )
+  }
+  if (fallen.length > spawnCount) {
+    const mid = fallen[Math.floor(fallen.length / 2)]!
+    _crumbleDust.set(
+      target.grid.centers[mid * 3]!,
+      target.grid.centers[mid * 3 + 1]!,
+      target.grid.centers[mid * 3 + 2]!,
+    )
+    spawnDust(_crumbleDust, 1, { kind: target.kind === 'volume' ? 'concrete' : 'drywall' })
   }
   target.revision++
   useDestruction.getState().bump()
@@ -757,9 +988,87 @@ function crumbleIslands(target: VoxelTarget): void {
   else sfx.crumble(total)
   // An island crumble can take the LAST cladding cells with it.
   maybeSkeletonSnap(target)
+  // Material left the world — walls resting on this target must re-probe.
+  noteStructureCarve(world, target.nodeId)
 }
 
+// ── Cross-target support collapse (MULTILEVEL-PLAN Phase B3) ────────────────
+// structure.ts owns the "what rests on what" bookkeeping and the staggered
+// cascade tick; this module supplies its two runtime needs — the live target
+// map and the whole-target crumble below — via the injected driver (keeps
+// structure.ts free of runtime imports from here).
+
+/**
+ * Structural collapse of an ENTIRE target — the support cascade's crumble
+ * path ("destroying what holds a thing up drops it"): every live cell dies
+ * through the same bookkeeping as an island crumble, debris SAMPLED
+ * (≤ CRUMBLE_DEBRIS_CAP, never 1:1), one haze plume, and the bare frame
+ * rains down via maybeSkeletonSnap. settleSupportAfterRemoval then tells
+ * the builder piece graph (piece-slots.notifySceneSupportChanged →
+ * SupportGraph.probeExternal re-check), so placed pieces standing on the
+ * crumbled host wall fall too. Returns how many cells fell.
+ */
+export function collapseWholeTarget(nodeId: string): number {
+  const target = useDestruction.getState().targets.get(nodeId)
+  if (!target || target.grid.aliveCount === 0) return 0
+  const { grid } = target
+  const total = grid.aliveCount
+  const debrisChance = Math.min(1, CRUMBLE_DEBRIS_CAP / total)
+  let first = -1
+  for (let idx = 0; idx < grid.count; idx++) {
+    if (!grid.alive[idx]) continue
+    grid.alive[idx] = 0
+    grid.aliveCount--
+    target.removedQueue.push(idx)
+    if (first < 0) first = idx
+    // Sheet bookkeeping only (torn cells) — same rule as island crumbles.
+    const sheetId = target.sheetByCell[idx]
+    if (sheetId !== undefined && sheetId >= 0) target.sheets[sheetId]!.torn++
+    if (Math.random() < debrisChance) {
+      spawnDebris(
+        grid.centers[idx * 3]!,
+        grid.centers[idx * 3 + 1]!,
+        grid.centers[idx * 3 + 2]!,
+        grid.cell,
+        target.baseColor,
+        1.6,
+      )
+    }
+  }
+  target.revision++
+  useDestruction.getState().bump()
+  // Nothing is left for a pending island pass to find.
+  const timer = islandTimers.get(nodeId)
+  if (timer !== undefined) {
+    clearTimeout(timer)
+    islandTimers.delete(nodeId)
+  }
+  if (first >= 0) {
+    spawnHaze(grid.centers[first * 3]!, grid.centers[first * 3 + 1]!, grid.centers[first * 3 + 2]!)
+  }
+  let framingGone = false
+  for (const stud of target.studs) {
+    if (stud.broken) {
+      framingGone = true
+      break
+    }
+  }
+  if (framingGone) sfx.woodCrumble(total)
+  else sfx.crumble(total)
+  maybeSkeletonSnap(target) // the whole frame rains down top-first
+  settleSupportAfterRemoval(target) // piece-graph notification (goal 3)
+  return total
+}
+
+// Inject the structure ticker's runtime needs (see structure.StructureDriver).
+wireStructureDriver({
+  targets: () => useDestruction.getState().targets,
+  collapse: collapseWholeTarget,
+})
+
 const _sheetCenter = new Vector3()
+/** Scratch launch direction for fly-off shards (the sheet's outward normal). */
+const _shardDir = { x: 0, y: 0, z: 0 }
 const _sheetNormal = new Vector3()
 
 /**
@@ -783,8 +1092,13 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
   useDestruction.getState().bump()
   // Shreds — torn-edge PLATES (debris.tsx's flat flutter path) sampled
   // across the sheet's own cells: the board leaves as ragged paper, not
-  // cubes. A couple of cube crumbs keep some weight in the fall.
+  // cubes. A couple of cube crumbs keep some weight in the fall. Shards
+  // launch along the sheet's OUTWARD normal — a ceiling board torn from
+  // below rains DOWN through the hole instead of popping up (Phase B).
   if (sheet.cells.length > 0) {
+    _shardDir.x = sheet.normal[0]
+    _shardDir.y = sheet.normal[1]
+    _shardDir.z = sheet.normal[2]
     const plates = Math.min(12, 5 + Math.round(freed / 10))
     for (let n = 0; n < plates; n++) {
       const idx = sheet.cells[Math.floor(Math.random() * sheet.cells.length)]!
@@ -795,6 +1109,7 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
         0.18 + Math.random() * 0.3,
         0.22 + Math.random() * 0.34,
         target.baseColor,
+        _shardDir,
       )
     }
     for (let n = 0; n < 3; n++) {
@@ -807,6 +1122,7 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
         target.baseColor,
         2.2,
         3.2,
+        _shardDir,
       )
     }
   }
@@ -867,13 +1183,14 @@ const WALL_PIERCE_RADIUS = 0.6
  * point sits ON the face the shot struck (mesh surface on first blood, DDA
  * voxel face afterwards), so its continuous coordinate along the thickness
  * axis lands in that skin's half of the grid. Only layered anatomy grids
- * (anisotropic — cellX ≠ cellZ) have skins; isotropic fallbacks return null
+ * (anisotropic — a pinned thickness cell: cellX ≠ cellZ for walls, cellY
+ * pinned for slab sandwiches) have skins; isotropic fallbacks return null
  * and carve the full volume as before.
  */
 const _skin: SkinLimit = { axis: 0, side: 0 }
 
 function entrySkin(grid: VoxelGridData, x: number, y: number, z: number): SkinLimit | null {
-  if (grid.cellX === grid.cellZ) return null
+  if (grid.cellX === grid.cellZ && grid.cellY === grid.cellX) return null
   const axis = thicknessAxisOf(grid)
   // Yaw grids index in their local frame — rotate the query point in.
   let px = x
@@ -996,11 +1313,12 @@ function settleSupportAfterRemoval(target: VoxelTarget): void {
  * were removed. `direction` (optional, phase 3) is the shot direction —
  * it aims the wall-tear dust plume through the hole.
  *
- * Walls carve SKIN-RESPECTING: below WALL_PIERCE_RADIUS the sphere only
- * removes cells of the drywall face the shot entered (resolved from the
+ * Walls AND slabs carve SKIN-RESPECTING: below WALL_PIERCE_RADIUS the
+ * sphere only removes cells of the face the shot entered (resolved from the
  * hit point), so a 0.12 m wall never loses both skins to one rifle round —
- * the far face falls to the next shot through the hole, or to a heavy
- * weapon whose tearRadius clears the pierce gate. */
+ * and shooting a ceiling from below never deletes the floor sheathing
+ * above it. The far face falls to the next shot through the hole, or to a
+ * heavy weapon whose tearRadius clears the pierce gate. */
 export function damageTarget(
   world: GameWorld,
   nodeId: string,
@@ -1010,8 +1328,11 @@ export function damageTarget(
 ): number {
   const target = ensureVoxelTarget(world, nodeId)
   if (!target) return 0
+  // Slabs ride the whole wall lane: skin-respecting pierce gate, drywall
+  // dust + paper shards, sheet fly-offs, framing splash-chips.
+  const layered = target.kind !== 'volume'
   const skin =
-    target.kind === 'wall' && radius < WALL_PIERCE_RADIUS
+    layered && radius < WALL_PIERCE_RADIUS
       ? entrySkin(target.grid, point.x, point.y, point.z)
       : null
   const removed = removeSphere(
@@ -1042,9 +1363,11 @@ export function damageTarget(
   // shooting.ts is deliberately silent for walls). Drywall tears throw a
   // MASSIVE billowing plume coned through the hole; plain volumes keep a
   // modest puff scaled by how much material the carve took out.
-  if (target.kind === 'wall') {
+  if (layered) {
     // Material tag (phase 4): 'drywall' puffs on light grazes and upgrades
     // to the full plume (+ auto haze) once the carve is heavy (≥ ~5 cells).
+    // Slabs voice the same way — the shot face is drywall (ceiling) or
+    // sheathing, both papery.
     spawnDust(point, Math.min(1, 0.45 + removed.length / 18), {
       kind: 'drywall',
       direction: direction ? _plumeDir.copy(direction) : undefined,
@@ -1076,9 +1399,9 @@ export function damageTarget(
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
   }
-  // Walls get the papery drywallCrunch from shooting.ts; only plain volumes
-  // voice their own crunch here (avoids the two sounds layering).
-  if (target.kind !== 'wall') sfx.voxelCrunch(Math.min(1, removed.length / 12))
+  // Walls/slabs get the papery drywallCrunch from shooting.ts; only plain
+  // volumes voice their own crunch here (avoids the two sounds layering).
+  if (!layered) sfx.voxelCrunch(Math.min(1, removed.length / 12))
 
   const prior = islandTimers.get(nodeId)
   if (prior) clearTimeout(prior)
@@ -1086,18 +1409,35 @@ export function damageTarget(
     nodeId,
     setTimeout(() => {
       islandTimers.delete(nodeId)
-      crumbleIslands(target)
+      crumbleIslands(world, target)
       settleSupportAfterRemoval(target) // island crumble can zero a piece
     }, 140),
   )
   // Cladding all gone? The bare frame can't stand — skeleton snap.
   maybeSkeletonSnap(target)
   settleSupportAfterRemoval(target)
+  // Cross-target support (Phase B3): whatever rested on this target must
+  // re-probe its footing once the carve settles.
+  noteStructureCarve(world, nodeId)
   return removed.length
 }
 
 /** Legacy alias. */
 export const damageWall = damageTarget
+
+/** True when a node carves through the WALL/SLAB tear lane — shooting.ts
+ * resolves `weapon.tearRadius` (and voices the drywall crunch) off this:
+ * an existing layered target, a scene wall, or a not-yet-voxelized
+ * slab-kind collider (first shot must already tear at full width). */
+export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
+  const target = useDestruction.getState().targets.get(nodeId)
+  if (target) return target.kind !== 'volume'
+  if (world.walls.has(nodeId)) return true
+  for (const collider of world.colliders) {
+    if (collider.nodeId === nodeId) return SLAB_KINDS.has(collider.nodeType)
+  }
+  return false
+}
 
 export type SegmentRayHit = {
   nodeId: string
@@ -1636,6 +1976,7 @@ export function dropTarget(nodeId: string): void {
   const state = useDestruction.getState()
   if (state.targets.delete(nodeId)) {
     state.bump()
+    dropStructureTarget(nodeId)
     // A scene replica leaving changes what can prop placed pieces; piece
     // replicas don't (their own unmount already runs the slot cleanup).
     if (!nodeId.startsWith(PLACED_PIECE_PREFIX)) {
@@ -1657,5 +1998,6 @@ export function resetDestruction(): void {
   skeletonTimers.length = 0
   skeletonSnapped.clear()
   prevoxelizeSkip.clear()
+  resetStructure()
   useDestruction.getState().reset()
 }
