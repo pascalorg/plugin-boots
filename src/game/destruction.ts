@@ -723,6 +723,11 @@ const JOIST_TOP_DROP = 0.04
  * walls — but with `hungBelow` (elevated inter-storey floors) the joists
  * frame at full depth with their TOPS at the slab underside instead, the
  * subfloor-over-joists picture a real thin floor deck presents from below.
+ * FOLLOW-UP: joists still run through stair holes — the world snapshot
+ * carries no stair-opening geometry today (stair nodes aren't hosted
+ * children of the slab the way doors/windows are of walls), so there is no
+ * trivially-detectable rect to clip against; wire it through the
+ * buildStuds-style opening clip once a stair-hole snapshot exists.
  */
 function buildJoists(bounds: Box3, thickness: number, hungBelow = false): SegmentMember[] {
   if (thickness < JOIST_EMBED_MIN && !hungBelow) return []
