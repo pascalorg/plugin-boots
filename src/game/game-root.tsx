@@ -9,6 +9,9 @@ import { GameBoundary } from './boundary'
 import { Builder, PlacedPieces } from './builder'
 import { clearDebris, Debris, debrisDump, setDebrisGroundProbe } from './debris'
 import {
+  collapseWholeTarget,
+  damageSegment,
+  ensureVoxelTarget,
   prevoxelizeTick,
   probeLandingY,
   resetDestruction,
@@ -440,6 +443,23 @@ function ActiveGame() {
       boards: () => dumpDestructionMembers('sheets'),
       segments: () => dumpDestructionMembers('segments'),
       sheets: () => dumpDestructionMembers('sheets'),
+      // QA-only total demolition of one node: kills every voxel and snaps
+      // every framing segment so save-demolition's strict classifier can be
+      // exercised deterministically (sweeping a whole wall clean by scripted
+      // gunfire is flaky under headless load). Same code paths as real
+      // damage — no state is written outside the destruction store.
+      levelTarget: (nodeId: string) => {
+        ensureVoxelTarget(world, nodeId)
+        const target = useDestruction.getState().targets.get(nodeId)
+        if (!target) return false
+        collapseWholeTarget(nodeId)
+        for (const segment of target.segments) {
+          if (segment.broken) continue
+          _idOrigin.set(segment.center[0], segment.center[1], segment.center[2])
+          damageSegment(world, nodeId, segment.id, 10_000, _idOrigin)
+        }
+        return true
+      },
       // Dust debug — plain-data dump from dust.tsx, never a live ref.
       dust: () => dustDebug(),
       // Debris debug — per-live-piece position + resolved landing plane
