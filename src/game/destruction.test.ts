@@ -200,6 +200,56 @@ describe('framing segments (charcoal sticks)', () => {
   })
 })
 
+describe('carve splash chips the framing (gunfire chips neighbors)', () => {
+  test('a rifle tear at mid-bay chips the flanking stick each side, never snaps it', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    // Stud lines on wall-1 sit at x = -1 + i*0.4064; aim between two of
+    // them (mid-bay) at stick height 1.35.
+    const bayX = -1 + 1.5 * 0.4064
+    damageTarget(world, 'wall-1', new Vector3(bayX, 1.35, -0.06), 0.55, new Vector3(0, 0, 1))
+    const chipped = wall.segments.filter((s) => !s.broken && s.hp === 1)
+    // Both flanking sticks (~0.2 m away) scuffed; nothing snapped by splash.
+    expect(chipped.length).toBeGreaterThanOrEqual(2)
+    expect(wall.segments.some((s) => s.broken)).toBe(false)
+    // The next studs over (~0.61 m) stayed clean: chips are local.
+    for (const seg of wall.segments) {
+      const dx = Math.abs(seg.center[0] - bayX)
+      if (seg.size[1] > seg.size[0] && dx > 0.56) expect(seg.hp).toBe(2)
+    }
+  })
+
+  test('repeated carves in the same bay keep the hp-1 floor (splash is sub-lethal)', () => {
+    const world = makeWorld()
+    const wall = ensureVoxelTarget(world, 'wall-1')!
+    const bayX = -1 + 1.5 * 0.4064
+    // Fresh cells fall each time (rising carve height + the far skin
+    // through the hole), so every carve re-runs the splash over the same
+    // flanking sticks.
+    for (const [y, z] of [
+      [1.15, -0.06],
+      [1.35, 0.02],
+      [1.55, -0.06],
+      [1.75, 0.02],
+    ] as const) {
+      damageTarget(world, 'wall-1', new Vector3(bayX, y, z), 0.55, new Vector3(0, 0, 1))
+    }
+    for (const seg of wall.segments) {
+      expect(seg.broken).toBe(false)
+      expect(seg.hp).toBeGreaterThanOrEqual(1)
+    }
+  })
+
+  test('volume carves splash nothing (no framing)', () => {
+    const world = makeWorld()
+    const slab = ensureVoxelTarget(world, 'slab-1')!
+    expect(slab.segments.length).toBe(0)
+    expect(() =>
+      damageTarget(world, 'slab-1', new Vector3(10, 1.35, -0.5), 0.4),
+    ).not.toThrow()
+  })
+})
+
 describe('island collapse on studless volumes (the shower cut)', () => {
   test('severing an item volume drops the floating top half after the settle delay', async () => {
     const world = makeWorld()

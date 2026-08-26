@@ -211,16 +211,18 @@ describe('studs: expose, chip, snap', () => {
     expect(exposed!.distance).toBeCloseTo(4.9555, 2)
     expect(exposed!.distance).toBeGreaterThan(5 - 0.06)
 
-    // Knife whittles: 2 hp → 1 (sticks snap fast).
-    expect(fire(world, KNIFE)).toBe('wall')
+    // The opening carve SPLASH-chipped the stick it exposed (2 → 1;
+    // splash is sub-lethal — chipSegmentSplash's hp-1 floor).
     const target = useDestruction.getState().targets.get('wall-1')!
     const stud = target.segments.find((s) => s.id === 10)!
     expect(stud.hp).toBe(1)
     expect(stud.broken).toBe(false)
 
-    // Gun finishes it: 24 damage ≥ 1 hp → snapped.
-    expect(fire(world, GUN)).toBe('wall')
+    // Knife whittles the scuffed stick: 1 hp → snapped (the full
+    // chip-then-snap ladder is asserted in destruction.test.ts).
+    expect(fire(world, KNIFE)).toBe('wall')
     expect(stud.broken).toBe(true)
+    expect(stud.hp).toBe(0)
     expect(studsSnapshot().find((s) => s.studId === 10)!.broken).toBe(true)
 
     // Broken studs are transparent to rays.

@@ -78,8 +78,11 @@ import { bvhFor, type GameWorld } from './world'
  *                             SKIN the shot entered (resolved from the hit
  *                             point) — the far face falls to the next shot
  *                             through the hole, or to a heavy weapon past
- *                             the gate. Returns the number of voxels
- *                             removed. `damageWall` is a legacy alias.
+ *                             the gate. Wall carves also SPLASH-CHIP the
+ *                             framing standing inside the sphere (hp-1
+ *                             floor, never snaps — see chipSegmentSplash).
+ *                             Returns the number of voxels removed.
+ *                             `damageWall` is a legacy alias.
  *   damageSegment(world, nodeId, segmentId, damage, point)   chip a framing
  *                             stick (wood splinters); at hp ≤ 0 it snaps
  *                             like charcoal — 2-3 tumbling pieces along its
@@ -877,6 +880,65 @@ function entrySkin(grid: VoxelGridData, x: number, y: number, z: number): SkinLi
   return _skin
 }
 
+/**
+ * Carve splash → framing chips. A gunshot that tears drywall also scuffs
+ * the lumber standing inside the tear: every unbroken stick whose long
+ * axis passes within the carve sphere loses 1 hp — but NEVER snaps (the
+ * hp-1 floor). Snapping stays a direct privilege: ray crossings
+ * (damageSegment at weapon damage) and blasts (explosionSegments). With
+ * 16" o.c. spacing and rifle/pistol tear radii (0.55/0.45 m), opening a
+ * bay from mid-span chips the flanking stick each side while the next
+ * studs over stay clean.
+ */
+function chipSegmentSplash(target: VoxelTarget, point: Vector3, radius: number): void {
+  if (target.segments.length === 0) return
+  const r2 = radius * radius
+  let voiced = false
+  for (const segment of target.segments) {
+    if (segment.broken || segment.hp <= 1) continue
+    const [sx, sy, sz] = segment.size
+    const long = Math.max(sx, sy, sz)
+    // Long-axis direction: verticals point up, plates run along their yaw.
+    let ax = 0
+    let ay = 1
+    let az = 0
+    if (sy < long) {
+      ax = Math.cos(segment.yaw)
+      ay = 0
+      az = Math.sin(segment.yaw)
+    }
+    // Distance from the carve point to the stick's axis segment.
+    const dx = point.x - segment.center[0]
+    const dy = point.y - segment.center[1]
+    const dz = point.z - segment.center[2]
+    const half = long / 2
+    let t = dx * ax + dy * ay + dz * az
+    if (t > half) t = half
+    else if (t < -half) t = -half
+    const ox = dx - ax * t
+    const oy = dy - ay * t
+    const oz = dz - az * t
+    if (ox * ox + oy * oy + oz * oz > r2) continue
+    segment.hp -= 1 // floor is 1 — the hp<=1 guard above keeps splash sub-lethal
+    // A couple of splinters flick off the scuffed edge (closest point on
+    // the stick), so the chip reads without any dust (wood contract).
+    for (let i = 0; i < 2; i++) {
+      spawnDebris(
+        segment.center[0] + ax * t,
+        segment.center[1] + ay * t,
+        segment.center[2] + az * t,
+        0.015 + Math.random() * 0.02,
+        WOOD,
+        1.8,
+        0.8,
+      )
+    }
+    voiced = true
+  }
+  // One knock per carve no matter how many sticks scuffed.
+  if (voiced) sfx.studHit()
+}
+
 /** Carve a sphere out of any target at a world point (voxelizes on first
  * hit); spawns debris, queues the island check. Returns how many voxels
  * were removed. `direction` (optional, phase 3) is the shot direction —
@@ -951,6 +1013,9 @@ export function damageTarget(
     }
     // Sheet accounting (hits + torn cells) — may fly whole sheets off.
     noteSheetCarve(target, removed, direction)
+    // Splash chips the framing standing in the tear (hp-1 floor — see
+    // chipSegmentSplash; only direct hits and blasts snap sticks).
+    chipSegmentSplash(target, point, radius)
   } else {
     // Material tag (phase 4): plain volumes voice as CONCRETE — small,
     // short-lived, grayer puffs (dust.tsx owns the styling).
