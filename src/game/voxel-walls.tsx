@@ -60,14 +60,19 @@ const _quat = new Quaternion()
 const _color = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 const UP = new Vector3(0, 1, 0)
+const Z_AXIS = new Vector3(0, 0, 1)
+const _qz = new Quaternion()
 
 /** Structural superset of destruction.ts's StudMember — boards may use
- * `torn`, wood uses `broken`; hp is optional for binary members. */
+ * `torn`, wood uses `broken`; hp is optional for binary members. Pitched
+ * roof members carry `pitch` and render Ry(−yaw)·Rz(pitch)
+ * (roof-framing.ts conventions); absent/0 keeps the yaw-only path. */
 type SandwichMember = {
   id: number
   center: [number, number, number]
   size: [number, number, number]
   yaw: number
+  pitch?: number
   hp?: number
   broken?: boolean
   torn?: boolean
@@ -135,7 +140,10 @@ function uploadLayer(
         _scale.y *= p
       }
     }
-    if (m.yaw === 0) _quat.identity()
+    if (m.pitch) {
+      // Pitched roof member: local→world = Ry(−yaw)·Rz(pitch).
+      _quat.setFromAxisAngle(UP, -m.yaw).multiply(_qz.setFromAxisAngle(Z_AXIS, m.pitch))
+    } else if (m.yaw === 0) _quat.identity()
     else _quat.setFromAxisAngle(UP, -m.yaw)
     _pos.set(m.center[0], m.center[1], m.center[2])
     _matrix.compose(_pos, _quat, _scale)

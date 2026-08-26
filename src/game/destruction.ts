@@ -5,6 +5,8 @@ import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
+import { buildRafters, rafterObbBasis } from './roof-framing'
+import { enumerateRoofPlanes } from './roof-planes'
 import { hideForGameKeepingRoots } from './session'
 import {
   dropStructureTarget,
@@ -17,10 +19,12 @@ import {
   buildVoxelGrid,
   dropInteriorCells,
   findUnsupportedIslands,
+  raycastObb,
   raycastVoxels,
   raycastYawObb,
   removeSphere,
   type SkinLimit,
+  type VoxelBasis,
   type VoxelGridData,
   type VoxelSource,
 } from './voxel'
@@ -162,6 +166,14 @@ export type SegmentMember = {
   yaw: number
   hp: number
   broken: boolean
+  /** Slope tilt (radians) — pitched roof members render/raycast as
+   * Ry(−yaw)·Rz(pitch) (roof-framing.ts conventions). Absent/0 keeps the
+   * yaw-only stud path bit-identical. */
+  pitch?: number
+  /** Roof-plane index this member frames (roof-framing.ts RafterMember). */
+  planeIndex?: number
+  /** Framing role tag ('rafter' | 'ridge' | 'plate' on roof members). */
+  role?: string
 }
 
 /** Legacy alias — `target.studs` IS the segments array now (same objects);
@@ -224,6 +236,10 @@ export type VoxelTarget = {
   removedQueue: number[]
   /** Bumped on every change so the renderer knows to re-upload. */
   revision: number
+  /** True for roof nodes (Phase C): the target frames RAFTERS instead of
+   * studs/joists, sheet fly-offs voice shingleRip, and torn shards wear the
+   * shingle debris tone. */
+  roof?: boolean
   /** True for plates SYNTHESIZED under zero-extent ceiling planes: their
    * cells hold another target up only by direct contact (structure.ts
    * PLATE_CONTACT_SLACK), never across the general SUPPORT_GAP band — a
@@ -469,6 +485,11 @@ function buildSegments(wall: WallEntry, layout: StudMember[]): SegmentMember[] {
 /** Node kinds that voxelize as the horizontal sandwich (thin axis = world
  * Y). 'floor' is defensive — hosts register floors as slabs today. */
 const SLAB_KINDS = new Set(['slab', 'ceiling', 'floor'])
+
+/** Node kinds that frame RAFTERS (Phase C3): the merged roof shell keeps
+ * its adaptive volume grid, but its cavity carries pitched 2×6 rafters +
+ * ridge boards from roof-framing.ts, revealed exactly like wall studs. */
+const ROOF_KINDS = new Set(['roof', 'roof-segment'])
 
 /** Synthesized plate thickness for ZERO-extent horizontals. Host ceiling
  * planes are 0 m thick; gridded isotropically they produce ~0.15 m cells
@@ -804,14 +825,21 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   // The stud-line layout is scaffolding only — the real members are the
   // stick segments split from it. `studs` aliases the SAME array. Slabs
   // frame with joists generated from their world box (mirror of the studs).
+  // Roof shells frame with pitched rafters laid out over the planes the
+  // merged mesh's sloped faces enumerate (single roof target — the flat
+  // buildRafters array IS the segments array, ids already 0..n−1).
+  const roof = nodeType !== null && ROOF_KINDS.has(nodeType)
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid))
     : kind === 'slab'
       ? buildJoists(_bounds, slabThickness, slabJoistsHang)
-      : []
+      : roof
+        ? buildRafters(null, null, enumerateRoofPlanes(meshes))
+        : []
   const target: VoxelTarget = {
     nodeId,
     kind,
+    roof,
     grid,
     baseColor: targetBaseColor(meshes),
     segments,
@@ -1163,6 +1191,7 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
         0.22 + Math.random() * 0.34,
         target.baseColor,
         _shardDir,
+        target.roof ? 'shingle' : 'drywall',
       )
     }
     for (let n = 0; n < 3; n++) {
@@ -1188,7 +1217,9 @@ function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector
     normal: _sheetNormal,
     direction: direction ? _plumeDir.copy(direction) : undefined,
   })
-  sfx.paperTear()
+  // Roof sheets shear off as shingles — drier rip, no papery crumple tail.
+  if (target.roof) sfx.shingleRip()
+  else sfx.paperTear()
   sfx.crumble(freed)
   // A whole board leaving can take the LAST cladding cells with it.
   maybeSkeletonSnap(target)
@@ -1282,14 +1313,16 @@ function chipSegmentSplash(target: VoxelTarget, point: Vector3, radius: number):
     if (segment.broken || segment.hp <= 1) continue
     const [sx, sy, sz] = segment.size
     const long = Math.max(sx, sy, sz)
-    // Long-axis direction: verticals point up, plates run along their yaw.
+    // Long-axis direction: verticals point up, plates run along their yaw,
+    // pitched rafters climb their slope (roof-framing.ts local X in world).
     let ax = 0
     let ay = 1
     let az = 0
     if (sy < long) {
-      ax = Math.cos(segment.yaw)
-      ay = 0
-      az = Math.sin(segment.yaw)
+      const ct = segment.pitch ? Math.cos(segment.pitch) : 1
+      ax = ct * Math.cos(segment.yaw)
+      ay = segment.pitch ? Math.sin(segment.pitch) : 0
+      az = ct * Math.sin(segment.yaw)
     }
     // Distance from the carve point to the stick's axis segment.
     const dx = point.x - segment.center[0]
@@ -1437,6 +1470,8 @@ export function damageTarget(
         0.1 + Math.random() * 0.16,
         0.12 + Math.random() * 0.2,
         target.baseColor,
+        undefined,
+        target.roof ? 'shingle' : 'drywall',
       )
     }
     // Sheet accounting (hits + torn cells) — may fly whole sheets off.
@@ -1451,6 +1486,26 @@ export function damageTarget(
       kind: 'concrete',
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
+    if (target.roof) {
+      // Roof shells are volume grids (until the plane-grid lane lands) but
+      // must still READ as roofing: a couple of torn shingle plates flutter
+      // off the carve rim, and splash chips the rafters standing in it.
+      const shards = Math.min(3, 1 + (removed.length >> 3))
+      for (let n = 0; n < shards; n++) {
+        const idx = removed[Math.floor(Math.random() * removed.length)]!
+        spawnFlatDebris(
+          target.grid.centers[idx * 3]!,
+          target.grid.centers[idx * 3 + 1]!,
+          target.grid.centers[idx * 3 + 2]!,
+          0.1 + Math.random() * 0.16,
+          0.12 + Math.random() * 0.2,
+          target.baseColor,
+          undefined,
+          'shingle',
+        )
+      }
+      chipSegmentSplash(target, point, radius)
+    }
   }
   // Walls/slabs get the papery drywallCrunch from shooting.ts; only plain
   // volumes voice their own crunch here (avoids the two sounds layering).
@@ -1544,8 +1599,13 @@ export type SegmentRayHit = {
 /** Legacy alias. */
 export type StudRayHit = SegmentRayHit
 
+/** Module-level scratch for pitched-member raycasts — allocation-free. */
+const _segmentBasis: VoxelBasis = { x: 0, y: 0, z: 0, w: 1 }
+
 /** Nearest live (unbroken) framing segment any voxelized wall exposes along
- * the ray — analytic ray-vs-OBB, no meshes involved. */
+ * the ray — analytic ray-vs-OBB, no meshes involved. Pitched roof members
+ * (segment.pitch set) route through the quaternion OBB with the
+ * roof-framing basis; yaw-only members keep the legacy path bit-identical. */
 export function raycastSegments(
   origin: Vector3,
   direction: Vector3,
@@ -1557,22 +1617,39 @@ export function raycastSegments(
   for (const target of useDestruction.getState().targets.values()) {
     for (const segment of target.segments) {
       if (segment.broken) continue
-      const t = raycastYawObb(
-        origin.x,
-        origin.y,
-        origin.z,
-        direction.x,
-        direction.y,
-        direction.z,
-        segment.center[0],
-        segment.center[1],
-        segment.center[2],
-        segment.size[0] / 2,
-        segment.size[1] / 2,
-        segment.size[2] / 2,
-        segment.yaw,
-        bestDist,
-      )
+      const t = segment.pitch
+        ? raycastObb(
+            origin.x,
+            origin.y,
+            origin.z,
+            direction.x,
+            direction.y,
+            direction.z,
+            segment.center[0],
+            segment.center[1],
+            segment.center[2],
+            segment.size[0] / 2,
+            segment.size[1] / 2,
+            segment.size[2] / 2,
+            rafterObbBasis(segment.yaw, segment.pitch, _segmentBasis),
+            bestDist,
+          )
+        : raycastYawObb(
+            origin.x,
+            origin.y,
+            origin.z,
+            direction.x,
+            direction.y,
+            direction.z,
+            segment.center[0],
+            segment.center[1],
+            segment.center[2],
+            segment.size[0] / 2,
+            segment.size[1] / 2,
+            segment.size[2] / 2,
+            segment.yaw,
+            bestDist,
+          )
       if (t === null || t >= bestDist) continue
       bestDist = t
       bestNode = target.nodeId
@@ -1912,16 +1989,18 @@ export function damageSegment(
   target.revision++
   useDestruction.getState().bump()
   // Charcoal-stick snap: 2-3 stick pieces spread along the long axis
-  // (verticals fall as stacked thirds, plates as run pieces).
+  // (verticals fall as stacked thirds, plates as run pieces, pitched
+  // rafters as slope pieces — roof-framing.ts local X in world).
   const [sx, sy, sz] = segment.size
   const long = Math.max(sx, sy, sz)
   let ax = 0
   let ay = 1
   let az = 0
   if (sy < long) {
-    ax = Math.cos(segment.yaw)
-    ay = 0
-    az = Math.sin(segment.yaw)
+    const ct = segment.pitch ? Math.cos(segment.pitch) : 1
+    ax = ct * Math.cos(segment.yaw)
+    ay = segment.pitch ? Math.sin(segment.pitch) : 0
+    az = ct * Math.sin(segment.yaw)
   }
   const pieces = 2 + (Math.random() < 0.5 ? 1 : 0)
   for (let i = 0; i < pieces; i++) {
