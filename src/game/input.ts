@@ -123,7 +123,18 @@ export class GameInput {
       e.stopImmediatePropagation()
       syncButtons(e.buttons)
     })
-    for (const type of ['click', 'dblclick', 'contextmenu', 'mousedown', 'mouseup'] as const) {
+    // mousedown/mouseup DO fire per button (unlike pointerdown, which skips
+    // secondary buttons while one is held) — they are the reliable
+    // transition source when the mouse is perfectly still, e.g. a careful
+    // ADS click ("multiple clicks per shot" bug, 2026-08-25).
+    for (const type of ['mousedown', 'mouseup'] as const) {
+      on(type, (e) => {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        if (this.pointerLocked) syncButtons(e.buttons)
+      })
+    }
+    for (const type of ['click', 'dblclick', 'contextmenu'] as const) {
       on(type, (e) => {
         e.preventDefault()
         e.stopImmediatePropagation()

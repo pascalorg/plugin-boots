@@ -55,7 +55,9 @@ import type { GameWorld } from './world'
  * segments inside the radius, so the grenade levels walls either way.
  */
 
-export const GRENADE_COOLDOWN = 5
+// Owner call 2026-08-25: INFINITE grenades, no count — the only limit is a
+// short re-arm so the throw animation reads (and the in-flight pool cap).
+export const GRENADE_COOLDOWN = 0.6
 export const GRENADE_FUSE = 2.5
 export const BLAST_RADIUS = 3.2
 /** Bots inside this radius take BLAST_BOT_DAMAGE and get flung. */
