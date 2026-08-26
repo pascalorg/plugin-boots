@@ -2,7 +2,7 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useLayoutEffect, useRef } from 'react'
-import { Color, DynamicDrawUsage, type InstancedMesh, Matrix4, Vector3 } from 'three'
+import { Color, CylinderGeometry, DynamicDrawUsage, Euler, type InstancedMesh, Matrix4, Quaternion, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { collideCapsule } from './collision'
@@ -48,12 +48,14 @@ import type { GameWorld } from './world'
  *                            component does this on mount and unmount).
  *
  * ── Destruction routing ───────────────────────────────────────────────
- * Detonation prefers destruction.ts's damageExplosion(world, center,
- * radius) — the collapse agent's phase-4 export (entry spheres + ragged
- * nibbles + segment breaks + sheet tears in one call). Feature-detected:
- * until it lands, a local fallback loops damageTarget spheres (one big
- * carve + rim nibbles per destructible node in range) and snaps framing
- * segments inside the radius, so the grenade levels walls either way.
+ * Detonation routes through destruction.ts's damageExplosion(world,
+ * center, radius) — landed phase-4 round 2 (center carve + ragged nibbles
+ * + segment breaks + sheet tears in one call; segment breaks arm the
+ * 30%-support collapse check). Still feature-detected so this file stays
+ * green against older checkouts: without it, a local fallback loops
+ * damageTarget spheres and snaps framing segments inside the radius.
+ * Glass: panes crossed in FLIGHT shatter (they're not colliders — swept
+ * per step), and every pane inside the blast radius shatters on boom.
  */
 
 // Owner call 2026-08-25: INFINITE grenades, no count — the only limit is a
@@ -93,6 +95,8 @@ type Grenade = {
   /** Whole seconds of flight already beeped (throw beeps at 0). */
   beeps: number
   bounced: boolean
+  /** End-over-end tumble phase (rad) — the thrown-stick read. */
+  spin: number
 }
 
 const pool: Grenade[] = Array.from({ length: POOL }, () => ({
@@ -102,6 +106,7 @@ const pool: Grenade[] = Array.from({ length: POOL }, () => ({
   fuse: 0,
   beeps: 0,
   bounced: false,
+  spin: 0,
 }))
 
 let cooldownLeft = 0
@@ -176,6 +181,7 @@ export function throwGrenade(world: GameWorld): boolean {
   slot.fuse = GRENADE_FUSE
   slot.beeps = 0
   slot.bounced = false
+  slot.spin = Math.random() * Math.PI * 2
   slot.alive = true
   beep() // arming blip; then once per second of fuse
   return true
@@ -259,6 +265,7 @@ function fallbackCarve(world: GameWorld, center: Vector3): void {
 
 const _fling = new Vector3()
 const _dustPoint = new Vector3()
+const _paneCenter = new Vector3()
 const SCRAP = new Color('#5d5a52')
 
 /**
@@ -274,6 +281,13 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   ).damageExplosion
   if (typeof boom === 'function') boom(world, center, BLAST_RADIUS)
   else fallbackCarve(world, center)
+
+  // Glass inside the blast shatters outright (shatterPane is idempotent).
+  for (const pane of world.glass) {
+    if (pane.mesh.getWorldPosition(_paneCenter).distanceTo(center) <= BLAST_RADIUS) {
+      shatterPane(pane)
+    }
+  }
 
   // Bots: damage + fling (positions shoved — the pathing push-out resolves
   // any wall the fling lands them against next frame).
@@ -406,6 +420,9 @@ export function updateGrenades(world: GameWorld, dt: number): void {
 }
 
 const _mat = new Matrix4()
+const _spinEuler = new Euler()
+const _spinQuat = new Quaternion()
+const _one = new Vector3(1, 1, 1)
 const ZERO_MAT = new Matrix4().makeScale(0, 0, 0)
 
 /**
@@ -415,6 +432,7 @@ const ZERO_MAT = new Matrix4().makeScale(0, 0, 0)
  */
 export function Grenades({ world }: { world: GameWorld }) {
   const meshRef = useRef<InstancedMesh>(null!)
+  const stickRef = useRef<InstancedMesh>(null!)
 
   // Fresh pool per session/world; teardown clears it (a grenade must never
   // survive into the next Jump in).
@@ -428,44 +446,75 @@ export function Grenades({ world }: { world: GameWorld }) {
   // WebGPU first-upload rule as instanceColor priming elsewhere.
   useLayoutEffect(() => {
     const mesh = meshRef.current
-    if (!mesh) return
+    const stick = stickRef.current
+    if (!mesh || !stick) return
     mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    for (let i = 0; i < POOL; i++) mesh.setMatrixAt(i, ZERO_MAT)
+    stick.instanceMatrix.setUsage(DynamicDrawUsage)
+    for (let i = 0; i < POOL; i++) {
+      mesh.setMatrixAt(i, ZERO_MAT)
+      stick.setMatrixAt(i, ZERO_MAT)
+    }
     mesh.instanceMatrix.needsUpdate = true
+    stick.instanceMatrix.needsUpdate = true
   }, [])
 
   useFrame((_, rawDt) => {
-    updateGrenades(world, Math.min(rawDt, 1 / 30))
+    const dtRender = Math.min(rawDt, 1 / 30)
+    updateGrenades(world, dtRender)
     // HUD grenade-ready pip (change-gated on the HUD side, so per-frame is
     // free while the value holds). This component owns the drive — hud.ts
     // only renders.
     getSession()?.hud.grenadePip?.(1 - grenadeCooldownLeft() / GRENADE_COOLDOWN)
     const mesh = meshRef.current
-    if (!mesh) return
+    const stick = stickRef.current
+    if (!mesh || !stick) return
     for (let i = 0; i < POOL; i++) {
       const g = pool[i]!
       if (g.alive) {
-        _mat.identity().setPosition(g.pos)
+        g.spin += (g.bounced ? 3.2 : 10) * dtRender
+        _spinEuler.set(g.spin, g.spin * 0.23, 0)
+        _spinQuat.setFromEuler(_spinEuler)
+        _mat.compose(g.pos, _spinQuat, _one)
         mesh.setMatrixAt(i, _mat)
+        stick.setMatrixAt(i, _mat)
       } else {
         mesh.setMatrixAt(i, ZERO_MAT)
+        stick.setMatrixAt(i, ZERO_MAT)
       }
     }
     mesh.instanceMatrix.needsUpdate = true
+    stick.instanceMatrix.needsUpdate = true
   })
 
+  // Stick grenade: cylinder HEAD (dark steel) + wooden HANDLE below it, two
+  // instanced meshes sharing every matrix so the whole thing tumbles
+  // end-over-end in flight.
   return (
-    <instancedMesh
-      ref={meshRef}
-      args={[undefined, undefined, POOL]}
-      frustumCulled={false}
-      userData={{ __boots: true }}
-    >
-      <sphereGeometry args={[0.085, 12, 10]} />
-      <meshStandardMaterial color="#39412f" roughness={0.6} metalness={0.3} />
-    </instancedMesh>
+    <>
+      <instancedMesh
+        ref={meshRef}
+        args={[HEAD_GEOMETRY, undefined, POOL]}
+        frustumCulled={false}
+        userData={{ __boots: true }}
+      >
+        <meshStandardMaterial color="#3b4148" roughness={0.5} metalness={0.45} />
+      </instancedMesh>
+      <instancedMesh
+        ref={stickRef}
+        args={[STICK_GEOMETRY, undefined, POOL]}
+        frustumCulled={false}
+        userData={{ __boots: true }}
+      >
+        <meshStandardMaterial color="#8a6a43" roughness={0.85} />
+      </instancedMesh>
+    </>
   )
 }
+
+/** Head sits above the origin, handle hangs below — tumbling around the
+ * origin reads exactly like a thrown stick grenade. */
+const HEAD_GEOMETRY = new CylinderGeometry(0.037, 0.037, 0.1, 10).translate(0, 0.1, 0)
+const STICK_GEOMETRY = new CylinderGeometry(0.0125, 0.0135, 0.23, 8).translate(0, -0.065, 0)
 
 /** The module keeps the latest world for dev/E2E detonations. */
 export function grenadeWorld(): GameWorld | null {

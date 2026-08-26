@@ -129,6 +129,9 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const poseRef = useRef<Group>(null!)
   const flashRef = useRef<Mesh>(null!)
   const cooldown = useRef(0)
+  const grenadeAnimT = useRef<number | null>(null)
+  const grenadeThrown = useRef(false)
+  const grenadeHandRef = useRef<Group>(null)
   const prevFiring = useRef(false)
   const swingT = useRef(1)
   const recoilT = useRef(1)
@@ -200,9 +203,10 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       else if (action === 'Digit5') switchWeapon('minigun')
       else if (action === 'Digit6') switchWeapon('hammer')
       else if (action === 'KeyG') {
-        // G is the grenade EVERYWHERE (group contract) — builder undo lives
-        // on KeyZ now, so there is nothing left for G to collide with.
-        throwGrenade(world)
+        // G is the grenade EVERYWHERE (group contract). The throw itself
+        // fires at the RELEASE keyframe of the wind-up below — the stick
+        // grenade rises in the hand, whips forward, and lets go.
+        if (grenadeAnimT.current === null) grenadeAnimT.current = 0
       } else if (action === 'WheelUp' || action === 'WheelDown') {
         const list = [...state.owned, 'builder' as const]
         const at = list.indexOf(state.weapon)
@@ -222,6 +226,39 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     }
 
     cooldown.current -= dt
+
+    // Stick-grenade wind-up: raise (0→0.12s), whip + RELEASE at 0.16s,
+    // follow-through to 0.3s. The hand model only shows during the arc.
+    if (grenadeAnimT.current !== null) {
+      const t = (grenadeAnimT.current += dt)
+      if (!grenadeThrown.current && t >= 0.16) {
+        grenadeThrown.current = true
+        throwGrenade(world)
+      }
+      if (t >= 0.3) {
+        grenadeAnimT.current = null
+        grenadeThrown.current = false
+      }
+    }
+    const hand = grenadeHandRef.current
+    if (hand) {
+      const t = grenadeAnimT.current
+      if (t === null) {
+        hand.visible = false
+      } else {
+        hand.visible = true
+        // Two-keyframe arc: low-right pocket → raised behind the shoulder →
+        // whipped forward past the camera edge.
+        const raise = Math.min(1, t / 0.12)
+        const whip = Math.max(0, Math.min(1, (t - 0.12) / 0.1))
+        hand.position.set(
+          0.34 - whip * 0.1,
+          -0.4 + raise * 0.42 - whip * 0.28,
+          -0.35 - whip * 0.3,
+        )
+        hand.rotation.set(-raise * 1.2 + whip * 2.1, -0.25, 0.2 - whip * 0.3)
+      }
+    }
     swingT.current = Math.min(1, swingT.current + dt * 5.2)
     recoilT.current = Math.min(1, recoilT.current + dt * 9)
     flashT.current -= dt
