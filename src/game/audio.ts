@@ -44,10 +44,11 @@
  *   no-op without WebAudio) — no null check.
  *
  * Phase-3 material one-shots: paperTear() (drywall skin ripping off in
- * plates), charSnap() (charred wood breaking — higher/shorter than
- * studSnap). crumble()/woodCrumble() now seat a low rumble bed + drifting
- * dust hiss under the bursts, scaling with `size`, for the heavy slow-lobby
- * collapse feel.
+ * plates), shingleRip() (roof sheet fly-off — drier/shorter than paperTear:
+ * layered noise burst over a low deck knock), charSnap() (charred wood
+ * breaking — higher/shorter than studSnap). crumble()/woodCrumble() now
+ * seat a low rumble bed + drifting dust hiss under the bursts, scaling
+ * with `size`, for the heavy slow-lobby collapse feel.
  *
  * Phase-4 one-shots: hammerSmash() — the warhammer's deep thunder crack
  * (60–90Hz thump stack + masonry snap + long dust tail, loud but limited);
@@ -344,6 +345,27 @@ export const sfx = {
       at += 0.03 + Math.random() * 0.045
       burst({ duration: 0.025, gain: 0.13 - i * 0.035, filterType: 'highpass', freq: 3200 + Math.random() * 2200 }, at)
     }
+  },
+
+  /**
+   * Shingle sheet ripping off the roof deck (MULTILEVEL-PLAN Phase C) —
+   * DRIER and SHORTER than paperTear: asphalt granules shear, they don't
+   * crinkle. One tight mid noise tear (lower band than the drywall paper
+   * sweep) layered with a hot granular scrape, seated on a low deck knock,
+   * then a single gritty tick — no papery crumple tail. Round-robin
+   * detuned; the destruction manager voices it on roof-sheet fly-offs
+   * where drywall sheets call paperTear().
+   */
+  shingleRip(): void {
+    const v = rr()
+    // dry mid tear — the mat shearing off the deck
+    burst({ duration: 0.045 + Math.random() * 0.015, gain: 0.5, freq: 950 * v, freqEnd: 1900 * v, q: 1.1 })
+    // granular scrape layered right on top
+    burst({ duration: 0.05, gain: 0.3, filterType: 'highpass', freq: 2700 * v, q: 0.7 }, 0.015)
+    // low knock — the deck thud under the sheet letting go
+    thump(120 * v, 0.07, 0.4, 0.01)
+    // one gritty tick, then silence (drier than paperTear's crumple tail)
+    burst({ duration: 0.03, gain: 0.12, freq: 1600 + Math.random() * 900, q: 2.5 }, 0.075)
   },
 
   /** Sharp wood crack: hot burst + resonant body + trailing splinter ticks. */

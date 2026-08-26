@@ -18,11 +18,15 @@ import { spawnDust } from './dust'
  *   spawnDebris(x, y, z, size, color, speed, ttl?, dir?) — classic cube
  *     chunk. `dir` (unit-ish vector) biases the launch velocity along it —
  *     ceiling material pops DOWN through the hole, not up.
- *   spawnFlatDebris(x, y, z, w, h, color, dir?)     — drywall/paper plate,
- *     w×h meters (torn-edge xy jitter), slow flutter, ~3s life, one tiny
- *     chip puff on its first ground slap. Live plates cap at 120 — the
- *     plate closest to expiry gets reused first. `dir` as above (a torn
- *     ceiling board leaves its face along −Y).
+ *   spawnFlatDebris(x, y, z, w, h, color, dir?, tone?) — drywall/paper
+ *     plate, w×h meters (torn-edge xy jitter), slow flutter, ~3s life, one
+ *     tiny chip puff on its first ground slap. Live plates cap at 120 —
+ *     the plate closest to expiry gets reused first. `dir` as above (a
+ *     torn ceiling board leaves its face along −Y). `tone` picks the
+ *     shade treatment: default 'drywall' keeps the bright symmetric
+ *     jitter; 'shingle' (roof sheets, MULTILEVEL-PLAN Phase C) darkens +
+ *     desaturates every shard below the base color — torn roofing reads
+ *     older/dirtier than fresh gypsum.
  *   debrisCensus()                                  — headless test probe:
  *     live slot count + flat count + mean launch vy of live pieces.
  *   clearDebris()                                   — session teardown.
@@ -160,6 +164,10 @@ const PLATE_THICKNESS = 0.016
 /** Max plate shards alive at once — beyond this the oldest gets recycled. */
 const FLAT_CAP = 120
 
+/** Shade treatment for flat shards — 'drywall' is the classic bright look,
+ * 'shingle' reads darker/older (roof sheets tearing off the deck). */
+export type FlatDebrisTone = 'drywall' | 'shingle'
+
 /**
  * Flat plate shard — torn drywall paper/board. Gentle outward pop, then a
  * slow fluttery fall (air drag + tilt side-slip in the frame loop). Edges
@@ -173,6 +181,7 @@ export function spawnFlatDebris(
   h: number,
   color: Color,
   dir?: { x: number; y: number; z: number },
+  tone: FlatDebrisTone = 'drywall',
 ): void {
   // Count live plates; under cap pressure, recycle the one closest to
   // expiry instead of burning a fresh ring slot.
@@ -197,7 +206,16 @@ export function spawnFlatDebris(
     if (!slots[index]!.alive) liveCount++
   }
   const slot = slots[index]!
-  colors[index]!.copy(color).offsetHSL(0, 0, (Math.random() - 0.5) * 0.06)
+  if (tone === 'shingle') {
+    // Weathered roofing: every shard lands BELOW the base color (one-sided
+    // lightness jitter) with a touch of desaturation — darker/older than
+    // the symmetric bright drywall treatment.
+    colors[index]!
+      .copy(color)
+      .offsetHSL(0, -Math.random() * 0.08, -(0.03 + Math.random() * 0.1))
+  } else {
+    colors[index]!.copy(color).offsetHSL(0, 0, (Math.random() - 0.5) * 0.06)
+  }
   slot.alive = true
   slot.flat = true
   slot.px = x
