@@ -351,9 +351,120 @@ function buildDiagonalWallGrid(wall: WallEntry, sources: VoxelSource[]): VoxelGr
   return grid.count > 0 ? grid : null
 }
 
-function buildStuds(
+// ── Wall openings (studs-through-openings fix) ─────────────────────────────
+
+/**
+ * One hosted door/window APERTURE in wall space: `u` runs along the wall
+ * from its START (metres), `v` is height above the wall base. Rects come
+ * from the host node snapshots collectWorld already carries (door/window
+ * `position` is the child's CENTER in this same wall-local frame — origin
+ * at the wall start, Y = center height; doors sit on the floor). Rects are
+ * inflated by OPENING_PAD so framing never kisses the aperture edge.
+ */
+export type WallOpening = {
+  u0: number
+  u1: number
+  v0: number
+  v1: number
+  kind: 'door' | 'window'
+}
+
+/** Aperture inflation — keeps clipped lumber a hair clear of the opening. */
+const OPENING_PAD = 0.02
+/** Clipped stud remainders (cripples) shorter than this are dropped. */
+const CRIPPLE_MIN = 0.25
+/** Header/sill members run the opening width plus this total bearing. */
+const HEADER_OVERHANG = 0.1
+/** Header/sill member height — same nominal band as the wall plates. */
+const HEADER_H = 0.09
+
+/** Snapshot node → inflated wall-space rect (null = not enough geometry).
+ * Width/height fall back to the host schema defaults (door 0.9 × 2.1,
+ * window 1.5 × 1.5); a snapshot with no `position` is unplaceable → null. */
+function openingFromNode(
+  node: Record<string, unknown>,
+  kind: 'door' | 'window',
+  length: number,
+  height: number,
+): WallOpening | null {
+  const pos = node.position
+  if (!Array.isArray(pos) || typeof pos[0] !== 'number' || typeof pos[1] !== 'number') {
+    return null
+  }
+  const w = typeof node.width === 'number' ? node.width : kind === 'door' ? 0.9 : 1.5
+  const h = typeof node.height === 'number' ? node.height : kind === 'door' ? 2.1 : 1.5
+  const u0 = Math.max(0, pos[0] - w / 2 - OPENING_PAD)
+  const u1 = Math.min(length, pos[0] + w / 2 + OPENING_PAD)
+  // Doors always reach the floor (host renders position[1] = height/2).
+  let v0 = pos[1] - h / 2
+  if (kind === 'door') v0 = Math.min(v0, 0)
+  v0 -= OPENING_PAD
+  const v1 = Math.min(height, pos[1] + h / 2 + OPENING_PAD)
+  if (u1 - u0 < 0.01 || v1 - v0 < 0.01) return null
+  return { u0, u1, v0, v1, kind }
+}
+
+/**
+ * All door/window apertures hosted by `wallId`, as inflated wall-space
+ * rects. Hosted children link to their wall via `parentId` (and the host
+ * schema's optional `wallId` mirror); window rects come from the
+ * OperableEntry snapshots (cabinets are wall-mounted, not apertures — they
+ * never cut framing). Doors with `openingKind: 'opening'` (frameless
+ * archways) are still apertures. Test worlds without node snapshots simply
+ * contribute nothing — walls keep their exact legacy framing.
+ */
+export function collectWallOpenings(world: GameWorld, wallId: string): WallOpening[] {
+  const wall = world.walls.get(wallId)
+  if (!wall) return []
+  const { start, end } = wall.node
+  const length = Math.hypot(end[0] - start[0], end[1] - start[1])
+  const height = wall.node.height ?? 2.7
+  if (length < 0.3) return []
+  const hosted = (node: Record<string, unknown> | undefined): node is Record<string, unknown> =>
+    !!node && (node.parentId === wallId || node.wallId === wallId)
+  const openings: WallOpening[] = []
+  for (const door of world.doors) {
+    if (!hosted(door.node)) continue
+    const rect = openingFromNode(door.node, 'door', length, height)
+    if (rect) openings.push(rect)
+  }
+  for (const operable of world.operables ?? []) {
+    if (operable.kind !== 'window' || !hosted(operable.node)) continue
+    const rect = openingFromNode(operable.node, 'window', length, height)
+    if (rect) openings.push(rect)
+  }
+  return openings
+}
+
+/** Subtract `cuts` intervals from [a, b] — the surviving sub-spans, sorted.
+ * Overlapping cuts compose (each cut re-splits whatever survived so far). */
+function subtractSpans(
+  a: number,
+  b: number,
+  cuts: ReadonlyArray<readonly [number, number]>,
+): Array<[number, number]> {
+  let spans: Array<[number, number]> = [[a, b]]
+  for (const [c0, c1] of cuts) {
+    const next: Array<[number, number]> = []
+    for (const [s0, s1] of spans) {
+      if (c1 <= s0 || c0 >= s1) {
+        next.push([s0, s1])
+        continue
+      }
+      if (c0 > s0) next.push([s0, c0])
+      if (c1 < s1) next.push([c1, s1])
+    }
+    spans = next
+  }
+  return spans.sort((x, y) => x[0] - y[0])
+}
+
+/** Exported for the deterministic stud-openings tests only — gameplay goes
+ * through ensureVoxelTarget, which feeds collectWallOpenings' rects in. */
+export function buildStuds(
   wall: GameWorld['walls'] extends Map<string, infer V> ? V : never,
   grid: VoxelGridData,
+  openings: WallOpening[] = [],
 ): StudMember[] {
   const { start, end } = wall.node
   const thickness = wall.node.thickness ?? 0.15
@@ -394,28 +505,112 @@ function buildStuds(
     const t = Math.min(1, (i * STUD_SPACING) / length)
     const x = start[0] + dx * t + offX
     const z = start[1] + dz * t + offZ
-    studs.push({
-      id: studs.length,
-      center: [x, baseY + height / 2, z],
-      size: [STUD_WIDTH, height - 0.1, depth],
-      yaw,
-      hp: STUD_HP,
-      broken: false,
-    })
+    // Openings clip the stud VERTICALLY: the aperture band [v0, v1] drops
+    // out and the remainders survive as cripples (above doors/windows,
+    // below sills) when long enough. Studs clear of every aperture take
+    // the exact legacy push — walls without openings stay byte-identical.
+    const u = Math.min(length, i * STUD_SPACING)
+    const cuts: Array<readonly [number, number]> = []
+    for (const o of openings) {
+      if (u + STUD_WIDTH / 2 > o.u0 && u - STUD_WIDTH / 2 < o.u1) cuts.push([o.v0, o.v1])
+    }
+    if (cuts.length === 0) {
+      studs.push({
+        id: studs.length,
+        center: [x, baseY + height / 2, z],
+        size: [STUD_WIDTH, height - 0.1, depth],
+        yaw,
+        hp: STUD_HP,
+        broken: false,
+      })
+      continue
+    }
+    for (const [v0, v1] of subtractSpans(0.05, height - 0.05, cuts)) {
+      if (v1 - v0 < CRIPPLE_MIN) continue
+      studs.push({
+        id: studs.length,
+        center: [x, baseY + (v0 + v1) / 2, z],
+        size: [STUD_WIDTH, v1 - v0, depth],
+        yaw,
+        hp: STUD_HP,
+        broken: false,
+      })
+    }
   }
-  // Top & bottom plates.
+  // Top & bottom plates. Doors reach the floor, so the BOTTOM plate clips
+  // in `u` across every door aperture (no lumber lying across a doorway);
+  // window bands never touch either plate. Clear plates keep the exact
+  // legacy push (byte-identical framing for walls without openings).
   for (const [cy, plateH] of [
     [baseY + 0.045, 0.09],
     [baseY + height - 0.045, 0.09],
   ] as const) {
-    studs.push({
-      id: studs.length,
-      center: [midX + offX, cy, midZ + offZ],
-      size: [length, plateH, depth],
-      yaw,
-      hp: STUD_HP,
-      broken: false,
-    })
+    const vc = cy - baseY // plate band center back in wall space
+    const cuts: Array<readonly [number, number]> = []
+    for (const o of openings) {
+      if (o.v0 < vc + plateH / 2 && o.v1 > vc - plateH / 2) cuts.push([o.u0, o.u1])
+    }
+    if (cuts.length === 0) {
+      studs.push({
+        id: studs.length,
+        center: [midX + offX, cy, midZ + offZ],
+        size: [length, plateH, depth],
+        yaw,
+        hp: STUD_HP,
+        broken: false,
+      })
+      continue
+    }
+    for (const [u0, u1] of subtractSpans(0, length, cuts)) {
+      if (u1 - u0 < CRIPPLE_MIN) continue
+      const um = (u0 + u1) / 2
+      studs.push({
+        id: studs.length,
+        center: [start[0] + (dx * um) / length + offX, cy, start[1] + (dz * um) / length + offZ],
+        size: [u1 - u0, plateH, depth],
+        yaw,
+        hp: STUD_HP,
+        broken: false,
+      })
+    }
+  }
+  // Realism garnish: a HEADER across each aperture top (opening width +
+  // bearing, lying flat like a plate run) and a SILL under windows. Both
+  // ride the plate lane through buildSegments, so they break at hp 2 like
+  // every other stick.
+  for (const o of openings) {
+    const um = (o.u0 + o.u1) / 2
+    const half = (o.u1 - o.u0 + HEADER_OVERHANG) / 2
+    const hu0 = Math.max(0, um - half)
+    const hu1 = Math.min(length, um + half)
+    if (hu1 - hu0 < 0.15) continue
+    const hum = (hu0 + hu1) / 2
+    const hx = start[0] + (dx * hum) / length + offX
+    const hz = start[1] + (dz * hum) / length + offZ
+    const headerV = o.v1 + HEADER_H / 2
+    if (headerV + HEADER_H / 2 <= height - HEADER_H) {
+      studs.push({
+        id: studs.length,
+        center: [hx, baseY + headerV, hz],
+        size: [hu1 - hu0, HEADER_H, depth],
+        yaw,
+        hp: STUD_HP,
+        broken: false,
+      })
+    }
+    if (o.kind === 'window') {
+      const sillV = o.v0 - HEADER_H / 2
+      if (sillV - HEADER_H / 2 >= HEADER_H) {
+        studs.push({
+          id: studs.length,
+          center: [hx, baseY + sillV, hz],
+          size: [hu1 - hu0, HEADER_H, depth],
+          yaw,
+          hp: STUD_HP,
+          broken: false,
+        })
+      }
+    }
   }
   return studs
 }
@@ -830,7 +1025,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   // buildRafters array IS the segments array, ids already 0..n−1).
   const roof = nodeType !== null && ROOF_KINDS.has(nodeType)
   const segments = wall
-    ? buildSegments(wall, buildStuds(wall, grid))
+    ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
       ? buildJoists(_bounds, slabThickness, slabJoistsHang)
       : roof
