@@ -2,7 +2,7 @@
 
 import { useFrame } from '@react-three/fiber'
 import { type ComponentType, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
-import { type Group, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
+import { CanvasTexture, type Group, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
@@ -106,10 +106,17 @@ export function GunTable({ world }: { world: GameWorld }) {
             <meshStandardMaterial color="#33363b" metalness={0.35} roughness={0.45} />
           </mesh>
         </Spin>
-        {/* work boots, sitting beside the guns — part of gearing up */}
-        <group position={[-0.68, TABLE_TOP, 0.12]} rotation={[0, 0.5, 0]}>
+        {/* work boots, sitting beside the guns — toes toward the player
+         * walking up (owner call: you should recognize the boots at a
+         * glance), with a small placard behind them. */}
+        <group position={[-0.68, TABLE_TOP, 0.12]} rotation={[0, Math.PI + 0.35, 0]}>
           <BootsPair />
         </group>
+        <TableSign
+          position={[-0.68, TABLE_TOP, -0.28]}
+          rotation={[0, 0, 0]}
+          text="PUT YOUR BOOTS ON"
+        />
       </WeaponTable>
       <WeaponTable
         world={world}
@@ -247,6 +254,52 @@ function SirenBeacon() {
     <group ref={rootRef} position={[0.76, TABLE_TOP, -0.3]}>
       <SirenModel />
       {active && <pointLight color="#ff2222" intensity={2} distance={6} position={[0, 0.14, 0]} />}
+    </group>
+  )
+}
+
+/** Small tabletop placard — canvas-textured board on a stub post. */
+function TableSign({
+  position,
+  rotation,
+  text,
+}: {
+  position: [number, number, number]
+  rotation: [number, number, number]
+  text: string
+}) {
+  const texture = useMemo(() => {
+    if (typeof document === 'undefined') return null
+    const canvas = document.createElement('canvas')
+    canvas.width = 256
+    canvas.height = 96
+    const g = canvas.getContext('2d')!
+    g.fillStyle = '#efe8d8'
+    g.fillRect(0, 0, 256, 96)
+    g.strokeStyle = '#7a5c3e'
+    g.lineWidth = 6
+    g.strokeRect(3, 3, 250, 90)
+    g.fillStyle = '#3a2f22'
+    g.font = 'bold 30px system-ui, sans-serif'
+    g.textAlign = 'center'
+    g.textBaseline = 'middle'
+    g.fillText(text, 128, 50)
+    return new CanvasTexture(canvas)
+  }, [text])
+  return (
+    <group position={position} rotation={rotation}>
+      <mesh position={[0, 0.09, 0]}>
+        <cylinderGeometry args={[0.008, 0.008, 0.18]} />
+        <meshStandardMaterial color="#7a5c3e" roughness={0.8} />
+      </mesh>
+      <mesh position={[0, 0.22, 0]}>
+        <boxGeometry args={[0.34, 0.13, 0.014]} />
+        {texture ? (
+          <meshStandardMaterial map={texture} roughness={0.85} />
+        ) : (
+          <meshStandardMaterial color="#efe8d8" roughness={0.85} />
+        )}
+      </mesh>
     </group>
   )
 }

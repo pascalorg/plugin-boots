@@ -93,11 +93,21 @@ export class GameInput {
       e.stopImmediatePropagation()
       this.state.keys.delete(e.code)
     })
+    // Button state comes from the `buttons` BITMASK, synced on every mouse
+    // event — per the Pointer Events spec, pressing a SECOND button while
+    // one is held fires only a move event (no new pointerdown), so
+    // down/up-only tracking loses "left-click while aiming" entirely (the
+    // 2026-08-25 "can't fire while ADS" bug).
+    const syncButtons = (buttons: number) => {
+      this.state.firing = (buttons & 1) !== 0
+      this.state.altFiring = (buttons & 2) !== 0
+    }
     on('mousemove', (e) => {
       if (!this.pointerLocked) return
       e.stopImmediatePropagation()
       this.state.lookX += e.movementX
       this.state.lookY += e.movementY
+      syncButtons(e.buttons)
     })
     on('pointerdown', (e) => {
       e.preventDefault()
@@ -106,14 +116,12 @@ export class GameInput {
         if (this.relockOnClick) this.requestLock()
         return
       }
-      if (e.button === 0) this.state.firing = true
-      if (e.button === 2) this.state.altFiring = true
+      syncButtons(e.buttons)
     })
     on('pointerup', (e) => {
       e.preventDefault()
       e.stopImmediatePropagation()
-      if (e.button === 0) this.state.firing = false
-      if (e.button === 2) this.state.altFiring = false
+      syncButtons(e.buttons)
     })
     for (const type of ['click', 'dblclick', 'contextmenu', 'mousedown', 'mouseup'] as const) {
       on(type, (e) => {

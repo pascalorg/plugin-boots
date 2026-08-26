@@ -306,7 +306,12 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         }
       } else {
         const spunUp = def.spinUp === undefined || spinT.current >= 1
-        const wantsShot = (def.auto ? firing : firing && !prevFiring.current) && spunUp
+        // Aiming turns the rifle into a precision semi-auto: shot per click
+        // (owner call 2026-08-25) — the ADS spread cut in shooting.ts does
+        // the accuracy half.
+        const semiForced = def.id === 'rifle' && (rigFeel.ads ?? 0) > 0.5
+        const wantsShot =
+          (def.auto && !semiForced ? firing : firing && !prevFiring.current) && spunUp
         if (wantsShot && cooldown.current <= 0) {
           // Carry the frame-grid remainder (capped at one interval) so fast
           // rates average true — at 60fps a plain reset turns 24/s into 20/s.
