@@ -41,6 +41,16 @@ import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, type WallPocket } fro
  * fully-dead roofs are skipped, schema failures fall back to skipped so
  * they stay game-only.
  *
+ * HOST DEFAULTS ARE UNTRUSTED (p5r1 QA gate g): registry `defaults()` is
+ * host code and CAN throw — the live editor's roof-segment definition
+ * builds its defaults by schema-parsing a stub id 'roof-segment_default',
+ * which fails core's `rseg_…` template-literal id check, so defaults()
+ * throws on EVERY call and 8/8 placed roofs silently skipped. Every
+ * creator therefore reads defaults through safeDefaults(): a throwing
+ * defaults() degrades to `{}` and the zod schema's own field defaults
+ * (including the generated id) carry the parse instead. A broken host
+ * defaults() may weaken an attempt — it must never decide it.
+ *
  * FLOORS (build grammar v2): a game floor piece ATTEMPTS a 'slab' registry
  * node — defaults + schema parse, explicit polygon = the piece's 3 × 3
  * footprint corners (world XZ, yaw-rotated about the piece center) at the
@@ -73,6 +83,17 @@ type RegistryDef = {
   schema?: { parse: (value: unknown) => unknown }
 }
 
+/** Host `defaults()` guarded against throws (see HOST DEFAULTS ARE
+ * UNTRUSTED above) — the schema's field defaults fill whatever a broken
+ * host defaults() failed to provide. */
+function safeDefaults(def: RegistryDef): Record<string, unknown> {
+  try {
+    return def.defaults?.() ?? {}
+  } catch {
+    return {}
+  }
+}
+
 /** Pocket a window/door child into a freshly-kept wall. Attempt-and-catch:
  * host schemas can demand more than we know — a throw means "skipped".
  * Wall-local frame: origin at the wall START, X along the wall, so the
@@ -84,7 +105,7 @@ function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number)
   if (!def?.schema) return false
   const cellW = PIECE_DIMS.wall[0] / CELLS
   const cellH = PIECE_DIMS.wall[1] / CELLS
-  const defaults = def.defaults?.() ?? {}
+  const defaults = safeDefaults(def)
   const doorHeight =
     typeof (defaults as { height?: unknown }).height === 'number'
       ? ((defaults as { height: number }).height as number)
@@ -117,7 +138,7 @@ function createRoofNode(piece: PlacedPiece, levelId: string): boolean {
   const pitchDeg = (Math.atan2(PIECE_DIMS.wall[1], run) * 180) / Math.PI
   try {
     const segment = def.schema.parse({
-      ...(def.defaults?.() ?? {}),
+      ...safeDefaults(def),
       object: 'node',
       parentId: levelId,
       visible: true,
@@ -159,7 +180,7 @@ function createSlabNode(piece: PlacedPiece, levelId: string): boolean {
   ]
   try {
     const slab = def.schema.parse({
-      ...(def.defaults?.() ?? {}),
+      ...safeDefaults(def),
       object: 'node',
       parentId: levelId,
       visible: true,
@@ -216,7 +237,7 @@ export function keepPlaced(): KeepResult {
     const span = trimmedWallSpan(piece.position, piece.yaw, plan.trimStartCols, plan.trimEndCols)
     try {
       const wall = def.schema.parse({
-        ...(def.defaults?.() ?? {}),
+        ...safeDefaults(def),
         object: 'node',
         parentId: levelId,
         visible: true,

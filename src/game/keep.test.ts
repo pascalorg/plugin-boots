@@ -10,6 +10,7 @@ import {
 } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { FULL_MASK, useBoots } from '../store'
+import { parseSlotId, slotPose } from './grid'
 import { keepPlaced } from './keep'
 
 /**
@@ -168,6 +169,58 @@ describe('keepPlaced against the REAL host schemas', () => {
     const result = keepPlaced()
     expect(result).toEqual({ kept: 0, skipped: 1, windows: 0, doors: 0, roofs: 0, floors: 0 })
     expect(useBoots.getState().placed).toEqual([])
+  })
+})
+
+describe('keepPlaced when the HOST defaults() throws (p5r1 gate g: 8/8 roofs skipped)', () => {
+  beforeAll(() => {
+    nodeRegistry._reset()
+    register('wall', WallNode, () => ({}))
+    // Reproduce the LIVE editor's roof-segment definition VERBATIM: its
+    // defaults() schema-parses a stub id 'roof-segment_default', which fails
+    // core's `rseg_…` template-literal id check — so defaults() THROWS on
+    // every call. Keep must survive this (safeDefaults) and still land the
+    // node via the schema's own field defaults (generated `rseg_` id).
+    register('roof-segment', RoofSegmentNode, () => {
+      const stub = RoofSegmentNode.parse({ id: 'roof-segment_default', type: 'roof-segment' })
+      const { id: _id, type: _type, ...rest } = stub
+      return rest as Record<string, unknown>
+    })
+  })
+
+  test('placed roof at a v2 R slot (nonzero i/k, rotQuarter 1) keeps as a real roof-segment', () => {
+    const slot = parseSlotId('R:2,3,0')
+    expect(slot).not.toBeNull()
+    const pose = slotPose(slot!, 1) // rotQuarter 1 → ascends toward +X
+    seed('roof', pose.position, pose.yaw, FULL_MASK, 'R:2,3,0')
+    const result = keepPlaced()
+    expect(result.kept).toBe(1)
+    expect(result.roofs).toBe(1)
+    expect(result.skipped).toBe(0)
+    const [roof] = nodesOf('roof-segment')
+    expect(roof).toBeDefined()
+    expect(roof!.parentId).toBe('level_test')
+    expect(roof!.roofType).toBe('shed')
+    expect(roof!.position).toEqual([7.5, 0, 10.5]) // cell (2,3) center, storey 0
+    expect(roof!.rotation).toBeCloseTo(Math.PI / 2, 9)
+    expect(roof!.width).toBe(3)
+    expect(roof!.depth).toBe(3)
+    expect(roof!.wallHeight).toBe(0)
+    expect(roof!.pitch as number).toBeCloseTo((Math.atan2(2.8, 3) * 180) / Math.PI, 9)
+    expect((roof!.id as string).startsWith('rseg_')).toBe(true) // schema-generated id
+  })
+
+  test('storey s=1 roof: baseY = 1·2.8 lands in the node position, skipped stays 0', () => {
+    const slot = parseSlotId('R:1,1,1')
+    const pose = slotPose(slot!, 3) // rotQuarter 3 → ascends toward −X
+    seed('roof', pose.position, pose.yaw, FULL_MASK, 'R:1,1,1')
+    const result = keepPlaced()
+    expect(result.kept).toBe(1)
+    expect(result.roofs).toBe(1)
+    expect(result.skipped).toBe(0)
+    const [roof] = nodesOf('roof-segment')
+    expect(roof!.position).toEqual([4.5, 2.8, 4.5])
+    expect(roof!.rotation).toBeCloseTo((3 * Math.PI) / 2, 9)
   })
 })
 

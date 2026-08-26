@@ -37,10 +37,10 @@ import type { TargetResult } from './grid'
  *   'out-of-reach' → 'too far'); 'ok' or null blanks it. Owner-keyed like
  *   prompt() (show = last-writer-wins, clear only while that owner holds
  *   the line) and change-gated, so per-frame calls are free while the
- *   reason holds. Wired caller: builder.tsx's ghost frame loop —
- *   `hud.ghostStatus?.(occupied ? 'occupied' : null, 'builder')` (its
- *   snap/raw poses are always reachable + self-supporting, so 'occupied'
- *   is the only reason today; the vocabulary stays the grid.ts alias).
+ *   reason holds. Wired caller: builder.tsx's grid-locked ghost frame loop —
+ *   `hud.ghostStatus?.(target.valid ? null : target.reason, 'builder')`,
+ *   the FULL failing reason of grid.resolveTargetSlot's TargetResult (all
+ *   three can occur now; the vocabulary stays the grid.ts alias).
  * - grenadePip(readyFraction) — bottom-right dot + 'G' label above the
  *   weapon line. 0 = just thrown (dim), ramps brighter across the 5s
  *   cooldown, ≥1 = ready (full bright, dot turns green). grenade.tsx

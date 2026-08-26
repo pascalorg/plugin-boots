@@ -767,3 +767,41 @@ chains read unsupported (flat sawtooth); movement can't walk the plank; and
 keep.ts roof→roof-segment conversion silently skips (all 8 roofs skipped in
 QA). Round 3 tasks dispatched: ghost-targeting owns the grid adjacency +
 ramp-run targeting + slope walk; store-keep owns the roof-segment debug.
+
+## Phase 5, round 3 — ramp chains hold + host defaults untrusted (2026-08-26, manager stitch)
+
+Gatekeeper found the repo quiet; ghost-targeting stalled (2nd stall →
+hand-built per protocol), store-keep landed.
+
+- **manager (hand-built ghost-targeting scope, grid.ts + grid.test.ts)**:
+  p5r2 QA gate c root cause closed — slotsTouching's R-case now carries the
+  4 storey-diagonal roof↔roof neighbors per axis (R:i±1,k,s±1 /
+  R:i,k±1,s±1): a ramp's high edge at y=2.8·(s+1) is real contact with the
+  next cell's ramp one storey up. Symmetric by construction (mirror pairs
+  in each expansion); feeds BOTH candidate support (piece-slots.isSupported
+  on empty slots) and the collapse BFS through the one shared function.
+  +1 regression test (R:12,8,1 ↔ R:11,8,0 etc, QA's exact failing slots);
+  the existing symmetry sweep covers the mirrors. QA's ramp-run targeting
+  trace already picked the right s+1 slots — support was the only lie.
+  Slope-walk: placed ramps are live colliders, 43° → normal.y ≈ 0.73 >
+  0.55 ground threshold; live re-verify is on next QA.
+- **store-keep (keep.ts + keep.test.ts)**: p5r1 gate-g roof skip solved —
+  the live host's roof-segment defaults() THROWS on every call (stub id
+  'roof-segment_default' fails core's rseg_ template check), so
+  def.defaults?.() inside the try guard-skipped 8/8 roofs. New module-
+  private safeDefaults (try/catch → {}) at all 4 defaults sites; schema
+  field defaults carry the parse. "HOST DEFAULTS ARE UNTRUSTED" doc block.
+  +2 regression tests against the REAL RoofSegmentNode schema with the
+  host's throwing defaults() verbatim (RED pre-fix, GREEN post).
+  UPSTREAM BUG to report: host roofSegmentDefinition.defaults() throws for
+  ALL callers — palette/tool creates of roof-segment likely broken too.
+- **manager**: hud.ts ghostStatus doc block synced to the grid-locked
+  caller. Seams audited (single slotsTouching feeds support + collapse;
+  keep bridge untouched). Brand grep clean. tsc exit 0; bun test exit 0 —
+  375 pass / 0 fail, 27 files.
+
+Open for next QA: gate c live re-run (run up ramps holding place). QA's
+secondary finding stands: pieces die only at aliveCount === 0 exactly
+(destruction.ts settleSupportAfterRemoval) — bulk fire strands ~9–22
+straggler bricks; a <3 % alive death threshold or island sweep would fix
+d/f playability.

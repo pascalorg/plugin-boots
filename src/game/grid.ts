@@ -316,6 +316,17 @@ export function slotsTouching(id: string): string[] {
     push('R', i + 1, k, s)
     push('R', i, k - 1, s)
     push('R', i, k + 1, s)
+    // Storey-diagonal roof chain (p5r2 QA gate c): a ramp's HIGH edge at
+    // y=STOREY·(s+1) coincides with the LOW edge of the next cell's ramp
+    // one storey up — real geometric contact on the shared cell boundary.
+    // Both diagonals per axis keep the relation symmetric (a+[+1,0,+1s]
+    // here has its mirror a+[−1,0,−1s] in the neighbor's own expansion).
+    for (const ss of [s - 1, s + 1]) {
+      push('R', i - 1, k, ss)
+      push('R', i + 1, k, ss)
+      push('R', i, k - 1, ss)
+      push('R', i, k + 1, ss)
+    }
   }
   return out.map(slotId)
 }

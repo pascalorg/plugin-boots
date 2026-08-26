@@ -181,6 +181,19 @@ describe('slotsTouching', () => {
     expect(slotsTouching('F:0,0,1')).toContain('Wz:0,1,0')
   })
 
+  test('ramps chain storey-diagonally (p5r2 QA gate c)', () => {
+    // A ramp's high edge (y = 2.8·(s+1)) meets the low edge of the next
+    // cell's ramp one storey up — the graph must carry that contact or the
+    // run-up-your-own-ramps flow reads every higher ramp as unsupported.
+    const touching = slotsTouching('R:12,8,1')
+    expect(touching).toContain('R:11,8,0') // the ramp you just ran up
+    expect(touching).toContain('R:13,8,2') // and the next one it will prop
+    expect(touching).toContain('R:12,7,0')
+    expect(touching).toContain('R:12,9,2')
+    // Mirrors hold (also covered by the symmetry sweep below).
+    expect(slotsTouching('R:11,8,0')).toContain('R:12,8,1')
+  })
+
   test('never returns negative storeys', () => {
     for (const id of slotsTouching('F:0,0,0')) {
       expect(parseSlotId(id)!.s).toBeGreaterThanOrEqual(0)
