@@ -271,29 +271,31 @@ function TableSign({
   const texture = useMemo(() => {
     if (typeof document === 'undefined') return null
     const canvas = document.createElement('canvas')
-    canvas.width = 256
+    canvas.width = 768
     canvas.height = 96
     const g = canvas.getContext('2d')!
     g.fillStyle = '#efe8d8'
-    g.fillRect(0, 0, 256, 96)
+    g.fillRect(0, 0, 768, 96)
     g.strokeStyle = '#7a5c3e'
     g.lineWidth = 6
-    g.strokeRect(3, 3, 250, 90)
+    g.strokeRect(3, 3, 762, 90)
     g.fillStyle = '#3a2f22'
-    g.font = 'bold 30px system-ui, sans-serif'
+    g.font = 'bold 44px system-ui, sans-serif'
     g.textAlign = 'center'
     g.textBaseline = 'middle'
-    g.fillText(text, 128, 50)
+    g.fillText(text, 384, 50)
     return new CanvasTexture(canvas)
   }, [text])
   return (
     <group position={position} rotation={rotation}>
-      <mesh position={[0, 0.09, 0]}>
-        <cylinderGeometry args={[0.008, 0.008, 0.18]} />
-        <meshStandardMaterial color="#7a5c3e" roughness={0.8} />
-      </mesh>
+      {[-0.42, 0.42].map((x) => (
+        <mesh key={x} position={[x, 0.09, 0]}>
+          <cylinderGeometry args={[0.008, 0.008, 0.18]} />
+          <meshStandardMaterial color="#7a5c3e" roughness={0.8} />
+        </mesh>
+      ))}
       <mesh position={[0, 0.22, 0]}>
-        <boxGeometry args={[0.34, 0.13, 0.014]} />
+        <boxGeometry args={[1.02, 0.13, 0.014]} />
         {texture ? (
           <meshStandardMaterial map={texture} roughness={0.85} />
         ) : (
