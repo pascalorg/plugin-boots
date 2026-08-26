@@ -294,16 +294,34 @@ function isGlassMesh(mesh: Mesh): boolean {
   return Boolean((m.transparent && (m.opacity ?? 1) < 0.95) || (m.transmission ?? 0) > 0.2)
 }
 
-function collectMeshes(root: Object3D): Mesh[] {
+/**
+ * Meshes of ONE node's subtree. `stopAt` (the registered roots of every
+ * OTHER collected solid node) fences the sweep: hosted children — doors /
+ * windows / wall-mounted items render NESTED inside their host wall's
+ * registered root — are their own solid nodes and must never be swept into
+ * the host's mesh set. Without the fence a closed door leaf + frame bake
+ * into the wall's voxel grid at prevoxelize (the doorway reads as solid
+ * voxel wall that never clears when the door opens — QA round-2 door
+ * walk-through bug) and their colliders misattribute bullet damage to the
+ * wall. Each fenced subtree is still collected — under its OWN nodeId, by
+ * its own SOLID_KINDS pass.
+ */
+function collectMeshes(root: Object3D, stopAt?: ReadonlySet<Object3D>): Mesh[] {
   const meshes: Mesh[] = []
-  root.traverse((obj) => {
+  const walk = (obj: Object3D): void => {
+    if (obj !== root && stopAt?.has(obj)) return
     const mesh = obj as Mesh
-    if (!mesh.isMesh || !mesh.visible) return
-    if ((mesh.userData as { __boots?: boolean }).__boots) return
-    const position = mesh.geometry?.getAttribute?.('position')
-    if (!position || position.count < 3) return
-    meshes.push(mesh)
-  })
+    if (
+      mesh.isMesh &&
+      mesh.visible &&
+      !(mesh.userData as { __boots?: boolean }).__boots &&
+      (mesh.geometry?.getAttribute?.('position')?.count ?? 0) >= 3
+    ) {
+      meshes.push(mesh)
+    }
+    for (const child of obj.children) walk(child)
+  }
+  walk(root)
   return meshes
 }
 
@@ -793,6 +811,19 @@ export function collectWorld(): GameWorld {
   const buildingAabb = new Box3()
   const meshBounds = new Box3()
 
+  // Registered roots of every collected solid node — the mesh-sweep fence
+  // (see collectMeshes). A wall's sweep stops at its hosted door / window /
+  // item roots; those subtrees are collected under their own nodeId instead.
+  const solidRoots = new Set<Object3D>()
+  for (const kind of SOLID_KINDS) {
+    const ids = sceneRegistry.byType[kind]
+    if (!ids) continue
+    for (const id of ids) {
+      const root = sceneRegistry.nodes.get(id)
+      if (root) solidRoots.add(root)
+    }
+  }
+
   for (const kind of SOLID_KINDS) {
     const ids = sceneRegistry.byType[kind]
     if (!ids) continue
@@ -813,7 +844,7 @@ export function collectWorld(): GameWorld {
       if (hidden) continue
 
       root.updateWorldMatrix(true, true)
-      const meshes = collectMeshes(root)
+      const meshes = collectMeshes(root, solidRoots)
       if (meshes.length === 0) continue
 
       const solidMeshes: Mesh[] = []
