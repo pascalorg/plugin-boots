@@ -151,6 +151,13 @@ export const playerRig = {
     shoveAccum.x += (dirX / len) * power
     shoveAccum.z += (dirZ / len) * power
   },
+  /** Vertical LAUNCH impulse (m/s) — explosions throw the player into the
+   * air ("fly away a few meters"). Consumed into vel.y next frame; capped
+   * so a point-blank grenade lofts, never orbits. */
+  launch(power: number): void {
+    if (!(power > 0)) return
+    launchAccum = Math.max(launchAccum, Math.min(power, 9))
+  },
   /** Camera-shake impulse (see the API block): accumulates power (cap 4),
    * decays ~6/s, applied as a random rotation OFFSET only — never state. */
   shake(power: number): void {
@@ -161,6 +168,8 @@ export const playerRig = {
 
 // --- Module-level combat state (reset when the Player mounts) --------------
 const shoveAccum = { x: 0, z: 0 }
+/** Pending vertical launch impulse (playerRig.launch), consumed per frame. */
+let launchAccum = 0
 /** Accumulated camera-shake power (playerRig.shake), decayed in the loop. */
 let shakePower = 0
 /** Reused MoveConfig for playerRig.speedScale ≠ 1 — module temp, only the
@@ -410,6 +419,12 @@ export function Player({ world }: { world: GameWorld }) {
       vel.current.z += shoveAccum.z
       shoveAccum.x = 0
       shoveAccum.z = 0
+    }
+    // Vertical launch (playerRig.launch — explosions): straight into vel.y,
+    // never additive past the impulse itself so stacked blasts loft, not orbit.
+    if (launchAccum > 0) {
+      vel.current.y = Math.max(vel.current.y, launchAccum)
+      launchAccum = 0
     }
 
     fallSpeed.current = vel.current.y

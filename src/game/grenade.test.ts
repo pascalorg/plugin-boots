@@ -88,11 +88,11 @@ afterEach(() => {
 })
 
 describe('throwVelocity', () => {
-  test('level throw goes -Z at ~9 m/s with the loft on top', () => {
+  test('level throw goes -Z at ~14 m/s with the loft on top', () => {
     const v = throwVelocity(new Vector3(), 0, 0)
-    expect(v.z).toBeCloseTo(-9, 5)
+    expect(v.z).toBeCloseTo(-14, 5)
     expect(v.x).toBeCloseTo(0, 5)
-    expect(v.y).toBeCloseTo(2, 5)
+    expect(v.y).toBeCloseTo(1.4, 5)
   })
 
   test('pitch aims the arc up', () => {

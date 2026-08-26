@@ -10,8 +10,9 @@ import { spawnDebris } from './debris'
 import * as destruct from './destruction'
 import { collideVoxelTargets, damageSegment, damageTarget, useDestruction } from './destruction'
 import { spawnDust, spawnHaze } from './dust'
+import { raycastGlass, shatterPane } from './glass'
 import { bots, damageBot } from './enemies-state'
-import { playerRig } from './player'
+import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
 import type { GameWorld } from './world'
 
@@ -69,9 +70,9 @@ const FLING_MAX = 4
 const SHAKE_RADIUS = 10
 const SHAKE_POWER = 1.4
 
-const THROW_SPEED = 9
+const THROW_SPEED = 14
 /** Extra upward bias so a level throw still arcs like a lob. */
-const THROW_LOFT = 2.0
+const THROW_LOFT = 1.4
 const GRAVITY = 16
 /** Restitution of the single allowed bounce. */
 const BOUNCE_DAMPING = 0.4
@@ -192,6 +193,7 @@ export { throwGrenade as throw }
 const FALLBACK_DESTRUCTIBLE = new Set([
   'wall',
   'door',
+  'window',
   'slab',
   'floor',
   'ceiling',
@@ -289,8 +291,28 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
 
   // Player feel: camera kick inside 10 m (shake is a phase-4 rig method —
   // optional-call so this file is green before AND after it lands).
-  if (playerRig.position.distanceTo(center) <= SHAKE_RADIUS) {
+  const playerDist = playerRig.position.distanceTo(center)
+  if (playerDist <= SHAKE_RADIUS) {
     ;(playerRig as typeof playerRig & { shake?: (power: number) => void }).shake?.(SHAKE_POWER)
+  }
+  // SELF-HARM (owner rule): blow yourself up and it hurts — and it LOFTS
+  // you a few metres. Damage + XZ shove route through damagePlayer (hurt
+  // read, vignette, stagger at 0); the vertical ride is rig.launch.
+  const HARM_RADIUS = BLAST_RADIUS * 2
+  if (playerDist <= HARM_RADIUS) {
+    const closeness = 1 - playerDist / HARM_RADIUS
+    const away = {
+      x: playerRig.position.x - center.x,
+      z: playerRig.position.z - center.z,
+    }
+    if (Math.hypot(away.x, away.z) < 1e-4) {
+      away.x = Math.random() - 0.5
+      away.z = Math.random() - 0.5
+    }
+    damagePlayer(Math.round(12 + 38 * closeness), away)
+    ;(playerRig as typeof playerRig & { launch?: (power: number) => void }).launch?.(
+      3.5 + 4.5 * closeness,
+    )
   }
 
   sfx.explosion()
@@ -325,6 +347,8 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
 
 const _velBefore = new Vector3()
 const _clip = new Vector3()
+const _flightFrom = new Vector3()
+const _flightDir = new Vector3()
 
 /**
  * One sim step: cooldown decay, fuse beeps, arc physics with the single
@@ -353,7 +377,18 @@ export function updateGrenades(world: GameWorld, dt: number): void {
     // normal impulse, so one reflected fraction of it makes the bounce:
     // v' = v_clipped − e·(v_before − v_clipped).
     g.vel.y -= GRAVITY * dt
+    _flightFrom.copy(g.pos)
     g.pos.addScaledVector(g.vel, dt)
+    // Glazing is not armor: panes aren't colliders (world.glass rides its
+    // own lane), so sweep the flight step and SMASH any pane crossed —
+    // the grenade keeps flying, the glass doesn't (QA p4r1 finding).
+    _flightDir.subVectors(g.pos, _flightFrom)
+    const flightLen = _flightDir.length()
+    if (flightLen > 1e-6) {
+      _flightDir.multiplyScalar(1 / flightLen)
+      const pane = raycastGlass(world, _flightFrom, _flightDir, flightLen + GRENADE_CAPSULE.radius)
+      if (pane) shatterPane(pane.pane)
+    }
     _velBefore.copy(g.vel)
     collideCapsule(g.pos, g.vel, world.colliders, GRENADE_CAPSULE)
     collideVoxelTargets(g.pos, g.vel, GRENADE_CAPSULE.radius, GRENADE_CAPSULE.height)
