@@ -54,6 +54,31 @@ export type DoorEntry = {
   root: Object3D
   /** Indices into GameWorld.colliders belonging to this door node. */
   colliderIndices: number[]
+  /** Shallow scene-store node snapshot taken at collect time — carries the
+   * type fields interaction dispatches on (doorType / openingKind /
+   * operationState, plus the geometry fields the host pose helpers read).
+   * Optional so hand-built test worlds (and pre-snapshot callers) keep
+   * working: no snapshot ⇒ the door is treated as a plain hinged leaf. */
+  node?: Record<string, unknown>
+}
+
+/**
+ * A non-door operable node the interaction system can open/close with E:
+ * windows (sliding/casement/awning/hopper/hung/louvered sashes) and
+ * cabinets/cabinet-modules (userData.cabinetPose fronts). Mirrors DoorEntry —
+ * root + collider indices + a node snapshot for the type fields the pose
+ * helpers dispatch on (windowType / openingKind / operationState …).
+ */
+export type OperableEntry = {
+  nodeId: string
+  /** The collected SOLID_KINDS registry kind: window | cabinet | cabinet-module. */
+  kind: string
+  /** The registered node root — the object whose named parts get posed. */
+  root: Object3D
+  /** Indices into GameWorld.colliders belonging to this node. */
+  colliderIndices: number[]
+  /** Shallow scene-store node snapshot taken at collect time. */
+  node: Record<string, unknown>
 }
 
 /**
@@ -105,6 +130,10 @@ export type GameWorld = {
   walls: Map<string, { node: WallNodeLike; root: Object3D; meshes: Mesh[] }>
   glass: GlassPane[]
   doors: DoorEntry[]
+  /** Non-door operables (window / cabinet / cabinet-module) for the E-interact
+   * system. Optional so hand-built test worlds don't have to carry it;
+   * collectWorld always fills it (possibly empty). */
+  operables?: OperableEntry[]
   /** Roots of engineering-overlay renderers (Bones X-ray members). Never
    * solid or destructible — game-root hides them for the session via the
    * restore ledger so no unbreakable ghost layer haunts voxelized walls.
@@ -711,6 +740,7 @@ export function collectWorld(): GameWorld {
   const walls = new Map<string, { node: WallNodeLike; root: Object3D; meshes: Mesh[] }>()
   const glass: GlassPane[] = []
   const doors: DoorEntry[] = []
+  const operables: OperableEntry[] = []
   const buildingAabb = new Box3()
   const meshBounds = new Box3()
 
@@ -771,7 +801,19 @@ export function collectWorld(): GameWorld {
       if (kind === 'door' && colliders.length > firstColliderIndex) {
         const colliderIndices: number[] = []
         for (let i = firstColliderIndex; i < colliders.length; i++) colliderIndices.push(i)
-        doors.push({ nodeId: id, root, colliderIndices })
+        doors.push({ nodeId: id, root, colliderIndices, node: { ...node } })
+      }
+
+      // Non-door operables the E-interact system can pose (window sashes,
+      // cabinet fronts). Snapshot mirrors DoorEntry; a node with no solid
+      // mesh (nothing to aim at) contributes no entry.
+      if (
+        (kind === 'window' || kind === 'cabinet' || kind === 'cabinet-module') &&
+        colliders.length > firstColliderIndex
+      ) {
+        const colliderIndices: number[] = []
+        for (let i = firstColliderIndex; i < colliders.length; i++) colliderIndices.push(i)
+        operables.push({ nodeId: id, kind, root, colliderIndices, node: { ...node } })
       }
 
       if (kind === 'wall' && Array.isArray(node.start) && Array.isArray(node.end)) {
@@ -821,6 +863,7 @@ export function collectWorld(): GameWorld {
     walls,
     glass,
     doors,
+    operables,
     overlayRoots,
     roadFootprints,
     hostTrees,
