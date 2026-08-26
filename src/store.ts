@@ -57,6 +57,12 @@ type BootsState = {
   /** Replace one placed piece's 9-bit cell mask (builder F edit mode).
    * The piece object is swapped, so its mesh + collider re-register. */
   setPlacedMask: (id: number, mask: number) => void
+  /** Rebuild one placed piece AS another piece type (edit-exit transform,
+   * e.g. a stair-silhouette wall mask folding into a ramp). Position, id
+   * and list order are preserved; the mask resets to FULL_MASK. The piece
+   * object is swapped, so its mesh + collider + voxel replica re-register.
+   * Callers guard the target pose with isOccupied first. */
+  transformPlaced: (id: number, piece: BuildPiece, yaw: number) => void
   removeLastPlaced: () => PlacedPiece | undefined
   resolvePlaced: () => void
   setPendingDecision: (pending: boolean) => void
@@ -93,6 +99,10 @@ export const useBoots = create<BootsState>((set, get) => ({
   setPlacedMask: (id, mask) =>
     set((s) => ({
       placed: s.placed.map((p) => (p.id === id ? { ...p, mask: mask & FULL_MASK } : p)),
+    })),
+  transformPlaced: (id, piece, yaw) =>
+    set((s) => ({
+      placed: s.placed.map((p) => (p.id === id ? { ...p, piece, yaw, mask: FULL_MASK } : p)),
     })),
   removeLastPlaced: () => {
     const s = get()

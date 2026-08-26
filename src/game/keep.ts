@@ -12,15 +12,17 @@ import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, type WallPocket } fro
  * A wall's 9-bit cell mask (bit = col + row·3, row 0 = bottom, col 0 at the
  * wall's START end) decides what Keep builds:
  *   511 (intact)            → plain wall node, full 3 m span.
- *   end column(s) fully dead → SHORTER wall: the span is trimmed by
- *                              (dead columns × 1 m cell width) per end.
- *   center cell (bit 4) dead,
- *   ring alive               → wall + a WINDOW node pocketed at the center
+ *   middle-row cell dead at ANY column, ring alive
+ *                            → wall + a WINDOW node pocketed at that column
  *                              (cell-sized, parented to the wall).
- *   bottom-center (bit 1) dead
- *   [optionally bit 4 too],
- *   rest alive               → wall + a DOOR node at the center (registry
+ *   bottom cell dead at ANY column [optionally the cell above too],
+ *   rest alive               → wall + a DOOR node at that column (registry
  *                              default height, cell width).
+ *   top row(s) fully dead,
+ *   lower rows fully alive   → SHORTER wall by HEIGHT: mask 7 keeps a
+ *                              0.93 m half wall, mask 63 a 1.87 m wall.
+ *   end column(s) fully dead → SHORTER wall by SPAN: trimmed by
+ *                              (dead columns × 1 m cell width) per end.
  *   anything else            → best-effort trimmed wall, and the piece also
  *                              counts as skipped (the pocket detail was
  *                              approximated away).
@@ -62,9 +64,10 @@ type RegistryDef = {
 /** Pocket a window/door child into a freshly-kept wall. Attempt-and-catch:
  * host schemas can demand more than we know — a throw means "skipped".
  * Wall-local frame: origin at the wall START, X along the wall, so the
- * center pocket sits at half the (untrimmed) 3 m span; position[1] is the
- * child's center height (the host renders child boxes centered). */
-function createPocketNode(pocket: WallPocket, wallId: string): boolean {
+ * pocket at column c sits at (c + 0.5) cell widths along the (untrimmed)
+ * 3 m span; position[1] is the child's center height (the host renders
+ * child boxes centered). */
+function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number): boolean {
   const def = nodeRegistry.get(pocket) as RegistryDef | undefined
   if (!def?.schema) return false
   const cellW = PIECE_DIMS.wall[0] / CELLS
@@ -83,7 +86,7 @@ function createPocketNode(pocket: WallPocket, wallId: string): boolean {
       visible: true,
       metadata: {},
       wallId,
-      position: [PIECE_DIMS.wall[0] / 2, centerY, 0],
+      position: [(pocketCol + 0.5) * cellW, centerY, 0],
       width: cellW,
       ...(pocket === 'window' ? { height: cellH } : {}),
     })
@@ -161,7 +164,8 @@ export function keepPlaced(): KeepResult {
         metadata: {},
         start: span.start,
         end: span.end,
-        height: PIECE_DIMS.wall[1],
+        // Dead TOP rows trim the kept height: mask 7 → 0.93 m, 63 → 1.87 m.
+        height: PIECE_DIMS.wall[1] * ((CELLS - plan.trimTopRows) / CELLS),
         thickness: PIECE_DIMS.wall[2],
       })
       useScene.getState().createNode(wall as AnyNode, levelId as AnyNodeId)
@@ -169,7 +173,8 @@ export function keepPlaced(): KeepResult {
       if (!plan.exact) result.skipped++ // interior detail approximated away
       if (plan.pocket !== 'none') {
         const wallId = (wall as { id?: unknown }).id
-        const created = typeof wallId === 'string' && createPocketNode(plan.pocket, wallId)
+        const created =
+          typeof wallId === 'string' && createPocketNode(plan.pocket, wallId, plan.pocketCol)
         if (created) {
           if (plan.pocket === 'window') result.windows++
           else result.doors++

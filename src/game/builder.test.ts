@@ -1,19 +1,29 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
-import { FULL_MASK, type PlacedPiece } from '../store'
+import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import {
+  builderDebug,
   CELLS,
   cellCenter,
   cellDims,
+  HALF_WALL_MASK,
   isOccupied,
   maskBit,
   PIECE_DIMS,
   piecePose,
+  planEditExitTransform,
   planWallMask,
   raycastPieceCell,
   resolveSnap,
   rotatedYaw,
+  STAIR_DOWN_MASK,
+  STAIR_UP_MASK,
   trimmedWallSpan,
+  TURBO_FIRST,
+  TURBO_NEXT,
+  turboStamp,
+  TWO_THIRD_WALL_MASK,
+  wallExitTransform,
 } from './builder'
 import { dropTarget, ensureVoxelTarget, resetDestruction, useDestruction } from './destruction'
 import { playerRig } from './player'
@@ -24,10 +34,12 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 /**
  * Builder grammar, headless: the pure snap resolver (wall chains + stacks,
  * floor tiling, roof low-edge docking), identical-pose occupancy, the 3×3
- * cell-mask math (cell picking, Keep's mask → node planning), the R-rotate
- * quarter-turn math, and the destructibility route for placed pieces
- * (nodeType 'block' → voxelize INSTANTLY at placement, dropTarget on
- * Z-undo).
+ * cell-mask math (cell picking, Keep's mask → node planning with height
+ * trims + off-center pockets), the R-rotate quarter-turn math, the turbo
+ * hold-to-place cadence, the edit-exit stair-mask → ramp transform (masks
+ * 311/95, exact-only, occupancy-guarded, transformPlaced store swap), and
+ * the destructibility route for placed pieces (nodeType 'block' → voxelize
+ * INSTANTLY at placement, dropTarget on Z-undo).
  */
 
 let nextId = 1
@@ -346,7 +358,9 @@ describe('planWallMask: trim columns + pocket detection', () => {
       kind: 'wall',
       trimStartCols: 0,
       trimEndCols: 0,
+      trimTopRows: 0,
       pocket: 'none',
+      pocketCol: 1,
       exact: true,
     })
   })
@@ -360,9 +374,11 @@ describe('planWallMask: trim columns + pocket detection', () => {
     expect(plan.kind).toBe('wall')
     if (plan.kind === 'wall') {
       expect(plan.pocket).toBe('window')
+      expect(plan.pocketCol).toBe(1)
       expect(plan.exact).toBe(true)
       expect(plan.trimStartCols).toBe(0)
       expect(plan.trimEndCols).toBe(0)
+      expect(plan.trimTopRows).toBe(0)
     }
   })
 
@@ -370,7 +386,47 @@ describe('planWallMask: trim columns + pocket detection', () => {
     const short = planWallMask(FULL_MASK & ~(1 << 1))
     const tall = planWallMask(FULL_MASK & ~((1 << 1) | (1 << 4)))
     expect(short.kind === 'wall' && short.pocket).toBe('door')
+    expect(short.kind === 'wall' && short.pocketCol).toBe(1)
     expect(tall.kind === 'wall' && tall.pocket).toBe('door')
+    expect(tall.kind === 'wall' && tall.pocketCol).toBe(1)
+  })
+
+  test('off-center window pockets are exact at any column', () => {
+    // Window at col c = the full ring minus exactly the middle-row cell.
+    for (const c of [0, 2] as const) {
+      const plan = planWallMask(FULL_MASK & ~(1 << (c + 3)))
+      expect(plan.kind).toBe('wall')
+      if (plan.kind === 'wall') {
+        expect(plan.pocket).toBe('window')
+        expect(plan.pocketCol).toBe(c)
+        expect(plan.exact).toBe(true)
+        expect(plan.trimStartCols).toBe(0)
+        expect(plan.trimEndCols).toBe(0)
+      }
+    }
+  })
+
+  test('side-door pockets are exact at any column (over-cell may join)', () => {
+    for (const c of [0, 2] as const) {
+      const short = planWallMask(FULL_MASK & ~(1 << c))
+      const tall = planWallMask(FULL_MASK & ~((1 << c) | (1 << (c + 3))))
+      expect(short.kind === 'wall' && short.pocket).toBe('door')
+      expect(short.kind === 'wall' && short.pocketCol).toBe(c)
+      expect(short.kind === 'wall' && short.exact).toBe(true)
+      expect(tall.kind === 'wall' && tall.pocket).toBe('door')
+      expect(tall.kind === 'wall' && tall.pocketCol).toBe(c)
+      expect(tall.kind === 'wall' && tall.exact).toBe(true)
+    }
+  })
+
+  test('pocket x position maps to (col + 0.5) cell widths in wall-local frame', () => {
+    // keep.ts places the pocket node at (pocketCol + 0.5)·cellW from the
+    // wall START — col 0 → 0.5 m, col 1 → 1.5 m (the old center), col 2 →
+    // 2.5 m, in the untrimmed 3 m frame (pockets never combine with trims).
+    const cellW = PIECE_DIMS.wall[0] / CELLS
+    expect((0 + 0.5) * cellW).toBeCloseTo(0.5)
+    expect((1 + 0.5) * cellW).toBeCloseTo(1.5)
+    expect((2 + 0.5) * cellW).toBeCloseTo(2.5)
   })
 
   test('fully-dead end columns trim the wall', () => {
@@ -386,10 +442,46 @@ describe('planWallMask: trim columns + pocket detection', () => {
     expect(middleOnly.kind === 'wall' && middleOnly.exact).toBe(true)
   })
 
+  test('dead TOP rows trim the kept wall height (masks 7 and 63 are exact)', () => {
+    const half = planWallMask(0b000000111) // bottom row only
+    expect(half.kind).toBe('wall')
+    if (half.kind === 'wall') {
+      expect(half.trimTopRows).toBe(2)
+      expect(half.exact).toBe(true)
+      expect(half.trimStartCols).toBe(0)
+      expect(half.trimEndCols).toBe(0)
+      expect(half.pocket).toBe('none')
+      // Keep maps this to height (3 − trimTopRows)·cellH ≈ 0.93 m.
+      expect(PIECE_DIMS.wall[1] * ((CELLS - half.trimTopRows) / CELLS)).toBeCloseTo(0.9333, 3)
+    }
+    const twoThird = planWallMask(0b000111111) // bottom two rows
+    expect(twoThird.kind === 'wall' && twoThird.trimTopRows).toBe(1)
+    expect(twoThird.kind === 'wall' && twoThird.exact).toBe(true)
+    if (twoThird.kind === 'wall') {
+      expect(PIECE_DIMS.wall[1] * ((CELLS - twoThird.trimTopRows) / CELLS)).toBeCloseTo(1.8667, 3)
+    }
+    // Precedence: mask 7 is a height-trim, NOT an inexact span walk.
+    expect(half.kind === 'wall' && half.exact).toBe(true)
+  })
+
+  test('dead BOTTOM rows under live ones stay a full-height best effort (no floating walls)', () => {
+    const floating = planWallMask(0b111111000) // top two rows alive, bottom dead
+    expect(floating.kind).toBe('wall')
+    if (floating.kind === 'wall') {
+      expect(floating.trimTopRows).toBe(0)
+      expect(floating.exact).toBe(false)
+      expect(floating.trimStartCols).toBe(0)
+      expect(floating.trimEndCols).toBe(0)
+    }
+  })
+
   test('other patterns fall back to a best-effort (inexact) trimmed wall', () => {
-    const cornerOut = planWallMask(FULL_MASK & ~1)
+    // A dead TOP corner: not a pocket, not a height trim (row 2 is only
+    // partly dead), no dead end column → full-span inexact wall.
+    const cornerOut = planWallMask(FULL_MASK & ~(1 << 6))
     expect(cornerOut.kind === 'wall' && cornerOut.exact).toBe(false)
     expect(cornerOut.kind === 'wall' && cornerOut.trimStartCols).toBe(0)
+    expect(cornerOut.kind === 'wall' && cornerOut.trimTopRows).toBe(0)
     const trimmedAndHoled = planWallMask((FULL_MASK & ~col(0)) & ~(1 << 4))
     expect(trimmedAndHoled.kind === 'wall' && trimmedAndHoled.trimStartCols).toBe(1)
     expect(trimmedAndHoled.kind === 'wall' && trimmedAndHoled.exact).toBe(false)
@@ -416,6 +508,164 @@ describe('trimmedWallSpan: dead columns shorten the node', () => {
     expect(span.start[1]).toBeCloseTo(3.5)
     expect(span.end[0]).toBeCloseTo(2)
     expect(span.end[1]).toBeCloseTo(1.5)
+  })
+})
+
+// --- Turbo hold-to-place cadence ---------------------------------------------
+
+describe('turboStamp: hold-to-place cadence', () => {
+  test('genre-canon values: 0.15 first, 0.05 per held pose change', () => {
+    expect(TURBO_FIRST).toBeCloseTo(0.15)
+    expect(TURBO_NEXT).toBeCloseTo(0.05)
+    expect(TURBO_FIRST).toBeGreaterThan(TURBO_NEXT)
+  })
+
+  test('fresh press stamps and arms the long lockout; held re-stamps run fast', () => {
+    expect(turboStamp(0, true, false, false)).toBe(TURBO_FIRST)
+    expect(turboStamp(0, true, true, false)).toBe(TURBO_FIRST) // press wins the label
+    expect(turboStamp(0, false, true, false)).toBe(TURBO_NEXT)
+  })
+
+  test('no stamp while cooling, while the pose holds, or over an occupied pose', () => {
+    expect(turboStamp(0.01, true, true, false)).toBeNull() // cooldown gate first
+    expect(turboStamp(0, false, false, false)).toBeNull() // held, pose unchanged
+    expect(turboStamp(0, true, false, true)).toBeNull() // occupied is silent
+    expect(turboStamp(0, false, true, true)).toBeNull()
+  })
+
+  test('a held sweep: press stamps at t=0, next pose change waits 0.15, then 0.05 cadence', () => {
+    // Simulate the frame loop's cooldown countdown against a sweeping
+    // crosshair (every frame a new pose), in integer 10 ms frames so the
+    // timeline is exact. turboStamp's gate is unit-agnostic (> 0).
+    const stamps: number[] = []
+    let cooldown = 0 // in frames
+    for (let frame = 0; frame <= 30; frame++) {
+      const arm = turboStamp(cooldown, frame === 0, true, false)
+      if (arm !== null) {
+        stamps.push(frame)
+        cooldown = Math.round(arm * 100) // seconds → 10 ms frames
+      }
+      cooldown -= 1
+    }
+    // Press stamp at 0 → 0.15 s lockout → stamp at frame 15, then every 5.
+    expect(stamps).toEqual([0, 15, 20, 25, 30])
+  })
+})
+
+// --- Edit-exit transforms: exact stair masks fold a wall into a ramp --------
+
+describe('wall mask constants', () => {
+  test('half/two-third/stair silhouettes have the documented values', () => {
+    expect(HALF_WALL_MASK).toBe(7)
+    expect(TWO_THIRD_WALL_MASK).toBe(63)
+    expect(STAIR_UP_MASK).toBe(311)
+    expect(STAIR_DOWN_MASK).toBe(95)
+    // Silhouette check: column heights 1·2·3 (up) and 3·2·1 (down).
+    const colHeight = (mask: number, c: number) =>
+      [0, 1, 2].filter((r) => mask & (1 << maskBit(c, r))).length
+    expect([0, 1, 2].map((c) => colHeight(STAIR_UP_MASK, c))).toEqual([1, 2, 3])
+    expect([0, 1, 2].map((c) => colHeight(STAIR_DOWN_MASK, c))).toEqual([3, 2, 1])
+  })
+})
+
+describe('wallExitTransform: exact-only stair classification', () => {
+  test('311 rises toward local +X → roof yaw = wall yaw + 90°', () => {
+    for (const wallYaw of [0, Math.PI / 2, -Math.PI / 2]) {
+      const t = wallExitTransform(STAIR_UP_MASK, wallYaw)
+      expect(t).not.toBeNull()
+      expect(t!.piece).toBe('roof')
+      expect(t!.yaw).toBeCloseTo(rotatedYaw(wallYaw, 1))
+    }
+  })
+
+  test('95 rises toward local −X → roof yaw = wall yaw − 90°', () => {
+    for (const wallYaw of [0, Math.PI / 2, -Math.PI / 2]) {
+      const t = wallExitTransform(STAIR_DOWN_MASK, wallYaw)
+      expect(t).not.toBeNull()
+      expect(t!.piece).toBe('roof')
+      expect(t!.yaw).toBeCloseTo(rotatedYaw(wallYaw, -1))
+    }
+  })
+
+  test('near-misses and every other pattern stay a carve (null)', () => {
+    expect(wallExitTransform(FULL_MASK, 0)).toBeNull()
+    expect(wallExitTransform(0, 0)).toBeNull()
+    expect(wallExitTransform(HALF_WALL_MASK, 0)).toBeNull()
+    expect(wallExitTransform(TWO_THIRD_WALL_MASK, 0)).toBeNull()
+    expect(wallExitTransform(STAIR_UP_MASK | (1 << 3), 0)).toBeNull() // one extra cell
+    expect(wallExitTransform(STAIR_UP_MASK & ~1, 0)).toBeNull() // one missing cell
+    expect(wallExitTransform(STAIR_DOWN_MASK | (1 << 5), 0)).toBeNull()
+  })
+})
+
+describe('planEditExitTransform: occupancy guard + piece gating', () => {
+  test('a stair-masked wall plans a ramp at its own position', () => {
+    const wall = placed('wall', 3, 0, 0, Math.PI / 2, STAIR_UP_MASK)
+    const plan = planEditExitTransform(wall, [wall])
+    expect(plan).not.toBeNull()
+    expect(plan!.piece).toBe('roof')
+    expect(plan!.yaw).toBeCloseTo(rotatedYaw(Math.PI / 2, 1))
+  })
+
+  test('refused when an identical roof pose already exists among OTHERS', () => {
+    const wall = placed('wall', 0, 0, 0, 0, STAIR_UP_MASK)
+    const targetYaw = rotatedYaw(0, 1)
+    const blocking = placed('roof', 0, 0, 0, targetYaw)
+    expect(planEditExitTransform(wall, [wall, blocking])).toBeNull()
+    // A roof in a DIFFERENT ascent (2π symmetry) does not block.
+    const otherFacing = placed('roof', 0, 0, 0, rotatedYaw(0, 3))
+    expect(planEditExitTransform(wall, [wall, otherFacing])).not.toBeNull()
+    // The wall itself never blocks its own transform.
+    expect(planEditExitTransform(wall, [wall])).not.toBeNull()
+  })
+
+  test('only walls transform; carved non-stair masks never do', () => {
+    const roof = placed('roof', 0, 0, 0, 0, STAIR_UP_MASK)
+    expect(planEditExitTransform(roof, [roof])).toBeNull()
+    const floor = placed('floor', 0, 0, 0, 0, STAIR_DOWN_MASK)
+    expect(planEditExitTransform(floor, [floor])).toBeNull()
+    const carved = placed('wall', 0, 0, 0, 0, FULL_MASK & ~(1 << 4))
+    expect(planEditExitTransform(carved, [carved])).toBeNull()
+  })
+})
+
+describe('transformPlaced: in-place piece rebuild (store action)', () => {
+  test('swaps piece type + yaw, resets mask to FULL, preserves id/position/order', () => {
+    const store = useBoots.getState()
+    store.addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
+    store.addPlaced({ piece: 'wall', position: [3, 0, 0], yaw: 0, mask: STAIR_UP_MASK })
+    store.addPlaced({ piece: 'floor', position: [6, 0, 0], yaw: 0 })
+    const before = useBoots.getState().placed
+    const target = before[1]!
+    useBoots.getState().transformPlaced(target.id, 'roof', Math.PI / 2)
+    const after = useBoots.getState().placed
+    expect(after.length).toBe(before.length)
+    expect(after.map((p) => p.id)).toEqual(before.map((p) => p.id)) // order + ids kept
+    const swapped = after[1]!
+    expect(swapped.id).toBe(target.id)
+    expect(swapped.piece).toBe('roof')
+    expect(swapped.yaw).toBeCloseTo(Math.PI / 2)
+    expect(swapped.mask).toBe(FULL_MASK)
+    expect(swapped.position).toEqual([3, 0, 0])
+    // Neighbors untouched (same objects — no gratuitous swaps).
+    expect(after[0]).toBe(before[0]!)
+    expect(after[2]).toBe(before[2]!)
+    useBoots.getState().resolvePlaced()
+  })
+})
+
+// --- builderDebug.isEditing: the Q-cycle gate viewmodel feature-detects -----
+
+describe('builderDebug.isEditing', () => {
+  test('publishes a plain boolean flag, false by default', () => {
+    // viewmodel.tsx feature-detects `isEditing` as a plain flag (or getter):
+    // absent = never editing. The builder must publish the plain-flag shape.
+    expect(typeof builderDebug.isEditing).toBe('boolean')
+    expect(builderDebug.isEditing).toBe(false)
+    // The exact read viewmodel performs:
+    const editFlag = (builderDebug as { isEditing?: boolean | (() => boolean) }).isEditing
+    const editing = typeof editFlag === 'function' ? editFlag() : editFlag === true
+    expect(editing).toBe(false)
   })
 })
 

@@ -55,7 +55,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *            snaps to a floor edge (rising away from the floor) or to a
  *            wall base (high edge kisses the wall top: WALL_H rise).
  * HOLD-TO-PLACE: holding LMB stamps a piece whenever the (possibly snapped)
- * ghost pose changes, min PLACE_INTERVAL between stamps — sweep a wall run.
+ * ghost pose changes — turbo cadence: TURBO_FIRST (0.15 s) after the fresh
+ * press, TURBO_NEXT (0.05 s) between held re-stamps — sweep a wall run.
  * VALIDITY: an identical pose (piece + position + yaw up to the piece's own
  * symmetry) is never placed twice — the ghost tints red over an occupied
  * pose, blue when free; occupied stamps are skipped silently.
@@ -72,8 +73,12 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * within 6 m and press F — a 3×3 ghost grid overlays the piece, the cell
  * under the crosshair highlights, LMB toggles that cell's mask bit
  * (pocket the middle of a wall = window; kill a side column = shorter
- * wall). F again — or aiming off the piece — exits. Placement, and the
- * placement ghost, pause while editing; Q piece-cycling stays live.
+ * wall), RMB resets the mask to intact (511). F again — or aiming off the
+ * piece — exits; exit-time classifies the final mask and EXACT staircase
+ * silhouettes (311/95) rebuild the wall as a ramp in place (see
+ * wallExitTransform). Placement, and the placement ghost, pause while
+ * editing; Q piece-cycling is gated off via builderDebug.isEditing
+ * (viewmodel.tsx feature-detects the flag).
  * NOTE: needs 'KeyF' in input.ts GAME_KEYS to receive the key.
  *
  * ── API (exported for tests / other systems) ──────────────────────────────
@@ -104,8 +109,10 @@ const LEVEL_STEP = 1.4
 const REACH = 3.2
 /** Raw ghost must land this close (XZ) to a candidate for the snap to win. */
 const SNAP_RANGE = 1.1
-/** Min seconds between hold-to-place stamps. */
-const PLACE_INTERVAL = 0.18
+/** Turbo hold-to-place cadence: the fresh-press stamp arms the longer
+ * lockout, held pose-change re-stamps run at the fast one. */
+export const TURBO_FIRST = 0.15
+export const TURBO_NEXT = 0.05
 /** Wall stacking wants the aim ray above this fraction of the neighbor's
  * height at its XZ — a real upward tilt (a level gaze at eye height 1.58
  * already clears a ground wall's midpoint, so 0.5 auto-towered). */
@@ -237,6 +244,27 @@ export function isOccupied(
     if (sameYaw(p.yaw, yaw, YAW_SYMMETRY[piece])) return true
   }
   return false
+}
+
+// --- Turbo hold-to-place cadence -------------------------------------------
+
+/**
+ * Pure hold-to-place decision for one frame: a stamp happens on the press
+ * edge or, while held, whenever the ghost pose changed — never while the
+ * cooldown is running or over an occupied pose. Returns the cooldown to arm
+ * for the NEXT stamp (TURBO_FIRST after a fresh press, TURBO_NEXT for held
+ * re-stamps), or null when no stamp should happen this frame.
+ */
+export function turboStamp(
+  cooldownLeft: number,
+  freshPress: boolean,
+  moved: boolean,
+  occupied: boolean,
+): number | null {
+  if (cooldownLeft > 0) return null
+  if (!freshPress && !moved) return null
+  if (occupied) return null
+  return freshPress ? TURBO_FIRST : TURBO_NEXT
 }
 
 // --- Adjacency snap -------------------------------------------------------
@@ -482,40 +510,82 @@ export type WallMaskPlan =
       trimStartCols: number
       /** Fully-dead columns to trim off the wall's end (col 2) end. */
       trimEndCols: number
+      /** Fully-dead TOP rows (0–2, counted from row 2 down) that trim the
+       * kept node's HEIGHT — mask 7 → a 0.93 m half wall, 63 → 1.87 m.
+       * Dead BOTTOM rows never trim (a wall node can't float). */
+      trimTopRows: number
       pocket: WallPocket
+      /** Column (0–2) of the window/door pocket; meaningful only when
+       * `pocket !== 'none'`. Col 0 sits at the wall's START (local −X). */
+      pocketCol: number
       /** False when the mask holds detail the node mapping approximates
        * away (interior holes that are neither window nor door pockets). */
       exact: boolean
     }
-
-const CENTER_BIT = 1 << maskBit(1, 1) // bit 4
-const BOTTOM_CENTER_BIT = 1 << maskBit(1, 0) // bit 1
 
 /** All three bits of column `col` (rows 0..2). */
 function columnBits(col: number): number {
   return (1 << maskBit(col, 0)) | (1 << maskBit(col, 1)) | (1 << maskBit(col, 2))
 }
 
+/** All three bits of row `row` (cols 0..2). */
+function rowBits(row: number): number {
+  return (1 << maskBit(0, row)) | (1 << maskBit(1, row)) | (1 << maskBit(2, row))
+}
+
+/** Fresh exact full-wall plan — patch fields per pattern before returning. */
+function fullWallPlan(): Extract<WallMaskPlan, { kind: 'wall' }> {
+  return {
+    kind: 'wall',
+    trimStartCols: 0,
+    trimEndCols: 0,
+    trimTopRows: 0,
+    pocket: 'none',
+    pocketCol: 1,
+    exact: true,
+  }
+}
+
 /**
- * Pure wall-mask → node plan for Keep: 511 → plain wall; center pocket
- * with the ring alive → window; bottom-center (± center) pocket → door;
- * fully-dead END columns trim the span; anything else is a best-effort
- * trimmed wall flagged `exact: false`; all-dead → skip.
+ * Pure wall-mask → node plan for Keep. Precedence (first match wins):
+ * full → window@col → door@col → height-trim (dead TOP rows over fully
+ * alive lower rows: masks 7/63) → span-trim (dead END columns) →
+ * best-effort trimmed wall flagged `exact: false` → skip (all dead).
+ * Pockets are the full ring minus EXACTLY the pocket bits, at any column:
+ * window = middle-row cell dead; door = bottom cell (± the cell above).
  */
 export function planWallMask(rawMask: number): WallMaskPlan {
   const mask = rawMask & FULL_MASK
   if (mask === 0) return { kind: 'skip' }
-  if (mask === FULL_MASK) {
-    return { kind: 'wall', trimStartCols: 0, trimEndCols: 0, pocket: 'none', exact: true }
+  if (mask === FULL_MASK) return fullWallPlan()
+  for (let col = 0; col < CELLS; col++) {
+    if (mask === (FULL_MASK & ~(1 << maskBit(col, 1)))) {
+      return { ...fullWallPlan(), pocket: 'window', pocketCol: col }
+    }
   }
-  if (mask === (FULL_MASK & ~CENTER_BIT)) {
-    return { kind: 'wall', trimStartCols: 0, trimEndCols: 0, pocket: 'window', exact: true }
+  for (let col = 0; col < CELLS; col++) {
+    const doorBit = 1 << maskBit(col, 0)
+    const overBit = 1 << maskBit(col, 1)
+    if (mask === (FULL_MASK & ~doorBit) || mask === (FULL_MASK & ~(doorBit | overBit))) {
+      return { ...fullWallPlan(), pocket: 'door', pocketCol: col }
+    }
   }
-  if (
-    mask === (FULL_MASK & ~BOTTOM_CENTER_BIT) ||
-    mask === (FULL_MASK & ~(BOTTOM_CENTER_BIT | CENTER_BIT))
-  ) {
-    return { kind: 'wall', trimStartCols: 0, trimEndCols: 0, pocket: 'door', exact: true }
+  // Height trim: fully-dead TOP rows over fully-alive remaining rows (the
+  // low-cover / 2/3-wall edits). Dead BOTTOM rows under live ones would
+  // float the node, so those fall through to the best-effort path instead.
+  let trimTopRows = 0
+  while (trimTopRows < CELLS - 1 && (mask & rowBits(CELLS - 1 - trimTopRows)) === 0) {
+    trimTopRows++
+  }
+  if (trimTopRows > 0) {
+    let lowerFull = true
+    for (let row = 0; row < CELLS - trimTopRows; row++) {
+      if ((mask & rowBits(row)) !== rowBits(row)) {
+        lowerFull = false
+        break
+      }
+    }
+    if (lowerFull) return { ...fullWallPlan(), trimTopRows }
   }
   let trimStartCols = 0
   while (trimStartCols < CELLS && (mask & columnBits(trimStartCols)) === 0) trimStartCols++
@@ -533,7 +603,7 @@ export function planWallMask(rawMask: number): WallMaskPlan {
       break
     }
   }
-  return { kind: 'wall', trimStartCols, trimEndCols, pocket: 'none', exact }
+  return { ...fullWallPlan(), trimStartCols, trimEndCols, exact }
 }
 
 /** World-space start/end of a wall piece after trimming dead end columns.
@@ -557,6 +627,56 @@ export function trimmedWallSpan(
   }
 }
 
+// --- Edit-exit transforms (exact mask patterns rebuild the piece) -----------
+
+/** Bottom row only alive — low half-wall cover (Keep trims to 0.93 m). */
+export const HALF_WALL_MASK = 0b000000111 // 7
+/** Bottom two rows alive — 2/3 wall (Keep trims to 1.87 m). */
+export const TWO_THIRD_WALL_MASK = 0b000111111 // 63
+/** Staircase silhouette, column heights 1·2·3 ascending toward local +X
+ * (bits 0,1,2 + 4,5 + 8). */
+export const STAIR_UP_MASK = 0b100110111 // 311
+/** Staircase silhouette, column heights 3·2·1 ascending toward local −X
+ * (bits 0,1,2 + 3,4 + 6). */
+export const STAIR_DOWN_MASK = 0b001011111 // 95
+
+export type EditTransform = { piece: BuildPiece; yaw: number }
+
+/**
+ * Exit-time wall-mask classification: an EXACT staircase silhouette
+ * rebuilds the wall as the inclined roof piece rising WALL_H along the
+ * wall's own run ("the wall folds down into a ramp"). The roof ascends
+ * along its local +Z while wall columns run along local +X, so the tall
+ * end at +X (311) needs yaw + π/2 and the tall end at −X (95) needs
+ * yaw − π/2. Anything else — including near-misses — stays a free-form
+ * carved mask and returns null.
+ */
+export function wallExitTransform(mask: number, wallYaw: number): EditTransform | null {
+  const m = mask & FULL_MASK
+  if (m === STAIR_UP_MASK) return { piece: 'roof', yaw: rotatedYaw(wallYaw, 1) }
+  if (m === STAIR_DOWN_MASK) return { piece: 'roof', yaw: rotatedYaw(wallYaw, -1) }
+  return null
+}
+
+/**
+ * The transform a CLOSING edit should apply to `piece`, or null. Walls
+ * only; exact stair masks only; refused when an identical pose (up to the
+ * target piece's yaw symmetry) already exists among the OTHER placed
+ * pieces — the transform must never stack a duplicate.
+ */
+export function planEditExitTransform(
+  piece: Pick<PlacedPiece, 'id' | 'piece' | 'position' | 'yaw' | 'mask'>,
+  placed: readonly PlacedPiece[],
+): EditTransform | null {
+  if (piece.piece !== 'wall') return null
+  const transform = wallExitTransform(piece.mask, piece.yaw)
+  if (!transform) return null
+  const others = placed.filter((p) => p.id !== piece.id)
+  const [x, y, z] = piece.position
+  if (isOccupied(others, transform.piece, x, y, z, transform.yaw)) return null
+  return transform
+}
+
 // --- Ghost ----------------------------------------------------------------
 
 type GhostState = {
@@ -576,9 +696,12 @@ const _debugGhost: GhostState = { x: 0, y: 0, z: 0, yaw: 0, piece: 'wall', occup
  * runs — same pattern as `__bootsPlayer`): headless E2E can't engage pointer
  * lock, so `holdFire` stands in for the held LMB (it is OR-ed with the real
  * input each frame). `ghost()` snapshots the currently resolved ghost pose.
+ * `isEditing` mirrors the F edit mode each frame — viewmodel.tsx
+ * feature-detects it to keep Q piece-cycling out of an open edit.
  */
-export const builderDebug: { holdFire: boolean; ghost: () => GhostState } = {
+export const builderDebug: { holdFire: boolean; isEditing: boolean; ghost: () => GhostState } = {
   holdFire: false,
+  isEditing: false,
   ghost: () => ({ ..._debugGhost }),
 }
 
@@ -711,11 +834,27 @@ type EditState = {
   yaw: number
 }
 
+/** Edit-exit confirm: classify the closing piece's final mask — an exact
+ * stair silhouette rebuilds it as a ramp IN PLACE (same id: the
+ * piece-object-swap contract re-registers mesh, collider BVH and voxel
+ * replica; Z-undo ordering is untouched). An occupied target pose refuses
+ * silently — the carve stays a carve, no sfx. */
+function applyEditExitTransform(id: number): void {
+  const state = useBoots.getState()
+  const piece = state.placed.find((p) => p.id === id)
+  if (!piece) return
+  const transform = planEditExitTransform(piece, state.placed)
+  if (!transform) return
+  state.transformPlaced(id, transform.piece, transform.yaw)
+  sfx.place()
+}
+
 export function Builder() {
   const ghostRef = useRef<Group>(null)
   const [ghost, setGhost] = useState<GhostState | null>(null)
   const [edit, setEdit] = useState<EditState | null>(null)
   const prevFire = useRef(false)
+  const prevAltFire = useRef(false)
   const prevUndo = useRef(false)
   const prevEditKey = useRef(false)
   const prevRotate = useRef(false)
@@ -735,6 +874,7 @@ export function Builder() {
     ;(globalThis as Record<string, unknown>).__bootsBuilder = builderDebug
     return () => {
       builderDebug.holdFire = false
+      builderDebug.isEditing = false
       delete (globalThis as Record<string, unknown>).__bootsBuilder
     }
   }, [])
@@ -745,7 +885,7 @@ export function Builder() {
   useEffect(() => {
     const session = getSession()
     if (!session) return
-    session.hud.editHint(editing ? 'F exit · click toggles cell' : null)
+    session.hud.editHint(editing ? 'F done · LMB carve · RMB reset' : null)
     return () => {
       getSession()?.hud.editHint(null)
     }
@@ -758,10 +898,16 @@ export function Builder() {
 
     if (!active) {
       if (ghost) setGhost(null)
-      if (edit) setEdit(null)
+      if (edit) {
+        // Weapon-switch closes the edit too — same exit-time confirm.
+        applyEditExitTransform(edit.id)
+        setEdit(null)
+      }
+      builderDebug.isEditing = false
       lastPlaced.current.has = false
       rotateTurns.current = 0
       prevFire.current = session.input.state.firing || builderDebug.holdFire
+      prevAltFire.current = session.input.state.altFiring
       prevEditKey.current = session.input.state.keys.has('KeyF')
       prevRotate.current = session.input.state.keys.has('KeyR')
       return
@@ -785,6 +931,7 @@ export function Builder() {
 
     // ── EDIT MODE ─────────────────────────────────────────────────────────
     if (edit) {
+      builderDebug.isEditing = true
       if (ghost) setGhost(null)
       // Z undo is paused while editing, but keep its edge tracker warm so
       // holding Z across the exit never fires a stale undo. Edit mode also
@@ -793,26 +940,40 @@ export function Builder() {
       prevUndo.current = session.input.state.keys.has('KeyZ')
       rotateTurns.current = 0
       prevRotate.current = session.input.state.keys.has('KeyR')
+      const altFiringNow = session.input.state.altFiring
       const piece = useBoots.getState().placed.find((p) => p.id === edit.id)
       const hit = piece ? raycastPieceCell(piece, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE) : null
-      // Exit: F again, the piece is gone, or the aim left it.
+      // Exit: F again, the piece is gone, or the aim left it. Exit-time is
+      // the confirm: the final mask classifies, exact stair silhouettes
+      // fold the wall into a ramp (see wallExitTransform).
       if (!piece || !hit || editKeyEdge) {
+        if (piece) applyEditExitTransform(piece.id)
         setEdit(null)
-        placeCooldown.current = PLACE_INTERVAL // a beat before hold-place resumes
+        builderDebug.isEditing = false
+        placeCooldown.current = TURBO_FIRST // a beat before hold-place resumes
         prevFire.current = firingNow
+        prevAltFire.current = altFiringNow
         return
       }
       if (firingNow && !prevFire.current && !staggered) {
         useBoots.getState().setPlacedMask(piece.id, piece.mask ^ (1 << hit.bit))
         sfx.place()
       }
+      // RMB resets the edit — the piece snaps back to intact (511). ADS is
+      // pistol/rifle-only, so the builder owns RMB freely.
+      if (altFiringNow && !prevAltFire.current && piece.mask !== FULL_MASK) {
+        useBoots.getState().setPlacedMask(piece.id, FULL_MASK)
+        sfx.place()
+      }
       prevFire.current = firingNow
+      prevAltFire.current = altFiringNow
       const mask = useBoots.getState().placed.find((p) => p.id === edit.id)?.mask ?? piece.mask
       if (edit.hover !== hit.bit || edit.mask !== mask) {
         setEdit({ ...edit, hover: hit.bit, mask })
       }
       return
     }
+    builderDebug.isEditing = false
     if (editKeyEdge) {
       // Enter edit: nearest of YOUR placed pieces the crosshair touches ≤ 6 m.
       let best: PlacedPiece | null = null
@@ -837,8 +998,10 @@ export function Builder() {
           z: best.position[2],
           yaw: best.yaw,
         })
+        builderDebug.isEditing = true
         if (ghost) setGhost(null)
         prevFire.current = firingNow
+        prevAltFire.current = session.input.state.altFiring
         return
       }
     }
@@ -854,6 +1017,7 @@ export function Builder() {
     const rotateDown = session.input.state.keys.has('KeyR')
     if (rotateDown && !prevRotate.current) {
       rotateTurns.current = (rotateTurns.current + 1) % 4
+      sfx.weaponSwitch() // audible detent per accepted quarter turn
     }
     prevRotate.current = rotateDown
 
@@ -886,12 +1050,14 @@ export function Builder() {
     _debugGhost.piece = buildPiece
     _debugGhost.occupied = occupied
 
-    // Place: on press, and while held whenever the ghost pose changes
-    // (min PLACE_INTERVAL apart). Occupied poses are skipped, no sound.
-    // Staggered hands can't stamp (matches the viewmodel's fire block);
-    // prevFire still tracks the raw button so recovery doesn't edge-place.
+    // Place: on press, and while held whenever the ghost pose changes —
+    // turbo cadence: the fresh-press stamp arms TURBO_FIRST, held
+    // re-stamps run at TURBO_NEXT (see turboStamp). Occupied poses are
+    // skipped, no sound. Staggered hands can't stamp (matches the
+    // viewmodel's fire block); prevFire still tracks the raw button so
+    // recovery doesn't edge-place.
     const firing = session.input.state.firing || builderDebug.holdFire
-    if (firing && !useBoots.getState().staggered && placeCooldown.current <= 0) {
+    if (firing && !useBoots.getState().staggered) {
       const last = lastPlaced.current
       const moved =
         !last.has ||
@@ -900,8 +1066,9 @@ export function Builder() {
         last.y !== gy ||
         last.z !== gz ||
         last.yaw !== gyaw
-      if ((!prevFire.current || moved) && !occupied) {
-        placeCooldown.current = PLACE_INTERVAL
+      const arm = turboStamp(placeCooldown.current, !prevFire.current, moved, occupied)
+      if (arm !== null) {
+        placeCooldown.current = arm
         useBoots.getState().addPlaced({ piece: buildPiece, position: [gx, gy, gz], yaw: gyaw })
         sfx.place()
         last.has = true
@@ -913,6 +1080,7 @@ export function Builder() {
       }
     }
     prevFire.current = firing
+    prevAltFire.current = session.input.state.altFiring
 
     // UNDO on KeyZ (G is the grenade everywhere now).
     const undoDown = session.input.state.keys.has('KeyZ')

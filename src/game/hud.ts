@@ -26,9 +26,9 @@ import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
  *   Painted UNDER the directional edge-glow strips (DOM order) so damage
  *   flashes stay readable during a stagger.
  * - editHint(text | null) — persistent mode-hint line for the builder's F
- *   edit mode ('F edit · click toggle cells'), on its OWN element above the
- *   shared prompt() line so door/table prompts never clobber it. Last write
- *   wins; null hides it. Cleared automatically on unmount.
+ *   edit mode ('F done · LMB carve · RMB reset'), on its OWN element above
+ *   the shared prompt() line so door/table prompts never clobber it. Last
+ *   write wins; null hides it. Cleared automatically on unmount.
  * - grenadePip(readyFraction) — bottom-right dot + 'G' label above the
  *   weapon line. 0 = just thrown (dim), ramps brighter across the 5s
  *   cooldown, ≥1 = ready (full bright, dot turns green). grenade.tsx
@@ -206,7 +206,7 @@ export class Hud {
     )
     el(
       `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em;white-space:nowrap`,
-      'Esc exit · G grenade · 6 hammer · Z undo',
+      'Esc exit · G grenade · R rotate · F edit · Z undo',
     )
 
     container.appendChild(root)
@@ -350,7 +350,7 @@ export class Hud {
   }
 
   /**
-   * Builder edit-mode hint line ('F edit · click toggle cells'). Persistent
+   * Builder edit-mode hint line ('F done · LMB carve · RMB reset'). Persistent
    * until cleared with null — dedicated element, so the shared prompt()
    * line stays free for doors/gun-table interactions. Last write wins.
    */
