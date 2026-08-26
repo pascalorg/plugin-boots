@@ -15,6 +15,7 @@ import {
   debugFlags,
   GROUND_BOT_CAPSULE,
   resetBots,
+  settleGroundBot,
   spawnBot,
   waveState,
 } from './enemies-state'
@@ -39,6 +40,11 @@ import type { GameWorld } from './world'
  * - MELEE LOS: an attack only lands if raycastVoxelTargets + a collider-box
  *   midpoint probe show clear air to the player — no punching through a
  *   sheet of drywall; a blocked attack triggers wall-follow instead.
+ * - GROUND SETTLE (bots on floors): droids/dogs settle toward the live
+ *   landing plane under their feet (enemies-state.settleGroundBot →
+ *   destruction.probeLandingY, cached ~0.2 s per bot, never per frame) —
+ *   they stand on slabs/upper floors, and a carved hole underfoot drops
+ *   them to the storey below. No stair pathing yet.
  * - DRONES: no capsule. A forward point probe (~1.2 m ahead, at rotor height
  *   and just below) vs every collider worldBox — voxelized walls keep their
  *   box, so drones climb over buildings rather than thread breaches — feeds
@@ -81,8 +87,6 @@ const DRONE_PROBE = 1.2
 const DRONE_CLIMB_RATE = 3
 const DRONE_SETTLE_RATE = 0.8
 const DRONE_CLIMB_MAX = 14
-/** Gentle settle pull so capsule step-ups (slabs, stoops) release (m/s). */
-const BOT_SETTLE_RATE = 3
 /** Retry pause after a melee attempt is blocked by a wall (s). */
 const MELEE_BLOCKED_RETRY = 0.4
 
@@ -372,10 +376,11 @@ export function Enemies({ world }: { world: GameWorld }) {
       } else if (!frozen) {
         const prevX = bot.position.x
         const prevZ = bot.position.z
-        // Pseudo-gravity settle so capsule step-ups (slabs, stoops) release.
-        if (bot.position.y > 0) {
-          bot.position.y = Math.max(0, bot.position.y - BOT_SETTLE_RATE * dt)
-        }
+        // GROUND SETTLE (bots on floors): pull toward the cached landing
+        // plane (destruction.probeLandingY) instead of y = 0 — bots stand on
+        // slabs/floors, and a carved hole underfoot drops them to the storey
+        // below. Step-ups (slabs, stoops) still release at the gentle rate.
+        settleGroundBot(world, bot, dt)
         bot.position.x += moveX * dt
         bot.position.z += moveZ * dt
         // BOT WALL RULE: one capsule pass vs host colliders + live voxels —

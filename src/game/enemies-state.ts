@@ -1,6 +1,8 @@
 import { Color, Vector3 } from 'three'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
+import { probeLandingY } from './destruction'
+import type { GameWorld } from './world'
 
 /**
  * The horde, as data: humanoid droids that march, robot dogs that lope,
@@ -53,6 +55,10 @@ export type Bot = {
   followSign: number
   /** Drones: extra altitude (m) gained to clear obstacles under the path. */
   climb: number
+  /** Ground bots: cached landing plane under the feet (settleGroundBot). */
+  groundY: number
+  /** Ground bots: seconds until the landing plane re-probes. */
+  groundT: number
 }
 
 /** Ground-bot (droid/dog) capsule for wall push-out — see BOT WALL RULE in
@@ -122,7 +128,52 @@ export function spawnBot(kind: BotKind, x: number, z: number): void {
     followT: 0,
     followSign: 1,
     climb: 0,
+    groundY: 0,
+    // Stagger the probe cadence so a whole wave never re-probes on the
+    // same frame (settleGroundBot probes as soon as this hits 0).
+    groundT: Math.random() * GROUND_PROBE_PERIOD,
   })
+}
+
+// --- BOTS ON FLOORS: ground settle (droid/dog only, drones never call this) --
+/** Near-support settle — the gentle pull that releases capsule step-ups
+ * (slabs, stoops), same rate the lane always had (m/s). */
+export const BOT_SETTLE_RATE = 3
+/** Unsupported settle — a carved hole underfoot drops the bot to the storey
+ * below fast enough to read as a fall (m/s). */
+export const BOT_FALL_RATE = 6
+/** Gap beyond which the settle reads as a fall (m): bigger than any slab
+ * step-up, far smaller than a storey. */
+const FALL_GAP = 0.6
+/** Landing-plane probe cadence (s) — cached per bot, never per frame. */
+const GROUND_PROBE_PERIOD = 0.2
+/** Probe from just above the feet so a surface exactly at foot level
+ * registers (probeLandingY rejects voxel hits < 0.02 from its start). */
+const GROUND_PROBE_LIFT = 0.1
+
+/**
+ * Pull a ground bot's feet toward the live landing plane under them —
+ * destruction.probeLandingY over collider tops + live voxel cells + the
+ * terrain plane. Standing on slabs/floors holds; walking over a carved
+ * hole drops to the next support below (near-support settle 3 m/s, real
+ * falls 6 m/s). The probe result is cached per bot for ~0.2 s; only the
+ * pull runs per frame. Never lifts — capsule step-up owns upward motion.
+ */
+export function settleGroundBot(world: GameWorld, bot: Bot, dt: number): void {
+  bot.groundT -= dt
+  if (bot.groundT <= 0) {
+    bot.groundT = GROUND_PROBE_PERIOD
+    bot.groundY = probeLandingY(
+      world,
+      bot.position.x,
+      bot.position.y + GROUND_PROBE_LIFT,
+      bot.position.z,
+    )
+  }
+  if (bot.position.y > bot.groundY) {
+    const rate = bot.position.y - bot.groundY > FALL_GAP ? BOT_FALL_RATE : BOT_SETTLE_RATE
+    bot.position.y = Math.max(bot.groundY, bot.position.y - rate * dt)
+  }
 }
 
 export type BotRayHit = { bot: Bot; distance: number; point: Vector3 }

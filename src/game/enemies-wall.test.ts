@@ -7,7 +7,7 @@ import {
   ensureVoxelTarget,
   resetDestruction,
 } from './destruction'
-import { GROUND_BOT_CAPSULE } from './enemies-state'
+import { BOT_SETTLE_RATE, GROUND_BOT_CAPSULE } from './enemies-state'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -86,7 +86,7 @@ function marchBot(
   const vel = new Vector3()
   const dir = new Vector3()
   const dt = 1 / 60
-  const SETTLE = 3 // enemies.tsx BOT_SETTLE_RATE — releases capsule step-ups
+  const SETTLE = BOT_SETTLE_RATE // near-support settle — releases capsule step-ups
   const steps = Math.round(seconds / dt)
   for (let i = 0; i < steps; i++) {
     dir.set(target.x - pos.x, 0, target.z - pos.z)
