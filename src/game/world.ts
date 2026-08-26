@@ -1,4 +1,5 @@
 import { sceneRegistry, useScene } from '@pascal-app/core'
+import { snapLevelsToTruePositions, useViewer } from '@pascal-app/viewer'
 import {
   Box3,
   BufferAttribute,
@@ -730,7 +731,55 @@ export function collectHostForestMeshes(
   return found
 }
 
+/**
+ * Snap every level group to its true stacked Y + visible before the world
+ * snapshot. The host LevelSystem LERPS group Y toward baseY every frame —
+ * a snapshot taken mid-animation (e.g. right after enterGame forced
+ * levelMode from 'exploded' to 'stacked') would bake collider inverse
+ * matrices at the wrong elevation, leaving invisible walls where storeys
+ * used to hover. The host's own `snapLevelsToTruePositions` does the exact
+ * elevation math; its restore closure is deliberately DISCARDED — the
+ * LevelSystem lerp reconverges from the snapped position (a no-op under the
+ * 'stacked' mode the session forces), so there is nothing to undo.
+ *
+ * try/catch: never let a host-version gap in the util take down Jump-in —
+ * a missed snap only matters when levels were mid-flight.
+ */
+export function snapLevelsForSnapshot(): void {
+  try {
+    snapLevelsToTruePositions()
+  } catch {
+    // Host without the util (or an empty registry): snapshot proceeds with
+    // whatever Y the groups currently hold.
+  }
+}
+
+/** Lowest storey ground: min world-Y over all registered level groups
+ * (post-snap that IS each level's baseY), clamped to the terrain plane at 0
+ * — spawn/respawn live on the terrain ring outside the building, so a
+ * basement's negative baseY must not sink the spawn underground. */
+function lowestLevelGroundY(): number {
+  let lowest = Number.POSITIVE_INFINITY
+  const levelIds = sceneRegistry.byType.level
+  if (levelIds) {
+    for (const id of levelIds) {
+      const obj = sceneRegistry.nodes.get(id)
+      if (!obj) continue
+      obj.updateWorldMatrix(true, false)
+      const y = _levelWorldPos.setFromMatrixPosition(obj.matrixWorld).y
+      if (y < lowest) lowest = y
+    }
+  }
+  return Number.isFinite(lowest) ? Math.max(0, lowest) : 0
+}
+
+const _levelWorldPos = new Vector3()
+
 export function collectWorld(): GameWorld {
+  // Whole-building presence: bake the snapshot at true stacked elevations,
+  // never mid-lerp (see snapLevelsForSnapshot).
+  snapLevelsForSnapshot()
+
   const nodes = useScene.getState().nodes as Record<
     string,
     { type?: string; visible?: boolean } & Partial<WallNodeLike> & Record<string, unknown>
@@ -837,13 +886,16 @@ export function collectWorld(): GameWorld {
   const hostTrees = collectHostTrees(nodes)
 
   // Spawn: outside the building along +X of its center, eye toward it.
+  // Y is the LOWEST level's ground (usually 0) — with the whole stacked
+  // building collected, buildingAabb spans every storey, but the ring stays
+  // on the ground the building rises from.
   const spawn = new Vector3(6, 0, 6)
   let spawnYaw = Math.PI * 0.75
   if (!buildingAabb.isEmpty()) {
     const center = buildingAabb.getCenter(new Vector3())
     const size = buildingAabb.getSize(new Vector3())
     const dist = Math.max(size.x, size.z) / 2 + 5
-    spawn.set(center.x + dist, 0, center.z + dist * 0.4)
+    spawn.set(center.x + dist, lowestLevelGroundY(), center.z + dist * 0.4)
     spawnYaw = Math.atan2(spawn.x - center.x, spawn.z - center.z) + Math.PI
     // Camera yaw convention: 0 looks down -Z; face the building center.
     const dx = center.x - spawn.x
@@ -851,12 +903,16 @@ export function collectWorld(): GameWorld {
     spawnYaw = Math.atan2(-dx, -dz)
   }
 
+  // Telemetry only (the game is whole-building; nothing gameplay-side keys
+  // on this). The editor's active level lives on the VIEWER's selection —
+  // the old `useScene.selectedLevelId` read pointed at a field that has
+  // never existed and was always null.
   const levelId =
     (
-      useScene.getState() as unknown as {
-        selectedLevelId?: string | null
+      useViewer.getState() as unknown as {
+        selection?: { levelId?: string | null }
       }
-    ).selectedLevelId ?? null
+    ).selection?.levelId ?? null
 
   return {
     colliders,

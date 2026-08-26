@@ -60,6 +60,34 @@ export function hideForGame(object: Object3D): void {
   object.visible = false
 }
 
+/**
+ * Whole-building presence: the game world is every storey, stacked. 'solo'
+ * hides/shadow-masks other levels and 'exploded' displaces them by 5 m gaps —
+ * either one would bake a partial or scattered building into the world
+ * snapshot. Force 'stacked' for the session with the same record/restore
+ * pattern enterGame uses for viewMode/cameraMode. 'manual' (like 'stacked')
+ * keeps storeys at their true elevations, so both are left untouched.
+ *
+ * Deliberately NO per-level visibility ledger: the host LevelSystem re-asserts
+ * visibility + layer masks from levelMode every frame, so the mode restore on
+ * teardown IS the whole undo (ledgering objects a host frame-loop owns is the
+ * ForeignOverlayHide mistake). Exported for unit tests.
+ */
+export function forceStackedLevelMode(teardown: Array<() => void>): void {
+  const viewer = useViewer.getState() as unknown as {
+    levelMode?: string
+    setLevelMode?: (mode: string) => void
+  }
+  const prev = viewer.levelMode
+  if (!viewer.setLevelMode || (prev !== 'solo' && prev !== 'exploded')) return
+  viewer.setLevelMode('stacked')
+  teardown.push(() => {
+    ;(useViewer.getState() as unknown as { setLevelMode?: (m: string) => void }).setLevelMode?.(
+      prev,
+    )
+  })
+}
+
 export function enterGame(): boolean {
   if (current || useBoots.getState().phase === 'game') return false
   if (typeof document === 'undefined') return false
@@ -99,6 +127,9 @@ export function enterGame(): boolean {
       ).setCameraMode?.(prevCameraMode)
     })
   }
+  // Whole-building presence: solo/exploded level modes would snapshot a
+  // partial or displaced building — force stacked, restore on exit.
+  forceStackedLevelMode(teardownList)
 
   // Position context for the HUD overlay.
   if (getComputedStyle(container).position === 'static') {

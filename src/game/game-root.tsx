@@ -329,6 +329,9 @@ function identifyRay(
 
 function ActiveGame() {
   // Snapshot once per session — walls don't move while you shoot them.
+  // collectWorld itself snaps every level group to its true stacked Y first
+  // (world.ts snapLevelsForSnapshot), so a jump-in right after enterGame
+  // forced levelMode never bakes mid-lerp storey elevations.
   const [world, setWorld] = useState(() => collectWorld())
   // Stable for the canvas' life — used by the __boots coplanar-suspect probe.
   const scene = useThree((s) => s.scene)
@@ -374,8 +377,8 @@ function ActiveGame() {
       world,
       fire: (weapon: 'pistol' | 'rifle' | 'knife' | 'minigun' = 'rifle') =>
         fire(world, WEAPONS[weapon]),
-      teleport: (x: number, z: number, yaw: number, pitch?: number) =>
-        playerDebug.teleport?.(x, z, yaw, pitch),
+      teleport: (x: number, z: number, yaw: number, pitch?: number, y?: number) =>
+        playerDebug.teleport?.(x, z, yaw, pitch, y),
       state: () => useBoots.getState(),
       wallNodes: () => Array.from(world.walls.values()).map((w) => w.node),
       doors: doorsDebug,

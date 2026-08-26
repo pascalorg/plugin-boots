@@ -1,4 +1,5 @@
 import { mock } from 'bun:test'
+import { sceneRegistry } from '@pascal-app/core'
 
 /**
  * bun-test preload (wired via bunfig.toml [test].preload).
@@ -44,13 +45,43 @@ mock.module('@pascal-app/editor', () => ({
   }),
 }))
 
-mock.module('@pascal-app/viewer', () => ({
-  useViewer: stubStore({
+mock.module('@pascal-app/viewer', () => {
+  const useViewer = stubStore({
     cameraMode: 'perspective' as string,
     setCameraMode: (() => {}) as (mode: string) => void,
+    // session.ts forces solo/exploded → stacked on Jump-in; the setter is
+    // FUNCTIONAL (unlike setCameraMode) so tests can assert the teardown
+    // round-trip through real state.
+    levelMode: 'stacked' as string,
+    setLevelMode: (() => {}) as (mode: string) => void,
     // keep.ts reads selection.levelId when converting kept pieces to nodes.
     selection: { levelId: 'level-test' } as { levelId: string | null },
-  }),
-  // renderer.tsx's hook — inert in headless tests.
-  useNodeEvents: () => {},
-}))
+  })
+  useViewer.setState({ setLevelMode: (mode: string) => useViewer.setState({ levelMode: mode }) })
+  return {
+    useViewer,
+    // renderer.tsx's hook — inert in headless tests.
+    useNodeEvents: () => {},
+    // world.ts snaps level groups to true stacked Y + visible before every
+    // snapshot (the host LevelSystem lerps group Y, so mid-flight snapshots
+    // bake wrong collider matrices). The real util computes elevations from
+    // the scene; this stub mirrors its CONTRACT with test-declared truth:
+    // any registered `level` group carrying `userData.__testTrueY` snaps to
+    // that Y and turns visible. Tests without level groups are untouched.
+    snapLevelsToTruePositions: () => {
+      const levelIds = sceneRegistry.byType.level
+      if (levelIds) {
+        for (const id of levelIds) {
+          const obj = sceneRegistry.nodes.get(id)
+          if (!obj) continue
+          const trueY = (obj.userData as { __testTrueY?: number }).__testTrueY
+          if (typeof trueY !== 'number') continue
+          obj.position.y = trueY
+          obj.visible = true
+          obj.updateMatrixWorld(true)
+        }
+      }
+      return () => {}
+    },
+  }
+})

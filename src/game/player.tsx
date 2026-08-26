@@ -251,7 +251,7 @@ export type PlayerSample = {
  * it is also published as `globalThis.__bootsPlayer` for page eval).
  */
 export const playerDebug: {
-  teleport?: (x: number, z: number, yaw: number, pitch?: number) => void
+  teleport?: (x: number, z: number, yaw: number, pitch?: number, y?: number) => void
   damage: typeof damagePlayer
   drainShove: () => { x: number; z: number }
   sample?: () => PlayerSample
@@ -263,6 +263,27 @@ export const playerDebug: {
     shoveAccum.z = 0
     return out
   },
+}
+
+/**
+ * Pure teleport application — the session-scoped playerDebug.teleport closure
+ * delegates here with its live feet/vel refs. `y` is optional (multi-storey
+ * E2E lands the rig on an upper floor); the default keeps the historical
+ * ground-teleport behavior.
+ */
+export function applyTeleport(
+  feet: Vector3,
+  vel: Vector3,
+  x: number,
+  z: number,
+  yaw: number,
+  pitch = 0,
+  y = 0,
+): void {
+  feet.set(x, y, z)
+  vel.set(0, 0, 0)
+  playerRig.yaw = yaw
+  playerRig.pitch = pitch
 }
 
 export function Player({ world }: { world: GameWorld }) {
@@ -308,12 +329,8 @@ export function Player({ world }: { world: GameWorld }) {
     regenPool = 0
     camera.fov = GAME_FOV
     camera.updateProjectionMatrix()
-    playerDebug.teleport = (x, z, yaw, pitch = 0) => {
-      feet.current.set(x, 0, z)
-      vel.current.set(0, 0, 0)
-      playerRig.yaw = yaw
-      playerRig.pitch = pitch
-    }
+    playerDebug.teleport = (x, z, yaw, pitch = 0, y = 0) =>
+      applyTeleport(feet.current, vel.current, x, z, yaw, pitch, y)
     playerDebug.sample = () => {
       const s = useBoots.getState()
       return {
