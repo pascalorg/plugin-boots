@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { sceneRegistry, useScene } from '@pascal-app/core'
 import { BoxGeometry, Group, Mesh, MeshBasicMaterial } from 'three'
-import { collectWorld } from './world'
+import { collectMeshes, collectSolidRoots, collectWorld } from './world'
 
 /**
  * Hosted-child mesh ownership (QA round-2 door walk-through bug): doors,
@@ -55,15 +55,21 @@ function buildWallWithHostedChildren() {
   door.position.set(1, -0.35, 0)
   wall.add(door)
 
-  // Window nested inside the wall root too: one solid sash + one glass pane.
+  // Window nested inside the wall root too: one solid sash + one glass pane
+  // + the host's full-rect interaction HITBOX (mesh.visible = true, MATERIAL
+  // invisible — never rendered/raycast by three, must never become a
+  // collider that eats glazing shots; QA p4r3 bug 2).
   const window = new Group()
   const sash = new Mesh(new BoxGeometry(1.2, 1.2, 0.05))
   const glassPane = new Mesh(
     new BoxGeometry(1.1, 1.1, 0.01),
     new MeshBasicMaterial({ transparent: true, opacity: 0.3 }),
   )
+  const hitbox = new Mesh(new BoxGeometry(1.2, 1.2, 0.06), new MeshBasicMaterial())
+  hitbox.material.visible = false
   window.add(sash)
   window.add(glassPane)
+  window.add(hitbox)
   window.position.set(-1, 0.2, 0)
   wall.add(window)
 
@@ -115,7 +121,7 @@ function buildWallWithHostedChildren() {
     ['level_1'] as never,
   )
 
-  return { wall, doorLeaf, doorFrame, sash, glassPane }
+  return { wall, doorLeaf, doorFrame, sash, glassPane, hitbox }
 }
 
 describe('collectWorld hosted-child mesh ownership', () => {
@@ -156,5 +162,30 @@ describe('collectWorld hosted-child mesh ownership', () => {
     const window = world.operables?.find((o) => o.nodeId === 'window_1')!
     expect(window).toBeDefined()
     expect(window.kind).toBe('window')
+  })
+
+  test('material-invisible interaction hitboxes never become colliders or glass (QA p4r3 bug 2)', () => {
+    const { hitbox } = buildWallWithHostedChildren()
+    const world = collectWorld()
+
+    expect(world.colliders.some((c) => c.mesh === hitbox)).toBe(false)
+    expect(world.glass.some((g) => g.mesh === hitbox)).toBe(false)
+  })
+
+  test('ResurrectionSweep lane: collectMeshes fenced by collectSolidRoots keeps hosted children out of the wall sweep', () => {
+    const { wall, hitbox } = buildWallWithHostedChildren()
+    collectWorld()
+
+    const fence = collectSolidRoots()
+    expect(fence.has(wall)).toBe(true)
+    const swept = collectMeshes(wall, fence)
+    // Only the wall's own mesh — never the nested door/window meshes, and
+    // never the material-invisible hitbox (game-root.tsx bug 1 fix).
+    expect(swept).toEqual([wall])
+    expect(swept.includes(hitbox)).toBe(false)
+
+    // collectWorld exposes the same fence on the snapshot.
+    const world = collectWorld()
+    expect(world.solidRoots?.has(wall)).toBe(true)
   })
 })

@@ -805,3 +805,52 @@ secondary finding stands: pieces die only at aliveCount === 0 exactly
 (destruction.ts settleSupportAfterRemoval) — bulk fire strands ~9–22
 straggler bricks; a <3 % alive death threshold or island sweep would fix
 d/f playability.
+
+## 2026-08-26 — phase 4 round 3, manager stitch
+
+Round shape: COMBAT group produced nothing (collapse agent stalled — its
+QA item "skeleton-collapse verification on real scenes" re-queued);
+trees-host stalled too. WORLD QA gate FAILED on two verified runtime bugs;
+both fixed here by the manager:
+
+- **game-root.tsx ResurrectionSweep hosted-children fence (QA p4r3 bug 1)**:
+  the ~0.5 s resurrection sweep used a bare `root.traverse` — on a
+  voxelized wall it descended into the wall's NESTED registered door/
+  window/item roots and ledger-hid them, so live windows and doors
+  vanished half a second after jump-in. Now sweeps through the exact same
+  lane collectWorld uses: `collectMeshes(root, collectSolidRoots())` —
+  both newly exported from world.ts (the fence set is rebuilt per 2 Hz
+  sweep so mid-session registrations fence correctly).
+- **world.ts collectMeshes material-visibility filter (QA p4r3 bug 2)**:
+  windows ship full-rect interaction HITBOXES as `mesh.visible = true`
+  meshes whose MATERIAL has `visible = false`; three.js never renders or
+  raycasts those (Mesh.raycast bails), but our mesh.visible-only check
+  collected them as solid 'window' colliders that ate every glazing shot
+  and grenade pass. New isMaterialInvisible predicate (array materials:
+  all-invisible ⇒ skip) wired into collectMeshes — hitboxes never become
+  colliders, glass, or sweep victims. Landed together with fix 1 so the
+  sweep can't re-hide the freed panes.
+- **world.ts collectSolidRoots + GameWorld.solidRoots**: fence builder
+  extracted + exported; collectWorld now also returns the fence on the
+  snapshot (`world.solidRoots`) for future consumers.
+- +2 regression tests in world-hosted-children.test.ts (hitbox never a
+  collider/glass; fenced sweep returns only the wall's own mesh).
+- Seam audit: KeyZ undo / KeyG grenade / Digit6 hammer consistent across
+  input.ts, builder.tsx, viewmodel.tsx, panel.tsx copy; playerRig.ads
+  writer (viewmodel) / reader (player FOV) intact; siren flag
+  enemies-state → guntable beacon intact; no stale imports of any
+  never-landed collapse API (support.ts exports unchanged). Panel Controls
+  copy already lists Z undo, G grenade, 6 hammer, RMB aim, R rotate — no
+  edit needed. Brand grep clean in src (docs/RESEARCH.md keeps its
+  verbatim OSS repo citations for license attribution).
+- tsc exit 0; bun test 377 pass / 0 fail, 27 files (375 + 2 new).
+
+Open for next QA: re-run the two BLOCKED gates with headed browser —
+glazing shatter via the glass lane and grenade mid-flight + 3.2 m
+detonation shatter (aim pane QUARTER points, not centers; script
+/tmp/boots-night/p4r3/qa3.mjs). Open design call (builder's latent gap):
+transformPlaced keeps the old wall slotId when an edit-exit turns a wall
+into a ramp — ramp stays registered on the W slot, the overlapping R slot
+stays placeable, ramp pose is off the R lattice. Re-queue: skeleton
+collapse on real scenes + owner feel-pass on char-collapse burst
+(GRAND-PLAN line 65 / MASTERPLAN T4); trees-host scope untouched.

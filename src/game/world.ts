@@ -135,6 +135,13 @@ export type GameWorld = {
    * system. Optional so hand-built test worlds don't have to carry it;
    * collectWorld always fills it (possibly empty). */
   operables?: OperableEntry[]
+  /** Registered roots of EVERY collected solid node — the hosted-child
+   * fence (see collectMeshes) shared with the voxelize-time hide: hosted
+   * doors / windows / items render NESTED inside their host wall's mesh,
+   * so `visible = false` on that mesh would cull them (invisible closed
+   * doors blocking an apparently-open doorway). Optional so hand-built
+   * test worlds don't have to carry it; collectWorld always fills it. */
+  solidRoots?: ReadonlySet<Object3D>
   /** Roots of engineering-overlay renderers (Bones X-ray members). Never
    * solid or destructible — game-root hides them for the session via the
    * restore ledger so no unbreakable ghost layer haunts voxelized walls.
@@ -294,6 +301,20 @@ function isGlassMesh(mesh: Mesh): boolean {
   return Boolean((m.transparent && (m.opacity ?? 1) < 0.95) || (m.transmission ?? 0) > 0.2)
 }
 
+/** Is every effective material of this mesh flagged invisible? Windows ship
+ * full-rect interaction HITBOXES as `mesh.visible = true` meshes whose
+ * MATERIAL has `visible = false` — three.js never renders (or raycasts,
+ * see Mesh.raycast) those, but a `mesh.visible` check alone would collect
+ * them as solid 'window' colliders that eat every glazing shot and grenade
+ * pass (QA p4r3 bug 2). Material-less meshes render nothing either. */
+function isMaterialInvisible(mesh: Mesh): boolean {
+  const material = mesh.material
+  if (Array.isArray(material)) {
+    return material.length === 0 || material.every((m) => !m || m.visible === false)
+  }
+  return !material || material.visible === false
+}
+
 /**
  * Meshes of ONE node's subtree. `stopAt` (the registered roots of every
  * OTHER collected solid node) fences the sweep: hosted children — doors /
@@ -304,9 +325,11 @@ function isGlassMesh(mesh: Mesh): boolean {
  * voxel wall that never clears when the door opens — QA round-2 door
  * walk-through bug) and their colliders misattribute bullet damage to the
  * wall. Each fenced subtree is still collected — under its OWN nodeId, by
- * its own SOLID_KINDS pass.
+ * its own SOLID_KINDS pass. Meshes whose effective material is invisible
+ * are skipped (see isMaterialInvisible). Exported so ResurrectionSweep in
+ * game-root.tsx hides through the exact same fence + filters.
  */
-function collectMeshes(root: Object3D, stopAt?: ReadonlySet<Object3D>): Mesh[] {
+export function collectMeshes(root: Object3D, stopAt?: ReadonlySet<Object3D>): Mesh[] {
   const meshes: Mesh[] = []
   const walk = (obj: Object3D): void => {
     if (obj !== root && stopAt?.has(obj)) return
@@ -315,6 +338,7 @@ function collectMeshes(root: Object3D, stopAt?: ReadonlySet<Object3D>): Mesh[] {
       mesh.isMesh &&
       mesh.visible &&
       !(mesh.userData as { __boots?: boolean }).__boots &&
+      !isMaterialInvisible(mesh) &&
       (mesh.geometry?.getAttribute?.('position')?.count ?? 0) >= 3
     ) {
       meshes.push(mesh)
@@ -323,6 +347,25 @@ function collectMeshes(root: Object3D, stopAt?: ReadonlySet<Object3D>): Mesh[] {
   }
   walk(root)
   return meshes
+}
+
+/**
+ * Registered roots of every SOLID_KINDS node currently in the registry —
+ * the `stopAt` fence for collectMeshes. collectWorld builds its snapshot
+ * fence through this; ResurrectionSweep (game-root.tsx) rebuilds it every
+ * sweep so hosted children registered mid-session still fence correctly.
+ */
+export function collectSolidRoots(): Set<Object3D> {
+  const solidRoots = new Set<Object3D>()
+  for (const kind of SOLID_KINDS) {
+    const ids = sceneRegistry.byType[kind]
+    if (!ids) continue
+    for (const id of ids) {
+      const root = sceneRegistry.nodes.get(id)
+      if (root) solidRoots.add(root)
+    }
+  }
+  return solidRoots
 }
 
 /**
@@ -814,15 +857,7 @@ export function collectWorld(): GameWorld {
   // Registered roots of every collected solid node — the mesh-sweep fence
   // (see collectMeshes). A wall's sweep stops at its hosted door / window /
   // item roots; those subtrees are collected under their own nodeId instead.
-  const solidRoots = new Set<Object3D>()
-  for (const kind of SOLID_KINDS) {
-    const ids = sceneRegistry.byType[kind]
-    if (!ids) continue
-    for (const id of ids) {
-      const root = sceneRegistry.nodes.get(id)
-      if (root) solidRoots.add(root)
-    }
-  }
+  const solidRoots = collectSolidRoots()
 
   for (const kind of SOLID_KINDS) {
     const ids = sceneRegistry.byType[kind]
@@ -951,6 +986,7 @@ export function collectWorld(): GameWorld {
     glass,
     doors,
     operables,
+    solidRoots,
     overlayRoots,
     roadFootprints,
     hostTrees,

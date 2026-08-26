@@ -32,7 +32,9 @@ import { PipelineWarmup } from './warmup'
 import { VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
 import {
+  collectMeshes,
   collectOverlayRoots,
+  collectSolidRoots,
   collectWorld,
   countCoplanarSuspects,
   type GameWorld,
@@ -52,6 +54,15 @@ import {
  * visible, absent from our colliders, untouchable by bullets or grenades.
  * Every ~0.5s, re-walk each voxelized node's registry root and hide any
  * visible mesh through the session ledger (restored on exit as always).
+ *
+ * The walk goes through collectMeshes with the SAME hosted-children fence
+ * collectWorld uses (QA p4r3 bug 1): a voxelized wall's subtree NESTS its
+ * hosted door/window/item roots, and an unfenced traverse hid those live
+ * nodes ~0.5 s after jump-in — windows and doors simply vanished. Fencing
+ * also keeps the sweep off glass panes and off windows' material-invisible
+ * interaction hitboxes (collectMeshes skips those), so the pane fix in
+ * world.ts stays fixed. The fence set is rebuilt per sweep (2 Hz registry
+ * walk — cheap) so mid-session registrations fence correctly.
  */
 function ResurrectionSweep() {
   const frame = useRef(0)
@@ -60,14 +71,11 @@ function ResurrectionSweep() {
     if (frame.current % 30 !== 0) return
     const targets = useDestruction.getState().targets
     if (targets.size === 0) return
+    const fence = collectSolidRoots()
     for (const nodeId of targets.keys()) {
       const root = sceneRegistry.nodes.get(nodeId as never)
       if (!root) continue
-      root.traverse((obj: Object3D) => {
-        const mesh = obj as Object3D & { isMesh?: boolean; userData: { __boots?: boolean } }
-        if (!mesh.isMesh || !mesh.visible || mesh.userData.__boots) return
-        hideForGame(obj)
-      })
+      for (const mesh of collectMeshes(root, fence)) hideForGame(mesh)
     }
   })
   return null
