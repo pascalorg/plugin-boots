@@ -1,6 +1,6 @@
 'use client'
 
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useMemo, useRef } from 'react'
 import {
   BoxGeometry,
@@ -16,8 +16,9 @@ import { sfx, type TreeCrackleHandle } from './audio'
 import { spawnDebris } from './debris'
 import { spawnDust } from './dust'
 import { scatter } from './nature'
+import { hideForGame } from './session'
 import { registerTreeRoutes } from './shooting'
-import type { GameWorld } from './world'
+import { collectHostForestMeshes, type GameWorld, type HostTreeNode } from './world'
 
 /**
  * Combat trees — the grove is a target class now. Same deterministic
@@ -38,14 +39,27 @@ import type { GameWorld } from './world'
  * a felled tree costs nothing persistent. Raycasts are analytic (vertical
  * trunk cylinder + canopy sphere), CPU-only, ~46 trees per shot.
  *
+ * REAL host-scene trees join the grove (phase 4): world.hostTrees (scene
+ * vegetation nodes — see world.ts isTreeKind / collectHostTrees) are
+ * hidden for the session THROUGH THE RESTORE LEDGER ONLY (hideForGame:
+ * the per-node registered roots plus the collective forest InstancedMeshes
+ * via collectHostForestMeshes — never the scene store; Esc restores them
+ * untouched) and replaced by combat trees at the same world transforms
+ * (hostTreePlacements: x/z/y base, yaw, scale from node height). Scattered
+ * trees landing within HOST_TREE_CLEARANCE of a host tree are dropped so
+ * the grove never doubles up (withoutHostOverlap).
+ *
  * ── API ────────────────────────────────────────────────────────────────
- *   <TreesDestruct world={world} />  builds the grove for the session and
- *       registers shooting.ts's tree routes on mount (cleared on unmount).
+ *   <TreesDestruct world={world} />  builds the grove for the session
+ *       (scattered + host replacements), hides host trees via the restore
+ *       ledger, and registers shooting.ts's tree routes on mount (routes
+ *       cleared on unmount; visibility restored by exitGame's ledger).
  *   treesDebug.dump()  plain per-tree state for `__boots.trees()`:
- *       { id, x, z, scale, state, hp, canopyDamage, burnT, charHits }.
+ *       { id, nodeId?, x, y, z, scale, state, hp, canopyDamage, burnT,
+ *         charHits } — nodeId set exactly on host-tree replacements.
  *   Pure helpers exported for tests: buildTreesFrom, raycastTrees,
- *       damageTree, updateBurning (no rendering/sfx inside — the component
- *       wraps them with effects).
+ *       damageTree, updateBurning, hostTreePlacements, withoutHostOverlap
+ *       (no rendering/sfx inside — the component wraps them with effects).
  * ───────────────────────────────────────────────────────────────────────
  */
 
@@ -54,14 +68,20 @@ export type TreeState = 'healthy' | 'burning' | 'charred' | 'stump'
 export type TreePlacement = {
   x: number
   z: number
+  /** Ground/base elevation (m); omitted = 0. Host trees on decks carry it. */
+  y?: number
   scale: number
   yaw: number
   /** Canopy rgb 0..1 (trunks share one bark brown). */
   color: [number, number, number]
+  /** Scene node id when this placement replaces a REAL host tree. */
+  nodeId?: string
 }
 
 export type CombatTree = TreePlacement & {
   id: number
+  /** Resolved base elevation (placement y, defaulted to 0). */
+  y: number
   state: TreeState
   hp: number
   canopyDamage: number
@@ -90,12 +110,74 @@ export function buildTreesFrom(placements: TreePlacement[]): CombatTree[] {
   return placements.map((p, id) => ({
     ...p,
     id,
+    y: p.y ?? 0,
     state: 'healthy' as TreeState,
     hp: TREE_HP,
     canopyDamage: 0,
     burnT: 0,
     charHits: CHAR_HITS,
   }))
+}
+
+// --- Host-tree replacement placements --------------------------------------
+
+/** Combat-tree apex height at scale 1 (canopy cone top: 3.6 + 3.4 / 2) —
+ * the divisor turning a host tree's node height into a matching scale. */
+export const COMBAT_TREE_APEX = 5.3
+/** Sanity clamp on host-derived scales (a 60 m sequoia node still spawns a
+ * shootable tree; a 0.5 m sapling stays raycastable). */
+const HOST_SCALE_MIN = 0.45
+const HOST_SCALE_MAX = 2.6
+/** Scattered trees this close (m, XZ) to a host tree are dropped — the
+ * replacement stands exactly there. */
+export const HOST_TREE_CLEARANCE = 1.6
+
+const HOST_CANOPY = new Color('#3f6d33')
+const _hostColor = new Color()
+
+/**
+ * Combat placements standing in for the REAL host trees, same world
+ * transforms: XZ + base elevation from the node's registered root, yaw from
+ * the node, scale from node height (height / COMBAT_TREE_APEX, clamped).
+ * Hidden-branch trees get no replacement. Canopy color is the scattered
+ * grove's green with a deterministic per-index lightness wobble.
+ */
+export function hostTreePlacements(hostTrees: readonly HostTreeNode[]): TreePlacement[] {
+  const placements: TreePlacement[] = []
+  for (let i = 0; i < hostTrees.length; i++) {
+    const tree = hostTrees[i]!
+    if (tree.hidden) continue
+    const scale = Math.min(HOST_SCALE_MAX, Math.max(HOST_SCALE_MIN, tree.height / COMBAT_TREE_APEX))
+    _hostColor.copy(HOST_CANOPY).offsetHSL(0, 0, (((i * 7919) % 13) / 13 - 0.5) * 0.08)
+    placements.push({
+      x: tree.x,
+      z: tree.z,
+      y: tree.y,
+      scale,
+      yaw: tree.yaw,
+      color: [_hostColor.r, _hostColor.g, _hostColor.b],
+      nodeId: tree.nodeId,
+    })
+  }
+  return placements
+}
+
+/** Scattered placements minus any landing within HOST_TREE_CLEARANCE (XZ)
+ * of a host tree — the replacement owns that spot. */
+export function withoutHostOverlap(
+  placements: TreePlacement[],
+  hostTrees: readonly HostTreeNode[],
+): TreePlacement[] {
+  if (hostTrees.length === 0) return placements
+  const clearanceSq = HOST_TREE_CLEARANCE * HOST_TREE_CLEARANCE
+  return placements.filter((p) => {
+    for (const tree of hostTrees) {
+      const dx = p.x - tree.x
+      const dz = p.z - tree.z
+      if (dx * dx + dz * dz < clearanceSq) return false
+    }
+    return true
+  })
 }
 
 export type TreePart = 'trunk' | 'canopy'
@@ -141,7 +223,7 @@ export function raycastTrees(
         if (disc >= 0) {
           const t = (-b - Math.sqrt(disc)) / a
           if (t > 0 && t < bestDist) {
-            const y = origin.y + direction.y * t
+            const y = origin.y + direction.y * t - tree.y
             if (y >= 0 && y <= TRUNK_H * s) {
               bestDist = t
               bestTree = tree.id
@@ -154,7 +236,7 @@ export function raycastTrees(
     // Canopy sphere — only while the crown exists (burned crowns are gone).
     if (tree.state !== 'charred') {
       const cx = origin.x - tree.x
-      const cy = origin.y - CANOPY_CY * s
+      const cy = origin.y - (tree.y + CANOPY_CY * s)
       const cz = origin.z - tree.z
       const r = CANOPY_R * s
       const b = cx * direction.x + cy * direction.y + cz * direction.z
@@ -246,7 +328,9 @@ export const treesDebug = {
   dump: (): Array<Record<string, unknown>> =>
     liveTrees.map((t) => ({
       id: t.id,
+      nodeId: t.nodeId,
       x: t.x,
+      y: t.y,
       z: t.z,
       scale: t.scale,
       state: t.state,
@@ -278,7 +362,7 @@ function burstCanopy(tree: CombatTree, charcoal: boolean): void {
     const h = Math.sqrt(1 - u * u)
     spawnDebris(
       tree.x + Math.cos(theta) * h * r,
-      CANOPY_CY * s + u * r,
+      tree.y + CANOPY_CY * s + u * r,
       tree.z + Math.sin(theta) * h * r,
       (0.11 + Math.random() * 0.08) * s,
       _burstColor,
@@ -294,7 +378,7 @@ function burstTrunk(tree: CombatTree, charcoal: boolean): void {
   const n = 12
   for (let i = 0; i < n; i++) {
     _burstColor.copy(charcoal ? CHARCOAL : BARK)
-    const y = (0.35 + ((TRUNK_H - 0.35) * i) / n) * s
+    const y = tree.y + (0.35 + ((TRUNK_H - 0.35) * i) / n) * s
     spawnDebris(
       tree.x + (Math.random() - 0.5) * 0.3 * s,
       y,
@@ -328,7 +412,7 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
       break
     }
     case 'ignite': {
-      _dustPos.set(tree.x, CANOPY_CY * tree.scale, tree.z)
+      _dustPos.set(tree.x, tree.y + CANOPY_CY * tree.scale, tree.z)
       spawnDust(_dustPos, 0.7, PUFF)
       sfx.voxelCrunch(0.35)
       revision++
@@ -337,7 +421,7 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
     case 'fell': {
       burstCanopy(tree, wasBurning)
       burstTrunk(tree, wasBurning)
-      _dustPos.set(tree.x, 1.2 * tree.scale, tree.z)
+      _dustPos.set(tree.x, tree.y + 1.2 * tree.scale, tree.z)
       spawnDust(_dustPos, 0.9, PUFF)
       if (wasBurning) sfx.charSnap()
       sfx.woodCrumble(0.7)
@@ -354,7 +438,7 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
     }
     case 'collapse': {
       burstTrunk(tree, true)
-      _dustPos.set(tree.x, 1 * tree.scale, tree.z)
+      _dustPos.set(tree.x, tree.y + 1 * tree.scale, tree.z)
       spawnDust(_dustPos, 0.7, PUFF)
       sfx.charSnap()
       sfx.woodCrumble(0.5)
@@ -378,7 +462,7 @@ const ZERO = new Matrix4().makeScale(0, 0, 0)
 const BRANCH_YAWS = [0.3, 2.4, 4.5]
 
 function setTreeMatrix(mesh: InstancedMesh, i: number, tree: CombatTree): void {
-  _pos.set(tree.x, 0, tree.z)
+  _pos.set(tree.x, tree.y, tree.z)
   _quat.setFromAxisAngle(_yAxis, tree.yaw)
   _scaleV.setScalar(tree.scale)
   _matrix.compose(_pos, _quat, _scaleV)
@@ -412,7 +496,7 @@ function syncInstances(
     for (let b = 0; b < CHAR_HITS; b++) {
       const j = i * CHAR_HITS + b
       if (tree.state === 'charred' && b < tree.charHits) {
-        _pos.set(tree.x, (TRUNK_H - 0.25) * s, tree.z)
+        _pos.set(tree.x, tree.y + (TRUNK_H - 0.25) * s, tree.z)
         _quat.setFromAxisAngle(_yAxis, tree.yaw + BRANCH_YAWS[b]!)
         _scaleV.setScalar(s)
         _matrix.compose(_pos, _quat, _scaleV)
@@ -456,7 +540,14 @@ const _finishedBurning: number[] = []
 const _flickerColor = new Color()
 
 export function TreesDestruct({ world }: { world: GameWorld }) {
-  const trees = useMemo(() => buildTreesFrom(treePlacements(world)), [world])
+  const scene = useThree((s) => s.scene)
+  const trees = useMemo(() => {
+    const host = world.hostTrees ?? []
+    return buildTreesFrom([
+      ...withoutHostOverlap(treePlacements(world), host),
+      ...hostTreePlacements(host),
+    ])
+  }, [world])
 
   const trunkGeometry = useMemo(
     () => new CylinderGeometry(TRUNK_R_TOP, TRUNK_R_BOT, TRUNK_H).translate(0, TRUNK_H / 2, 0),
@@ -481,6 +572,18 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
   const smokeClock = useRef(0)
 
   useEffect(() => {
+    // Host trees leave the stage for the session: hide the per-node
+    // registered roots (selection proxies — they mount real geometry while
+    // hovered/selected) AND the collective forest InstancedMeshes, all
+    // through the restore ledger — exitGame flips every visibility back,
+    // the scene store is never written. hideForGame skips already-hidden
+    // objects, so effect re-runs (world refresh, Fast Refresh) are safe.
+    const host = world.hostTrees ?? []
+    if (host.length > 0) {
+      for (const tree of host) hideForGame(tree.root)
+      for (const mesh of collectHostForestMeshes(scene, host)) hideForGame(mesh)
+    }
+
     liveTrees = trees
     revision++
     registerTreeRoutes<TreeHit>({
@@ -493,7 +596,7 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
       crackle.current?.stop()
       crackle.current = null
     }
-  }, [trees])
+  }, [trees, world, scene])
 
   useFrame((_, rawDt) => {
     const dt = Math.min(rawDt, 1 / 30)
@@ -504,7 +607,7 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
     for (const id of _finishedBurning) {
       const tree = trees[id]!
       burstCanopy(tree, true)
-      _dustPos.set(tree.x, CANOPY_CY * tree.scale, tree.z)
+      _dustPos.set(tree.x, tree.y + CANOPY_CY * tree.scale, tree.z)
       spawnDust(_dustPos, 0.8, PUFF)
       sfx.charSnap()
       revision++
@@ -540,12 +643,12 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
       if (smoke) {
         _dustPos.set(
           tree.x + (Math.random() - 0.5) * tree.scale,
-          (CANOPY_CY + 1) * tree.scale,
+          tree.y + (CANOPY_CY + 1) * tree.scale,
           tree.z + (Math.random() - 0.5) * tree.scale,
         )
         spawnDust(_dustPos, 0.35 + t * 0.3, PUFF)
         if (Math.random() < 0.4) {
-          spawnDebris(tree.x, (CANOPY_CY + 0.5) * tree.scale, tree.z, 0.05, EMBER, 1.2, 1.1)
+          spawnDebris(tree.x, tree.y + (CANOPY_CY + 0.5) * tree.scale, tree.z, 0.05, EMBER, 1.2, 1.1)
         }
       }
     }

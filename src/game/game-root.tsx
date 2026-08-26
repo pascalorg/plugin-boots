@@ -2,7 +2,7 @@
 
 import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
-import type { Object3D } from 'three'
+import { type Object3D, Raycaster, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { GameBoundary } from './boundary'
 import { Builder, PlacedPieces } from './builder'
@@ -21,9 +21,9 @@ import { GlassCracks, resetGlass } from './glass'
 import { Grenades } from './grenade'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
-import { Player, playerDebug } from './player'
+import { Player, playerDebug, playerRig } from './player'
 import { getSession, hideForGame, getSessionSerial } from './session'
-import { fire } from './shooting'
+import { aimDirection, fire } from './shooting'
 import { GameSky } from './sky'
 import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
@@ -208,6 +208,94 @@ function dumpDestructionMembers(field: 'segments' | 'sheets'): Array<Record<stri
   return out
 }
 
+const _idRay = new Raycaster()
+const _idOrigin = new Vector3()
+const _idDir = new Vector3()
+
+/** One entry of the identifyAim() hit chain — plain data, never live refs. */
+type IdentifiedHit = {
+  name: string
+  type: string
+  /** Ancestor names root-ward (nearest parent first; '' → placeholder). */
+  parentNames: string[]
+  userDataKeys: string[]
+  nodeId: string | null
+  materialName: string | null
+  materialColor: string | null
+  visible: boolean
+  layersMask: number
+  distance: number
+  point: [number, number, number]
+  boots: boolean
+}
+
+/**
+ * Diagnosis probe (mid-surface lane 2026-08-25): raycast the WHOLE scene —
+ * recursive, every layer — and name the first few surfaces that would
+ * actually RENDER along the ray (self + every ancestor visible; mask-0
+ * objects are skipped by the layer test, matching the per-frame hider).
+ * This is the tool that identifies a mystery unbreakable face: name, parent
+ * chain, userData keys, material, layers, distance. Read-only.
+ */
+function identifyRay(
+  scene: Object3D,
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  max = 5,
+): IdentifiedHit[] {
+  _idRay.ray.origin.set(ox, oy, oz)
+  _idRay.ray.direction.set(dx, dy, dz).normalize()
+  _idRay.far = 500
+  _idRay.layers.enableAll()
+  let intersections: Array<{ object: Object3D; distance: number; point: Vector3 }> = []
+  try {
+    intersections = _idRay.intersectObject(scene, true)
+  } catch {
+    // A hostile object without raycast support — fall through with what we have.
+  }
+  const out: IdentifiedHit[] = []
+  for (const hit of intersections) {
+    if (out.length >= max) break
+    // Would-render filter: an invisible object OR ancestor culls the surface.
+    let renders = true
+    let nodeId: string | null = null
+    const parentNames: string[] = []
+    for (let walker: Object3D | null = hit.object; walker; walker = walker.parent) {
+      if (!walker.visible) {
+        renders = false
+        break
+      }
+      if (walker !== hit.object) parentNames.push(walker.name || `<${walker.type}>`)
+      const id = (walker.userData as { nodeId?: unknown }).nodeId
+      if (nodeId === null && typeof id === 'string') nodeId = id
+    }
+    if (!renders) continue
+    const mesh = hit.object as unknown as {
+      material?: { name?: string; color?: { getHexString?: () => string } }
+    }
+    const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
+    out.push({
+      name: hit.object.name,
+      type: hit.object.type,
+      parentNames,
+      userDataKeys: Object.keys(hit.object.userData ?? {}),
+      nodeId,
+      materialName: material?.name || null,
+      materialColor: material?.color?.getHexString?.() ?? null,
+      visible: hit.object.visible,
+      layersMask: hit.object.layers.mask,
+      distance: hit.distance,
+      point: [hit.point.x, hit.point.y, hit.point.z],
+      boots: Boolean((hit.object.userData as { __boots?: boolean }).__boots),
+    })
+  }
+  return out
+}
+
 function ActiveGame() {
   // Snapshot once per session — walls don't move while you shoot them.
   const [world, setWorld] = useState(() => collectWorld())
@@ -310,6 +398,25 @@ function ActiveGame() {
       // via the SAME exported predicates the hiders use, so QA asserting
       // this asserts the match set itself.
       countCoplanarSuspects: () => countCoplanarSuspects(scene),
+      // Mid-surface identifier (owner round 2026-08-25): name the surfaces
+      // the crosshair ray would actually RENDER, nearest-first — the tool
+      // that attributes any "unbreakable face" to its owning mesh. (It
+      // cleared the owner's report: the veil plugging fresh breaches was
+      // lingering dust/haze, fixed in dust.tsx.)
+      identifyAim: (max = 5) => {
+        _idOrigin.copy(playerRig.position)
+        aimDirection(_idDir, 0)
+        return identifyRay(
+          scene,
+          _idOrigin.x,
+          _idOrigin.y,
+          _idOrigin.z,
+          _idDir.x,
+          _idDir.y,
+          _idDir.z,
+          max,
+        )
+      },
       // Combat-tree dump (trees-destruct.tsx): id/x/z/scale/state/hp/
       // canopyDamage/burnT/charHits per tree; [] outside a session.
       trees: () => treesDebug.dump(),

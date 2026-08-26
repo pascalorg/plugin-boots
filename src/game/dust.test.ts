@@ -1,6 +1,17 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Vector3 } from 'three'
-import { clearDust, coneDirection, dustCounts, spawnDust, spawnHaze } from './dust'
+import {
+  clearDust,
+  coneDirection,
+  dustCounts,
+  dustDebug,
+  HAZE_MAX_RADIUS,
+  HAZE_NEAR_DEAD,
+  HAZE_NEAR_FULL,
+  hazeNearFade,
+  spawnDust,
+  spawnHaze,
+} from './dust'
 
 /**
  * Pure-logic pins for the dust module: cone sampling math, per-kind spawn
@@ -143,5 +154,44 @@ describe('spawnHaze', () => {
     spawnHaze(P, 3)
     spawnHaze(1, 2, 3)
     expect(dustCounts().haze).toBe(2)
+  })
+})
+
+// ── Haze anti-"fake wall" guards (owner mid-surface round 2026-08-26) ──────
+// A haze quad centered in a carve breach read as a solid gray plane plugging
+// the hole. These pins keep haze an atmosphere: capped size, faint, short,
+// and fully dissolved near the camera.
+
+describe('haze veil guards', () => {
+  test('size is clamped, opacity faint, life short — even for a huge plume haze', () => {
+    for (let i = 0; i < 12; i++) spawnHaze(P, 10) // way past the cap
+    const meta = dustDebug().hazeMeta as Array<{ size: number; ttl: number; alpha: number }>
+    expect(meta.length).toBe(12)
+    for (const s of meta) {
+      // Base radius capped at HAZE_MAX_RADIUS; spawn wobble adds ≤ 10%.
+      expect(s.size).toBeLessThanOrEqual(HAZE_MAX_RADIUS * 1.1 + 1e-9)
+      expect(s.alpha).toBeLessThanOrEqual(0.22 + 1e-9)
+      expect(s.ttl).toBeLessThanOrEqual(3.4 + 1e-9)
+      expect(s.ttl).toBeGreaterThanOrEqual(2.4 - 1e-9)
+    }
+  })
+
+  test('hazeNearFade: invisible at the camera, full past the fade band, monotonic', () => {
+    expect(hazeNearFade(0)).toBe(0)
+    expect(hazeNearFade(HAZE_NEAR_DEAD)).toBe(0)
+    expect(hazeNearFade(HAZE_NEAR_FULL)).toBe(1)
+    expect(hazeNearFade(50)).toBe(1)
+    let prev = 0
+    for (let d = HAZE_NEAR_DEAD; d <= HAZE_NEAR_FULL + 1e-9; d += 0.05) {
+      const f = hazeNearFade(d)
+      expect(f).toBeGreaterThanOrEqual(prev)
+      expect(f).toBeGreaterThanOrEqual(0)
+      expect(f).toBeLessThanOrEqual(1)
+      prev = f
+    }
+    // Mid-band is genuinely between — the fade is a ramp, not a step.
+    const mid = hazeNearFade((HAZE_NEAR_DEAD + HAZE_NEAR_FULL) / 2)
+    expect(mid).toBeGreaterThan(0.25)
+    expect(mid).toBeLessThan(0.75)
   })
 })

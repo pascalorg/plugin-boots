@@ -1,11 +1,21 @@
 import { sceneRegistry, useScene } from '@pascal-app/core'
-import { Box3, BufferAttribute, BufferGeometry, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
+import {
+  Box3,
+  BufferAttribute,
+  BufferGeometry,
+  type InstancedMesh,
+  Matrix4,
+  type Mesh,
+  type Object3D,
+  Vector3,
+} from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
 
 /**
  * One-shot world snapshot taken when the game starts: which host meshes are
  * solid (colliders + bullet targets), which walls are voxel-destructible,
- * which panes are glass, where the building sits, and where to spawn.
+ * which panes are glass, which scene nodes are vegetation trees (combat
+ * replacement — hostTrees), where the building sits, and where to spawn.
  *
  * BVHs are cached per-geometry in a module WeakMap — never attached to the
  * host's `geometry.boundsTree`, so the editor's own raycasting is untouched.
@@ -62,6 +72,33 @@ export type RoadFootprint = {
   maxZ: number
 }
 
+/**
+ * One host-scene vegetation tree node (a plugin kind like `trees:tree`),
+ * captured so the session can swap it for a combat tree at the same world
+ * transform. `root` is the node's REGISTERED object — for instanced plant
+ * plugins that is the per-node selection proxy (it carries the node's world
+ * transform and mounts the real geometry while hovered/selected), so hiding
+ * it through the restore ledger covers the proxy lane; the collective
+ * forest InstancedMeshes are found separately via collectHostForestMeshes.
+ */
+export type HostTreeNode = {
+  nodeId: string
+  /** The registered node root — hide via the session restore ledger only. */
+  root: Object3D
+  /** World-space base position (includes level offset + floor lift). */
+  x: number
+  y: number
+  z: number
+  /** Y rotation in radians (node.rotation[1], 0 when absent). */
+  yaw: number
+  /** Overall tree height in meters (node.height, defaulted when absent). */
+  height: number
+  /** True when the node sits on a hidden branch (level toggled off …).
+   * Hidden trees get NO combat replacement but stay in the list so forest
+   * InstancedMesh matching still recognizes every instance. */
+  hidden: boolean
+}
+
 export type GameWorld = {
   colliders: ColliderEntry[]
   /** wall nodeId → its colliders' indices + node data (for stud generation). */
@@ -79,6 +116,10 @@ export type GameWorld = {
    * hand-built test worlds don't have to carry it; collectWorld always
    * fills it (possibly empty). */
   roadFootprints?: RoadFootprint[]
+  /** Host-scene vegetation trees (isTreeKind registry kinds) captured for
+   * combat replacement by trees-destruct.tsx. Optional so hand-built test
+   * worlds don't carry it; collectWorld always fills it (possibly empty). */
+  hostTrees?: HostTreeNode[]
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -516,6 +557,150 @@ export function collectRoadFootprints(colliders: readonly ColliderEntry[]): Road
   return footprints
 }
 
+// ---------------------------------------------------------------------------
+// Host-scene vegetation trees (combat replacement — trees-destruct.tsx)
+// ---------------------------------------------------------------------------
+
+/** Exact registry kinds that are host vegetation trees. */
+export const TREE_KINDS = ['tree', 'vegetation']
+
+/** Kind SUFFIXES treated as host trees in addition to the exact list —
+ * plugin kinds namespace as `<plugin>:<kind>` (the community vegetation
+ * plugin registers `trees:tree`), so any registered `*:tree` /
+ * `*:vegetation` is a tree by construction. Exported so QA can assert the
+ * predicate. Grass/flower kinds (`trees:grass`, `trees:flower`) are ground
+ * flora, NOT trees — they stay untouched. */
+export const TREE_KIND_SUFFIXES = [':tree', ':vegetation']
+
+/** The node-detection predicate: is this registry kind a host tree?
+ * Single source of truth for collectHostTrees — QA asserting this asserts
+ * the collection's match set. */
+export function isTreeKind(kind: string): boolean {
+  if (!kind) return false
+  if (TREE_KINDS.includes(kind)) return true
+  for (const suffix of TREE_KIND_SUFFIXES) if (kind.endsWith(suffix)) return true
+  return false
+}
+
+/** Fallback overall height (m) when a tree node carries no numeric height. */
+const DEFAULT_HOST_TREE_HEIGHT = 6
+
+const _treePos = new Vector3()
+
+/**
+ * Every registered host tree node, world transform resolved from the
+ * REGISTERED object (instanced plant plugins keep the per-node registered
+ * proxy at the node's transform, floor lift included — the store position
+ * is level-local). Hidden-branch trees are captured with `hidden: true`
+ * (see HostTreeNode). `nodes` is the scene store's node record —
+ * collectWorld passes its own snapshot; tests pass a hand-built record.
+ */
+export function collectHostTrees(nodes: Record<string, Record<string, unknown>>): HostTreeNode[] {
+  const hostTrees: HostTreeNode[] = []
+  for (const kind of Object.keys(sceneRegistry.byType)) {
+    if (!isTreeKind(kind)) continue
+    const ids = sceneRegistry.byType[kind]
+    if (!ids) continue
+    for (const id of ids) {
+      const root = sceneRegistry.nodes.get(id)
+      const node = nodes[id]
+      if (!root || !node) continue
+      root.updateWorldMatrix(true, false)
+      _treePos.setFromMatrixPosition(root.matrixWorld)
+      const rotation = node.rotation
+      const yaw = Array.isArray(rotation) && typeof rotation[1] === 'number' ? rotation[1] : 0
+      const height =
+        typeof node.height === 'number' && Number.isFinite(node.height) && node.height > 0
+          ? node.height
+          : DEFAULT_HOST_TREE_HEIGHT
+      hostTrees.push({
+        nodeId: id,
+        root,
+        x: _treePos.x,
+        y: _treePos.y,
+        z: _treePos.z,
+        yaw,
+        height,
+        hidden: onHiddenBranch(root),
+      })
+    }
+  }
+  return hostTrees
+}
+
+/** XZ tolerance (m) matching a forest instance to a captured tree. Instance
+ * matrices and the registered proxy share the exact same source transform,
+ * so this only absorbs float folding (parent level matrix multiply). */
+const TREE_MATCH_EPS_XZ = 0.075
+/** Y tolerance (m) — instance Y and proxy Y both come from the host's floor
+ * lift but through two code paths; keep it loose (a tree is meters tall). */
+const TREE_MATCH_EPS_Y = 1.5
+
+const _forestMatrix = new Matrix4()
+
+/**
+ * Is this object a collective forest InstancedMesh for the captured host
+ * trees? Instanced plant plugins batch every tree of a geometry variant
+ * into one InstancedMesh AT THE SCENE ROOT (outside any registered root,
+ * no marker name/userData), so the only reliable signature is positional:
+ * every live instance translation must coincide with a captured tree's
+ * world position (hidden ones included — see HostTreeNode.hidden), and the
+ * instance count can't exceed the tree count. Zero-count meshes never
+ * match. Exported so QA can assert the predicate.
+ */
+export function isForestInstancedMesh(
+  object: Object3D,
+  hostTrees: readonly HostTreeNode[],
+): boolean {
+  const mesh = object as InstancedMesh
+  if ((mesh as { isInstancedMesh?: boolean }).isInstancedMesh !== true) return false
+  const count = mesh.count
+  if (count === 0 || count > hostTrees.length) return false
+  for (let i = 0; i < count; i++) {
+    mesh.getMatrixAt(i, _forestMatrix)
+    const e = _forestMatrix.elements
+    let matched = false
+    for (const tree of hostTrees) {
+      if (
+        Math.abs(e[12]! - tree.x) <= TREE_MATCH_EPS_XZ &&
+        Math.abs(e[14]! - tree.z) <= TREE_MATCH_EPS_XZ &&
+        Math.abs(e[13]! - tree.y) <= TREE_MATCH_EPS_Y
+      ) {
+        matched = true
+        break
+      }
+    }
+    if (!matched) return false
+  }
+  return true
+}
+
+/**
+ * The collective forest InstancedMeshes rendering the captured host trees —
+ * the meshes the session must hide (through the restore ledger ONLY)
+ * alongside the per-node registered roots. Skips `__boots` subtrees
+ * wholesale: the combat grove is itself an InstancedMesh standing at the
+ * same transforms, and matching it would hide the replacement. Pure and
+ * read-only — never mutates the scene.
+ */
+export function collectHostForestMeshes(
+  sceneRoot: Object3D,
+  hostTrees: readonly HostTreeNode[],
+): Object3D[] {
+  const found: Object3D[] = []
+  if (hostTrees.length === 0) return found
+  const walk = (object: Object3D): void => {
+    if ((object.userData as { __boots?: boolean }).__boots) return
+    if (isForestInstancedMesh(object, hostTrees)) {
+      found.push(object)
+      return
+    }
+    for (const child of object.children) walk(child)
+  }
+  walk(sceneRoot)
+  return found
+}
+
 export function collectWorld(): GameWorld {
   const nodes = useScene.getState().nodes as Record<
     string,
@@ -607,6 +792,7 @@ export function collectWorld(): GameWorld {
 
   const overlayRoots = collectOverlayRoots()
   const roadFootprints = collectRoadFootprints(colliders)
+  const hostTrees = collectHostTrees(nodes)
 
   // Spawn: outside the building along +X of its center, eye toward it.
   const spawn = new Vector3(6, 0, 6)
@@ -637,6 +823,7 @@ export function collectWorld(): GameWorld {
     doors,
     overlayRoots,
     roadFootprints,
+    hostTrees,
     buildingAabb,
     spawn,
     spawnYaw,

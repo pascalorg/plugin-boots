@@ -42,7 +42,12 @@ import {
  *     Legacy scalar form spawnDust(x, y, z, intensity, kind?) is still
  *     accepted (5th arg optional, shape or material).
  *   spawnHaze(position, radius?) — one large, faint, slow-rising quad,
- *     4–6 s — call ONCE per crumble/collapse. Legacy (x, y, z) accepted.
+ *     ~2.4–3.4 s — call ONCE per crumble/collapse. Legacy (x, y, z)
+ *     accepted. Radius is clamped to HAZE_MAX_RADIUS, and haze quads fade
+ *     out entirely near the camera (hazeNearFade) — a lingering billboard
+ *     centered in a carve breach must NEVER read as a solid wall plugging
+ *     the hole (owner mid-surface round 2026-08-26: the "unbreakable
+ *     surface" was exactly this quad).
  *   clearDust() — session teardown (also runs on <DustSystem/> unmount).
  *   <DustSystem/> — renders both pools; mount in the game-root fragment.
  */
@@ -59,6 +64,33 @@ export type DustMaterial = 'drywall' | 'concrete' | 'wood'
 
 /** Drywall at/above this intensity upgrades from puff to plume (+haze). */
 const DRYWALL_HEAVY = 0.7
+
+/**
+ * Haze anti-"fake wall" guards (owner mid-surface round 2026-08-26): after
+ * a heavy drywall carve, the auto-haze quad sat centered in the breach for
+ * 4–6 s at ~0.3 alpha and 5–8 m across — through the hole it read as a
+ * solid gray speckled surface, and every follow-up shot re-seeded it, so
+ * the breach looked permanently plugged by an unbreakable mid-wall layer.
+ * Caps below keep haze an atmosphere, never a surface.
+ */
+/** Hard cap on a haze quad's base radius (m) — plume auto-haze asked 3.6. */
+export const HAZE_MAX_RADIUS = 2.4
+/** Camera distance (m) at/below which a haze quad is fully invisible. */
+export const HAZE_NEAR_DEAD = 0.9
+/** Camera distance (m) at/above which a haze quad is fully opaque. */
+export const HAZE_NEAR_FULL = 2.4
+
+/**
+ * Proximity multiplier for haze alpha: 0 at ≤ HAZE_NEAR_DEAD, 1 at
+ * ≥ HAZE_NEAR_FULL, smoothstep between — walking up to (or through) a
+ * breach dissolves the veil before it can read as a solid plane.
+ */
+export function hazeNearFade(distance: number): number {
+  if (distance <= HAZE_NEAR_DEAD) return 0
+  if (distance >= HAZE_NEAR_FULL) return 1
+  const t = (distance - HAZE_NEAR_DEAD) / (HAZE_NEAR_FULL - HAZE_NEAR_DEAD)
+  return t * t * (3 - 2 * t)
+}
 
 export type DustOpts = {
   /** Surface normal at the impact — main axis of the ejection cone. */
@@ -336,17 +368,18 @@ function spawnHazeAt(x: number, y: number, z: number, radius?: number): void {
   s.vx = (Math.random() - 0.5) * 0.1
   s.vy = 0.1 + Math.random() * 0.08
   s.vz = (Math.random() - 0.5) * 0.1
-  s.size = (radius ?? 2.4 + Math.random() * 1.2) * (0.9 + Math.random() * 0.2)
+  // Clamp + soften (see HAZE_MAX_RADIUS block): atmosphere, never a surface.
+  s.size = Math.min(radius ?? 2.4 + Math.random() * 1.2, HAZE_MAX_RADIUS) * (0.9 + Math.random() * 0.2)
   s.roll = Math.random() * Math.PI * 2
   s.spin = (Math.random() - 0.5) * 0.24
-  s.alpha = 0.28 + Math.random() * 0.07
+  s.alpha = 0.17 + Math.random() * 0.05
   s.shade = 0.95 + Math.random() * 0.1
   s.cr = DUST_R
   s.cg = DUST_G
   s.cb = DUST_B
   s.tile = Math.floor(Math.random() * 3)
   s.drag = 0
-  s.ttl = 4 + Math.random() * 2
+  s.ttl = 2.4 + Math.random()
   s.ttl0 = s.ttl
 }
 
@@ -364,10 +397,19 @@ export function dustCounts(): { puffs: number; haze: number } {
 
 /**
  * Plain-data dump for the `__boots.dust()` debug handle (game-root
- * feature-detects this export). Counts + caps only — never live refs.
+ * feature-detects this export). Counts + caps + per-live-haze metadata
+ * (the anti-"fake wall" caps are QA-visible) — never live refs.
  */
 export function dustDebug(): Record<string, unknown> {
-  return { puffs: puffLive, haze: hazeLive, puffCap: PUFF_CAP, hazeCap: HAZE_CAP }
+  return {
+    puffs: puffLive,
+    haze: hazeLive,
+    puffCap: PUFF_CAP,
+    hazeCap: HAZE_CAP,
+    hazeMeta: haze
+      .filter((s) => s.alive)
+      .map((s) => ({ size: s.size, ttl: s.ttl, alpha: s.alpha })),
+  }
 }
 
 // --- Rendering ---------------------------------------------------------
@@ -511,7 +553,9 @@ const SETTLE_GRAVITY = 0.4
  * Advance one pool + upload matrices/colors/alphas. Growth: quads start
  * small and disperse to ~2.2× base size; fade-in is a snap (~10% of life),
  * fade-out eases across the rest — dust blooms then hangs. Fade rides the
- * per-instance alpha attribute (NormalBlending), never the color.
+ * per-instance alpha attribute (NormalBlending), never the color. Haze
+ * quads (isPuff false) additionally multiply in hazeNearFade(camera
+ * distance) so a close-up billboard can never read as a solid wall.
  */
 function stepPool(
   pool: QuadSlot[],
@@ -519,6 +563,7 @@ function stepPool(
   dt: number,
   camQuat: Quaternion,
   isPuff: boolean,
+  camPos?: Vector3,
 ): number {
   const alphaAttr = mesh.geometry.getAttribute('instanceAlpha') as InstancedBufferAttribute
   const tileAttr = mesh.geometry.getAttribute('instanceTile') as InstancedBufferAttribute
@@ -548,7 +593,13 @@ function stepPool(
     s.roll += s.spin * dt
     const k = 1 - s.ttl / s.ttl0 // 0 → 1 over life
     const grow = s.size * (0.55 + 1.65 * k)
-    const fade = Math.min(1, k / 0.1) * (1 - k) * (1 - k)
+    let fade = Math.min(1, k / 0.1) * (1 - k) * (1 - k)
+    if (!isPuff && camPos) {
+      const ddx = s.px - camPos.x
+      const ddy = s.py - camPos.y
+      const ddz = s.pz - camPos.z
+      fade *= hazeNearFade(Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz))
+    }
     _roll.setFromAxisAngle(_viewAxis, s.roll)
     _quat.copy(camQuat).multiply(_roll)
     _pos.set(s.px, s.py, s.pz)
@@ -608,7 +659,7 @@ export function DustSystem() {
     const dt = Math.min(rawDt, 1 / 30)
     const camQuat = state.camera.quaternion
     puffLive = stepPool(puffs, puffMesh, dt, camQuat, true)
-    hazeLive = stepPool(haze, hazeMesh, dt, camQuat, false)
+    hazeLive = stepPool(haze, hazeMesh, dt, camQuat, false, state.camera.position)
   })
 
   if (!texture) return null
