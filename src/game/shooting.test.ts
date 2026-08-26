@@ -113,7 +113,7 @@ describe('tear routing: tearRadius rules walls, holeRadius rules volumes', () =>
     expect(torn).toBeGreaterThan(plain * 3)
   })
 
-  test('tearRadius does NOT touch non-wall volumes (kind-wall targets only)', () => {
+  test('tearRadius does NOT touch non-wall volumes (tear lane = walls + slabs only)', () => {
     const plain = removedByOneShot(GUN, 'crate-1', 10)
     const torn = removedByOneShot(TEAR_GUN, 'crate-1', 10)
     expect(useDestruction.getState().targets.get('crate-1')!.kind).toBe('volume')

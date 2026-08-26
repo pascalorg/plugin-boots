@@ -22,6 +22,9 @@ import { useDestruction, type VoxelTarget } from './destruction'
  *      are pre-voxelized on enter), so it has to read clean and cozy at a
  *      glance. Voxel removal writes a zero-scale matrix at the voxel's
  *      index on revision bumps — indices stay stable, uploads stay small.
+ *      SLAB sandwiches (kind 'slab' — horizontal, thickness axis Y) wear
+ *      two tones: top skin keeps the host floor tone, bottom skin (the
+ *      ceiling face) lightens toward drywall white.
  *   2. BOARDS — flat drywall plates behind the voxels (#e8e4dc, faint
  *      per-plate shade jitter, ~1% per-plate inset for the hairline seam
  *      read). Torn plates hide via zero-scale.
