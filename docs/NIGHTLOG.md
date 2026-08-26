@@ -736,3 +736,34 @@ chips framing (chipSegmentSplash, hp-1 floor). Suite: 307 pass / 0 fail,
 tsc clean, real exit codes checked. Known QA-watch items: no budgeted
 placement-voxelize queue (turbo worst case ~20 ensureVoxelTarget/s), panel
 copy still says floors stay game-only (Keep now attempts slabs).
+
+## Phase 5, round 2 — turbo clad budget + Keep toast truth (2026-08-26, manager stitch)
+
+Two workers this round; both landed clean on top of the overnight owner
+commits (quaternion-grid basis, E-interact, Phase A stacked levels).
+
+- **ghost-targeting** (builder.tsx + builder.test.ts): the REVIEW's perf
+  risk closed — requestPieceClad replaces the raw ensureVoxelTarget call in
+  PlacedPieceMesh's layout effect. Gap ≥ CLAD_BURST_MS (125 ms, between
+  TURBO_FIRST 150 and TURBO_NEXT 50) with no backlog → instant bricks
+  (single clicks unchanged); otherwise a head-index FIFO (dedupe per
+  nodeId, backlog captures slow newcomers so order beats freshness) that
+  PlacedPieces drains CLAD_DRAIN_PER_FRAME=2 per frame (~120/s vs 20/s
+  worst case). cancelPieceClad on unmount — a drained slot never clads a
+  dead entry; already-clad pieces (bullet-hit damageTarget) no-op.
+  Deferred pieces keep the plain solid mesh: visible, collidable,
+  shootable. resetCladQueue in session teardown. +7 tests.
+- **hud-panel** (panel.tsx): Keep toast now surfaces result.floors; wall
+  count fixed (kept counts roofs/floors too — walls = kept − roofs −
+  floors); keep-note copy matches keep.ts slab semantics (full slabs only,
+  3×3 partial edits deferred). hud.ts audited, no changes needed.
+- **manager**: seams audited (KeepResult.floors exists; PlacedPieces
+  mounted in game-root drains + resets the queue; no host wiring). Brand
+  grep clean. tsc exit 0; bun test exit 0 — 369 pass / 0 fail, 26 files.
+
+Carry-over from p5r1 QA (gate c FAIL, still open — grid.ts untouched since
+ad1b970): slotsTouching 'R' has no cross-storey R↔R adjacency, so ramp
+chains read unsupported (flat sawtooth); movement can't walk the plank; and
+keep.ts roof→roof-segment conversion silently skips (all 8 roofs skipped in
+QA). Round 3 tasks dispatched: ghost-targeting owns the grid adjacency +
+ramp-run targeting + slope walk; store-keep owns the roof-segment debug.

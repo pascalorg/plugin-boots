@@ -69,14 +69,23 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * removes each piece from the store, so its unmount runs the exact undo
  * cleanup (collider splice + voxel dropTarget) + a debris burst.
  *
- * ── INSTANT BRICKS (phase 4) ──────────────────────────────────────────────
+ * ── INSTANT BRICKS (phase 4) + TURBO CLAD BUDGET (phase 5) ────────────────
  * A placed piece is voxel-clad THE MOMENT it lands: PlacedPieceMesh routes
- * itself through ensureVoxelTarget in its layout effect (before first
+ * itself through requestPieceClad in its layout effect (before first
  * paint), so the merged-box mesh ledger-hides immediately, its collider
  * entry disables (voxels take over collision — never double-solid), and the
  * piece reads as bricks from the first frame. Degenerate grids fall back to
  * the plain solid mesh. Undo/mask-edit cleanup still drops the replica via
  * dropTarget.
+ * BUDGET (REVIEW perf risk): a turbo sweep lands up to 20 pieces/s and 20
+ * voxelizations/s would hitch. Placements arriving closer together than
+ * CLAD_BURST_MS (~8/s — the threshold sits BETWEEN the turbo cadences, so
+ * TURBO_FIRST singles stay instant and TURBO_NEXT sweep stamps defer) push
+ * into a FIFO that PlacedPieces' frame loop drains CLAD_DRAIN_PER_FRAME
+ * per frame; until its turn a deferred piece keeps the plain solid mesh —
+ * visible, collidable, shootable (damageTarget voxelizes on demand, the
+ * drain then no-ops on the existing target). Unmount cancels its pending
+ * request, so a drained slot never clads a dead entry.
  *
  * ── 3×3 CELL MASK (phase 3) ───────────────────────────────────────────────
  * Every placed piece renders as a 3×3 grid of cell boxes honoring its
@@ -112,6 +121,9 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *       piece-slots.ts's job now.
  *   rotatedYaw(autoYaw, quarterTurns)   pure R-rotate math: auto-facing yaw
  *       + quarter turns, wrapped to [−π, π) so poses stay comparable.
+ *   requestPieceClad / cancelPieceClad / drainCladQueue / cladQueueSize /
+ *   resetCladQueue + CLAD_BURST_MS / CLAD_DRAIN_PER_FRAME    the budgeted
+ *       voxelize queue (see TURBO CLAD BUDGET above).
  *   builderDebug (dev, `globalThis.__bootsBuilder` in-game)   holdFire
  *       stands in for the held LMB in headless E2E; ghost() snapshots the
  *       resolved slot ghost (slotId, pose, valid, reason).
@@ -692,6 +704,89 @@ function makeSceneSupportProbe(world: GameWorld): SceneSupportProbe {
   }
 }
 
+// --- Budgeted clad queue (TURBO CLAD BUDGET — see the header block) ----------
+
+/** Placements arriving closer together than this (ms) read as a turbo burst
+ * and defer. Sits between the turbo cadences: TURBO_FIRST placements
+ * (≥150 ms apart — every single click) voxelize instantly, TURBO_NEXT sweep
+ * stamps (50 ms apart) queue. 125 ms ≡ the REVIEW's ~8/s threshold. */
+export const CLAD_BURST_MS = 125
+/** Deferred voxelizations drained per frame (~120/s at 60 fps — comfortably
+ * above the 20/s turbo worst case, so the backlog stays a few frames deep). */
+export const CLAD_DRAIN_PER_FRAME = 2
+
+const cladNow: () => number =
+  typeof performance !== 'undefined' ? () => performance.now() : () => Date.now()
+
+/** FIFO of deferred clads. Entries are never spliced — cancellation just
+ * drops the nodeId from `cladPending`, and the drain skips stale rows —
+ * so `cladHead` walks forward without reshuffling (no hot-loop work). */
+const cladQueue: { world: GameWorld; nodeId: string }[] = []
+let cladHead = 0
+/** nodeIds still owed a clad — the dedupe (one queue row per piece) AND the
+ * cancellation token (unmount deletes; the drain honors the deletion). */
+const cladPending = new Set<string>()
+let lastCladRequestAt = Number.NEGATIVE_INFINITY
+
+/** Deferred clads still owed (skips cancelled rows) — QA/test hook. */
+export function cladQueueSize(): number {
+  return cladPending.size
+}
+
+/**
+ * Voxel-clad `nodeId` now if placements are landing slowly (single clicks —
+ * the instant-bricks feel is untouched), else join the FIFO: a burst is a
+ * request < CLAD_BURST_MS after the previous one, and while ANY backlog
+ * exists newcomers queue behind it regardless of their gap (FIFO order
+ * beats freshness — draining must never starve the oldest plain piece).
+ * `nowMs` is injectable for tests; callers omit it.
+ */
+export function requestPieceClad(world: GameWorld, nodeId: string, nowMs = cladNow()): void {
+  const burst = nowMs - lastCladRequestAt < CLAD_BURST_MS
+  lastCladRequestAt = nowMs
+  if (!burst && cladPending.size === 0) {
+    ensureVoxelTarget(world, nodeId)
+    return
+  }
+  if (cladPending.has(nodeId)) return
+  cladPending.add(nodeId)
+  cladQueue.push({ world, nodeId })
+}
+
+/** Forget a pending clad (piece unmounted before its turn). Idempotent;
+ * a nodeId that already clad — or was never queued — is a no-op. */
+export function cancelPieceClad(nodeId: string): void {
+  cladPending.delete(nodeId)
+}
+
+/**
+ * Voxelize up to `limit` deferred pieces (cancelled rows don't count
+ * against the budget). PlacedPieces drives this once per frame. A piece
+ * that already clad through another door (damageTarget on a bullet hit)
+ * no-ops here — ensureVoxelTarget returns the live target untouched.
+ */
+export function drainCladQueue(limit = CLAD_DRAIN_PER_FRAME): void {
+  let clad = 0
+  while (cladHead < cladQueue.length && clad < limit) {
+    const request = cladQueue[cladHead++]!
+    if (!cladPending.delete(request.nodeId)) continue // cancelled while queued
+    ensureVoxelTarget(request.world, request.nodeId)
+    clad++
+  }
+  if (cladHead >= cladQueue.length) {
+    cladQueue.length = 0 // fully drained — release the world refs
+    cladHead = 0
+  }
+}
+
+/** Session teardown / test isolation: drop the backlog and the burst clock. */
+export function resetCladQueue(): void {
+  cladQueue.length = 0
+  cladHead = 0
+  cladPending.clear()
+  lastCladRequestAt = Number.NEGATIVE_INFINITY
+}
+
 const PIECE_DEBRIS_COLOR = new Color('#9aa8b5')
 /** Debris chunks per collapsed piece — a visible burst, not a particle storm
  * (cascades can evict dozens of pieces back-to-back). */
@@ -699,10 +794,13 @@ const COLLAPSE_DEBRIS = 7
 
 /** One placed piece: the RENDERED merged-cell mesh doubles as its collider,
  * and the piece is voxel-clad THE MOMENT it lands — the layout effect
- * routes it straight through ensureVoxelTarget (before first paint), which
- * ledger-hides this mesh, disables the collider entry it just pushed
- * (voxels own collision + bullets from frame one — never double-solid),
- * and hands rendering to the voxel replica: bricks from the beginning.
+ * routes it through requestPieceClad (before first paint), which for a
+ * single placement runs ensureVoxelTarget right away: it ledger-hides this
+ * mesh, disables the collider entry it just pushed (voxels own collision +
+ * bullets from frame one — never double-solid), and hands rendering to the
+ * voxel replica: bricks from the beginning. TURBO bursts defer instead
+ * (see the clad queue above): the piece stays this plain solid mesh —
+ * visible, collidable, shootable — until the per-frame drain clads it.
  * A mask edit swaps the piece OBJECT in the store, so this effect re-runs:
  * the old collider entry is spliced out (and the voxel replica of the old
  * shape dropped) and a fresh entry with the new merged-cell BVH goes in,
@@ -732,11 +830,15 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
       nodeType: 'block',
     }
     world.colliders.push(entry)
-    // INSTANT BRICKS: voxelize now, not on first hit. ensureVoxelTarget
-    // hides the mesh and sets entry.disabled itself; a null return means a
-    // degenerate grid — the plain solid mesh above stays as the fallback.
-    ensureVoxelTarget(world, entry.nodeId)
+    // INSTANT BRICKS, budgeted: single placements voxelize now, not on
+    // first hit; turbo bursts defer to the clad FIFO. Either way
+    // ensureVoxelTarget hides the mesh and sets entry.disabled itself when
+    // it runs; a null return means a degenerate grid — the plain solid
+    // mesh above stays as the fallback (the same look a deferred piece
+    // wears while it waits).
+    requestPieceClad(world, entry.nodeId)
     return () => {
+      cancelPieceClad(entry.nodeId) // still queued → never clad a dead entry
       entry.disabled = true
       const index = world.colliders.indexOf(entry)
       if (index !== -1) world.colliders.splice(index, 1)
@@ -764,11 +866,16 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
 /** Solid, collidable render of everything placed this session — and the
  * session wiring for the slot registry: installs the scene-support probe,
  * re-registers any stored pieces (re-entry with a pending Keep/Discard),
- * and owns the collapse listener (store removal + debris burst; the
- * piece's unmount then runs the exact undo cleanup: collider splice +
- * voxel dropTarget). Unmount = session teardown → resetPieceSlots(). */
+ * owns the collapse listener (store removal + debris burst; the piece's
+ * unmount then runs the exact undo cleanup: collider splice + voxel
+ * dropTarget), and drains the budgeted clad FIFO a few pieces per frame.
+ * Unmount = session teardown → resetPieceSlots() + resetCladQueue(). */
 export function PlacedPieces({ world }: { world: GameWorld }) {
   const placed = useBoots((s) => s.placed)
+
+  useFrame(() => {
+    drainCladQueue()
+  })
 
   useEffect(() => {
     setSceneSupportProbe(makeSceneSupportProbe(world))
@@ -794,6 +901,7 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     return () => {
       off()
       resetPieceSlots() // cancels pending rings; probe + registry die with the session
+      resetCladQueue() // pending clads die too (their meshes just unmounted)
     }
   }, [world])
 

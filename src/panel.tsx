@@ -8,7 +8,8 @@ import { enterGame } from './game/session'
 /**
  * The Boots left-rail panel. One big verb: Jump in — the whole editor
  * becomes a game. After a session where you built pieces, the panel offers
- * to keep them (converted into real walls) or discard everything.
+ * to keep them (converted into real wall / roof-segment / slab nodes) or
+ * discard everything.
  */
 export default function BootsPanel() {
   const pendingDecision = useBoots((s) => s.pendingDecision)
@@ -56,15 +57,19 @@ export default function BootsPanel() {
               className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
               onClick={() => {
                 const result = keepPlaced()
+                // `kept` counts every converted piece; roofs and floors are
+                // also tallied separately, so walls = the remainder.
+                const walls = result.kept - result.roofs - result.floors
                 const extras = [
                   result.roofs > 0 ? `${result.roofs} roof${result.roofs === 1 ? '' : 's'}` : '',
+                  result.floors > 0 ? `${result.floors} floor${result.floors === 1 ? '' : 's'}` : '',
                   result.windows > 0 ? `${result.windows} window${result.windows === 1 ? '' : 's'}` : '',
                   result.doors > 0 ? `${result.doors} door${result.doors === 1 ? '' : 's'}` : '',
                 ]
                   .filter(Boolean)
                   .join(', ')
                 setLastKept(
-                  `Kept ${result.kept} wall${result.kept === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
+                  `Kept ${walls} wall${walls === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
                     result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''
                   }`,
                 )
@@ -86,7 +91,8 @@ export default function BootsPanel() {
           </div>
           {otherCount > 0 && (
             <p className="text-[11px] text-sidebar-foreground/40">
-              Roofs try to become real roof segments; floors stay game-only for now.
+              Roofs try to become real roof segments; floors try to become real slabs (full slabs
+              only for now — 3×3 partial edits are deferred).
             </p>
           )}
         </section>

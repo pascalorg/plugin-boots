@@ -3,9 +3,13 @@ import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import {
   builderDebug,
+  cancelPieceClad,
   CELLS,
   cellCenter,
   cellDims,
+  CLAD_BURST_MS,
+  cladQueueSize,
+  drainCladQueue,
   HALF_WALL_MASK,
   isOccupied,
   maskBit,
@@ -14,6 +18,8 @@ import {
   planEditExitTransform,
   planWallMask,
   raycastPieceCell,
+  requestPieceClad,
+  resetCladQueue,
   rotatedYaw,
   STAIR_DOWN_MASK,
   STAIR_UP_MASK,
@@ -62,7 +68,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * edit-exit stair-mask → ramp transform (masks 311/95, exact-only,
  * occupancy-guarded, transformPlaced store swap), and the destructibility
  * route for placed pieces (nodeType 'block' → voxelize INSTANTLY at
- * placement, dropTarget on Z-undo).
+ * placement for singles, via the budgeted clad FIFO for turbo bursts;
+ * dropTarget on Z-undo).
  */
 
 let nextId = 1
@@ -876,5 +883,149 @@ describe('instant voxelize at placement (PlacedPieceMesh wiring, mock level)', (
     // Z-undo / unmount cleanup still drops the replica cleanly.
     dropTarget(entry.nodeId)
     expect(useDestruction.getState().targets.has(entry.nodeId)).toBe(false)
+  })
+})
+
+// --- Deferred clad: the turbo voxelize budget (REVIEW perf risk) -------------
+// requestPieceClad is what PlacedPieceMesh's layout effect calls now: lone
+// placements keep the instant-bricks path, turbo-cadence bursts defer to a
+// FIFO drained a few per frame — the piece stays the plain solid mesh
+// fallback (visible + collidable) until its turn.
+
+/** A world with `n` placed-wall colliders (nodeIds __boots-piece-1..n),
+ * registered the way PlacedPieceMesh does it, spaced one cell apart. */
+function worldWithPlacedWalls(n: number): GameWorld {
+  const colliders: ColliderEntry[] = []
+  const aabb = new Box3()
+  for (let i = 0; i < n; i++) {
+    const pose = piecePose('wall', 0)
+    const mesh = new Mesh(new BoxGeometry(...PIECE_DIMS.wall))
+    mesh.position.set(i * 3, pose.y, 0)
+    mesh.updateMatrixWorld(true)
+    mesh.geometry.computeBoundingBox()
+    const entry: ColliderEntry = {
+      mesh,
+      bvh: bvhFor(mesh),
+      inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+      worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+      root: mesh,
+      nodeId: `__boots-piece-${i + 1}`,
+      nodeType: 'block',
+    }
+    colliders.push(entry)
+    aabb.union(entry.worldBox)
+  }
+  return {
+    colliders,
+    walls: new Map(),
+    glass: [],
+    doors: [],
+    overlayRoots: [],
+    buildingAabb: aabb,
+    spawn: new Vector3(0, 0, 6),
+    spawnYaw: 0,
+    levelId: null,
+  }
+}
+
+describe('deferred clad: turbo bursts queue, singles stay instant', () => {
+  afterEach(() => {
+    resetCladQueue()
+    resetDestruction()
+  })
+
+  const targets = () => useDestruction.getState().targets
+
+  test('the burst threshold sits BETWEEN the turbo cadences', () => {
+    // TURBO_FIRST placements (single clicks, ≥150 ms apart) must voxelize
+    // instantly; TURBO_NEXT sweep stamps (50 ms apart) must defer.
+    expect(CLAD_BURST_MS).toBeLessThan(TURBO_FIRST * 1000)
+    expect(CLAD_BURST_MS).toBeGreaterThan(TURBO_NEXT * 1000)
+  })
+
+  test('a lone placement voxelizes instantly — the instant-bricks feel is untouched', () => {
+    const world = worldWithPlacedWalls(1)
+    requestPieceClad(world, '__boots-piece-1', 0)
+    expect(targets().has('__boots-piece-1')).toBe(true)
+    expect(world.colliders[0]!.disabled).toBe(true) // voxels own collision now
+    expect(cladQueueSize()).toBe(0)
+  })
+
+  test('a turbo sweep defers: plain mesh + live collider until the FIFO drains', () => {
+    const world = worldWithPlacedWalls(4)
+    // Press stamp, then TURBO_NEXT-cadence stamps 50 ms apart.
+    requestPieceClad(world, '__boots-piece-1', 0)
+    requestPieceClad(world, '__boots-piece-2', 50)
+    requestPieceClad(world, '__boots-piece-3', 100)
+    requestPieceClad(world, '__boots-piece-4', 150)
+    expect(targets().has('__boots-piece-1')).toBe(true) // the press was a single
+    // The burst pieces are NOT voxelized yet — the plain solid mesh path
+    // (same as a degenerate grid's fallback) keeps them visible + solid.
+    expect(targets().has('__boots-piece-2')).toBe(false)
+    expect(world.colliders[1]!.disabled).toBeFalsy()
+    expect(cladQueueSize()).toBe(3)
+    // One frame's drain clads the budget's worth, in placement order…
+    drainCladQueue(2)
+    expect(targets().has('__boots-piece-2')).toBe(true)
+    expect(targets().has('__boots-piece-3')).toBe(true)
+    expect(targets().has('__boots-piece-4')).toBe(false)
+    expect(world.colliders[1]!.disabled).toBe(true)
+    expect(cladQueueSize()).toBe(1)
+    // …the next frame finishes the backlog.
+    drainCladQueue(2)
+    expect(targets().has('__boots-piece-4')).toBe(true)
+    expect(cladQueueSize()).toBe(0)
+  })
+
+  test('a slow request behind a backlog joins the FIFO (order beats freshness)', () => {
+    const world = worldWithPlacedWalls(3)
+    requestPieceClad(world, '__boots-piece-1', 0)
+    requestPieceClad(world, '__boots-piece-2', 50) // burst → queued
+    requestPieceClad(world, '__boots-piece-3', 1000) // slow gap, but a backlog exists
+    expect(targets().has('__boots-piece-3')).toBe(false)
+    expect(cladQueueSize()).toBe(2)
+    drainCladQueue(1)
+    expect(targets().has('__boots-piece-2')).toBe(true) // oldest first
+    expect(targets().has('__boots-piece-3')).toBe(false)
+    drainCladQueue(1)
+    expect(targets().has('__boots-piece-3')).toBe(true)
+  })
+
+  test('cancel (unmount before its turn) never clads a dead entry nor eats the budget', () => {
+    const world = worldWithPlacedWalls(3)
+    requestPieceClad(world, '__boots-piece-1', 0)
+    requestPieceClad(world, '__boots-piece-2', 50)
+    requestPieceClad(world, '__boots-piece-3', 100)
+    cancelPieceClad('__boots-piece-2') // Z-undo mid-burst
+    expect(cladQueueSize()).toBe(1)
+    drainCladQueue(1) // the cancelled row is skipped for free
+    expect(targets().has('__boots-piece-2')).toBe(false)
+    expect(targets().has('__boots-piece-3')).toBe(true)
+    expect(cladQueueSize()).toBe(0)
+  })
+
+  test('dedupe per nodeId; a piece clad through another door no-ops on drain', () => {
+    const world = worldWithPlacedWalls(2)
+    requestPieceClad(world, '__boots-piece-1', 0)
+    requestPieceClad(world, '__boots-piece-2', 50)
+    requestPieceClad(world, '__boots-piece-2', 100) // mask-edit re-request while queued
+    expect(cladQueueSize()).toBe(1)
+    // A bullet hits the still-plain piece first: damageTarget's own
+    // ensureVoxelTarget clads it ahead of the queue.
+    const early = ensureVoxelTarget(world, '__boots-piece-2')
+    expect(early).not.toBeNull()
+    drainCladQueue()
+    expect(targets().get('__boots-piece-2')).toBe(early!) // same target, untouched
+    expect(cladQueueSize()).toBe(0)
+  })
+
+  test('after the backlog drains and the burst cools, singles are instant again', () => {
+    const world = worldWithPlacedWalls(3)
+    requestPieceClad(world, '__boots-piece-1', 0)
+    requestPieceClad(world, '__boots-piece-2', 50)
+    drainCladQueue()
+    requestPieceClad(world, '__boots-piece-3', 300) // 250 ms later, queue empty
+    expect(targets().has('__boots-piece-3')).toBe(true)
+    expect(cladQueueSize()).toBe(0)
   })
 })
