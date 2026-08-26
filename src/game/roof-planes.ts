@@ -1,4 +1,4 @@
-import type { Color, Mesh } from 'three'
+import { Color, type Mesh } from 'three'
 import { type RoofPlaneBasis, roofPlaneFrame } from './roof-framing'
 
 /**
@@ -276,17 +276,58 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
   return planes
 }
 
+/** Minimal material slice roofSurfaceColor needs (Mesh['material'] items). */
+type MaterialLike = { color?: Color; map?: { image?: unknown } }
+
+/**
+ * Average color of a material's texture map, sampled through a tiny 2D
+ * canvas (browser only — headless test environments simply return null).
+ * The host's shingle materials carry their whole look in the MAP with a
+ * pure-white base color, so reading `material.color` alone yields white;
+ * the 8×8 down-draw average recovers the texture's real tone. Returns null
+ * for compressed/undrawable images (callers keep the base color then).
+ */
+function averageMapColor(material: MaterialLike): Color | null {
+  const image = material.map?.image
+  if (!image || typeof document === 'undefined') return null
+  try {
+    const size = 8
+    const canvas = document.createElement('canvas')
+    canvas.width = size
+    canvas.height = size
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return null
+    ctx.drawImage(image as CanvasImageSource, 0, 0, size, size)
+    const data = ctx.getImageData(0, 0, size, size).data
+    let r = 0
+    let g = 0
+    let b = 0
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]!
+      g += data[i + 1]!
+      b += data[i + 2]!
+    }
+    const n = (data.length / 4) * 255
+    // Canvas bytes are sRGB — convert into three's working color space.
+    return new Color().setRGB(r / n, g / n, b / n, 'srgb')
+  } catch {
+    return null
+  }
+}
+
 /**
  * Dominant ROOF SURFACE color of the merged shell — the fix for the C2 QA
  * defect where targetBaseColor grabbed the FIRST material slot (usually the
  * white Wall/Trim tone) so voxelized roofs rendered white. The merged CSG
- * mesh carries material groups; the roof surface is whichever material owns
- * the most sloped UP-facing triangle area, so sum that per material slot
- * and return the winner's color (cloned). Returns null when no sloped face
- * carries a colored material — callers keep their existing fallback.
+ * mesh carries material groups (0 Wall/Trim, 1 Deck, 2 Interior, 3
+ * Shingle); the roof surface is whichever material owns the most sloped
+ * UP-facing triangle area. Textured winners (the host shingle slots are
+ * white-color + texture) resolve through the map's average tone × base
+ * color. Returns null when no sloped face carries a colored material —
+ * callers keep their existing fallback.
  */
 export function roofSurfaceColor(meshes: readonly Mesh[]): Color | null {
-  const areas = new Map<Color, number>()
+  const areas = new Map<MaterialLike, number>()
   const v = [0, 0, 0, 0, 0, 0, 0, 0, 0]
   for (const mesh of meshes) {
     const geometry = mesh.geometry
@@ -307,9 +348,10 @@ export function roofSurfaceColor(meshes: readonly Mesh[]): Color | null {
       v[o + 2] = m[2]! * x + m[6]! * y + m[10]! * z + m[14]!
     }
     for (const group of groups) {
-      const material = materials[Math.min(group.materialIndex ?? 0, materials.length - 1)]
-      const color = (material as { color?: Color } | undefined)?.color
-      if (!color) continue
+      const material = materials[Math.min(group.materialIndex ?? 0, materials.length - 1)] as
+        | MaterialLike
+        | undefined
+      if (!material?.color) continue
       const start = group.start
       const end = Math.min(total, group.start + group.count)
       let area = 0
@@ -334,16 +376,18 @@ export function roofSurfaceColor(meshes: readonly Mesh[]): Color | null {
         if (ny <= 0 || !slopedPitchOk(ny)) continue
         area += len / 2
       }
-      if (area > 0) areas.set(color, (areas.get(color) ?? 0) + area)
+      if (area > 0) areas.set(material, (areas.get(material) ?? 0) + area)
     }
   }
-  let best: Color | null = null
+  let best: MaterialLike | null = null
   let bestArea = 0
-  for (const [color, area] of areas) {
+  for (const [material, area] of areas) {
     if (area > bestArea) {
       bestArea = area
-      best = color
+      best = material
     }
   }
-  return best ? best.clone() : null
+  if (!best?.color) return null
+  const mapTone = averageMapColor(best)
+  return mapTone ? mapTone.multiply(best.color) : best.color.clone()
 }
