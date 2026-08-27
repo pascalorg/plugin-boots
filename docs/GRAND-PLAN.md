@@ -47,6 +47,12 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   :3002, pushes per round.
 - E2E gap verification (agent): Bones-installed scene (coplanar suspects
   = 0 in game) + host Nature-tree ignite path.
+- QA round 2 (2026-08-26): GREEN at `edf3a42` — all round-1 paint fixes
+  re-verified live, zero invariant violations. Manager confirmation on
+  QA's Gate 2 flag: pyramid grammar (roof 2×2 corner heights, floor 2×2
+  quadrant masks) was NOT scoped this round — the binding
+  BUILD-GRAMMAR-V2-REVIEW verdict defers it, and it stays phase 6 item 2
+  below. No fleet lane owned it; nothing failed to land.
 
 ## Next (phase 6 — the shape-preserving pass)
 
