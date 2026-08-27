@@ -26,6 +26,7 @@ import { GlassCracks, resetGlass } from './glass'
 import { Grenades } from './grenade'
 import { GunTable } from './guntable'
 import { Nature } from './nature'
+import { PaintTool } from './paint'
 import { Player, playerDebug, playerRig } from './player'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { aimDirection, fire } from './shooting'
@@ -517,6 +518,7 @@ function ActiveGame() {
     <>
       <Player world={world} />
       <Viewmodel world={world} />
+      <PaintTool world={world} />
       <Prevoxelize world={world} />
       <ForeignOverlayHide />
       <OverlaySweep />

@@ -6,6 +6,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { Hud } from './hud'
 import { GameInput } from './input'
+import { capturePaint } from './paint-keep'
 import { captureDemolition } from './save-demolition'
 
 /**
@@ -322,5 +323,7 @@ export function exitGame(): void {
   // Snapshot leveled scene nodes BEFORE the game tree (and the destruction
   // state with it) unmounts — the panel offers to save the demolition too.
   const leveled = captureDemolition()
-  useBoots.getState().setPendingDecision(placed.length > 0 || leveled > 0)
+  // Same deal for paint: snapshot sprayed coats before the ledger resets.
+  const painted = capturePaint()
+  useBoots.getState().setPendingDecision(placed.length > 0 || leveled > 0 || painted > 0)
 }

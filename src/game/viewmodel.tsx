@@ -9,6 +9,7 @@ import { sfx } from './audio'
 import { builderDebug } from './builder'
 import { throwGrenade } from './grenade'
 import { MOVE } from './movement'
+import { cyclePaintColor, SprayerModel } from './paint'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { fire } from './shooting'
@@ -32,6 +33,12 @@ import type { GameWorld } from './world'
  * animation stack: draw-in, breathing, look-lag, run bob, landing dip.
  */
 
+/** Everything the hand can hold: the arsenal plus the two tools. 'paint'
+ * joins store.ts's WeaponId with the manager's one-liner — until then the
+ * union lives here and one cast at the setWeapon boundary bridges it (the
+ * fleet feature-detect idiom; the cast is a no-op after the one-liner). */
+type ToolId = WeaponId | 'paint'
+
 /**
  * Classic FPS anchor: low-right of screen, barrel converging on the crosshair.
  * Tuned to the weapon-models extents at the game FOV (90-ish vertical): the
@@ -41,7 +48,7 @@ import type { GameWorld } from './world'
  * of the camera through recoil (+0.07 z) and draw-in, clear of the near plane.
  */
 const POSES: Record<
-  WeaponId,
+  ToolId,
   { pos: [number, number, number]; rot: [number, number, number] }
 > = {
   knife: { pos: [0.3, -0.3, -0.42], rot: [0.05, -0.24, 0.12] },
@@ -55,6 +62,9 @@ const POSES: Record<
   // like a lance — the swing offsets below rotate the whole pose group.
   hammer: { pos: [0.3, -0.42, -0.42], rot: [-1.25, -0.16, 0.1] },
   builder: { pos: [0.32, -0.33, -0.46], rot: [0.07, -0.28, 0.14] },
+  // Sprayer at carry: the little can rides close and slightly rolled in,
+  // nozzle converging on the crosshair like the guns.
+  paint: { pos: [0.28, -0.3, -0.4], rot: [0.12, -0.3, 0.1] },
 }
 
 /**
@@ -66,7 +76,7 @@ const POSES: Record<
  * spread scaling hangs off it too (grenade agent's routing edit).
  */
 const ADS_POSES: Partial<
-  Record<WeaponId, { pos: [number, number, number]; rot: [number, number, number] }>
+  Record<ToolId, { pos: [number, number, number]; rot: [number, number, number] }>
 > = {
   pistol: { pos: [0, -0.21, -0.38], rot: [0, 0, 0] },
   rifle: { pos: [0, -0.235, -0.44], rot: [0, 0, 0] },
@@ -137,7 +147,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const recoilT = useRef(1)
   const flashT = useRef(0)
 
-  const weapon = useBoots((s) => s.weapon)
+  const weapon = useBoots((s) => s.weapon) as ToolId
 
   // Animation state.
   const prevWeapon = useRef(weapon)
@@ -202,13 +212,19 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       else if (action === 'Digit4' || action === 'KeyB') switchWeapon('builder')
       else if (action === 'Digit5') switchWeapon('minigun')
       else if (action === 'Digit6') switchWeapon('hammer')
-      else if (action === 'KeyG') {
+      else if (action === 'Digit7') switchWeapon('paint')
+      else if (action === 'KeyR' && (state.weapon as ToolId) === 'paint') {
+        // R is the builder's ROTATE (held state) everywhere else — with the
+        // sprayer up the tap cycles the palette instead; PaintTool's
+        // change-gated HUD line picks the new color up next frame.
+        cyclePaintColor()
+      } else if (action === 'KeyG') {
         // G is the grenade EVERYWHERE (group contract). The throw itself
         // fires at the RELEASE keyframe of the wind-up below — the stick
         // grenade rises in the hand, whips forward, and lets go.
         if (grenadeAnimT.current === null) grenadeAnimT.current = 0
       } else if (action === 'WheelUp' || action === 'WheelDown') {
-        const list = [...state.owned, 'builder' as const]
+        const list: ToolId[] = [...state.owned, 'builder', 'paint']
         const at = list.indexOf(state.weapon)
         const next = list[(at + (action === 'WheelDown' ? 1 : list.length - 1)) % list.length]!
         switchWeapon(next)
@@ -265,7 +281,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     if (flashRef.current) flashRef.current.visible = flashT.current > 0
 
     const firing = session.input.state.firing
-    const current = useBoots.getState().weapon
+    const current = useBoots.getState().weapon as ToolId
     const staggered = useBoots.getState().staggered
     // Weapon droop while staggered — slow lerp both ways so the arm sags
     // and recovers smoothly instead of snapping.
@@ -304,7 +320,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // Holding fire on a spinUp weapon first accelerates the barrels (no
     // shots); at full spin the trigger block below runs the 24/s stream.
     // Release (or switch/stagger) winds it back down — the whine follows.
-    const heldDef = current !== 'builder' ? WEAPONS[current] : undefined
+    const heldDef = current !== 'builder' && current !== 'paint' ? WEAPONS[current] : undefined
     const wantsSpin = heldDef?.spinUp !== undefined && firing && !staggered
     spinT.current = wantsSpin
       ? Math.min(1, spinT.current + dt / (heldDef?.spinUp ?? 1))
@@ -329,7 +345,9 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       spinDragging.current = false
     }
 
-    if (current !== 'builder' && !staggered) {
+    // The sprayer's trigger loop lives in PaintTool (paint.tsx) — it reads
+    // the non-consuming `firing` state, so the input queue stays ours alone.
+    if (current !== 'builder' && current !== 'paint' && !staggered) {
       const def = WEAPONS[current]
       if (def.id === 'hammer') {
         // Two-phase strike: the click only STARTS the wind-up — the hit
@@ -542,6 +560,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const showMinigun = weapon === 'minigun'
   const showHammer = weapon === 'hammer'
   const showBuilder = weapon === 'builder'
+  const showPaint = weapon === 'paint'
 
   return (
     <group ref={rigRef} userData={{ __boots: true }}>
@@ -580,6 +599,10 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         <group visible={showBuilder}>
           <HammerModel />
         </group>
+        {/* Slot-7 paint sprayer — the can's label band tracks the palette. */}
+        <group visible={showPaint}>
+          <SprayerModel />
+        </group>
         {/* Muzzle flash: repositioned to the active gun's muzzle at fire time. */}
         <mesh position={[0, 0, -0.4]} ref={flashRef} visible={false}>
           <planeGeometry args={[0.16, 0.16]} />
@@ -590,10 +613,12 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   )
 }
 
-function switchWeapon(target: WeaponId): void {
+function switchWeapon(target: ToolId): void {
   const state = useBoots.getState()
-  if (target !== 'builder' && !state.owned.includes(target)) return
-  if (state.weapon === target) return
-  state.setWeapon(target)
+  // Both tools are always available; guns must be picked up first. The
+  // setWeapon cast is the ToolId bridge (see the type's doc above).
+  if (target !== 'builder' && target !== 'paint' && !state.owned.includes(target)) return
+  if ((state.weapon as ToolId) === target) return
+  state.setWeapon(target as WeaponId)
   sfx.weaponSwitch()
 }

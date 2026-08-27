@@ -74,6 +74,7 @@ const WEAPON_LABEL: Record<string, string> = {
   minigun: 'THE BIG ONE',
   builder: 'BUILD',
   hammer: 'HAMMER',
+  paint: 'PAINT',
 }
 
 export class Hud {
@@ -90,6 +91,8 @@ export class Hud {
   private waveEl: HTMLDivElement | null = null
   private pipEl: HTMLDivElement | null = null
   private pipDotEl: HTMLDivElement | null = null
+  private paintEl: HTMLDivElement | null = null
+  private paintDotEl: HTMLDivElement | null = null
   private crossTicksEl: HTMLDivElement | null = null
   private crossDotEl: HTMLDivElement | null = null
   private unsub: (() => void) | null = null
@@ -214,6 +217,16 @@ export class Hud {
     const pipLabel = document.createElement('span')
     pipLabel.textContent = 'G'
     this.pipEl.appendChild(pipLabel)
+    // Paint swatch — current spray color above the grenade pip, hidden until
+    // the sprayer is drawn (see paintSwatch()).
+    this.paintEl = el(
+      `position:absolute;right:28px;bottom:76px;display:none;align-items:center;gap:6px;color:#fff;font:${FONT};font-size:11px;letter-spacing:0.08em;text-shadow:0 1px 3px rgba(0,0,0,0.8)`,
+    )
+    this.paintDotEl = document.createElement('div')
+    this.paintDotEl.style.cssText =
+      'width:10px;height:10px;border-radius:3px;border:1px solid rgba(255,255,255,0.7)'
+    this.paintEl.appendChild(this.paintDotEl)
+    this.paintEl.appendChild(document.createElement('span'))
     // Change gates start from the mounted visual state (pip ready, hip ADS 0)
     // so the first driven frame diffs against what's actually on screen.
     this.pipF = 1
@@ -365,6 +378,24 @@ export class Hud {
   }
 
   /**
+   * Paint-sprayer swatch (above the grenade pip). `hex` = current palette
+   * color, null hides the line. Caller: paint.tsx, change-gated on its side,
+   * feature-detected as `hud.paintSwatch?.(hex, name)`.
+   */
+  paintSwatch(hex: string | null, label = ''): void {
+    const line = this.paintEl
+    const dot = this.paintDotEl
+    if (!line || !dot) return
+    if (!hex) {
+      line.style.display = 'none'
+      return
+    }
+    line.style.display = 'flex'
+    dot.style.background = hex
+    ;(line.lastChild as HTMLElement).textContent = `${label} (R)`
+  }
+
+  /**
    * Aim-down-sights crosshair morph. `v` 0..1 (playerRig.ads): the four hip
    * ticks fade OUT (opacity 1-v) and the small center dot fades IN (opacity
    * v). Safe to call every frame — change-gated. Caller: viewmodel.tsx, as
@@ -482,6 +513,8 @@ export class Hud {
     this.staggerEl = null
     this.pipEl = null
     this.pipDotEl = null
+    this.paintEl = null
+    this.paintDotEl = null
     this.crossTicksEl = null
     this.crossDotEl = null
     this.pipF = -1

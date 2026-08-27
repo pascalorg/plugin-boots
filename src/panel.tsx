@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { useBoots } from './store'
 import { discardPlaced, keepPlaced } from './game/keep'
+import { applyPaint, discardPaint, usePaintKeep } from './game/paint-keep'
 import { deleteDestroyed, discardDemolition, useDemolition } from './game/save-demolition'
 import { enterGame } from './game/session'
 
@@ -16,6 +17,7 @@ export default function BootsPanel() {
   const pendingDecision = useBoots((s) => s.pendingDecision)
   const placed = useBoots((s) => s.placed)
   const destroyed = useDemolition((s) => s.destroyed)
+  const painted = usePaintKeep((s) => s.painted)
   const [lastKept, setLastKept] = useState<string | null>(null)
 
   const wallCount = placed.filter((p) => p.piece === 'wall').length
@@ -46,7 +48,7 @@ export default function BootsPanel() {
         ⏵ Jump in
       </button>
 
-      {pendingDecision && (placed.length > 0 || destroyed.length > 0) && (
+      {pendingDecision && (placed.length > 0 || destroyed.length > 0 || painted.length > 0) && (
         <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
           <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
             Nothing was saved while you played — shooting, breaking, all of it stays in the game.
@@ -66,6 +68,13 @@ export default function BootsPanel() {
               the building (undoable). Partially damaged walls always stay intact.
             </p>
           )}
+          {painted.length > 0 && (
+            <p className="text-xs leading-relaxed">
+              You painted <span className="font-semibold">{painted.length}</span> building
+              element{painted.length > 1 ? 's' : ''} — saving recolors {painted.length > 1 ? 'them' : 'it'} to
+              {painted.length > 1 ? ' their' : ' its'} dominant coat (undoable).
+            </p>
+          )}
           <div className="flex gap-2">
             <button
               className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
@@ -83,10 +92,15 @@ export default function BootsPanel() {
                   .filter(Boolean)
                   .join(', ')
                 const removed = deleteDestroyed()
+                // Paint applies AFTER the demolition delete so nodes removed
+                // just above are skipped instead of patched.
+                const repainted = applyPaint()
                 setLastKept(
                   `Kept ${walls} wall${walls === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
                     removed > 0 ? ` · deleted ${removed} leveled element${removed === 1 ? '' : 's'}` : ''
-                  }${result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''}`,
+                  }${repainted > 0 ? ` · repainted ${repainted}` : ''}${
+                    result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''
+                  }`,
                 )
               }}
               type="button"
@@ -98,6 +112,7 @@ export default function BootsPanel() {
               onClick={() => {
                 discardPlaced()
                 discardDemolition()
+                discardPaint()
                 setLastKept('Discarded — your building is exactly as it was')
               }}
               type="button"
@@ -122,8 +137,8 @@ export default function BootsPanel() {
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the table</p>
         <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
-        <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer</p>
-        <p>RMB aim (pistol/rifle) · Q cycle piece · Esc exit</p>
+        <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer · 7 paint</p>
+        <p>RMB aim (pistol/rifle) · Q cycle piece · R cycles paint color · Esc exit</p>
         <p>
           Pieces lock to the grid — look up to build the ceiling above you, R rotates (walls flip
           sides, roofs turn), run up your ramps while holding click to chain them, Z undo, G

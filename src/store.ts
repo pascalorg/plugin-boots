@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'minigun' | 'hammer' | 'builder'
+export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'minigun' | 'hammer' | 'builder' | 'paint'
 export type BuildPiece = 'wall' | 'floor' | 'roof'
 
 /** All nine cells of a piece's 3×3 grid alive (see PlacedPiece.mask). */
