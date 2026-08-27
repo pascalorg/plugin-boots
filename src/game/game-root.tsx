@@ -1,6 +1,7 @@
 'use client'
 
 import { sceneRegistry } from '@pascal-app/core'
+import { useViewer } from '@pascal-app/viewer'
 import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import { type Object3D, Raycaster, Vector3 } from 'three'
@@ -85,6 +86,51 @@ function ResurrectionSweep() {
       for (const mesh of collectMeshes(root, fence)) hideForGame(mesh)
     }
   })
+  return null
+}
+
+/**
+ * Display-rate frames for the session: the host advances R3F through a
+ * FrameLimiter capped at 50 fps (fixed 20 ms quanta), which beats against
+ * 120 Hz displays as judder — the "feels slow" live report; measured frame
+ * COST was 8–10 ms, so the headroom exists. While the game runs, this
+ * pauses the limiter (renderPaused is read ONLY by it) and drives
+ * `advance` from a raw rAF at the display's own rate, continuing the R3F
+ * clock epoch from where the limiter left it (capped dt so the first
+ * sample never spikes). The limiter's other duty — pixel-ratio/size sync —
+ * is replicated on size/dpr changes (fullscreen enters right after mount).
+ * On exit everything restores; the limiter resumes its own saved clock
+ * (one stale-dt frame in the editor, clamped by consumers).
+ */
+function FrameBooster() {
+  const advance = useThree((s) => s.advance)
+  const gl = useThree((s) => s.gl)
+  const size = useThree((s) => s.size)
+  const dpr = useThree((s) => s.viewport.dpr)
+  const clock = useThree((s) => s.clock)
+  useEffect(() => {
+    gl.setPixelRatio(dpr)
+    gl.setSize(size.width, size.height, false)
+  }, [gl, size, dpr])
+  useEffect(() => {
+    const prevPaused = useViewer.getState().renderPaused
+    useViewer.setState({ renderPaused: true })
+    let frameTime = clock.elapsedTime
+    let lastNow = 0
+    let raf = 0
+    const tick = (now: number) => {
+      raf = requestAnimationFrame(tick)
+      const dt = lastNow > 0 ? Math.min((now - lastNow) / 1000, 0.05) : 1 / 120
+      lastNow = now
+      frameTime += dt
+      advance(frameTime)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => {
+      cancelAnimationFrame(raf)
+      useViewer.setState({ renderPaused: prevPaused })
+    }
+  }, [advance, clock])
   return null
 }
 
@@ -544,6 +590,7 @@ function ActiveGame() {
       <ResurrectionSweep />
       <TreesDestruct world={world} />
       <PerfMonitor />
+      <FrameBooster />
     </>
   )
 }

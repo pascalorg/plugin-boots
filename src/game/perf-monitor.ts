@@ -1,7 +1,7 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 
 /**
  * Lag recorder (owner request 2026-08-27): the owner plays on localhost,
@@ -183,16 +183,25 @@ export function perfReset(): void {
  * mid-session — see ActiveGame's remount-healing note.)
  */
 export function PerfMonitor(): null {
+  const lastNow = useRef(0)
   useEffect(() => {
     monitor.reset()
+    lastNow.current = 0
     return () => {
       const summary = monitor.stats()
       if (summary.frames > 0) console.info('[boots] perf', summary)
     }
   }, [])
   // Default priority (0) — observe the loop, never reorder it.
-  useFrame((_, rawDt) => {
-    monitor.recordFrame(rawDt * 1000)
+  // WALL-CLOCK deltas, not the useFrame dt: the host advances R3F through a
+  // FrameLimiter in fixed quanta, so rawDt is a synthetic constant (exactly
+  // 20 ms at the 50 fps default) no matter how long frames really take —
+  // a recorder on that clock reads "all good" forever (perf investigation,
+  // 2026-08-28). performance.now() between frames is the truth.
+  useFrame(() => {
+    const now = performance.now()
+    if (lastNow.current > 0) monitor.recordFrame(now - lastNow.current)
+    lastNow.current = now
   })
   return null
 }
