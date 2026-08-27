@@ -238,8 +238,21 @@ export function enterGame(): boolean {
   current = session
 
   sfx.resume()
-  void container.requestFullscreen?.().catch(() => {})
+  // Sequence the lock AFTER the fullscreen transition settles: firing both
+  // back-to-back makes browsers reject the lock with WrongDocumentError
+  // mid-churn, leaving a fullscreen-but-unlocked session (mouse degraded —
+  // the "can't place a ramp" live report). attach() below fires the first
+  // attempt anyway (harmless if it loses the race); these retries land
+  // once the document is stable. relock-on-click remains the backstop.
+  const fullscreen: Promise<unknown> =
+    container.requestFullscreen?.().catch(() => {}) ?? Promise.resolve()
   input.attach(canvas)
+  void fullscreen.then(() => {
+    input.requestLock()
+    window.setTimeout(() => {
+      if (current === session && document.pointerLockElement !== canvas) input.requestLock()
+    }, 350)
+  })
   input.onEscape = () => {
     // Esc with the catalog up closes the menu, not the game (this path only
     // fires with the pointer lock already released — exactly the menu case).
@@ -254,12 +267,21 @@ export function enterGame(): boolean {
   const onLockChange = () => {
     if (document.pointerLockElement === canvas) {
       hadLock = true
+      hud.prompt(null, 'lock')
       return
     }
     // The item catalog releases the lock deliberately (mouse becomes a
     // cursor over the menu) — that release is not an exit.
     if (hadLock && current === session && !isItemMenuOpen()) exitGame()
   }
+  // Never-locked sessions stay playable (input.ts flows buttons/deltas
+  // regardless) but the cursor can hit the screen edge — say so instead of
+  // leaving the player to wonder. Cleared the moment the lock engages.
+  window.setTimeout(() => {
+    if (current === session && !hadLock && document.pointerLockElement !== canvas) {
+      hud.prompt('click to capture the mouse', 'lock')
+    }
+  }, 900)
   let hadFullscreen = false
   const onFullscreenChange = () => {
     if (document.fullscreenElement) {

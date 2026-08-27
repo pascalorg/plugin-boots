@@ -143,8 +143,15 @@ export class GameInput {
       this.state.firing = (buttons & 1) !== 0
       this.state.altFiring = (buttons & 2) !== 0
     }
+    // UNLOCKED SESSIONS ARE STILL PLAYABLE: the initial pointer-lock
+    // request can be rejected (WrongDocumentError mid-fullscreen churn) and
+    // some environments never grant it — gating the mouse on the lock made
+    // those sessions silently mouse-dead (look frozen, LMB never firing;
+    // the "still can't place a ramp" live report, A/B-proven). Buttons and
+    // movement deltas flow regardless of lock; the lock only removes the
+    // cursor-hits-screen-edge limit.
     on('mousemove', (e) => {
-      if (!this.pointerLocked) return
+      if (this.menuOpen) return
       e.stopImmediatePropagation()
       this.state.lookX += e.movementX
       this.state.lookY += e.movementY
@@ -157,11 +164,8 @@ export class GameInput {
       }
       e.preventDefault()
       e.stopImmediatePropagation()
-      if (!this.pointerLocked) {
-        if (this.relockOnClick) this.requestLock()
-        return
-      }
       syncButtons(e.buttons)
+      if (!this.pointerLocked && this.relockOnClick) this.requestLock()
     })
     on('pointerup', (e) => {
       if (this.menuOpen) {
@@ -184,7 +188,7 @@ export class GameInput {
         }
         e.preventDefault()
         e.stopImmediatePropagation()
-        if (this.pointerLocked) syncButtons(e.buttons)
+        syncButtons(e.buttons)
       })
     }
     for (const type of ['click', 'dblclick', 'contextmenu'] as const) {
