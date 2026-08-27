@@ -4,6 +4,7 @@ import { useFrame } from '@react-three/fiber'
 import { useLayoutEffect, useRef } from 'react'
 import { Color, DynamicDrawUsage, Euler, type InstancedMesh, Matrix4, Quaternion, Vector3 } from 'three'
 import { spawnDust } from './dust'
+import { createProbeMemo } from './probe-memo'
 
 /**
  * One global ring buffer of tumbling debris — voxel chunks, sparks, glass
@@ -108,7 +109,22 @@ export type DebrisGroundProbe = (x: number, y: number, z: number) => number
 let groundProbe: DebrisGroundProbe | null = null
 export function setDebrisGroundProbe(probe: DebrisGroundProbe | null): void {
   groundProbe = probe
+  probeMemo.clear()
 }
+
+/**
+ * Post-blast probe burst guard (perf round 2026-08-27, finding B4): a
+ * grenade's carves + crumbles put 100–200 pieces in the air within a
+ * second, each due one apex probe — and probeLandingY walks ALL colliders
+ * plus a DDA per call. Two layers keep that off the detonation frames:
+ * a 0.5 m-bucket memo (blast debris shares a footprint — see probe-memo.ts)
+ * and a per-frame cap on MISSES; a piece past the cap simply keeps falling
+ * un-probed and retries next frame (holding the default plane one extra
+ * frame is invisible). Steady-state single shots are untouched — a lone
+ * piece probes the frame it crests, exactly as before.
+ */
+const probeMemo = createProbeMemo()
+const MAX_PROBE_MISSES_PER_FRAME = 8
 
 export function spawnDebris(
   x: number,
@@ -358,6 +374,7 @@ export function Debris() {
     if (!mesh) return
     if (liveCount === 0) return
     const dt = Math.min(rawDt, 1 / 30)
+    let probeMisses = 0
     for (let i = 0; i < CAPACITY; i++) {
       const s = slots[i]!
       if (!s.alive) continue
@@ -386,10 +403,23 @@ export function Debris() {
       s.rz += s.wz * dt
       // One-shot landing probe at apex (first descending frame): pick the
       // floor this piece rests on — an upper-storey slab, a wall top, or
-      // the terrain plane. See setDebrisGroundProbe.
+      // the terrain plane. See setDebrisGroundProbe. Memo-first with a
+      // per-frame miss budget (post-blast burst guard above): over budget,
+      // the piece stays un-probed and retries next frame.
       if (!s.probed && s.vy <= 0) {
-        s.probed = true
-        if (groundProbe) s.ground = s.rest + groundProbe(s.px, s.py, s.pz)
+        if (!groundProbe) {
+          s.probed = true
+        } else {
+          let floor = probeMemo.peek(s.px, s.py, s.pz)
+          if (floor === undefined && probeMisses < MAX_PROBE_MISSES_PER_FRAME) {
+            probeMisses++
+            floor = probeMemo.probe(groundProbe, s.px, s.py, s.pz)
+          }
+          if (floor !== undefined) {
+            s.probed = true
+            s.ground = s.rest + floor
+          }
+        }
       }
       const half = s.ground
       if (s.py < half && s.vy < 0) {

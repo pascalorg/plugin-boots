@@ -60,6 +60,15 @@ describe('char-feel one-shots (silent no-ops headless)', () => {
   })
 })
 
+describe('session-start warmers (silent no-ops headless)', () => {
+  test('prime() is idempotent and safe without WebAudio', () => {
+    expect(() => {
+      sfx.prime() // first-use cost prepay (noise buffer + master chain)
+      sfx.prime() // idempotent — warmup remounts every session
+    }).not.toThrow()
+  })
+})
+
 describe('heartbeat mapping stays the single severity source', () => {
   test('bpm curve endpoints', () => {
     expect(lowHpSeverity(100)).toBe(0)

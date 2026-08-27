@@ -156,7 +156,11 @@ export default function BootsPanel() {
         </p>
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the table</p>
-        <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
+        <p>
+          Peaceful for as long as you like — grab guns, build, nothing comes. Throw the breaker on
+          the switch wall by the gear table (E) and the countdown starts: the machines come in
+          waves.
+        </p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer · 7 paint</p>
         <p>RMB aim (pistol/rifle) · Q or Z/X/C/V pick piece · R cycles paint color · Esc exit</p>
         <p>

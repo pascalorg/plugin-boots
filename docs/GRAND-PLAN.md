@@ -52,6 +52,18 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   Save/Discard). 563 tests / 18.2k assertions green. Doc debt:
   BUILD-GRAMMAR-V2.md still says 3-piece grammar — refresh next round.
 
+- Phase 6 round 1 (2026-08-27 night, fleet 4 lanes + manager stitch):
+  combat is OPT-IN — the breaker SwitchWall by the gear table is the only
+  wave trigger (gun pickup never spawns bots; pure tickWaveDirector +
+  armWaves, invariant test-pinned; dedicated breakerThrow voice) · real
+  catalog models in prod (itemModelLoader wires Draco+meshopt decoders —
+  the proxy-box regression was a missing DRACOLoader) · item destruction
+  wears the material (per-cell sub-mesh tones → voxels/debris/dust) ·
+  perf: shot broadphase before BVH, warmup BVH drain + crater/scorch +
+  audio prime, probeLandingY memo, settle-timer de-coalescing · ramp
+  targeting ray-march fix + weapon-tracked HUD keybar with AZERTY
+  captions. 610 tests / 19.8k assertions green.
+
 ## In flight
 
 - Phase 4 round 2 (fleet): QA-driven refinements — builder/keep/hud/
@@ -83,10 +95,10 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
 
 ## Next (phase 6 — the shape-preserving pass)
 
-1. Items keep their SHAPE when breaking (owner call): glass-like item
-   sub-meshes (shower panels…) route through the GLASS shatter system;
-   opaque parts voxelize at fine silhouette-preserving cells; v2 = convex
-   mesh fracture.
+1. Items keep their SHAPE when breaking (owner call): fine
+   silhouette-preserving voxelization + per-cell material colors SHIPPED
+   (round 1); still open — glass-like item sub-meshes (shower panels…)
+   route through the GLASS shatter system; v2 = convex mesh fracture.
 2. Pyramid grammar: roof 2×2 corner heights + floor 2×2 quadrant masks
    (the FULL_MASK ripple round).
 3. Paint tool; bots opening doors; real Bones members as the framing when

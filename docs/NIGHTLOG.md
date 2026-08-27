@@ -955,3 +955,74 @@ catalog GLBs fall back to proxies until host decoders are wired; QA
 should sight-check the build-table hammer rake and the overlapping
 build/gear prompt circles; optional makeSceneSupportProbe '__boots-'
 prefix widen (tall furniture can prop an upper build slot) left as-is.
+
+## Phase 6 round 1 — switch wall / real items / perf / ramp fixes (2026-08-27 night, manager stitch)
+
+Four disjoint lanes integrated in one pass; full suite 610 pass / 0 fail
+(19,842 assertions), `tsc --noEmit` clean.
+
+- SWITCH-WALL (enemies-state/enemies/guntable): combat is now OPT-IN.
+  Gun pickup NEVER triggers waves — the wave director is a pure state
+  machine (`tickWaveDirector` in enemies-state.ts, allocation-free
+  DirectorStep) armed ONLY by `armWaves()`, which fires from the new
+  SwitchWall fixture: a concrete stub + steel cap 3.4 m forward / 2.2 m
+  lateral of spawn (gear-table side), wearing a two-hand industrial
+  breaker (twin arms + red cross-grip, 0.4 s sweep chasing
+  `waveState.armed`), "PUT YOUR BOOTS ON" placard and twin siren beacons
+  (the single red pointLight MOVED here from the gear table). E throws
+  the breaker → latch clunk → the existing countdown theatre runs
+  unchanged. Gear-table sign: GEAR UP → YOU ARE COOKED; its E grants
+  gear only. `resetBots()` swings the handle back up. Opt-in invariant
+  pinned: owning pistol+rifle+minigun for a simulated 60 s produces zero
+  director events and zero bots (enemies-waves.test.ts).
+- ITEMS-REAL (item-place/destruction): catalog GLBs now LOAD in prod —
+  the bare GLTFLoader threw "No DRACOLoader instance provided" on every
+  Draco-compressed system-catalog model and everything degraded to proxy
+  boxes; `itemModelLoader()` wires DRACOLoader (gstatic 1.5.5 decoders)
+  + MeshoptDecoder per session (KTX2 deliberately unwired — no catalog
+  GLB needs it). Item destruction wears the material: voxelize-time
+  `sampleItemCellColors` gives each cell the dominant tone (material
+  color × 8×8 map average, group-resolved multi-materials, volume
+  tiebreak so detail shells win) of its nearest sub-mesh region;
+  `target.baseColor` becomes the palette average; `cellTint` feeds
+  debris in carves/crumbles/collapses. Silhouette pinned: item grids are
+  surface-traced at 0.055–0.11 m (L-shape test — no AABB fill).
+- PERF-FIXES (shooting/warmup/audio/probe-memo/dust/debris): fire() got
+  a ray-vs-worldBox broadphase before any BVH touch (kills the shot-#1
+  build-every-BVH freeze, ~95 % distance-cull steady-state);
+  PipelineWarmup drains remaining lazy BVHs at 4 ms/frame after the
+  material pass and pre-warms the crater dirt + scorch decal pipelines
+  with craters.tsx's real geometry builders; `sfx.prime()` moves the 48k
+  noise-buffer fill + voice-path compile into the Jump-in gesture; new
+  probe-memo.ts (0.5 m XZ buckets / 1 m Y bands / 400 ms TTL, packed
+  numeric keys) memoizes dust floor probes and debris apex probes with
+  an 8-miss/frame cap.
+- RAMP-FIXES (grid/hud/builder): R slots (stairs/roof) march the aim
+  ray's successive cells world-aware — first PLACEABLE cell wins, so one
+  placed ramp no longer dead-ends every later aim as "occupied"; beyond
+  ±PITCH_BAND a crossing disagreeing with the aim intent bumps one
+  storey from the player's (no double-bump). HUD keybind bar is
+  weapon-tracked (builder shows the full piece/cycle/edit/undo set) and
+  mount() upgrades captions via navigator.keyboard.getLayoutMap() so
+  AZERTY players see the keys their physical positions actually are.
+  STAIR geometry documented (4.1 m at ≈43°: STOREY 2.8 ≠ CELL 3).
+- Manager wiring beyond the lane diffs: voxel-walls.tsx consumes
+  `wall.cellColors` per instance (item voxels wear their region tone,
+  same jitter); dust.tsx `tint` opt + destruction call sites (item dust
+  blends 65/35 toward concrete gray); destruction B2 settle jitter
+  (round-robin 0–150 ms so multi-node blasts' crumbles/structure checks
+  don't coalesce — two test waits widened 240/260→450 ms) + B5 indexed
+  removedQueue pushes (spread-push argument-limit landmine);
+  `sfx.breakerThrow()` (low thunk + metallic snap + contact buzz,
+  louder than doorLatch) swapped into the SwitchWall throw;
+  `<PipelineWarmup world={world} />`; panel controls copy rewritten for
+  opt-in combat.
+
+Deferred / follow-ups: PROD PIN is the real ramp outage (pins 54 commits
+behind, no 'stairs' piece at 7f5b912) — needs a host release-PR bump;
+optional e.key piece-hotkey fallback for Firefox/Safari AZERTY captions;
+turbo slow-hold double-place (per spec — revisit if the owner hits it);
+STOREY 2.8 vs real 2.5 m host levels + world-aligned grid vs rotated
+buildings (design-level); community `file:` dep can nest npm 0.9.1 under
+the plugin locally (prod unaffected); QA scripts that gear up and wait
+for waves must now throw the breaker (`armWaves()` from enemies-state).

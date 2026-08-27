@@ -153,7 +153,12 @@ export const TURBO_FIRST = 0.15
 export const TURBO_NEXT = 0.05
 
 /** Roof dims are the FALLBACK box only (legacy corner-less pieces): placed
- * roofs render/collide as the bilinear patch (roof-corners.ts). */
+ * roofs render/collide as the bilinear patch (roof-corners.ts).
+ * Stairs plank: a 3 m cell run rising exactly ONE STOREY (2.8 m) — its
+ * length is the hypotenuse √(3² + 2.8²) ≈ 4.103, hence 4.1. Deliberately
+ * NOT a 45° / 4.24 m plank: STOREY (2.8) ≠ CELL (3), and a 45° rise would
+ * top out 0.2 m proud of the storey line, so stacked levels and the
+ * ramp-chain flow wouldn't land flush. */
 export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   wall: [3, WALL_H, 0.12],
   floor: [3, 0.12, 3],
@@ -161,6 +166,8 @@ export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   roof: [3, 0.12, 3],
 }
 
+/** ≈ −43.0°, atan2(rise = one STOREY, run = one CELL) — not 45° by design
+ * (see the PIECE_DIMS.stairs note above). */
 const STAIR_TILT = -Math.atan2(WALL_H, 3)
 
 export function piecePose(piece: BuildPiece, baseY: number): { y: number; tilt: number } {
@@ -975,7 +982,11 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
 
 /** Direct piece hotkeys while the builder is held — the classic PC row:
  * Z wall · X floor · C stairs · V roof (Q still cycles for one-handed
- * play; undo lives on U). Every code needs an input.ts GAME_KEYS entry. */
+ * play; undo lives on U). Every code needs an input.ts GAME_KEYS entry.
+ * Advertised in-game by the HUD keybind bar while the builder is held
+ * (hud.builderKeybarText — keep the two lists in step). These match
+ * PHYSICAL positions (e.code): on AZERTY the caps differ (the HUD bar
+ * resolves real caps via the Keyboard API where available). */
 export const PIECE_KEYS: ReadonlyArray<readonly [string, BuildPiece]> = [
   ['KeyZ', 'wall'],
   ['KeyX', 'floor'],

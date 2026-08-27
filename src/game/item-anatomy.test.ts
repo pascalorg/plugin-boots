@@ -158,8 +158,9 @@ function boxCollider(
   nodeType: string,
   size: [number, number, number],
   center: [number, number, number],
+  material?: MeshBasicMaterial | MeshBasicMaterial[],
 ): ColliderEntry {
-  const mesh = new Mesh(new BoxGeometry(size[0], size[1], size[2]))
+  const mesh = new Mesh(new BoxGeometry(size[0], size[1], size[2]), material)
   mesh.position.set(center[0], center[1], center[2])
   mesh.updateMatrixWorld(true)
   mesh.geometry.computeBoundingBox()
@@ -236,5 +237,102 @@ describe('item silhouette cells (ensureVoxelTarget)', () => {
     const target = ensureVoxelTarget(world, 'block-1')!
     expect(target.item).toBe(false)
     expect(target.grid.cellX).toBeCloseTo(0.15, 5)
+  })
+
+  test('the grid hugs an L-shaped silhouette — no cells in the empty quadrant', () => {
+    // Two boxes forming an L in plan; the fourth quadrant (x, z > 0.4) is
+    // real air and must stay cell-free — items trace their SHAPE, they
+    // never fall back to a crude AABB box fill.
+    const world = makeWorld([
+      boxCollider('bench-1', 'item', [0.4, 0.6, 0.8], [0.2, 0.3, 0.4]),
+      boxCollider('bench-1', 'item', [0.4, 0.6, 0.4], [0.6, 0.3, 0.2]),
+    ])
+    const target = ensureVoxelTarget(world, 'bench-1')!
+    let inEmptyQuadrant = 0
+    for (let i = 0; i < target.grid.count; i++) {
+      if (!target.grid.alive[i]) continue
+      const x = target.grid.centers[i * 3]!
+      const z = target.grid.centers[i * 3 + 2]!
+      // 0.46 clears the last legitimate 0.11 m cell column (spans → 0.44).
+      if (x > 0.46 && z > 0.46) inEmptyQuadrant++
+    }
+    expect(inEmptyQuadrant).toBe(0)
+    expect(target.grid.aliveCount).toBeGreaterThan(100)
+  })
+})
+
+// ── Item palette (cellColors — the voxels wear the material) ────────────────
+
+describe('item palette sampling (ensureVoxelTarget cellColors)', () => {
+  test('per-cell colors come from the sub-mesh region the cell sits in', () => {
+    const red = new MeshBasicMaterial({ color: '#aa2222' })
+    const blue = new MeshBasicMaterial({ color: '#2233aa' })
+    const world = makeWorld([
+      boxCollider('dresser-1', 'item', [0.8, 0.4, 0.8], [0, 0.2, 0], red),
+      boxCollider('dresser-1', 'item', [0.8, 0.4, 0.8], [0, 0.6, 0], blue),
+    ])
+    const target = ensureVoxelTarget(world, 'dresser-1')!
+    const colors = target.cellColors!
+    expect(colors).toBeDefined()
+    expect(colors.length).toBe(target.grid.count * 3)
+    let lower = 0
+    let upper = 0
+    for (let i = 0; i < target.grid.count; i++) {
+      const y = target.grid.centers[i * 3 + 1]!
+      // Skip the 0.11 m cell row straddling the 0.4 m material seam.
+      if (y < 0.35) {
+        expect(colors[i * 3]!).toBeCloseTo(red.color.r, 5)
+        expect(colors[i * 3 + 2]!).toBeCloseTo(red.color.b, 5)
+        lower++
+      } else if (y > 0.45) {
+        expect(colors[i * 3]!).toBeCloseTo(blue.color.r, 5)
+        expect(colors[i * 3 + 2]!).toBeCloseTo(blue.color.b, 5)
+        upper++
+      }
+    }
+    expect(lower).toBeGreaterThan(0)
+    expect(upper).toBeGreaterThan(0)
+    // baseColor becomes the palette average — dust and fallback debris stay
+    // in the item's own family instead of the greige default.
+    expect(target.baseColor.r).toBeGreaterThan(blue.color.r)
+    expect(target.baseColor.r).toBeLessThan(red.color.r)
+    expect(target.baseColor.b).toBeGreaterThan(red.color.b)
+    expect(target.baseColor.b).toBeLessThan(blue.color.b)
+  })
+
+  test('multi-material sub-meshes resolve to the group-dominant material', () => {
+    const red = new MeshBasicMaterial({ color: '#aa2222' })
+    const blue = new MeshBasicMaterial({ color: '#2233aa' })
+    const geometry = new BoxGeometry(0.6, 0.6, 0.6)
+    geometry.clearGroups()
+    geometry.addGroup(0, 12, 0)
+    geometry.addGroup(12, Infinity, 1) // "to the end" — 24 of 36 indices
+    const mesh = new Mesh(geometry, [red, blue])
+    mesh.position.set(0, 0.3, 0)
+    mesh.updateMatrixWorld(true)
+    mesh.geometry.computeBoundingBox()
+    const worldBox = mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld)
+    const world = makeWorld([
+      {
+        mesh,
+        bvh: bvhFor(mesh),
+        inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+        worldBox,
+        root: mesh,
+        nodeId: 'crate-1',
+        nodeType: 'item',
+      },
+    ])
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    const colors = target.cellColors!
+    for (let i = 0; i < target.grid.count; i++) {
+      expect(colors[i * 3]!).toBeCloseTo(blue.color.r, 5)
+      expect(colors[i * 3 + 2]!).toBeCloseTo(blue.color.b, 5)
+    }
+  })
+
+  test('non-item targets carry no cellColors — walls/volumes are untouched', () => {
+    const world = makeWorld([boxCollider('block-2', 'block', [1, 1, 1], [0, 0.5, 0])])
+    expect(ensureVoxelTarget(world, 'block-2')!.cellColors).toBeUndefined()
   })
 })

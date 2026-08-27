@@ -16,6 +16,8 @@ import {
   type Object3D,
   SRGBColorSpace,
 } from 'three'
+import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js'
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { create } from 'zustand'
 import { useBoots, type WeaponId } from '../store'
@@ -37,13 +39,14 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * until the sidebar Save converts them into real `item` nodes (or Discard
  * drops them) — the scene store is NEVER written from here.
  *
- * MODELS: plain GLTFLoader on the catalog's public GLB URL, one template
- * per catalog id for the whole session (module cache) — ghost and every
- * placement clone it. Host GLB materials are standard three materials
- * (WebGPU-safe, no shaders, no lights added). A failed load (CORS, 404,
- * unsupported compression — the host's retrying loader isn't exported to
- * plugins) degrades to a labeled proxy box sized from the catalog
- * dimensions; placement and Keep still work.
+ * MODELS: GLTFLoader (with the host's Draco + meshopt decoder wiring — the
+ * system catalog GLBs are Draco-compressed) on the catalog's public GLB
+ * URL, one template per catalog id for the whole session (module cache) —
+ * ghost and every placement clone it. Host GLB materials are standard
+ * three materials (WebGPU-safe, no shaders, no lights added). A failed
+ * load (CORS, 404, KTX2-textured — see loadModel) degrades to a labeled
+ * proxy box sized from the catalog dimensions; placement and Keep still
+ * work.
  *
  * COLLIDERS: each placement registers ONE Box3-shaped collider (BoxGeometry
  * sized from catalog dimensions × scale — 12 triangles, never a BVH over
@@ -239,6 +242,27 @@ const resolveUrl = (src: string): string => {
   return (typeof resolve === 'function' ? resolve(src) : null) ?? src
 }
 
+/** Lazy session GLTFLoader — exported for tests. Decoder wiring mirrors
+ * the host's item renderer (nodes/src/item/renderer.tsx
+ * configureItemModelLoader): nearly every system-catalog GLB is
+ * Draco-compressed (extensionsRequired KHR_draco_mesh_compression), so a
+ * bare GLTFLoader threw "No DRACOLoader instance provided" and EVERY
+ * placement degraded to the labeled proxy box. Draco/meshopt decode is
+ * CPU/WASM — WebGPU-safe, no shaders. The gstatic decoder path is the one
+ * the host already ships to prod. KTX2 (basisu textures) is deliberately
+ * NOT wired: no catalog GLB uses it today and it would need renderer
+ * access — such items keep the proxy. */
+export function itemModelLoader(): GLTFLoader {
+  if (!loader) {
+    loader = new GLTFLoader()
+    const draco = new DRACOLoader(loader.manager)
+    draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.5/')
+    loader.setDRACOLoader(draco)
+    loader.setMeshoptDecoder(MeshoptDecoder)
+  }
+  return loader
+}
+
 /** Load (or reuse) the item's GLB scene template. Rejections are recorded
  * per catalog id with their failure class — `itemLoadFailures()` reports
  * them and every consumer falls back to the labeled proxy box. */
@@ -247,8 +271,7 @@ function loadModel(asset: CatalogEntry): Promise<Group> {
   if (cached?.status === 'ready') return Promise.resolve(cached.template)
   if (cached?.status === 'loading') return cached.promise
   if (cached?.status === 'failed') return Promise.reject(new Error(cached.error))
-  loader ??= new GLTFLoader()
-  const promise = loader
+  const promise = itemModelLoader()
     .loadAsync(resolveUrl(asset.src))
     .then((gltf) => {
       const template = gltf.scene as unknown as Group

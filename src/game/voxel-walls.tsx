@@ -58,6 +58,7 @@ const _pos = new Vector3()
 const _scale = new Vector3()
 const _quat = new Quaternion()
 const _color = new Color()
+const _cellTone = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 const UP = new Vector3(0, 1, 0)
 const Z_AXIS = new Vector3(0, 0, 1)
@@ -267,6 +268,7 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
       _courseTone.copy(wall.baseColor).offsetHSL(0, 0, -0.055)
       _underTone.copy(wall.baseColor).offsetHSL(0, -0.08, 0.16)
     }
+    const cellColors = wall.cellColors
     for (let i = 0; i < grid.count; i++) {
       if (grid.alive[i]) {
         _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
@@ -283,7 +285,11 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
       const j2 = ((i * 1597334677) % 89) / 89
       let base = wall.baseColor
       let jitter = 0.1
-      if (isSlab && grid.coords[i * 3 + 1] === 0) base = _ceilingTone
+      if (cellColors) {
+        // Item palette (destruction.ts sampleItemCellColors): each voxel
+        // wears its sub-mesh region tone; keep the gentle wall jitter below.
+        base = _cellTone.setRGB(cellColors[i * 3]!, cellColors[i * 3 + 1]!, cellColors[i * 3 + 2]!)
+      } else if (isSlab && grid.coords[i * 3 + 1] === 0) base = _ceilingTone
       else if (isRoof) {
         if (grid.coords[i * 3 + 2] !== 0) base = _underTone
         else {

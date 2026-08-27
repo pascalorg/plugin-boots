@@ -276,7 +276,8 @@ describe('island collapse on studless volumes (the shower cut)', () => {
     expect(above).toBeGreaterThan(0)
     // …until the island timer fires — then it falls as debris, numerically
     // visible in aliveCount (the __boots.targets() census field).
-    await new Promise((resolve) => setTimeout(resolve, 260))
+    // 140 ms settle + up to 150 ms B2 jitter → wait past the worst case.
+    await new Promise((resolve) => setTimeout(resolve, 450))
     expect(target.grid.aliveCount).toBeLessThan(afterCarve)
     for (let i = 0; i < target.grid.count; i++) {
       if (target.grid.centers[i * 3 + 1]! > 1.7) expect(target.grid.alive[i]).toBe(0)

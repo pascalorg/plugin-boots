@@ -536,7 +536,7 @@ function ActiveGame() {
       <Builder />
       <Enemies world={world} />
       <Nature world={world} />
-      <PipelineWarmup />
+      <PipelineWarmup world={world} />
       <ResurrectionSweep />
       <TreesDestruct world={world} />
     </>

@@ -6,6 +6,8 @@ import {
   GRAB_RANGE,
   minigunTablePosition,
   nearestGrabbable,
+  SWITCH_WALL_SIZE,
+  switchWallPosition,
   TABLE_SIZE,
   tablePosition,
 } from './guntable'
@@ -97,6 +99,53 @@ describe('spawn table layout', () => {
       [...tables].map(([id, t]) => [id, { ...t, taken: true }] as const),
     )
     expect(nearestGrabbable(0, 0, taken)).toBeNull()
+  })
+
+  test('switch wall: outside grab range at spawn, gear side, past the gear table', () => {
+    for (const yaw of YAWS) {
+      const world = fakeWorld(new Vector3(3, 0, -2), yaw)
+      // The peaceful entry keeps a single BUILD prompt at spawn — the
+      // breaker never competes there; you walk to it on purpose.
+      expect(switchWallPosition(world).distanceTo(world.spawn)).toBeGreaterThan(GRAB_RANGE)
+      const [switchLat, switchFwd] = spawnFrame(world, switchWallPosition(world))
+      const [gearLat] = spawnFrame(world, tablePosition(world))
+      expect(switchFwd).toBeGreaterThan(0)
+      // Same side of the lot as the gear table (the trigger moved off it,
+      // not across the map).
+      expect(switchLat * gearLat).toBeGreaterThan(0)
+    }
+  })
+
+  test('switch wall footprint never touches the gear table', () => {
+    for (const yaw of YAWS) {
+      const world = fakeWorld(new Vector3(-1, 0, 6), yaw)
+      const [switchLat, switchFwd] = spawnFrame(world, switchWallPosition(world))
+      const [gearLat, gearFwd] = spawnFrame(world, tablePosition(world))
+      const latGap =
+        Math.abs(switchLat - gearLat) - (SWITCH_WALL_SIZE[0] + TABLE_SIZE[0]) / 2
+      const fwdGap =
+        Math.abs(switchFwd - gearFwd) - (SWITCH_WALL_SIZE[2] + TABLE_SIZE[2]) / 2
+      expect(Math.max(latGap, fwdGap)).toBeGreaterThan(0.05)
+    }
+  })
+
+  test('the breaker joins the arbitration: E at the wall serves the switch alone', () => {
+    for (const yaw of YAWS) {
+      const world = fakeWorld(new Vector3(3, 0, -2), yaw)
+      const at = switchWallPosition(world)
+      const tables = (thrown: boolean) =>
+        new Map([
+          ['build', { x: buildTablePosition(world).x, z: buildTablePosition(world).z, taken: false }],
+          ['gear', { x: tablePosition(world).x, z: tablePosition(world).z, taken: false }],
+          ['rear', { x: minigunTablePosition(world).x, z: minigunTablePosition(world).z, taken: false }],
+          ['switch', { x: at.x, z: at.z, taken: thrown }],
+        ])
+      // Standing at the breaker, one E throws the switch — nothing else…
+      expect(nearestGrabbable(at.x, at.z, tables(false))).toBe('switch')
+      // …and once thrown (taken mirrors waveState.armed) the same spot
+      // falls through to the next fixture instead of re-throwing.
+      expect(nearestGrabbable(at.x, at.z, tables(true))).not.toBe('switch')
+    }
   })
 
   test('build and gear footprints never overlap', () => {

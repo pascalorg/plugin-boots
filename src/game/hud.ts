@@ -51,6 +51,9 @@ import type { TargetResult } from './grid'
  *   crosshair ticks fade OUT and a small center dot fades IN as v→1.
  *   viewmodel.tsx drives it per frame from playerRig.ads (guarded:
  *   `hud.setAds?.(v)`); change-gated like grenadePip.
+ * - Keybind bar: automatic. Follows store.weapon — while the BUILDER is
+ *   held it lists the piece hotkeys (builderKeybarText: Z/X/C/V/Q, with
+ *   layout-map caps on non-QWERTY), otherwise KEYBAR_DEFAULT.
  */
 
 const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
@@ -65,6 +68,47 @@ const GHOST_REASON_LABEL: Record<Exclude<GhostReason, 'ok'>, string> = {
   unsupported: 'needs support',
   occupied: 'occupied',
   'out-of-reach': 'too far',
+}
+
+/** Bottom keybind bar, holstered/default loadout. */
+export const KEYBAR_DEFAULT = 'Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog'
+
+/** Physical piece-hotkey codes → what they do. Mirrors builder.tsx's
+ * PIECE_KEYS + the Q cycle (duplicated as display data — hud must not import
+ * the React builder: builder → session → hud would cycle). */
+const BUILDER_KEY_CODES: ReadonlyArray<readonly [string, string]> = [
+  ['KeyZ', 'wall'],
+  ['KeyX', 'floor'],
+  ['KeyC', 'stairs'],
+  ['KeyV', 'roof'],
+  ['KeyQ', 'cycle'],
+]
+
+/** QWERTY caps for the physical codes (the no-Keyboard-API fallback). */
+const QWERTY_LABEL: Record<string, string> = {
+  KeyZ: 'Z',
+  KeyX: 'X',
+  KeyC: 'C',
+  KeyV: 'V',
+  KeyQ: 'Q',
+}
+
+/**
+ * Keybind-bar text while the BUILDER is held — the piece hotkeys must be
+ * discoverable in-game, not only in the sidebar panel (owner QA 2026-08-27:
+ * "no ramp, no roof" traced to the bar never mentioning stairs/roof keys).
+ * `labelFor` maps a physical e.code to the cap printed on that key; the
+ * default is QWERTY. input.ts matches e.code (physical position), so on
+ * AZERTY the key AT KeyZ prints W — mount() upgrades the captions through
+ * the Keyboard API's layout map where the browser offers it.
+ */
+export function builderKeybarText(
+  labelFor: (code: string) => string = (code) => QWERTY_LABEL[code] ?? code,
+): string {
+  const pieces = BUILDER_KEY_CODES.map(([code, action]) => `${labelFor(code)} ${action}`).join(
+    ' · ',
+  )
+  return `${pieces} · R rotate/shape · F edit · U undo · Esc exit`
 }
 
 const WEAPON_LABEL: Record<string, string> = {
@@ -95,6 +139,9 @@ export class Hud {
   private paintDotEl: HTMLDivElement | null = null
   private crossTicksEl: HTMLDivElement | null = null
   private crossDotEl: HTMLDivElement | null = null
+  private keybarEl: HTMLDivElement | null = null
+  /** Builder-mode keybar text — QWERTY caps until the layout map resolves. */
+  private builderBar = builderKeybarText()
   private unsub: (() => void) | null = null
   private hitTimer: ReturnType<typeof setTimeout> | null = null
   private flashTimer: ReturnType<typeof setTimeout> | null = null
@@ -249,10 +296,40 @@ export class Hud {
     this.editHintEl = el(
       `position:absolute;left:50%;bottom:132px;transform:translateX(-50%);color:rgba(255,255,255,0.85);font:${FONT};font-size:12px;letter-spacing:0.08em;background:rgba(0,0,0,0.4);padding:4px 10px;border-radius:6px;opacity:0;transition:opacity 0.15s`,
     )
-    el(
+    // Keybind bar — swaps to the builder's piece-hotkey listing while the
+    // builder is held (render() below drives it off store.weapon).
+    this.keybarEl = el(
       `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em;white-space:nowrap`,
-      'Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog',
+      KEYBAR_DEFAULT,
     )
+
+    // The piece hotkeys match PHYSICAL key positions (e.code), so non-QWERTY
+    // layouts print different caps on those keys (AZERTY: KeyZ is W, KeyQ is
+    // A). Where the Keyboard API exists, upgrade the builder bar to the
+    // layout's real labels; the QWERTY captions stay the fallback.
+    const keyboard =
+      typeof navigator === 'undefined'
+        ? undefined
+        : (
+            navigator as Navigator & {
+              keyboard?: {
+                getLayoutMap?: () => Promise<{ get: (code: string) => string | undefined }>
+              }
+            }
+          ).keyboard
+    const layoutMap = keyboard?.getLayoutMap?.()
+    if (layoutMap) {
+      layoutMap
+        .then((map) => {
+          this.builderBar = builderKeybarText((code) =>
+            (map.get(code) ?? QWERTY_LABEL[code] ?? code).toUpperCase(),
+          )
+          if (this.keybarEl && useBoots.getState().weapon === 'builder') {
+            this.keybarEl.textContent = this.builderBar
+          }
+        })
+        .catch(() => {}) // permission/api refusal → keep the QWERTY captions
+    }
 
     container.appendChild(root)
 
@@ -261,6 +338,12 @@ export class Hud {
       if (this.weaponEl) {
         const label = WEAPON_LABEL[s.weapon] ?? s.weapon.toUpperCase()
         this.weaponEl.textContent = s.weapon === 'builder' ? `${label} · ${s.buildPiece.toUpperCase()} (Q)` : label
+      }
+      // Keybind bar tracks the held weapon: the builder shows its piece
+      // hotkeys (Z/X/C/V/Q — discoverability), everything else the default.
+      if (this.keybarEl) {
+        const bar = s.weapon === 'builder' ? this.builderBar : KEYBAR_DEFAULT
+        if (this.keybarEl.textContent !== bar) this.keybarEl.textContent = bar
       }
       if (this.healthEl) this.healthEl.textContent = `♥ ${Math.max(0, Math.round(s.health))}`
       this.health = s.health
@@ -517,6 +600,7 @@ export class Hud {
     this.paintDotEl = null
     this.crossTicksEl = null
     this.crossDotEl = null
+    this.keybarEl = null
     this.pipF = -1
     this.lastAds = -1
   }

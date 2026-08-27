@@ -268,6 +268,12 @@ export type VoxelTarget = {
    * shape-preserving cells, carve dust voiced 'concrete'-lite (the
    * porcelain read — see damageTarget). */
   item?: boolean
+  /** Per-voxel RGB (3 floats per index, working color space) — sampled at
+   * VOXELIZE time from the item's own sub-mesh materials (silhouette lane
+   * only; see sampleItemCellColors). voxel-walls.tsx prefers it over
+   * baseColor per cell (same value jitter as walls) and debris tint reads
+   * it through cellTint. Never touched per frame. */
+  cellColors?: Float32Array
   /** True for plates SYNTHESIZED under zero-extent ceiling planes: their
    * cells hold another target up only by direct contact (structure.ts
    * PLATE_CONTACT_SLACK), never across the general SUPPORT_GAP band — a
@@ -767,6 +773,175 @@ function buildItemGrid(sources: VoxelSource[], bounds: Box3): VoxelGridData {
     grid = buildVoxelGrid(sources, bounds.clone(), cell, false)
   }
   return grid
+}
+
+// ── Item palette (owner: "underline the material, embrace the shape") ───────
+// Colorless generic voxels read as nothing; an item's voxels should wear the
+// item's own materials. At VOXELIZE time (never per frame) each solid
+// sub-mesh resolves one dominant tone — material.color × the map's canvas
+// average, the roof-surface-color recipe — and every grid cell is primed
+// from the region (sub-mesh world AABB) it came from. voxel-walls.tsx reads
+// target.cellColors per instance; debris tint reads it via cellTint.
+
+/** Minimal material slice the palette sampler reads (Mesh['material']). */
+type ItemMaterialLike = { color?: Color; map?: { image?: unknown } | null }
+
+/**
+ * Average tone of a material's texture map through a tiny 2D canvas —
+ * the averageMapColor recipe from the roof-surface-color work (kept local:
+ * roof-planes.ts's helper is module-private and also owns an async GPU
+ * path items don't need). Null headless or for compressed/undrawable
+ * images — callers keep the base color then.
+ */
+function itemMapAverage(material: ItemMaterialLike): Color | null {
+  const image = material.map?.image
+  if (!image || typeof document === 'undefined') return null
+  try {
+    const size = 8
+    const canvas = document.createElement('canvas')
+    canvas.width = size
+    canvas.height = size
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return null
+    ctx.drawImage(image as CanvasImageSource, 0, 0, size, size)
+    const data = ctx.getImageData(0, 0, size, size).data
+    let r = 0
+    let g = 0
+    let b = 0
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]!
+      g += data[i + 1]!
+      b += data[i + 2]!
+    }
+    const n = (data.length / 4) * 255
+    // Canvas bytes are sRGB — convert into three's working color space.
+    return new Color().setRGB(r / n, g / n, b / n, 'srgb')
+  } catch {
+    return null
+  }
+}
+
+/** Dominant material of one sub-mesh: single materials win outright;
+ * multi-material meshes resolve through geometry groups to the material
+ * covering the most indices (GLB primitives export finite group counts —
+ * Infinity counts read as "to the end"). */
+function dominantMeshMaterial(mesh: Mesh): ItemMaterialLike | null {
+  const material = mesh.material
+  if (!Array.isArray(material)) return (material as unknown as ItemMaterialLike) ?? null
+  if (material.length === 0) return null
+  const groups = mesh.geometry.groups
+  if (groups.length === 0) return material[0] as unknown as ItemMaterialLike
+  const total = mesh.geometry.getIndex()?.count ?? mesh.geometry.getAttribute('position')?.count ?? 0
+  let bestIndex = 0
+  let bestCount = -1
+  const counts = new Map<number, number>()
+  for (const group of groups) {
+    const count = Number.isFinite(group.count) ? group.count : Math.max(0, total - group.start)
+    const slot = group.materialIndex ?? 0
+    counts.set(slot, (counts.get(slot) ?? 0) + count)
+  }
+  for (const [slot, count] of counts) {
+    if (count > bestCount) {
+      bestCount = count
+      bestIndex = slot
+    }
+  }
+  return (material[bestIndex] ?? material[0]) as unknown as ItemMaterialLike
+}
+
+/** One sub-mesh's resolved tone: base color × map average when the map is
+ * drawable (host GLB materials often carry the look in the MAP over a
+ * white base — reading `color` alone yields white), else the base color,
+ * else the neutral targetBaseColor fallback tone. */
+function itemRegionColor(mesh: Mesh): Color {
+  const material = dominantMeshMaterial(mesh)
+  const base = material?.color
+  const mapTone = material ? itemMapAverage(material) : null
+  if (mapTone) return base ? mapTone.multiply(base) : mapTone
+  if (base) return base.clone()
+  return new Color('#d8d2c7')
+}
+
+/** Region-volume tiebreak weight (m³ → score): at d² parity (cell inside
+ * several overlapping sub-mesh boxes) the SMALLER region wins — a faucet's
+ * chrome beats the whole-sink body — while any real distance gap (≳ 3 cm)
+ * still beats volume. */
+const REGION_VOLUME_WEIGHT = 1e-4
+
+const _regionSize = new Vector3()
+
+/**
+ * Prime one color per grid cell from the sub-mesh region it came from: the
+ * region minimizing (squared distance to its world AABB) +
+ * (volume × REGION_VOLUME_WEIGHT) — containment reads as distance 0, so
+ * detail shells beat enclosing bodies, and surface cells whose centers sit
+ * a hair proud of a thin shell still resolve to it. Also returns the
+ * cell-weighted average tone (the target's baseColor → dust/fallback
+ * debris inherit the palette). Voxelize-time only — O(cells × sub-meshes),
+ * ≤ ~2600 × a handful. Null when the node exposes no solid meshes.
+ */
+function sampleItemCellColors(
+  grid: VoxelGridData,
+  meshes: readonly Mesh[],
+): { colors: Float32Array; average: Color } | null {
+  if (meshes.length === 0 || grid.count === 0) return null
+  const regions: Array<{ box: Box3; score: number; r: number; g: number; b: number }> = []
+  for (const mesh of meshes) {
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+    const box = mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld)
+    box.getSize(_regionSize)
+    const tone = itemRegionColor(mesh)
+    regions.push({
+      box,
+      score: _regionSize.x * _regionSize.y * _regionSize.z * REGION_VOLUME_WEIGHT,
+      r: tone.r,
+      g: tone.g,
+      b: tone.b,
+    })
+  }
+  const colors = new Float32Array(grid.count * 3)
+  let sumR = 0
+  let sumG = 0
+  let sumB = 0
+  for (let i = 0; i < grid.count; i++) {
+    const x = grid.centers[i * 3]!
+    const y = grid.centers[i * 3 + 1]!
+    const z = grid.centers[i * 3 + 2]!
+    let best = regions[0]!
+    let bestScore = Infinity
+    for (const region of regions) {
+      const b = region.box
+      const dx = Math.max(b.min.x - x, 0, x - b.max.x)
+      const dy = Math.max(b.min.y - y, 0, y - b.max.y)
+      const dz = Math.max(b.min.z - z, 0, z - b.max.z)
+      const score = dx * dx + dy * dy + dz * dz + region.score
+      if (score < bestScore) {
+        bestScore = score
+        best = region
+      }
+    }
+    colors[i * 3] = best.r
+    colors[i * 3 + 1] = best.g
+    colors[i * 3 + 2] = best.b
+    sumR += best.r
+    sumG += best.g
+    sumB += best.b
+  }
+  return {
+    colors,
+    average: new Color(sumR / grid.count, sumG / grid.count, sumB / grid.count),
+  }
+}
+
+const _cellTint = new Color()
+
+/** Debris/shard tone for one removed cell: the sampled item palette when
+ * the target carries one (scratch — spawnDebris/spawnFlatDebris copy the
+ * color immediately), the target's flat baseColor otherwise. */
+function cellTint(target: VoxelTarget, idx: number): Color {
+  const colors = target.cellColors
+  if (!colors) return target.baseColor
+  return _cellTint.setRGB(colors[idx * 3]!, colors[idx * 3 + 1]!, colors[idx * 3 + 2]!)
 }
 
 /** Synthesized plate thickness for ZERO-extent horizontals. Host ceiling
@@ -1367,6 +1542,11 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   // they enumerate zero planes and frame nothing.
   const roof = nodeType !== null && ROOF_KINDS.has(nodeType)
   const item = nodeType !== null && ITEM_FAMILY_KINDS.has(nodeType)
+  // Item palette: sample the sub-mesh materials ONCE, at voxelize time —
+  // the voxels (and their debris) wear the item's own tones, and the
+  // target's flat baseColor becomes the palette average so dust/fallbacks
+  // stay in family.
+  const itemPalette = item ? sampleItemCellColors(grid, meshes) : null
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -1380,7 +1560,9 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     roof,
     item,
     grid,
-    baseColor: (wall ? nodeCoatColor(nodeId) : null) ?? targetBaseColor(meshes),
+    baseColor:
+      itemPalette?.average ?? (wall ? nodeCoatColor(nodeId) : null) ?? targetBaseColor(meshes),
+    cellColors: itemPalette?.colors,
     segments,
     studs: segments,
     sheets: sheetInfo?.sheets ?? [],
@@ -1435,6 +1617,15 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
 const prevoxelizeSkip = new Set<string>()
 
 const islandTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+let settleJitterRr = 0
+/** B2 (perf 2026-08-27): round-robin 0–150 ms added to the fixed settle
+ * delays so a multi-node blast's island crumbles + structure checks land
+ * across several frames instead of coalescing into one. */
+function nextSettleJitter(): number {
+  settleJitterRr = (settleJitterRr + 1) % 6
+  return settleJitterRr * 30
+}
 
 /** Scratch for the crumble remainder dust burst. */
 const _crumbleDust = new Vector3()
@@ -1646,7 +1837,7 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
       target.grid.centers[idx * 3 + 1]!,
       target.grid.centers[idx * 3 + 2]!,
       target.grid.cell,
-      target.baseColor,
+      cellTint(target, idx),
       1.6,
     )
   }
@@ -1657,7 +1848,10 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
       target.grid.centers[mid * 3 + 1]!,
       target.grid.centers[mid * 3 + 2]!,
     )
-    spawnDust(_crumbleDust, 1, { kind: target.kind === 'volume' ? 'concrete' : 'drywall' })
+    spawnDust(_crumbleDust, 1, {
+      kind: target.kind === 'volume' ? 'concrete' : 'drywall',
+      tint: target.item ? target.baseColor : undefined,
+    })
   }
   target.revision++
   useDestruction.getState().bump()
@@ -1724,7 +1918,7 @@ export function collapseWholeTarget(nodeId: string): number {
         grid.centers[idx * 3 + 1]!,
         grid.centers[idx * 3 + 2]!,
         grid.cell,
-        target.baseColor,
+        cellTint(target, idx),
         1.6,
       )
     }
@@ -2101,7 +2295,8 @@ function damageTargetOne(
     skin ?? undefined,
   )
   if (removed.length === 0) return 0
-  target.removedQueue.push(...removed)
+  // B5: indexed pushes — spread-push blows the argument limit on 1000+-cell carves.
+  for (let i = 0; i < removed.length; i++) target.removedQueue.push(removed[i]!)
   target.revision++
   useDestruction.getState().bump()
   const debrisCount = Math.min(removed.length, 10)
@@ -2112,7 +2307,7 @@ function damageTargetOne(
       target.grid.centers[idx * 3 + 1]!,
       target.grid.centers[idx * 3 + 2]!,
       target.grid.cell * (0.6 + Math.random() * 0.5),
-      target.baseColor,
+      cellTint(target, idx),
       2.6,
     )
   }
@@ -2167,6 +2362,7 @@ function damageTargetOne(
       {
         kind: 'concrete',
         direction: direction ? _plumeDir.copy(direction) : undefined,
+        tint: target.item ? target.baseColor : undefined,
       },
     )
     if (target.roof) {
@@ -2202,7 +2398,7 @@ function damageTargetOne(
       islandTimers.delete(nodeId)
       crumbleIslands(world, target)
       settleSupportAfterRemoval(target) // island crumble can zero a piece
-    }, 140),
+    }, 140 + nextSettleJitter()),
   )
   // Cladding all gone? The bare frame can't stand — skeleton snap.
   maybeSkeletonSnap(target)
@@ -2383,7 +2579,7 @@ function scheduleStructureCheck(world: GameWorld, nodeId: string): void {
       structTimers.delete(nodeId)
       const target = useDestruction.getState().targets.get(nodeId)
       if (target) checkStructuralCollapse(world, target)
-    }, 160),
+    }, 160 + nextSettleJitter()),
   )
 }
 

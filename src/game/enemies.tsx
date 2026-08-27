@@ -27,6 +27,7 @@ import {
   setDoorApproach,
   settleGroundBot,
   spawnBot,
+  tickWaveDirector,
   waveState,
 } from './enemies-state'
 import { damagePlayer, playerRig } from './player'
@@ -72,11 +73,12 @@ import type { GameWorld } from './world'
  *   `bot.climb`: they rise while blocked, settle slowly when clear, and
  *   barely advance horizontally mid-climb.
  *
- * Pacing (see enemies-state.ts for the state shape):
- * - Peaceful until the first gun pickup, then a 5s "⚠ AI robot zombies
- *   incoming — N" countdown on the wave line (waveState.countdownActive is
- *   true for exactly that window — the gun-table siren spins off it), then
- *   WAVE 1 and the normal director.
+ * Pacing (see enemies-state.ts for the state shape + tickWaveDirector):
+ * - Peaceful until the industrial breaker switch is thrown (guntable.tsx →
+ *   armWaves() — gun pickups never wake the horde), then a 5s "⚠ AI robot
+ *   zombies incoming — N" countdown on the wave line (waveState.
+ *   countdownActive is true for exactly that window — the switch-wall siren
+ *   spins off it), then WAVE 1 and the normal director.
  * - Countdown audio: sfx.machineSpinup() — a dedicated gear-up voice whose
  *   setProgress(0..1) sweeps pitch/filter/tremolo/level across the 5s; each
  *   tick lands a relay clack (doorLatch), the final second an arming rack
@@ -225,20 +227,18 @@ export function Enemies({ world }: { world: GameWorld }) {
       heart.current = null
     }
 
-    // Wave director: peaceful grace → one-shot alert countdown → waves.
-    if (!waveState.alerted) {
-      if (boots.owned.includes('pistol') || boots.owned.includes('rifle') || boots.owned.includes('minigun')) {
-        waveState.alerted = true
-        waveState.countdown = ALERT_SECONDS
-        waveState.countdownActive = true // gun-table siren spins off this
-        // Distant machine spin-up under the ticking line (stop any stale
-        // voice first — resetBots() mid-session re-arms the alert).
-        spinup.current?.stop()
-        spinup.current = sfx.machineSpinup?.() ?? null
-        countdownTick.current = ALERT_SECONDS + 1
-      }
-    } else if (waveState.countdown > 0) {
-      waveState.countdown -= dt
+    // Wave director: peaceful grace → (breaker switch) → one-shot alert
+    // countdown → waves. State transitions live in enemies-state's
+    // tickWaveDirector (armed is the ONLY wake input — never gun pickups);
+    // this layer turns the step into sfx, labels and spawns.
+    const step = tickWaveDirector(dt, bots.length)
+    if (step.alertStarted) {
+      // Distant machine spin-up under the ticking line (stop any stale
+      // voice first — resetBots() mid-session re-arms the alert).
+      spinup.current?.stop()
+      spinup.current = sfx.machineSpinup?.() ?? null
+      countdownTick.current = ALERT_SECONDS + 1
+    } else if (waveState.countdownActive) {
       // Per-second tell: a relay clack each tick, the arming rack on the
       // last one — the lot's machinery waking up, somewhere out there.
       const tick = Math.max(1, Math.ceil(waveState.countdown))
@@ -250,22 +250,19 @@ export function Enemies({ world }: { world: GameWorld }) {
       // Rising cue: pitch/filter/tremolo/level all ride progress 0→1 across
       // the whole countdown (the voice caps its own level — no scaling here).
       spinup.current?.setProgress(1 - waveState.countdown / ALERT_SECONDS)
-      if (waveState.countdown <= 0) {
-        waveState.countdownActive = false // siren winds down with the spin-up
-        spinup.current?.stop()
-        spinup.current = null
-        spawnLabel.current = 'HERE THEY COME' // first wave only
-        spawnWave(world) // WAVE 1
-        waveLabelT.current = 3
-      }
-    } else if (bots.length === 0) {
-      waveState.intermission -= dt
-      if (waveState.intermission <= 0) {
-        spawnLabel.current = null
-        spawnWave(world)
-        waveLabelT.current = 3
-      }
-    } else if (waveLabelT.current > 0) {
+    }
+    if (step.assaultStarted) {
+      // siren winds down with the spin-up (countdownActive already false)
+      spinup.current?.stop()
+      spinup.current = null
+      spawnLabel.current = 'HERE THEY COME' // first wave only
+      spawnWave(world) // WAVE 1
+      waveLabelT.current = 3
+    } else if (step.waveDue) {
+      spawnLabel.current = null
+      spawnWave(world)
+      waveLabelT.current = 3
+    } else if (waveState.alerted && waveState.countdown <= 0 && bots.length > 0 && waveLabelT.current > 0) {
       waveLabelT.current -= dt
     }
 

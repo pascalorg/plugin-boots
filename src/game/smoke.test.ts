@@ -325,8 +325,8 @@ describe('unsupported islands crumble after the settle delay', () => {
       if (target.grid.alive[i] && target.grid.centers[i * 3 + 1]! > 2.25) above++
     }
     expect(above).toBeGreaterThan(0)
-    // …until the island timer (140ms) fires.
-    await new Promise((resolve) => setTimeout(resolve, 240))
+    // …until the island timer (140ms + up to 150ms B2 settle jitter) fires.
+    await new Promise((resolve) => setTimeout(resolve, 450))
     expect(target.grid.aliveCount).toBeLessThan(afterCarve)
     for (let i = 0; i < target.grid.count; i++) {
       if (target.grid.centers[i * 3 + 1]! > 2.25) expect(target.grid.alive[i]).toBe(0)

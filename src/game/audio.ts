@@ -242,6 +242,23 @@ export const sfx = {
   },
 
   /**
+   * Pre-pay every first-use audio cost during a loading beat (perf round
+   * 2026-08-27, minigun finding A3): builds the context + master chain,
+   * fills the 1-second noise buffer (a 48k-iteration JS loop that otherwise
+   * lands inside the FIRST gunshot's frame) and runs one inaudible burst so
+   * the whole source→filter→gain→master path has voiced once. Idempotent
+   * and near-free after the first call; silent no-op without WebAudio.
+   * warmup.tsx calls it at session start — inside the Jump-in user gesture,
+   * so the context is allowed to run.
+   */
+  prime(): void {
+    const c = ensureContext()
+    if (!c || !master) return
+    noise(c)
+    burst({ duration: 0.02, gain: 0.0001, freq: 1000 })
+  },
+
+  /**
    * Concussion muffle, 0 (clear) → 1 (fully concussed). Sweeps the master
    * lowpass from 19kHz down to 700Hz on an exponential curve, smoothed over
    * ~80ms. Driven from enemies.tsx on stagger edges — this module only
@@ -612,6 +629,16 @@ export const sfx = {
   doorLatch(): void {
     thump(550, 0.035, 0.2, 0, 'square')
     thump(380, 0.035, 0.2, 0.04, 'square')
+  },
+
+  /** Heavy electrical knife-switch CLUNK — the breaker throw on the switch
+   * wall. Low thunk + metallic snap + a brief contact buzz; ~0.3 s total,
+   * deliberately louder than doorLatch (it arms the whole assault). */
+  breakerThrow(): void {
+    thump(95, 0.14, 0.55) // the low body of the handle slamming home
+    burst({ duration: 0.05, gain: 0.45, freq: 2600, freqEnd: 900, q: 3 }) // metallic snap
+    thump(300, 0.05, 0.35, 0.03, 'square') // contact clack
+    thump(120, 0.22, 0.16, 0.06, 'sawtooth') // brief mains buzz as contacts seat
   },
 
   hitmarker(): void {

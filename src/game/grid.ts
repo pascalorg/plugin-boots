@@ -21,8 +21,12 @@
  * default target = the neighbor of the player's cell along the yaw
  * cardinal; a DDA march of the camera ray (≤ REACH) across grid planes
  * overrides it with the first slot boundary crossed; pitch beyond ±PITCH_BAND
- * retargets one storey up/down. Occupancy and support are injected so this
- * module stays pure (grid knows geometry, the game knows state).
+ * retargets one storey up/down. For stairs/roofs the march is WORLD-AWARE
+ * (resolveRayRSlot): it walks successive cell entries and takes the first
+ * PLACEABLE one, and the pitch-band intent corrects each crossing's storey —
+ * the raw crossing height is erratic at mid pitches (p4 ramp QA). Occupancy
+ * and support are injected so this module stays pure (grid knows geometry,
+ * the game knows state).
  */
 
 export const CELL = 3
@@ -122,8 +126,8 @@ function roofQuarter(d: [number, number]): number {
 /**
  * DDA the eye ray over grid planes and return the first slot the PIECE kind
  * cares about: walls take the first VERTICAL plane crossed, floors the
- * first HORIZONTAL plane, stairs/roofs the first cell entered beyond the
- * player's (both live on R slots).
+ * first HORIZONTAL plane. Stairs/roofs (R slots) go through the world-aware
+ * resolveRayRSlot march instead — never through here.
  */
 type Crossing = { t: number; axis: 'x' | 'z' | 'y'; plane: number }
 /** March scratch — ≤ 8 crossings per axis, reused every call (the builder
@@ -168,9 +172,6 @@ function rayOverride(input: TargetInput): Slot | null {
   const dy = Math.sin(input.pitch)
   const dz = -Math.cos(input.yaw) * cp
 
-  const startCellI = cellOf(ox + dx * RAY_START)
-  const startCellK = cellOf(oz + dz * RAY_START)
-
   _crossings.length = 0
   marchAxis(ox, dx, CELL, 'x')
   marchAxis(oz, dz, CELL, 'z')
@@ -181,7 +182,6 @@ function rayOverride(input: TargetInput): Slot | null {
     const x = ox + dx * c.t
     const y = oy + dy * c.t
     const z = oz + dz * c.t
-    const s = Math.max(0, storeyOf(y - (c.axis === 'y' ? 0.05 * Math.sign(dy) : EYE * 0)))
     if (input.piece === 'wall' && c.axis === 'x') {
       return { kind: 'Wx', i: c.plane, k: cellOf(z), s: Math.max(0, storeyOf(y)) }
     }
@@ -191,16 +191,76 @@ function rayOverride(input: TargetInput): Slot | null {
     if (input.piece === 'floor' && c.axis === 'y') {
       return { kind: 'F', i: cellOf(x), k: cellOf(z), s: Math.max(0, c.plane) }
     }
-    if ((input.piece === 'stairs' || input.piece === 'roof') && c.axis !== 'y') {
-      const i = c.axis === 'x' ? (dx > 0 ? c.plane : c.plane - 1) : cellOf(x)
-      const k = c.axis === 'z' ? (dz > 0 ? c.plane : c.plane - 1) : cellOf(z)
-      if (i !== startCellI || k !== startCellK) {
-        return { kind: 'R', i, k, s: Math.max(0, storeyOf(y)) }
-      }
-    }
-    void s
   }
   return null
+}
+
+/**
+ * R-slot ray targeting (stairs/roofs): march the aim ray's CELL entries and
+ * return the first PLACEABLE slot. Two aim-feel fixes over the plain
+ * first-crossing override (2026-08-27 owner QA, live repro):
+ * - an occupied/unsupported cell no longer dead-ends the aim — one placed
+ *   ramp used to make EVERY pitch from the same spot read "occupied"; the
+ *   march walks on to the next cell the ray crosses, ≤ REACH;
+ * - the storey honors the PITCH-BAND intent: the raw crossing height is
+ *   erratic at mid pitches (a wall-top aim from outside resolved a GROUND
+ *   cell), so beyond ±PITCH_BAND a crossing that disagrees with the intent
+ *   is bumped one storey up/down from the player's own.
+ * Returns the NEAREST failing result when nothing along the ray is
+ * placeable (its reason drives the HUD status line), or null when the ray
+ * exits reach without entering a new cell (caller falls back to the
+ * player-anchored default slot).
+ */
+function resolveRayRSlot(
+  input: TargetInput,
+  quarter: number,
+  world: WorldProbe,
+): TargetResult | null {
+  const [px, py, pz] = input.position
+  const ox = px
+  const oy = py + EYE
+  const oz = pz
+  const cp = Math.cos(input.pitch)
+  const dx = -Math.sin(input.yaw) * cp
+  const dy = Math.sin(input.pitch)
+  const dz = -Math.cos(input.yaw) * cp
+
+  const startCellI = cellOf(ox + dx * RAY_START)
+  const startCellK = cellOf(oz + dz * RAY_START)
+  const playerS = Math.max(0, storeyOf(py))
+  const up = input.pitch > PITCH_BAND
+  const down = input.pitch < -PITCH_BAND
+
+  _crossings.length = 0
+  marchAxis(ox, dx, CELL, 'x')
+  marchAxis(oz, dz, CELL, 'z')
+  _crossings.sort(byT)
+
+  let first: TargetResult | null = null
+  let prevI = startCellI
+  let prevK = startCellK
+  let prevS = -1
+  for (const c of _crossings) {
+    const x = ox + dx * c.t
+    const y = oy + dy * c.t
+    const z = oz + dz * c.t
+    const i = c.axis === 'x' ? (dx > 0 ? c.plane : c.plane - 1) : cellOf(x)
+    const k = c.axis === 'z' ? (dz > 0 ? c.plane : c.plane - 1) : cellOf(z)
+    if (i === startCellI && k === startCellK) continue // never your own cell
+    let s = Math.max(0, storeyOf(y))
+    // Pitch-band intent beats the erratic crossing height — but only when
+    // they DISAGREE (a crossing already a storey up is never double-bumped).
+    if (up && s <= playerS) s = playerS + 1
+    else if (down && s >= playerS) s = Math.max(0, playerS - 1)
+    if (i === prevI && k === prevK && s === prevS) continue // x/z pair, same cell
+    prevI = i
+    prevK = k
+    prevS = s
+    const result = evaluateSlot({ kind: 'R', i, k, s }, quarter, input, world)
+    if (result.valid) return result
+    if (!first) first = result
+  }
+  return first
 }
 
 /** Default slot: the neighbor of the player's cell along the yaw cardinal. */
@@ -264,10 +324,6 @@ function evaluateSlot(
 export function resolveTargetSlot(input: TargetInput, world: WorldProbe): TargetResult {
   const d = yawCardinal(input.yaw)
   const wall = input.piece === 'wall'
-  const raw = rayOverride(input)
-  const override = raw && wall ? applyWallFlip(raw, d, input.rotState) : raw
-  const base = defaultSlot(input)
-  const fallback = wall ? applyWallFlip(base, d, input.rotState) : base
 
   // Stairs: R adds ascent quarter-turns on top of the facing. Roof: R
   // cycles SHAPE presets instead (builder-side), so the yaw stays aimed
@@ -278,6 +334,24 @@ export function resolveTargetSlot(input: TargetInput, world: WorldProbe): Target
       : input.piece === 'roof'
         ? roofQuarter(d)
         : 0
+
+  // R slots (stairs/roofs): world-aware ray march — same first-valid-wins /
+  // nearest-failure-reports contract as the wall/floor path below.
+  if (input.piece === 'stairs' || input.piece === 'roof') {
+    const primary = resolveRayRSlot(input, quarter, world)
+    const base = defaultSlot(input)
+    if (primary) {
+      if (primary.valid || sameSlot(primary.slot, base)) return primary
+      const secondary = evaluateSlot(base, quarter, input, world)
+      return secondary.valid ? secondary : primary
+    }
+    return evaluateSlot(base, quarter, input, world)
+  }
+
+  const raw = rayOverride(input)
+  const override = raw && wall ? applyWallFlip(raw, d, input.rotState) : raw
+  const base = defaultSlot(input)
+  const fallback = wall ? applyWallFlip(base, d, input.rotState) : base
 
   // Ray override first, player-anchored fallback second (skipped when it is
   // the same slot); first valid wins, else the FIRST failing result reports.

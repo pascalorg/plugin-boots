@@ -262,6 +262,81 @@ describe('terrain grounding', () => {
     expect(isTerrainGrounded('Wz:4,-2,0')).toBe(true)
     expect(isTerrainGrounded('F:0,0,1')).toBe(false)
   })
+
+  test('R slots at storey 0 count TERRAIN as support — a ground ramp just works', () => {
+    // Genre parity: stairs/roofs on open ground need no wall or floor.
+    expect(isTerrainGrounded('R:10,11,0')).toBe(true)
+    expect(isTerrainGrounded('R:10,11,1')).toBe(false)
+    // Pure end-to-end: open terrain far from anything, terrain-only support.
+    const result = resolveTargetSlot(
+      { position: [31.5, 0, 31.5], yaw: -Math.PI / 2, pitch: 0, piece: 'stairs', rotState: 0 },
+      { isOccupied: () => false, isSupported: isTerrainGrounded },
+    )
+    expect(result.slotId).toBe('R:11,10,0')
+    expect(result.valid).toBe(true)
+    expect(result.reason).toBe('ok')
+  })
+})
+
+describe('resolveTargetSlot — R-slot ray march (ramp aim-feel)', () => {
+  test('pitch past the band bumps a LOW crossing to the storey above', () => {
+    // Aiming up at 0.62 rad (just past PITCH_BAND): the first crossing's
+    // height is still below storey 1 — the erratic mid-pitch case that used
+    // to resolve a GROUND cell. The pitch-band intent wins.
+    const result = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0.62, piece: 'stairs', rotState: 0 },
+      OPEN,
+    )
+    expect(result.slotId).toBe('R:1,0,1')
+    expect(result.valid).toBe(true)
+  })
+
+  test('a crossing already a storey up is never double-bumped', () => {
+    // Steeper aim: the crossing height alone already reads storey 1.
+    const result = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0.75, piece: 'stairs', rotState: 0 },
+      OPEN,
+    )
+    expect(parseSlotId(result.slotId)!.s).toBe(1)
+  })
+
+  test('an occupied cell no longer dead-ends the aim: the march walks on', () => {
+    // One ramp placed in the adjacent cell used to turn EVERY aim from this
+    // spot red ("occupied") until the player physically moved.
+    const world = {
+      isOccupied: (id: string) => id === 'R:1,0,0',
+      isSupported: () => true,
+    }
+    const result = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'stairs', rotState: 0 },
+      world,
+    )
+    expect(result.slotId).toBe('R:2,0,0')
+    expect(result.valid).toBe(true)
+  })
+
+  test('everything along the ray blocked → the NEAREST failure reports', () => {
+    const world = { isOccupied: () => true, isSupported: () => true }
+    const result = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'stairs', rotState: 0 },
+      world,
+    )
+    expect(result.slotId).toBe('R:1,0,0')
+    expect(result.valid).toBe(false)
+    expect(result.reason).toBe('occupied')
+  })
+
+  test("the march never targets the player's own cell", () => {
+    // Looking straight down past the band: no cell entry along the ray —
+    // falls back to the player-anchored neighbor, never R of the own cell.
+    const result = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: -1.4, piece: 'roof', rotState: 0 },
+      OPEN,
+    )
+    const slot = parseSlotId(result.slotId)!
+    expect(slot.kind).toBe('R')
+    expect([slot.i, slot.k]).not.toEqual([0, 0])
+  })
 })
 
 describe('reach', () => {

@@ -167,6 +167,8 @@ export function registerTreeRoutes<H extends TreeRayHit>(routes: TreeCombatRoute
 const _origin = new Vector3()
 const _direction = new Vector3()
 const _ray = new Ray()
+const _worldRay = new Ray()
+const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _point = new Vector3()
 const SPARK = new Color('#c9c2b4')
@@ -329,9 +331,21 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
   let solidNodeType: string | null = null
   _point.set(0, 0, 0)
 
-  // Solid host meshes (lowest priority).
+  // Solid host meshes (lowest priority). Broadphase first: a ray-vs-AABB
+  // test against collider.worldBox costs nanoseconds and culls the vast
+  // majority of colliders per shot — critically it also keeps the FIRST
+  // trigger pull from touching `.bvh` on every collider in the scene at
+  // once (world.ts builds each BVH lazily on first access; without this
+  // cull, shot #1 paid dozens-to-hundreds of synchronous MeshBVH builds
+  // in one frame — the minigun first-fire freeze, perf round 2026-08-27).
+  // A box entry point farther than the current winner can never beat it
+  // either (entry ≤ true hit distance), so the same test distance-culls.
+  _worldRay.origin.copy(_origin)
+  _worldRay.direction.copy(_direction)
   for (const collider of world.colliders) {
     if (collider.disabled) continue
+    const entry = _worldRay.intersectBox(collider.worldBox, _boxHit)
+    if (entry === null || entry.distanceTo(_origin) > bestDist) continue
     _inverse.copy(collider.inverse)
     _ray.origin.copy(_origin).applyMatrix4(_inverse)
     _ray.direction.copy(_direction).transformDirection(_inverse)

@@ -13,14 +13,17 @@ import type { DoorEntry, GameWorld } from './world'
  *
  * PACING (owned here + enemies.tsx):
  * - GRACE: while `waveState.alerted` is false the lot is peaceful — no
- *   spawns, no wave text. Walking, building, breaking walls never wake the
- *   horde; only picking up a gun (pistol/rifle in useBoots.owned) does.
- * - ALERT: the first gun pickup starts a one-shot ALERT_SECONDS countdown
+ *   spawns, no wave text. Walking, building, breaking walls, and CRUCIALLY
+ *   gearing up never wake the horde — combat is strictly OPT-IN. The ONLY
+ *   trigger is the industrial breaker switch on the wall stub by the spawn
+ *   tables (guntable.tsx → armWaves()).
+ * - ALERT: throwing the switch starts a one-shot ALERT_SECONDS countdown
  *   ("⚠ AI robot zombies incoming — 5") over a rising machine spin-up, a
  *   clack per tick; at 0 the line flashes HERE THEY COME and the wave
  *   director takes over (WAVE 1). `waveState.countdownActive` is true for
- *   exactly that window — the gun-table siren beacon spins off it.
- *   resetBots() re-arms the whole grace→alert cycle.
+ *   exactly that window — the switch-wall siren beacon spins off it.
+ *   resetBots() re-arms the whole grace→alert cycle (and resets the switch
+ *   handle back UP — it mirrors `waveState.armed`).
  * - MERCY: while the player is staggered bots never attack — ground bots
  *   hold a 4–6 m ring, drones climb +1 m and hover (see enemies.tsx).
  * - DOORWAYS: ground bots stuck against a facade hunt the nearest closed
@@ -100,31 +103,95 @@ let botId = 1
 /** Dev/E2E toggles — see header. Not used by any gameplay path directly. */
 export const debugFlags = { botsFrozen: false }
 
-/** Length of the "robot zombies incoming" countdown after the first gun pickup. */
+/** Length of the "robot zombies incoming" countdown after the switch throw. */
 export const ALERT_SECONDS = 5
 
 export const waveState = {
   wave: 0,
   /** Countdown to next wave while no bots are alive. */
   intermission: 4,
-  /** Flips true on the first gun pickup — the lot stays peaceful before. */
+  /**
+   * The industrial breaker switch (guntable.tsx) — true from the throw until
+   * resetBots(). Combat is strictly OPT-IN: this flag is the ONLY thing the
+   * wave director reads to leave grace. Gun pickups never touch it — you can
+   * carry the whole arsenal for an hour and the lot stays peaceful. The
+   * switch handle mirrors it every frame (down while armed, back UP on reset).
+   */
+  armed: false,
+  /** Flips true when the armed director starts the alert — peaceful before. */
   alerted: false,
   /** Seconds left on the one-shot alert countdown once alerted. */
   countdown: ALERT_SECONDS,
   /**
-   * COUNTDOWN THEATRE FLAG — true for exactly the post-pickup alert window
-   * (gun picked up → countdown hits 0), false before, after, and on reset.
-   * Owned by enemies.tsx; the gun-table siren beacon reads it every frame to
-   * spin its red head + run sfx.sirenLoop while the HUD line ticks
-   * "⚠ AI robot zombies incoming — N". Poll it — no events fire.
+   * COUNTDOWN THEATRE FLAG — true for exactly the post-throw alert window
+   * (switch thrown → countdown hits 0), false before, after, and on reset.
+   * Owned by the director tick below; the switch-wall siren beacon reads it
+   * every frame to spin its red head + run sfx.sirenLoop while the HUD line
+   * ticks "⚠ AI robot zombies incoming — N". Poll it — no events fire.
    */
   countdownActive: false,
+}
+
+/**
+ * Throw the breaker: arm the wave director. Idempotent — a second E on the
+ * thrown switch (or during the assault) changes nothing. The alert theatre
+ * itself starts on the next director tick (tickWaveDirector), so the switch
+ * stays a dumb lever: it writes one flag and the director owns the rest.
+ */
+export function armWaves(): void {
+  waveState.armed = true
+}
+
+/** What one director tick decided — the theatre layer (enemies.tsx) turns
+ * these into sfx/labels/spawns; state transitions all happen here. */
+export type DirectorStep = {
+  /** The switch throw registered — start the countdown theatre (spin-up). */
+  alertStarted: boolean
+  /** The countdown just hit zero — HERE THEY COME (spawn WAVE 1). */
+  assaultStarted: boolean
+  /** An intermission expired with the lot clear — spawn the next wave. */
+  waveDue: boolean
+}
+
+const _step: DirectorStep = { alertStarted: false, assaultStarted: false, waveDue: false }
+
+/**
+ * The wave director's state machine, one frame: grace → (switch armed) →
+ * alert countdown → assault waves with intermissions. Pure over waveState +
+ * its inputs — NO store reads: weapon ownership is deliberately not an input,
+ * so bots can never spawn off a pickup (the opt-in invariant, pinned by
+ * enemies-waves.test.ts). Returns a shared step record (allocation-free hot
+ * loop) — consume it before the next tick.
+ */
+export function tickWaveDirector(dt: number, botsAlive: number): DirectorStep {
+  _step.alertStarted = false
+  _step.assaultStarted = false
+  _step.waveDue = false
+  if (!waveState.alerted) {
+    if (waveState.armed) {
+      waveState.alerted = true
+      waveState.countdown = ALERT_SECONDS
+      waveState.countdownActive = true
+      _step.alertStarted = true
+    }
+  } else if (waveState.countdown > 0) {
+    waveState.countdown -= dt
+    if (waveState.countdown <= 0) {
+      waveState.countdownActive = false
+      _step.assaultStarted = true
+    }
+  } else if (botsAlive === 0) {
+    waveState.intermission -= dt
+    if (waveState.intermission <= 0) _step.waveDue = true
+  }
+  return _step
 }
 
 export function resetBots(): void {
   bots.length = 0
   waveState.wave = 0
   waveState.intermission = 4
+  waveState.armed = false
   waveState.alerted = false
   waveState.countdown = ALERT_SECONDS
   waveState.countdownActive = false

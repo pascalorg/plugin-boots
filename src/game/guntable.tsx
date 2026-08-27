@@ -6,7 +6,7 @@ import { CanvasTexture, type Group, Matrix4, type Mesh, type Object3D, Vector3 }
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
-import { waveState } from './enemies-state'
+import { armWaves, waveState } from './enemies-state'
 import { playerRig } from './player'
 import { getSession } from './session'
 import * as weaponModels from './weapon-models'
@@ -25,13 +25,22 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * be able to break apart").
  *
  * Set dressing (phase 4):
- * - First table: a pair of work boots beside the guns, and the SIREN BEACON
- *   on the far corner. The beacon is a persistent fixture — it survives the
- *   pickup (that's when it matters) and only leaves if the table breaks.
- *   While the post-pickup alert countdown runs it spins its light ~7 rad/s,
- *   casts a small red point light, and drives sfx.sirenLoop quietly.
+ * - First table: a pair of work boots beside the guns. Picking up here
+ *   grants the gear and NOTHING else — combat is strictly opt-in (see the
+ *   switch wall below); the table's own sign flips GEAR UP → YOU ARE COOKED.
  * - Rear table: the warhammer lies next to the rotary gun; picking up there
  *   grants BOTH — the big one and the hammer join the loadout together.
+ *
+ * THE SWITCH WALL (combat opt-in): a short concrete stub of wall beside the
+ * spawn tables carrying a MASSIVE two-hand industrial breaker switch — the
+ * big metal handle sits UP and throws DOWN on E (retro-lab vibes), and
+ * that throw is the ONLY thing that wakes the horde (enemies-state.armWaves
+ * → the alert countdown theatre → waves). The siren beacons live up here
+ * now (they moved off the gear table with the trigger), the placard reads
+ * PUT YOUR BOOTS ON, and the handle mirrors waveState.armed every frame —
+ * down for the whole assault, back up when resetBots() re-arms the grace.
+ * The stub joins the same grab arbitration as the tables, so one E press
+ * still serves exactly one fixture.
  */
 
 /**
@@ -51,12 +60,12 @@ const TABLE_HEIGHT = 0.82
 const TABLE_TOP = TABLE_HEIGHT + 0.03
 export const GRAB_RANGE = 2.4
 
-/** Live tables' grab candidacy, keyed by nodeId — each WeaponTable
- * registers on mount and mirrors `taken`. The build and gear grab discs
- * overlap almost everywhere on the spawn approach, so one E press must
- * serve exactly ONE table: the nearest untaken one (a double grant would
- * hand out the rifle alongside the builder and trip the wave director,
- * destroying the peaceful entry). */
+/** Live fixtures' grab candidacy, keyed by nodeId — each WeaponTable (and
+ * the switch wall) registers on mount and mirrors `taken`. The build and
+ * gear grab discs overlap almost everywhere on the spawn approach, so one
+ * E press must serve exactly ONE fixture: the nearest untaken one (a
+ * double grant would hand out the rifle alongside the builder — and a
+ * stray E must never reach the breaker switch by accident). */
 const grabTables = new Map<string, { x: number; z: number; taken: boolean }>()
 
 /** Nearest untaken table within grab range — pure, exported for tests.
@@ -103,6 +112,22 @@ export function buildTablePosition(world: GameWorld): Vector3 {
   )
 }
 
+/** The switch wall's stub footprint (w, h, d) — chest-high and a bit more. */
+export const SWITCH_WALL_SIZE: [number, number, number] = [1.2, 1.35, 0.18]
+
+/** The switch wall: past the gear table on its side of the lot, outside
+ * grab range at spawn (the peaceful entry keeps a single BUILD prompt) and
+ * clear of the gear table's footprint — you walk to the breaker on purpose. */
+export function switchWallPosition(world: GameWorld): Vector3 {
+  const fwdX = -Math.sin(world.spawnYaw)
+  const fwdZ = -Math.cos(world.spawnYaw)
+  return new Vector3(
+    world.spawn.x + fwdX * 3.4 - fwdZ * 2.2,
+    0,
+    world.spawn.z + fwdZ * 3.4 + fwdX * 2.2,
+  )
+}
+
 /** The heavy table: mirrored behind the spawn with the opposite side-step. */
 export function minigunTablePosition(world: GameWorld): Vector3 {
   const fwdX = -Math.sin(world.spawnYaw)
@@ -118,6 +143,7 @@ export function GunTable({ world }: { world: GameWorld }) {
   const frontPos = useMemo(() => tablePosition(world), [world])
   const rearPos = useMemo(() => minigunTablePosition(world), [world])
   const buildPos = useMemo(() => buildTablePosition(world), [world])
+  const switchPos = useMemo(() => switchWallPosition(world), [world])
   const geared = useBoots((s) => s.owned.includes('rifle'))
   const hasMinigun = useBoots((s) => s.owned.includes('minigun'))
   const hasBuilder = useBoots((s) => s.owned.includes('builder'))
@@ -125,8 +151,8 @@ export function GunTable({ world }: { world: GameWorld }) {
   return (
     <>
       {/* BUILD table: the peaceful entry. Grants ONLY the builder tool —
-       * the wave director keys off pistol/rifle/minigun ownership, so no
-       * countdown, no siren, no bots until the gear table is touched. */}
+       * and since the wave director keys off the breaker switch alone, no
+       * pickup anywhere wakes the horde. */}
       <WeaponTable
         world={world}
         position={buildPos}
@@ -167,22 +193,21 @@ export function GunTable({ world }: { world: GameWorld }) {
         prompt="Press E — gear up"
         promptOwner="guntable"
         onPickup={() => {
+          // Gear ONLY — the wave director never reads ownership; combat
+          // waits for the breaker switch (SwitchWall below).
           const s = useBoots.getState()
           s.giveWeapon('pistol')
           s.giveWeapon('rifle')
           s.setWeapon('rifle')
         }}
         fixtures={
-          <>
-            <SirenBeacon />
-            {/* The placard is a FIXTURE: it outlives the pickup (and flips
-             * to the taunt once you're geared). */}
-            <TableSign
-              position={[0, TABLE_TOP, -0.28]}
-              rotation={[0, 0, 0]}
-              text={geared ? 'YOU ARE COOKED' : 'PUT YOUR BOOTS ON'}
-            />
-          </>
+          /* The placard is a FIXTURE: it outlives the pickup (and flips
+           * to the taunt once you're geared). */
+          <TableSign
+            position={[0, TABLE_TOP, -0.28]}
+            rotation={[0, 0, 0]}
+            text={geared ? 'YOU ARE COOKED' : 'GEAR UP'}
+          />
         }
       >
         {/* pistol on display — lying flat on the tabletop (owner call) */}
@@ -246,6 +271,8 @@ export function GunTable({ world }: { world: GameWorld }) {
           )}
         </group>
       </WeaponTable>
+      {/* The combat opt-in: sirens, placard and the breaker all live here. */}
+      <SwitchWall position={switchPos} world={world} yaw={world.spawnYaw} />
     </>
   )
 }
@@ -259,6 +286,183 @@ function Spin({ position, children }: { position: [number, number, number]; chil
   return (
     <group position={position} ref={ref}>
       {children}
+    </group>
+  )
+}
+
+const SWITCH_NODE_ID = '__boots-switch'
+
+/** Lever pose: rotation.x of the pivot group. UP tips the big handle just
+ * off vertical toward the player; DOWN throws it well past horizontal. */
+const LEVER_UP = 0.35
+const LEVER_DOWN = 2.7
+/** The full throw sweeps in ~0.4 s (rad/s) — same lerp both directions. */
+const LEVER_RATE = (LEVER_DOWN - LEVER_UP) / 0.4
+
+/**
+ * The switch wall: a short concrete stub by the spawn tables carrying the
+ * industrial breaker switch — a massive two-hand knife-lever on a steel
+ * backplate, handle UP at rest, thrown DOWN on E. That throw (armWaves) is
+ * the ONLY way combat starts; the handle chases waveState.armed every frame
+ * so it stays down for the whole assault and swings back up when
+ * resetBots() restores the grace. The siren beacons and the PUT YOUR BOOTS
+ * ON placard live here. The stub's slab + cap are real colliders (and a
+ * voxelizable destruction target) exactly like the tables, and the E
+ * interaction joins the tables' nearest-grabbable arbitration.
+ */
+function SwitchWall({
+  world,
+  position,
+  yaw,
+}: {
+  world: GameWorld
+  position: Vector3
+  yaw: number
+}) {
+  const solidRefs = useRef<(Mesh | null)[]>([])
+  const leverRef = useRef<Group>(null)
+  const leverAngle = useRef(LEVER_UP)
+  const prevE = useRef(false)
+  const promptShown = useRef(false)
+  const broken = useDestruction((s) => s.targets.has(SWITCH_NODE_ID))
+
+  // Grab arbitration entry: the stub competes with the tables so one E
+  // press serves exactly one fixture. `taken` mirrors waveState.armed —
+  // refreshed per frame below (the flag lives outside React), so a thrown
+  // switch stops prompting and a reset re-arms it without a remount.
+  useEffect(() => {
+    grabTables.set(SWITCH_NODE_ID, { x: position.x, z: position.z, taken: waveState.armed })
+    return () => {
+      grabTables.delete(SWITCH_NODE_ID)
+    }
+  }, [position])
+
+  // The slab + cap are colliders for the session — the WeaponTable idiom:
+  // the RENDERED meshes register, so voxelization hides exactly what the
+  // player sees and the voxel replica is wall-shaped.
+  useEffect(() => {
+    const entries: ColliderEntry[] = []
+    for (const mesh of solidRefs.current) {
+      if (!mesh) continue
+      mesh.updateWorldMatrix(true, false)
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+      const entry: ColliderEntry = {
+        mesh,
+        bvh: bvhFor(mesh),
+        inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+        worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+        root: mesh,
+        nodeId: SWITCH_NODE_ID,
+        nodeType: 'item',
+      }
+      world.colliders.push(entry)
+      entries.push(entry)
+    }
+    return () => {
+      for (const entry of entries) entry.disabled = true
+    }
+  }, [world])
+
+  useFrame((_, dt) => {
+    // The throw (and the reset): chase armed's target pose at the 0.4 s
+    // sweep rate — a real handle motion, not a snap.
+    const target = waveState.armed ? LEVER_DOWN : LEVER_UP
+    if (leverAngle.current !== target) {
+      const delta = target - leverAngle.current
+      leverAngle.current += Math.sign(delta) * Math.min(Math.abs(delta), LEVER_RATE * dt)
+      if (leverRef.current) leverRef.current.rotation.x = leverAngle.current
+    }
+
+    const session = getSession()
+    if (!session) return
+    const entry = grabTables.get(SWITCH_NODE_ID)
+    if (entry) entry.taken = waveState.armed || broken
+    const near =
+      !waveState.armed &&
+      !broken &&
+      nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) === SWITCH_NODE_ID
+    if (near !== promptShown.current) {
+      promptShown.current = near
+      session.hud.prompt(near ? 'Press E — throw the switch' : null, 'switchwall')
+    }
+    const ePressed = session.input.state.keys.has('KeyE')
+    if (near && ePressed && !prevE.current) {
+      armWaves() // the ONLY combat trigger — the wave director takes over
+      sfx.breakerThrow() // heavy knife-switch clunk — the assault is armed
+      session.hud.prompt(null, 'switchwall')
+      promptShown.current = false
+    }
+    prevE.current = ePressed
+  })
+
+  const [wallW, wallH, wallD] = SWITCH_WALL_SIZE
+  return (
+    <group position={[position.x, 0, position.z]} rotation={[0, yaw, 0]} userData={{ __boots: true }}>
+      {/* the stub: chest-high concrete and a steel cap the sirens bolt onto */}
+      <mesh
+        castShadow
+        position={[0, wallH / 2, 0]}
+        ref={(mesh) => {
+          solidRefs.current[0] = mesh
+        }}
+      >
+        <boxGeometry args={[wallW, wallH, wallD]} />
+        <meshStandardMaterial color="#8d9096" roughness={0.9} />
+      </mesh>
+      <mesh
+        castShadow
+        position={[0, wallH + 0.025, 0]}
+        ref={(mesh) => {
+          solidRefs.current[1] = mesh
+        }}
+      >
+        <boxGeometry args={[wallW + 0.06, 0.05, wallD + 0.06]} />
+        <meshStandardMaterial color="#3a3d42" metalness={0.4} roughness={0.55} />
+      </mesh>
+      {!broken && (
+        <>
+          {/* the industrial breaker switch, on the spawn-facing face */}
+          <group position={[0, 0, wallD / 2]}>
+            {/* steel backplate */}
+            <mesh position={[0, 0.88, 0.03]}>
+              <boxGeometry args={[0.42, 0.55, 0.06]} />
+              <meshStandardMaterial color="#2a2d33" metalness={0.5} roughness={0.5} />
+            </mesh>
+            {/* hinge bosses on the pivot line */}
+            {[-0.11, 0.11].map((x) => (
+              <mesh key={x} position={[x, 0.72, 0.08]} rotation={[0, 0, Math.PI / 2]}>
+                <cylinderGeometry args={[0.035, 0.035, 0.05, 10]} />
+                <meshStandardMaterial color="#54565c" metalness={0.6} roughness={0.4} />
+              </mesh>
+            ))}
+            {/* the massive two-hand lever — pivot at the hinge line */}
+            <group position={[0, 0.72, 0.08]} ref={leverRef} rotation={[LEVER_UP, 0, 0]}>
+              {[-0.11, 0.11].map((x) => (
+                <mesh key={x} position={[x, 0.21, 0]}>
+                  <boxGeometry args={[0.045, 0.42, 0.035]} />
+                  <meshStandardMaterial color="#6d7076" metalness={0.65} roughness={0.35} />
+                </mesh>
+              ))}
+              {/* the big red cross-grip: grab it with both hands */}
+              <mesh position={[0, 0.42, 0]} rotation={[0, 0, Math.PI / 2]}>
+                <cylinderGeometry args={[0.034, 0.034, 0.36, 12]} />
+                <meshStandardMaterial color="#c43a35" roughness={0.5} />
+              </mesh>
+            </group>
+          </group>
+          {/* the marching orders moved here with the trigger */}
+          <TableSign
+            position={[0, 1.02, wallD / 2 + 0.005]}
+            rotation={[0, 0, 0]}
+            scale={0.9}
+            text="PUT YOUR BOOTS ON"
+          />
+          {/* twin sirens on the cap — the primary carries the lot's single
+           * always-mounted red pointLight (moved off the gear table). */}
+          <SirenBeacon position={[-0.42, wallH + 0.05, 0]} primary />
+          <SirenBeacon position={[0.42, wallH + 0.05, 0]} />
+        </>
+      )}
     </group>
   )
 }
@@ -283,7 +487,7 @@ function resolveSirenLoop(): SirenHandle | null {
 /**
  * The alert countdown window: bots-pathing owns the flag semantics in
  * enemies-state.ts — `waveState.countdownActive` is true exactly while the
- * post-pickup ALERT_SECONDS countdown runs (false before, after, and on
+ * post-throw ALERT_SECONDS countdown runs (false before, after, and on
  * resetBots()).
  */
 function alertCountdownActive(): boolean {
@@ -291,13 +495,22 @@ function alertCountdownActive(): boolean {
 }
 
 /**
- * The siren beacon on the first table's corner. Dormant until the alert
- * countdown starts, then: the 'beacon-light' child (tagged by the model via
- * userData) spins ~7 rad/s, a small red point light exists for exactly the
- * countdown window, and sfx.sirenLoop plays quietly. Everything stops when
- * the countdown ends and on unmount.
+ * A siren beacon — now mounted on the switch wall's cap (it moved there
+ * with the combat trigger). Dormant until the alert countdown starts, then:
+ * the 'beacon-light' child (tagged by the model via userData) spins
+ * ~7 rad/s, a small red point light flares for exactly the countdown
+ * window, and sfx.sirenLoop plays quietly. Everything stops when the
+ * countdown ends and on unmount. Exactly ONE beacon is `primary`: it owns
+ * the single red pointLight (still always-mounted — moved, never
+ * duplicated) and the siren voice; secondaries just spin their heads.
  */
-function SirenBeacon() {
+function SirenBeacon({
+  position,
+  primary = false,
+}: {
+  position: [number, number, number]
+  primary?: boolean
+}) {
   const rootRef = useRef<Group>(null)
   const headRef = useRef<Object3D | null>(null)
   const activeRef = useRef(false)
@@ -325,25 +538,35 @@ function SirenBeacon() {
     if (on !== activeRef.current) {
       activeRef.current = on
       setActive(on)
-      if (on) {
-        if (!sirenResolved.current) {
-          sirenResolved.current = true
-          sirenRef.current = resolveSirenLoop()
+      if (primary) {
+        if (on) {
+          if (!sirenResolved.current) {
+            sirenResolved.current = true
+            sirenRef.current = resolveSirenLoop()
+          }
+          sirenRef.current?.start()
+        } else {
+          sirenRef.current?.stop()
         }
-        sirenRef.current?.start()
-      } else {
-        sirenRef.current?.stop()
       }
     }
     if (on && headRef.current) headRef.current.rotation.y += dt * 7
   })
 
   return (
-    <group ref={rootRef} position={[0.76, TABLE_TOP, -0.3]}>
+    <group ref={rootRef} position={position}>
       <SirenModel />
-      {/* ALWAYS mounted: adding a light mid-session recompiles pipelines
-       * (the gear-up lag burst) — only intensity animates. */}
-      <pointLight color="#ff2222" distance={6} intensity={active ? 2 : 0} position={[0, 0.14, 0]} />
+      {/* ALWAYS mounted (primary only — the lot's single siren light):
+       * adding a light mid-session recompiles pipelines (the gear-up lag
+       * burst) — only intensity animates. */}
+      {primary && (
+        <pointLight
+          color="#ff2222"
+          distance={6}
+          intensity={active ? 2 : 0}
+          position={[0, 0.14, 0]}
+        />
+      )}
     </group>
   )
 }

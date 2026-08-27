@@ -72,6 +72,14 @@ describe('support answers (grid.WorldProbe)', () => {
     expect(isSupported('F:5,5,3')).toBe(false)
   })
 
+  test('an empty R slot on open terrain is supported — ground ramps/roofs always place', () => {
+    // Genre parity (owner QA 2026-08-27): stairs and roofs at storey 0 need
+    // no wall, floor, or scene geometry — TERRAIN is their support root.
+    expect(isSupported('R:30,30,0')).toBe(true)
+    expect(isSupported('R:-7,12,0')).toBe(true)
+    expect(isSupported('R:30,30,1')).toBe(false) // sky ramp still needs support
+  })
+
   test('a candidate touching a supported piece is supported', () => {
     registerPlacement('Wz:0,0,0', 1) // grounded
     registerPlacement('Wz:0,0,1', 2) // stacked, supported through 1

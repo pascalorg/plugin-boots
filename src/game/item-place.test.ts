@@ -10,6 +10,7 @@ import {
   type ItemAnchor,
   itemFootprint,
   itemGhostActive,
+  itemModelLoader,
   itemOverlapsPlayer,
   useItems,
 } from './item-place'
@@ -180,6 +181,29 @@ describe('itemOverlapsPlayer: placement must never entomb the player', () => {
     const lamp: [number, number, number] = [0.3, 0.4, 0.3]
     expect(itemOverlapsPlayer(0, PLAYER_CAPSULE.height + 0.05, 0, 0, lamp, 0, 0, 0)).toBe(false)
     expect(itemOverlapsPlayer(0, PLAYER_CAPSULE.height - 0.05, 0, 0, lamp, 0, 0, 0)).toBe(true)
+  })
+})
+
+describe('itemModelLoader: catalog GLBs decode (2026-08-27 real-models fix)', () => {
+  test('wires Draco + meshopt — the system catalog is Draco-compressed', () => {
+    const loader = itemModelLoader()
+    // A bare GLTFLoader throws "No DRACOLoader instance provided" on every
+    // KHR_draco_mesh_compression catalog GLB → the labeled-proxy fallback
+    // for the WHOLE catalog. The decoder host is the host renderer's own.
+    const draco = (
+      loader as unknown as { dracoLoader: { decoderPaths: { wasm?: string } } | null }
+    ).dracoLoader
+    expect(draco).not.toBeNull()
+    expect(draco!.decoderPaths.wasm).toBe(
+      'https://www.gstatic.com/draco/versioned/decoders/1.5.5/draco_decoder.wasm',
+    )
+    expect(
+      (loader as unknown as { meshoptDecoder: unknown }).meshoptDecoder,
+    ).toBeTruthy()
+  })
+
+  test('one loader per session — repeat calls reuse the instance', () => {
+    expect(itemModelLoader()).toBe(itemModelLoader())
   })
 })
 

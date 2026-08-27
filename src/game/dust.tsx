@@ -13,6 +13,7 @@ import {
   Quaternion,
   Vector3,
 } from 'three'
+import { createProbeMemo } from './probe-memo'
 
 /**
  * Impact dust + lingering haze. Two ring buffers of camera-facing quads on
@@ -98,6 +99,8 @@ export type DustOpts = {
   /** Shot/travel direction — bends the cone slightly downrange. */
   direction?: Vector3
   kind?: DustKind | DustMaterial
+  /** Base color override (working space) — item carves pass the sampled palette average. */
+  tint?: { r: number; g: number; b: number }
 }
 
 type QuadSlot = {
@@ -177,7 +180,15 @@ export type DustFloorProbe = (x: number, y: number, z: number) => number
 let floorProbe: DustFloorProbe | null = null
 export function setDustFloorProbe(probe: DustFloorProbe | null): void {
   floorProbe = probe
+  probeMemo.clear()
 }
+
+/** Post-blast probe dedupe (perf round 2026-08-27, finding B4): one boom
+ * seeds 10+ bursts in a ~4 m footprint in the same frame, each probing the
+ * same few floor cells — the 0.5 m-bucket memo (probe-memo.ts) collapses
+ * those to one probeLandingY per cell per 400 ms. Spawns still probe
+ * synchronously (the burst needs its floor at birth), so no cap here. */
+const probeMemo = createProbeMemo()
 /** Quad centers hover this far above their floor once settled. */
 const FLOOR_REST = 0.06
 
@@ -307,7 +318,7 @@ export function spawnDust(
   if (puffLive > PUFF_CAP * PRESSURE) count = Math.max(1, count >> 1)
 
   const jitter = kind === 'plume' ? 0.45 : 0.2
-  const floorY = floorProbe ? floorProbe(x, y, z) : 0
+  const floorY = floorProbe ? probeMemo.get(floorProbe, x, y, z) : 0
   for (let n = 0; n < count; n++) {
     const s = puffs[puffCursor]!
     puffCursor = (puffCursor + 1) % PUFF_CAP
@@ -343,9 +354,12 @@ export function spawnDust(
       s.alpha = 0.36 + k * 0.1
       s.drag = 4.2
     }
-    s.cr = concrete ? CONC_R : DUST_R
-    s.cg = concrete ? CONC_G : DUST_G
-    s.cb = concrete ? CONC_B : DUST_B
+    // Item carves pass a sampled palette tint — blended toward the concrete
+    // gray so the cloud reads as pulverized material, not confetti.
+    const tint = opts?.tint
+    s.cr = tint ? tint.r * 0.65 + CONC_R * 0.35 : concrete ? CONC_R : DUST_R
+    s.cg = tint ? tint.g * 0.65 + CONC_G * 0.35 : concrete ? CONC_G : DUST_G
+    s.cb = tint ? tint.b * 0.65 + CONC_B * 0.35 : concrete ? CONC_B : DUST_B
     if (hasAxis) {
       coneDirection(_vel, _axis, CONE_SPREAD, Math.random(), Math.random())
       s.vx = _vel.x * speed
