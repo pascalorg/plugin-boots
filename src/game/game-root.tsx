@@ -28,6 +28,7 @@ import { GunTable } from './guntable'
 import { GameItems } from './item-place'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
+import { PerfMonitor, perfReset, perfSnapshot } from './perf-monitor'
 import { Player, playerDebug, playerRig } from './player'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { aimDirection, fire } from './shooting'
@@ -503,6 +504,9 @@ function ActiveGame() {
           ...p,
           position: [...p.position] as [number, number, number],
         })),
+      // Frame-lag recorder (perf-monitor.ts): spike log + p95/worst summary.
+      perf: () => perfSnapshot(),
+      perfReset,
     }
     return () => {
       delete (globalThis as Record<string, unknown>).__boots
@@ -539,6 +543,7 @@ function ActiveGame() {
       <PipelineWarmup world={world} />
       <ResurrectionSweep />
       <TreesDestruct world={world} />
+      <PerfMonitor />
     </>
   )
 }

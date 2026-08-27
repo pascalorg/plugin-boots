@@ -25,6 +25,7 @@ import { sfx } from './audio'
 import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
 import { dropTarget, probeLandingY } from './destruction'
 import { type CatalogEntry, closeItemMenu, isItemMenuOpen, openItemMenu } from './inventory'
+import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld, isGlassLikeMesh } from './world'
@@ -282,6 +283,7 @@ function loadModel(asset: CatalogEntry): Promise<Group> {
     .then((gltf) => {
       const template = gltf.scene as unknown as Group
       modelCache.set(asset.id, { status: 'ready', template })
+      perfEvent('item-load')
       return template
     })
     .catch((cause: unknown) => {

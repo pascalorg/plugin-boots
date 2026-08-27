@@ -1062,3 +1062,48 @@ gear/build/switch grab-disc proximity (~1.0–1.5 m, nearest-untaken
 arbitration held) — both logged for the owner's feel pass.
 
 610 tests / 19.8k assertions green; tsc clean.
+
+## Phase 6 round 2 — paint feel + lag recorder (2026-08-27, fleet round 3, manager stitch)
+
+Four lanes launched, two survived. ROOF-CLIP and COLORS+CEILING died
+leaving zero files in the tree — nothing to salvage, nothing to revert;
+their cross-file wiring requests (roof-planes re-exports, paint serial
+clear) had no deliverables behind them and were skipped. Both requeue.
+
+PAINT-FEEL (paint.tsx + paint.test.ts):
+- Fixed SPLAT_RADIUS retired for pure `splatRadiusAt(distance)` —
+  clamped quadratic ease-in, r = 0.12 + 1.28·t², t = clamp((d−1)/7, 0, 1).
+  ≤1 m paints exactly one 0.15 m wall cell (legible writing strokes);
+  ≥8 m blooms to 1.4 m. sprayPaint records the true hit distance
+  (voxel-skin wins update bestDist, misses null it). Manager decision:
+  PAINT_RANGE 7→9 m KEPT so the 8 m broad-cone anchor is reachable —
+  flag to the owner if the reach change reads wrong in play.
+- The can shows its color: valve-collar cap ring in the live palette
+  color + enlarged label band wearing a "PRESS R" CanvasTexture
+  (palette background, rec-601 contrast ink via `paintLabelInk`; band
+  rotated π off the cylinder UV seam). Texture cache is a module Map
+  gated on palette membership, built per coat, never per frame, never
+  disposed (dust-texture idiom); frame loop swaps material.map only on
+  hex change — no shader recompile, zero per-frame allocations.
+- Writing-mode HUD prompt: `WRITING_DISTANCE = 2`, pure `paintPrompt` —
+  actively spraying a surface hit < 2 m flips the owner-keyed
+  hud.prompt line to 'WRITING MODE — R next color' (feature-detected;
+  no hud.ts or viewmodel.tsx changes needed).
+
+LAG-RECORDER (perf-monitor.ts + 16 tests):
+- createFrameStats: injectable-clock pure factory; Float32Array(3600)
+  ring (60 s @ 60 fps), exponential mean (alpha 0.02) seeded by frame 1;
+  spike = delta > max(3× rolling mean-before, 50 ms), log capped at 200.
+- Spikes tagged by the most recent perfEvent(name) within 500 ms wall
+  clock. Singletons: perfEvent (two writes, safe anywhere), perfSnapshot
+  ({frames, mean, p95, worst, spikes} — copies, never live refs),
+  perfReset. PerfMonitor: the one useFrame subscriber (priority 0),
+  resets on mount, console.info dump on session exit.
+- Manager wiring: PerfMonitor mounted in ActiveGame; `__boots.perf()` +
+  `__boots.perfReset` handles; perfEvent call sites in grenade.tsx
+  (grenade-boom), viewmodel.tsx (minigun-trigger, once per spin-up from
+  rest), destruction.ts (voxelize, after cache-hit/roof-group early
+  returns), builder.tsx (clad-drain, only when work drained),
+  item-place.tsx (item-load, on GLB ready), enemies.tsx (wave-spawn).
+
+634 tests / 19,948 assertions green; tsc clean; both real exit codes 0.

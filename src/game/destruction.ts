@@ -5,6 +5,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
+import { perfEvent } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
 import { enumerateRoofPlanes, roofSurfaceColor } from './roof-planes'
@@ -1411,6 +1412,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     return null
   }
 
+  perfEvent('voxelize')
   const wall = world.walls.get(nodeId)
   const meshes: Mesh[] = []
   let nodeType: string | null = null

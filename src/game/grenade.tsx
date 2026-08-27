@@ -13,6 +13,7 @@ import { collideVoxelTargets, damageSegment, damageTarget, useDestruction } from
 import { spawnDust, spawnHaze } from './dust'
 import { raycastGlass, shatterPane } from './glass'
 import { bots, damageBot } from './enemies-state'
+import { perfEvent } from './perf-monitor'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
 import type { GameWorld } from './world'
@@ -276,6 +277,7 @@ const SCRAP = new Color('#5d5a52')
  * voice, dust storm. Exported for tests/E2E.
  */
 export function explodeAt(world: GameWorld, center: Vector3): void {
+  perfEvent('grenade-boom')
   // Carve — feature-detect the phase-4 collapse export.
   const boom = (
     destruct as { damageExplosion?: (w: GameWorld, c: Vector3, r: number) => number }

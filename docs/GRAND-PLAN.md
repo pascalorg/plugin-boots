@@ -63,6 +63,22 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   audio prime, probeLandingY memo, settle-timer de-coalescing · ramp
   targeting ray-march fix + weapon-tracked HUD keybar with AZERTY
   captions. 610 tests / 19.8k assertions green.
+- Phase 6 round 2 (2026-08-27 night, fleet round 3: 2 lanes landed, 2
+  died with zero output — roof-clip + colors/ceiling requeue next
+  round): paint FEEL — splat radius is distance-driven (`splatRadiusAt`,
+  clamped quadratic ease 0.12 m at ≤1 m → 1.4 m at ≥8 m; one wall cell
+  up close for legible writing, exaggerated late-bloom cone far out;
+  PAINT_RANGE 7→9 m so the 8 m anchor is reachable), the spray can wears
+  its palette color (valve-collar cap + "PRESS R" CanvasTexture band,
+  bounded per-coat texture cache, hex-change-gated frame loop), and a
+  writing-mode HUD prompt flips on while spraying a surface < 2 m ·
+  frame-LAG recorder (perf-monitor.ts): 60 s Float32Array ring, zero
+  per-frame allocations, spike log (>3× rolling mean, min 50 ms) tagged
+  by the nearest `perfEvent` within 500 ms — call sites at grenade-boom /
+  minigun-trigger / voxelize / clad-drain / item-load / wave-spawn;
+  `__boots.perf()` snapshot ({frames, mean, p95, worst, spikes}) +
+  `__boots.perfReset`, console dump on session exit. 634 tests / 19.9k
+  assertions green.
 
 ## In flight
 

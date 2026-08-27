@@ -30,6 +30,7 @@ import {
   tickWaveDirector,
   waveState,
 } from './enemies-state'
+import { perfEvent } from './perf-monitor'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
 import type { GameWorld } from './world'
@@ -123,6 +124,7 @@ const _doorCenter = new Vector3()
 
 /** Spawn the next wave in a ring around the building. */
 function spawnWave(world: GameWorld): void {
+  perfEvent('wave-spawn')
   waveState.wave++
   waveState.intermission = 5
   const count = 3 + waveState.wave * 2

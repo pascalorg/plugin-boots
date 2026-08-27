@@ -20,6 +20,7 @@ import {
   type TargetResult,
 } from './grid'
 import { itemGhostActive } from './item-place'
+import { perfEvent } from './perf-monitor'
 import {
   isDeathLocked,
   isOccupied as slotIsOccupied,
@@ -831,6 +832,7 @@ export function drainCladQueue(limit = CLAD_DRAIN_PER_FRAME): void {
     ensureVoxelTarget(request.world, request.nodeId)
     clad++
   }
+  if (clad > 0) perfEvent('clad-drain')
   if (cladHead >= cladQueue.length) {
     cladQueue.length = 0 // fully drained — release the world refs
     cladHead = 0

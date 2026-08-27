@@ -3,6 +3,7 @@
 import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
 import {
+  CanvasTexture,
   Color,
   type InstancedMesh,
   Matrix4,
@@ -25,7 +26,9 @@ import type { GameWorld } from './world'
  * The paint sprayer — slot 7. Fire tints whatever the crosshair touches:
  * host walls' voxel/cladding replicas, floors/slabs/roofs, placed builder
  * pieces (their voxel clads), all through ONE lane — a splat marks the
- * alive grid cells within SPLAT_RADIUS of the hit point and the renderer's
+ * alive grid cells within the spray cone's radius at the hit distance
+ * (splatRadiusAt: close = pencil-thin writing strokes, far = a broad
+ * wall-coating fan) and the renderer's
  * EXISTING per-instance color attribute wears the tint (no new meshes,
  * no shaders — CPU setColorAt + needsUpdate, WebGPU-safe). A pristine
  * paintable node voxelizes on first coat exactly like first blood does.
@@ -69,10 +72,37 @@ export const PAINT_PALETTE: readonly PaintColor[] = [
 
 /** Splats per second while the trigger is held. */
 const PAINT_RATE = 9
-/** Sprayer reach (m) — painting is close work, well under gun range. */
-const PAINT_RANGE = 7
-/** World radius (m) of cells one splat coats around the hit point. */
-export const SPLAT_RADIUS = 0.6
+/** Sprayer reach (m) — long enough to stand back and coat a whole wall
+ * at the broad end of the cone, still well under gun range. */
+const PAINT_RANGE = 9
+
+// ── The spray cone (distance-driven splat radius) ─────────────────────────
+//
+// Real aerosol widens with distance; we EXAGGERATE it (owner call): nose
+// against the wall the splat is a one-cell-wide stroke you can WRITE with,
+// eight meters back one splat blankets over a meter. Quadratic ease keeps
+// the radius tight through the whole writing range and blooms late.
+
+/** Inside this distance (m) the splat stays at its narrowest. */
+export const SPLAT_NEAR_DIST = 1
+/** Narrow-end radius (m) — one 0.15 m wall cell wide: legible strokes. */
+export const SPLAT_NEAR_RADIUS = 0.12
+/** Beyond this distance (m) the cone is fully open. */
+export const SPLAT_FAR_DIST = 8
+/** Broad-end radius (m) — one splat covers most of a wall face. */
+export const SPLAT_FAR_RADIUS = 1.4
+
+/** Pure cone curve: hit distance (m) → splat radius (m). Clamped quadratic
+ * ease-in between the near/far anchors — flat narrow plateau ≤ 1 m, slow
+ * growth through writing range, late bloom to 1.4 m at ≥ 8 m. */
+export function splatRadiusAt(distance: number): number {
+  const span = SPLAT_FAR_DIST - SPLAT_NEAR_DIST
+  const t = Math.min(Math.max((distance - SPLAT_NEAR_DIST) / span, 0), 1)
+  return SPLAT_NEAR_RADIUS + (SPLAT_FAR_RADIUS - SPLAT_NEAR_RADIUS) * t * t
+}
+
+/** Painting nearer than this (m) is "writing mode" — the HUD says so. */
+export const WRITING_DISTANCE = 2
 
 /** Node types a coat can voxelize (mirrors shooting's destructible lane —
  * paintable ⊆ destructible, so painting never voxelizes what bullets
@@ -104,6 +134,12 @@ export function cyclePaintColor(): PaintColor {
   return PAINT_PALETTE[colorIndex]!
 }
 
+/** The HUD line copy — writing mode (spraying inside WRITING_DISTANCE)
+ * vs the plain paint prompt. Pure; exported for tests. */
+export function paintPrompt(writing: boolean, colorName: string): string {
+  return writing ? 'WRITING MODE — R next color' : `PAINT · ${colorName} — R next color`
+}
+
 // ── The splat ledger (read by paint-keep on exit) ─────────────────────────
 
 /** nodeId → voxel cell index → palette index. Later coats overwrite. */
@@ -118,7 +154,16 @@ export const getPaintedByNode = (): ReadonlyMap<string, ReadonlyMap<number, numb
 export function resetPaint(): void {
   paintedByNode.clear()
   nodeSerials.clear()
+  lastHitDistance = null
 }
+
+// ── Last hit distance (drives the cone + the writing-mode HUD line) ───────
+
+let lastHitDistance: number | null = null
+
+/** Distance (m) of the most recent spray tick's surface hit; null while
+ * spraying at nothing. PaintTool reads it for the writing-mode prompt. */
+export const lastSprayHitDistance = (): number | null => lastHitDistance
 
 /**
  * Pure splat-cell selection: every ALIVE cell whose world center sits
@@ -163,8 +208,9 @@ const _point = new Vector3()
 /**
  * One trigger tick: resolve the crosshair ray (voxel skins beat solid
  * colliders on a near-tie, same priority shooting uses), voxelize a
- * pristine paintable node, then ledger the splat cells. Returns true when
- * any cell took paint.
+ * pristine paintable node, then ledger the splat cells — sized by the
+ * spray cone at the HIT DISTANCE (close = writing stroke, far = wall
+ * coat). Returns true when any cell took paint.
  */
 export function sprayPaint(world: GameWorld): boolean {
   _origin.copy(playerRig.position)
@@ -199,8 +245,13 @@ export function sprayPaint(world: GameWorld): boolean {
     nodeId = voxelHit.nodeId
     needsVoxelize = false
     _point.copy(voxelHit.point)
+    bestDist = voxelHit.distance
   }
-  if (!nodeId) return false
+  if (!nodeId) {
+    lastHitDistance = null
+    return false
+  }
+  lastHitDistance = bestDist
   if (needsVoxelize) {
     if (!solidType || !PAINTABLE.has(solidType)) return false
     if (!ensureVoxelTarget(world, nodeId)) return false // degenerate grid
@@ -208,7 +259,7 @@ export function sprayPaint(world: GameWorld): boolean {
   const target = useDestruction.getState().targets.get(nodeId)
   if (!target) return false
 
-  const cells = selectSplatCells(target.grid, _point.x, _point.y, _point.z, SPLAT_RADIUS)
+  const cells = selectSplatCells(target.grid, _point.x, _point.y, _point.z, splatRadiusAt(bestDist))
   if (cells.length === 0) return false
   let painted = paintedByNode.get(nodeId)
   if (!painted) {
@@ -313,24 +364,83 @@ export function drainPaintTints(scene: Object3D): void {
 const CAN_BODY = '#b6b9be'
 const CAN_DARK = '#7f838a'
 const NOZZLE = '#2b2e33'
+/** Label ink pair — picked per palette entry by paintLabelInk(). */
+const INK_DARK = '#1c1e22'
+const INK_LIGHT = '#f4f2ea'
+
+/** Pure contrast pick: dark ink on light coats, light ink on dark coats
+ * (rec-601 luma on the palette hex). Exported for tests. */
+export function paintLabelInk(hex: string): string {
+  const r = Number.parseInt(hex.slice(1, 3), 16)
+  const g = Number.parseInt(hex.slice(3, 5), 16)
+  const b = Number.parseInt(hex.slice(5, 7), 16)
+  const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return luma > 0.55 ? INK_DARK : INK_LIGHT
+}
+
+/** hex → "PRESS R" band texture. Module cache — built once per PALETTE
+ * entry (membership-gated, so the map is bounded to the 7 coats), shared
+ * by every SprayerModel mount and NEVER rebuilt per frame. Textures live
+ * for the module lifetime (the dust-texture idiom); R3F only disposes the
+ * JSX materials, never these maps. */
+const labelTextures = new Map<string, CanvasTexture>()
+
+export function paintLabelTexture(hex: string): CanvasTexture | null {
+  // Bound the cache: only real palette coats mint a texture.
+  if (!PAINT_PALETTE.some((swatch) => swatch.hex === hex)) return null
+  const cached = labelTextures.get(hex)
+  if (cached) return cached
+  if (typeof document === 'undefined') return null // SSR/tests: color-only band
+  const canvas = document.createElement('canvas')
+  canvas.width = 512
+  canvas.height = 128
+  const g = canvas.getContext('2d')
+  if (!g) return null
+  g.fillStyle = hex
+  g.fillRect(0, 0, 512, 128)
+  const ink = paintLabelInk(hex)
+  g.strokeStyle = ink
+  g.lineWidth = 4
+  g.strokeRect(150, 20, 212, 88)
+  g.fillStyle = ink
+  g.font = 'bold 44px system-ui, sans-serif'
+  g.textAlign = 'center'
+  g.textBaseline = 'middle'
+  // Centered at u=0.5 — the band mesh spins π so this faces the camera
+  // (cylinder UVs put u=0 at +Z, which is also the seam).
+  g.fillText('PRESS R', 256, 66)
+  const texture = new CanvasTexture(canvas)
+  labelTextures.set(hex, texture)
+  return texture
+}
 
 /**
  * Compact aerosol can for the viewmodel (weapon-models conventions: grip at
- * the origin, -Z forward). The label band wears the LIVE palette color —
- * one change-gated material write per cycle, no new materials.
+ * the origin, -Z forward). The label band wears the LIVE palette color with
+ * "PRESS R" printed on it (module-cached CanvasTexture per coat) and the
+ * cap ring under the nozzle wears the same color — one change-gated
+ * material write per cycle, no new materials, no per-frame texture work.
  */
 export function SprayerModel() {
   const bandRef = useRef<Mesh>(null)
+  const capRef = useRef<Mesh>(null)
   useFrame(() => {
     const band = bandRef.current
-    if (!band) return
+    const cap = capRef.current
+    if (!band || !cap) return
     const material = band.material as MeshStandardMaterial
     const hex = currentPaintColor().hex
     if (material.userData.hex !== hex) {
       material.userData.hex = hex
-      material.color.set(hex)
+      const label = paintLabelTexture(hex)
+      if (label) material.map = label // texture swap only — same shader
+      else material.color.set(hex)
+      ;(cap.material as MeshStandardMaterial).color.set(hex)
     }
   })
+  // Module state survives weapon switches — mount with the CURRENT coat.
+  const initial = currentPaintColor()
+  const initialLabel = paintLabelTexture(initial.hex)
   return (
     <group>
       {/* Can body — squat cylinder resting in the fist. */}
@@ -338,10 +448,22 @@ export function SprayerModel() {
         <cylinderGeometry args={[0.042, 0.042, 0.15, 12]} />
         <meshStandardMaterial color={CAN_BODY} metalness={0.35} roughness={0.45} />
       </mesh>
-      {/* Label band — the live paint color (frame loop above tints it). */}
-      <mesh position={[0, 0.018, 0]} ref={bandRef}>
-        <cylinderGeometry args={[0.0435, 0.0435, 0.07, 12]} />
-        <meshStandardMaterial color={PAINT_PALETTE[0]!.hex} roughness={0.6} />
+      {/* Label band — the live paint color wearing "PRESS R" (frame loop
+       * above swaps the cached texture per cycle). π turn: the print sits
+       * at u=0.5, the face toward the camera. */}
+      <mesh position={[0, 0.018, 0]} ref={bandRef} rotation={[0, Math.PI, 0]}>
+        <cylinderGeometry args={[0.0445, 0.0445, 0.1, 16]} />
+        {initialLabel ? (
+          <meshStandardMaterial map={initialLabel} roughness={0.6} />
+        ) : (
+          <meshStandardMaterial color={initial.hex} roughness={0.6} />
+        )}
+      </mesh>
+      {/* Valve collar — the color-cap dot you read at a glance (sits on
+       * the neck's 0.02 top rim, wrapping the nozzle button's base). */}
+      <mesh position={[0, 0.113, 0]} ref={capRef}>
+        <cylinderGeometry args={[0.021, 0.024, 0.014, 12]} />
+        <meshStandardMaterial color={initial.hex} roughness={0.55} />
       </mesh>
       {/* Crimped base rim. */}
       <mesh position={[0, -0.052, 0]}>
@@ -401,19 +523,6 @@ export function PaintTool({ world }: { world: GameWorld }) {
     const state = useBoots.getState()
     const active = (state.weapon as string) === 'paint'
 
-    // HUD color line: paintSwatch once hud.ts ships it (manager wiring),
-    // the owner-keyed shared prompt line until then.
-    const color = currentPaintColor()
-    const key = active ? color.hex : ''
-    if (key !== hudKey.current) {
-      hudKey.current = key
-      const hud = session.hud as typeof session.hud & {
-        paintSwatch?: (hex: string | null, label?: string) => void
-      }
-      if (hud.paintSwatch) hud.paintSwatch(active ? color.hex : null, color.name)
-      else hud.prompt(active ? `PAINT · ${color.name} — R next color` : null, 'paint')
-    }
-
     // Held trigger: soft hiss while spraying, splats at PAINT_RATE. An
     // armed item ghost owns the click (itemGhostActive — the viewmodel's
     // fire gate excludes 'paint', so this loop gates itself).
@@ -422,6 +531,27 @@ export function PaintTool({ world }: { world: GameWorld }) {
       (session.input.state.firing || paintDebug.holdFire) &&
       !state.staggered &&
       !itemGhostActive()
+
+    // HUD color line: paintSwatch once hud.ts ships it (manager wiring),
+    // the owner-keyed shared prompt line until then. Spraying a surface
+    // inside WRITING_DISTANCE flips the line to the writing-mode hint.
+    const color = currentPaintColor()
+    const distance = lastSprayHitDistance()
+    const writing = wants && distance !== null && distance < WRITING_DISTANCE
+    const key = active ? (writing ? `w${color.hex}` : color.hex) : ''
+    if (key !== hudKey.current) {
+      hudKey.current = key
+      const hud = session.hud as typeof session.hud & {
+        paintSwatch?: (hex: string | null, label?: string) => void
+      }
+      if (hud.paintSwatch) hud.paintSwatch(active ? color.hex : null, color.name)
+      if (typeof hud.prompt === 'function') {
+        if (!active) hud.prompt(null, 'paint')
+        else if (writing || !hud.paintSwatch) hud.prompt(paintPrompt(writing, color.name), 'paint')
+        else hud.prompt(null, 'paint') // swatch shows the coat; free the line
+      }
+    }
+
     if (wants !== spraying.current) {
       spraying.current = wants
       if (wants) {

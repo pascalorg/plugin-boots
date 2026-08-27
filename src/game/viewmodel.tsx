@@ -11,6 +11,7 @@ import { throwGrenade } from './grenade'
 import { itemGhostActive } from './item-place'
 import { MOVE } from './movement'
 import { cyclePaintColor, SprayerModel } from './paint'
+import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { fire } from './shooting'
@@ -325,6 +326,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // Release (or switch/stagger) winds it back down — the whine follows.
     const heldDef = current !== 'builder' && current !== 'paint' ? WEAPONS[current] : undefined
     const wantsSpin = heldDef?.spinUp !== undefined && firing && !staggered
+    if (wantsSpin && spinT.current === 0) perfEvent('minigun-trigger')
     spinT.current = wantsSpin
       ? Math.min(1, spinT.current + dt / (heldDef?.spinUp ?? 1))
       : Math.max(0, spinT.current - dt / SPIN_DOWN_TIME)
