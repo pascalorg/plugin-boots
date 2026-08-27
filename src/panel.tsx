@@ -144,7 +144,10 @@ export default function BootsPanel() {
           sides, roofs turn), run up your ramps while holding click to chain them, Z undo, G
           grenade.
         </p>
-        <p>F edits a placed piece's 3×3 cells — pocket the middle for a window.</p>
+        <p>
+          F edits a placed piece — 3×3 cells on walls and floors (pocket the middle for a window),
+          corner heights on roofs (raise or drop corners for slopes, valleys and flat caps).
+        </p>
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
       </section>
     </div>

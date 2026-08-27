@@ -28,6 +28,11 @@ export type PlacedPiece = {
    * OFF the support graph (never registered, never collapsed, never
    * counted for occupancy); everything else about them keeps working. */
   slotId?: string
+  /** Roof 2×2 corner heights (roof-corners.ts) — pyramid grammar. Set on
+   * every R-slot roof placement (defaults to the classic slope); ABSENT on
+   * fold-transformed ramps (they keep the tilted-plank render and their
+   * wall slot's structural role — see transformPlaced) and legacy roofs. */
+  corners?: [number, number, number, number]
 }
 
 export type BootsPhase = 'editor' | 'game'
@@ -66,11 +71,19 @@ type BootsState = {
   /** Replace one placed piece's 9-bit cell mask (builder F edit mode).
    * The piece object is swapped, so its mesh + collider re-register. */
   setPlacedMask: (id: number, mask: number) => void
+  /** Replace a roof piece's 2×2 corner heights (builder F edit on corner
+   * roofs). Same piece-object-swap contract as setPlacedMask. */
+  setPlacedCorners: (id: number, corners: [number, number, number, number]) => void
   /** Rebuild one placed piece AS another piece type (edit-exit transform,
    * e.g. a stair-silhouette wall mask folding into a ramp). Position, id
-   * and list order are preserved; the mask resets to FULL_MASK. The piece
-   * object is swapped, so its mesh + collider + voxel replica re-register.
-   * Callers guard the target pose with isOccupied first. */
+   * and list order are preserved; the mask resets to FULL_MASK and any
+   * roof corners are dropped (folded ramps render as the classic tilted
+   * plank). The piece object is swapped, so its mesh + collider + voxel
+   * replica re-register. Callers guard the target pose with isOccupied
+   * first. slotId is DELIBERATELY kept: the folded ramp inherits the wall
+   * slot's structural role (supports above like the wall did — the p5r2/r3
+   * QA'd behavior); it is not re-keyed to an R slot because its pose is
+   * the wall edge, not a cell center. */
   transformPlaced: (id: number, piece: BuildPiece, yaw: number) => void
   removeLastPlaced: () => PlacedPiece | undefined
   /** Remove one placed piece by id — the support-cascade path (collapse
@@ -115,9 +128,15 @@ export const useBoots = create<BootsState>((set, get) => ({
     set((s) => ({
       placed: s.placed.map((p) => (p.id === id ? { ...p, mask: mask & FULL_MASK } : p)),
     })),
+  setPlacedCorners: (id, corners) =>
+    set((s) => ({
+      placed: s.placed.map((p) => (p.id === id ? { ...p, corners } : p)),
+    })),
   transformPlaced: (id, piece, yaw) =>
     set((s) => ({
-      placed: s.placed.map((p) => (p.id === id ? { ...p, piece, yaw, mask: FULL_MASK } : p)),
+      placed: s.placed.map((p) =>
+        p.id === id ? { ...p, piece, yaw, mask: FULL_MASK, corners: undefined } : p,
+      ),
     })),
   removeLastPlaced: () => {
     const s = get()

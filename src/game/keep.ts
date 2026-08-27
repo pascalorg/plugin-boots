@@ -2,6 +2,7 @@ import { type AnyNode, type AnyNodeId, nodeRegistry, useScene } from '@pascal-ap
 import { useViewer } from '@pascal-app/viewer'
 import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, type WallPocket } from './builder'
+import { classifyRoofShape, CORNER_RISE, type RoofCorners } from './roof-corners'
 
 /**
  * The bridge back to the editor: after a session, Keep converts the pieces
@@ -130,8 +131,35 @@ function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number)
   }
 }
 
-/** Best-effort roof piece → shed 'roof-segment' node. */
-function createRoofNode(piece: PlacedPiece, levelId: string): boolean {
+/** Best-effort roof piece → node(s). Legacy planks and slope corner
+ * patterns map to a shed 'roof-segment' exactly as before; corner patterns
+ * widen the family (pyramid grammar):
+ *   flat (0 or 4 high corners) → a 'slab' node at eave/ridge elevation
+ *                                (a roof terrace) — exact.
+ *   slope (2 adjacent high)    → shed rotated so it ascends toward the
+ *                                high edge (piece yaw + quarter·90°) — exact.
+ *   corner / valley / saddle   → shed along the canonical quarter, the
+ *                                closest single-plane read of the shape —
+ *                                kept, but counted as approximated
+ *                                (`exact: false`), same convention as
+ *                                non-exact wall masks. */
+function createRoofNode(piece: PlacedPiece, levelId: string): { ok: boolean; exact: boolean } {
+  const corners = piece.corners as RoofCorners | undefined
+  if (corners) {
+    const shape = classifyRoofShape(corners)
+    if (shape.kind === 'flat') {
+      const elevation = piece.position[1] + (shape.high ? CORNER_RISE : 0)
+      return { ok: createSlabNode(piece, levelId, elevation), exact: true }
+    }
+    const quarter = shape.kind === 'saddle' ? 0 : shape.quarter
+    const ok = createShedNode(piece, levelId, piece.yaw + (quarter * Math.PI) / 2)
+    return { ok, exact: shape.kind === 'slope' }
+  }
+  return { ok: createShedNode(piece, levelId, piece.yaw), exact: true }
+}
+
+/** The classic shed 'roof-segment' attempt (3 m plan run rising WALL_H). */
+function createShedNode(piece: PlacedPiece, levelId: string, rotation: number): boolean {
   const def = nodeRegistry.get('roof-segment') as RegistryDef | undefined
   if (!def?.schema) return false
   const run = PIECE_DIMS.wall[0] // roofs rise WALL_H over a 3 m plan run
@@ -144,7 +172,7 @@ function createRoofNode(piece: PlacedPiece, levelId: string): boolean {
       visible: true,
       metadata: {},
       position: [piece.position[0], piece.position[1], piece.position[2]],
-      rotation: piece.yaw,
+      rotation,
       roofType: 'shed',
       width: run,
       depth: run,
@@ -165,7 +193,7 @@ function createRoofNode(piece: PlacedPiece, levelId: string): boolean {
  * yaw about its center — a no-op for the square v2 slots (yaw snaps to
  * 90°) but correct for any legacy pose. Missing kind / schema throw →
  * false, and the caller counts the piece as skipped. */
-function createSlabNode(piece: PlacedPiece, levelId: string): boolean {
+function createSlabNode(piece: PlacedPiece, levelId: string, elevation?: number): boolean {
   const def = nodeRegistry.get('slab') as RegistryDef | undefined
   if (!def?.schema) return false
   const hx = PIECE_DIMS.floor[0] / 2
@@ -187,7 +215,7 @@ function createSlabNode(piece: PlacedPiece, levelId: string): boolean {
       metadata: {},
       polygon: [corner(-hx, -hz), corner(hx, -hz), corner(hx, hz), corner(-hx, hz)],
       holes: [],
-      elevation: piece.position[1],
+      elevation: elevation ?? piece.position[1],
       autoFromWalls: false,
     })
     useScene.getState().createNode(slab as AnyNode, levelId as AnyNodeId)
@@ -208,9 +236,11 @@ export function keepPlaced(): KeepResult {
   }
   for (const piece of placed) {
     if (piece.piece === 'roof') {
-      if ((piece.mask & FULL_MASK) !== 0 && createRoofNode(piece, levelId)) {
+      const made = (piece.mask & FULL_MASK) !== 0 ? createRoofNode(piece, levelId) : null
+      if (made?.ok) {
         result.kept++
         result.roofs++
+        if (!made.exact) result.skipped++ // shape approximated to one plane
       } else {
         result.skipped++
       }

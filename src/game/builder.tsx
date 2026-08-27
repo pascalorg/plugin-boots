@@ -30,6 +30,15 @@ import {
   setSceneSupportProbe,
 } from './piece-slots'
 import { playerRig } from './player'
+import {
+  CORNER_RISE,
+  CORNER_XZ,
+  cornerRoofGeometry,
+  raycastRoofCorner,
+  type RoofCorners,
+  SLOPE_CORNERS,
+  toggleCorner,
+} from './roof-corners'
 import { getSession } from './session'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -809,7 +818,12 @@ const COLLAPSE_DEBRIS = 7
  * the door colliderIndices. */
 function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorld }) {
   const meshRef = useRef<Mesh>(null)
-  const geometry = geometryForMask(piece.piece, piece.mask)
+  // Corner roofs render/collide as the bilinear patch (roof-corners.ts);
+  // the 3×3 mask has no meaning on a patch, so it is ignored for them.
+  const geometry =
+    piece.piece === 'roof' && piece.corners
+      ? cornerRoofGeometry(piece.corners)
+      : geometryForMask(piece.piece, piece.mask)
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
@@ -850,13 +864,16 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
 
   if (!geometry) return null // every cell dead — nothing to render or collide
   const pose = piecePose(piece.piece, piece.position[1])
+  // Corner-roof patches carry their heights IN the geometry: base-y
+  // position, no plank tilt.
+  const cornered = piece.piece === 'roof' && piece.corners !== undefined
   return (
     <mesh
       castShadow
       geometry={geometry}
-      position={[piece.position[0], pose.y, piece.position[2]]}
+      position={[piece.position[0], cornered ? piece.position[1] : pose.y, piece.position[2]]}
       ref={meshRef}
-      rotation={[piece.piece === 'roof' ? pose.tilt : 0, piece.yaw, 0, 'YXZ']}
+      rotation={[piece.piece === 'roof' && !cornered ? pose.tilt : 0, piece.yaw, 0, 'YXZ']}
     >
       <meshStandardMaterial color="#9aa8b5" roughness={0.7} metalness={0.15} />
     </mesh>
@@ -922,15 +939,47 @@ const EDIT_CELL_BITS = [0, 1, 2, 3, 4, 5, 6, 7, 8] as const
 type EditState = {
   /** PlacedPiece id under edit. */
   id: number
-  /** Mask bit of the cell under the crosshair. */
+  /** Mask bit of the cell under the crosshair — or, on a corner roof, the
+   * CORNER index (0..3, roof-corners.ts ring order). */
   hover: number
   /** Mirror of the piece's mask (drives overlay re-render on toggle). */
   mask: number
+  /** Mirror of a corner roof's heights; null = 3×3 cell editing. */
+  corners: RoofCorners | null
   piece: BuildPiece
   x: number
   y: number
   z: number
   yaw: number
+}
+
+/** Unified F-edit targeting: corner roofs raycast the bilinear patch and
+ * report the nearest CORNER; everything else raycasts its 3×3 cells. */
+function raycastEditTarget(
+  piece: PlacedPiece,
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  maxT: number,
+): { t: number; bit: number } | null {
+  if (piece.piece === 'roof' && piece.corners) {
+    const hit = raycastRoofCorner(
+      piece.corners,
+      { x: piece.position[0], y: piece.position[1], z: piece.position[2], yaw: piece.yaw },
+      ox,
+      oy,
+      oz,
+      dx,
+      dy,
+      dz,
+      maxT,
+    )
+    return hit ? { t: hit.t, bit: hit.corner } : null
+  }
+  return raycastPieceCell(piece, ox, oy, oz, dx, dy, dz, maxT)
 }
 
 /** Edit-exit confirm: classify the closing piece's final mask — an exact
@@ -981,17 +1030,25 @@ export function Builder() {
     }
   }, [])
 
-  // HUD mode-hint line: shown while the 3x3 cell editor is open, cleared on
-  // exit/unmount (hud.editHint owns its own element — prompts never clobber it).
+  // HUD mode-hint line: shown while the cell/corner editor is open, cleared
+  // on exit/unmount (hud.editHint owns its own element — prompts never
+  // clobber it).
   const editing = edit !== null
+  const editingCorners = edit?.corners !== null && edit !== null
   useEffect(() => {
     const session = getSession()
     if (!session) return
-    session.hud.editHint(editing ? 'F done · LMB carve · RMB reset' : null)
+    session.hud.editHint(
+      editing
+        ? editingCorners
+          ? 'F done · LMB raise/drop corner · RMB slope'
+          : 'F done · LMB carve · RMB reset'
+        : null,
+    )
     return () => {
       getSession()?.hud.editHint(null)
     }
-  }, [editing])
+  }, [editing, editingCorners])
 
   useFrame((_, dt) => {
     const session = getSession()
@@ -1044,7 +1101,7 @@ export function Builder() {
       prevRotate.current = session.input.state.keys.has('KeyR')
       const altFiringNow = session.input.state.altFiring
       const piece = useBoots.getState().placed.find((p) => p.id === edit.id)
-      const hit = piece ? raycastPieceCell(piece, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE) : null
+      const hit = piece ? raycastEditTarget(piece, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE) : null
       // Exit: F again, the piece is gone, or the aim left it. Exit-time is
       // the confirm: the final mask classifies, exact stair silhouettes
       // fold the wall into a ramp (see wallExitTransform).
@@ -1055,6 +1112,30 @@ export function Builder() {
         placeCooldown.current = TURBO_FIRST // a beat before hold-place resumes
         prevFire.current = firingNow
         prevAltFire.current = altFiringNow
+        return
+      }
+      if (piece.piece === 'roof' && piece.corners) {
+        // Corner roof: LMB toggles the aimed corner's height, RMB snaps the
+        // shape back to the classic slope.
+        if (firingNow && !prevFire.current && !staggered) {
+          useBoots.getState().setPlacedCorners(piece.id, toggleCorner(piece.corners, hit.bit))
+          sfx.place()
+        }
+        if (
+          altFiringNow &&
+          !prevAltFire.current &&
+          piece.corners.join('') !== SLOPE_CORNERS.join('')
+        ) {
+          useBoots.getState().setPlacedCorners(piece.id, SLOPE_CORNERS)
+          sfx.place()
+        }
+        prevFire.current = firingNow
+        prevAltFire.current = altFiringNow
+        const live = useBoots.getState().placed.find((p) => p.id === edit.id)
+        const corners = live?.corners ?? piece.corners
+        if (edit.hover !== hit.bit || edit.corners?.join('') !== corners.join('')) {
+          setEdit({ ...edit, hover: hit.bit, corners })
+        }
         return
       }
       if (firingNow && !prevFire.current && !staggered) {
@@ -1082,7 +1163,7 @@ export function Builder() {
       let bestT = EDIT_RANGE
       let bestBit = 0
       for (const p of useBoots.getState().placed) {
-        const hit = raycastPieceCell(p, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE)
+        const hit = raycastEditTarget(p, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE)
         if (hit && hit.t <= bestT) {
           best = p
           bestT = hit.t
@@ -1094,6 +1175,7 @@ export function Builder() {
           id: best.id,
           hover: bestBit,
           mask: best.mask,
+          corners: best.piece === 'roof' && best.corners ? best.corners : null,
           piece: best.piece,
           x: best.position[0],
           y: best.position[1],
@@ -1199,6 +1281,9 @@ export function Builder() {
           position: [pose.position[0], pose.position[1], pose.position[2]],
           yaw: pose.yaw,
           slotId: target.slotId,
+          // Pyramid grammar: every R-slot roof starts as the classic slope;
+          // F-edit toggles corners afterwards (2×2 corner heights).
+          ...(buildPiece === 'roof' ? { corners: SLOPE_CORNERS } : {}),
         })
         if (registerPlacement(target.slotId, stored.id)) {
           holdAttempted.current.add(target.slotId)
@@ -1231,6 +1316,35 @@ export function Builder() {
   })
 
   if (!active) return null
+
+  // Corner-roof edit overlay: one marker per corner AT its current height —
+  // hovered corner hot, raised corners cool blue, dropped corners faint red.
+  if (edit && edit.corners) {
+    return (
+      <group
+        position={[edit.x, edit.y, edit.z]}
+        rotation={[0, edit.yaw, 0]}
+        userData={{ __boots: true }}
+      >
+        {edit.corners.map((height, index) => {
+          const [cx, cz] = CORNER_XZ[index]!
+          const hovered = edit.hover === index
+          return (
+            // biome-ignore lint/suspicious/noArrayIndexKey: corners are positional
+            <mesh key={index} position={[cx, height * CORNER_RISE + 0.35, cz]}>
+              <boxGeometry args={[0.5, 0.5, 0.5]} />
+              <meshBasicMaterial
+                color={hovered ? '#ffd34d' : height ? '#59a7ff' : '#ff5a4d'}
+                depthWrite={false}
+                opacity={hovered ? 0.65 : 0.35}
+                transparent
+              />
+            </mesh>
+          )
+        })}
+      </group>
+    )
+  }
 
   // Edit-mode overlay: a 3×3 ghost grid over the piece — hovered cell hot,
   // live cells cool blue, dead cells faint red (click resurrects them).

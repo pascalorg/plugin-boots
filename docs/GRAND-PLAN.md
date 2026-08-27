@@ -53,6 +53,14 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   quadrant masks) was NOT scoped this round — the binding
   BUILD-GRAMMAR-V2-REVIEW verdict defers it, and it stays phase 6 item 2
   below. No fleet lane owned it; nothing failed to land.
+- Pyramid grammar SHIPPED (hand-built, 2026-08-27, after the fleet lane
+  stalled 6×): roof pieces carry 2×2 corner heights (roof-corners.ts
+  bilinear patch — slope/corner/valley/flat/saddle), F-edit toggles the
+  aimed corner (RMB snaps back to slope), Keep maps flat→slab (terrace),
+  slope→shed exact, others→shed approximated (counts skipped). Floor
+  quadrant masks are SUPERSEDED by the finer 3×3 F-edit that already
+  shipped. transformPlaced slotId retention pinned by test as deliberate
+  (folded ramps inherit the wall slot's structural role).
 
 ## Next (phase 6 — the shape-preserving pass)
 
