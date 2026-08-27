@@ -1,5 +1,18 @@
 'use client'
 
+import * as pascalCore from '@pascal-app/core'
+import { useScene } from '@pascal-app/core'
+
+/** Newer hosts export runAsSingleSceneHistoryStep (collapses every scene
+ * mutation inside `run` into ONE undo step). The plugin's pinned core
+ * typings (0.9.1) predate it, so resolve it defensively — an older host
+ * just keeps today's multi-step behavior. */
+const runAsOneHistoryStep = <T,>(run: () => T): T => {
+  const step = (
+    pascalCore as { runAsSingleSceneHistoryStep?: (store: unknown, run: () => T) => T }
+  ).runAsSingleSceneHistoryStep
+  return step ? step(useScene, run) : run()
+}
 import { useState } from 'react'
 import { useBoots } from './store'
 import { applyItems, discardItems } from './game/item-keep'
@@ -93,7 +106,20 @@ export default function BootsPanel() {
             <button
               className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
               onClick={() => {
-                const result = keepPlaced()
+                // ONE history step for the whole save: every bridge write
+                // (kept pieces, demolition deletes, paint patches, item
+                // creates — several store actions) collapses into a single
+                // Cmd+Z in the editor. Without this a saved roof alone was
+                // two undo steps (container + segment).
+                const { result, removed, repainted, itemsResult } = runAsOneHistoryStep(() => {
+                  const result = keepPlaced()
+                  const removed = deleteDestroyed()
+                  // Paint applies AFTER the demolition delete so nodes
+                  // removed just above are skipped instead of patched.
+                  const repainted = applyPaint()
+                  const itemsResult = applyItems()
+                  return { result, removed, repainted, itemsResult }
+                })
                 // `kept` counts every converted piece; roofs and floors are
                 // also tallied separately, so walls = the remainder.
                 const walls = result.kept - result.roofs - result.floors
@@ -105,11 +131,6 @@ export default function BootsPanel() {
                 ]
                   .filter(Boolean)
                   .join(', ')
-                const removed = deleteDestroyed()
-                // Paint applies AFTER the demolition delete so nodes removed
-                // just above are skipped instead of patched.
-                const repainted = applyPaint()
-                const itemsResult = applyItems()
                 setLastKept(
                   `Kept ${walls} wall${walls === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
                     removed > 0 ? ` · deleted ${removed} leveled element${removed === 1 ? '' : 's'}` : ''
