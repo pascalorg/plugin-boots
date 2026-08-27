@@ -745,3 +745,40 @@ export function findUnsupportedIslands(
   }
   return islands
 }
+
+/** True when a WORLD point lies within the grid's volume (inclusive bounds,
+ * small epsilon): the coincident-layer test damageTarget's fan-out uses to
+ * tell interpenetrating duplicate walls (carve point ON both surfaces)
+ * from merely-touching neighbors (stacked storeys, slab/wall seams). Same
+ * frame handling as removeSphere. */
+export function gridContainsPoint(
+  grid: VoxelGridData,
+  x: number,
+  y: number,
+  z: number,
+  eps = 1e-3,
+): boolean {
+  const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
+  let lx = x
+  let ly = y
+  let lz = z
+  if (!basisIsYawOnly(grid.q)) {
+    rotateByBasis(grid.q, x, y, z, _v)
+    lx = _v.x
+    ly = _v.y
+    lz = _v.z
+  } else if (yaw !== 0) {
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    lx = x * cos + z * sin
+    lz = -x * sin + z * cos
+  }
+  return (
+    lx >= origin.x - eps &&
+    lx <= origin.x + nx * cellX + eps &&
+    ly >= origin.y - eps &&
+    ly <= origin.y + ny * cellY + eps &&
+    lz >= origin.z - eps &&
+    lz <= origin.z + nz * cellZ + eps
+  )
+}

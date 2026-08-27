@@ -18,6 +18,7 @@ import {
   wireStructureDriver,
 } from './structure'
 import {
+  gridContainsPoint,
   buildVoxelGrid,
   dropInteriorCells,
   findUnsupportedIslands,
@@ -1279,7 +1280,11 @@ const ROOF_SHEET_TILE = 1.2
 /** Carve-radius safety floor for roof/volume targets, as a fraction of the
  * largest cell dimension — no target can ever be bulletproof again (QA C2
  * defect b: 0.5 m adaptive cells vs 0.11 m pistol holeRadius). */
-const CARVE_CELL_FLOOR = 0.75
+/** ≥ a cell's half-diagonal (√3/2 ≈ 0.866): 0.75 left a dead band where a
+ * carve sphere centered on a cell FACE missed the cell's center — catalog
+ * items ate ~half of all rifle rounds with zero cells removed (the
+ * "bullet-sponge toilet" live finding). */
+const CARVE_CELL_FLOOR = 0.88
 /** Slack the plane grid's bounds add through the thickness so the outer
  * and inner surfaces sit strictly inside the first/last cell layer (a face
  * exactly on a cell boundary voxelizes flakily — see PLATE_SYNTH_T). */
@@ -2311,7 +2316,32 @@ export function damageTarget(
     }
     return total
   }
-  return damageTargetOne(world, target, point, radius, direction)
+  let total = damageTargetOne(world, target, point, radius, direction)
+  // COINCIDENT LAYERS (the "undestroyable wall" live report): room-drawn
+  // houses ship one wall per ROOM side, so shared boundaries are TWO
+  // stacked wall nodes (plus partial collinear overlaps). The per-target
+  // skin pierce opened one skin of ONE twin per shot while the other kept
+  // rendering over the hole — four perfectly co-located hits to see any
+  // progress. Fan the same carve out to every other ALREADY-VOXELIZED
+  // layered target: removeSphere is a no-op on grids the sphere never
+  // reaches (the same economics as the roof fan-out above), so this only
+  // costs on true overlaps — and one shot now opens the same hole in every
+  // coincident layer. Pristine far walls stay untouched (voxelizing on a
+  // miss would be wasted work; they enroll when a shot actually reaches
+  // them through the hole).
+  if (total > 0 && target.kind !== 'volume') {
+    for (const other of useDestruction.getState().targets.values()) {
+      if (other === target || other.kind === 'volume') continue
+      // Interpenetration test, not sphere reach: duplicates share the very
+      // surface the shot entered (carve point ON both volumes), while a
+      // stacked storey or a slab/wall seam merely TOUCHES — a grenade-class
+      // sphere at a joint must not chew the neighbor through the fan-out
+      // (locality there stays the per-target carve's job).
+      if (!gridContainsPoint(other.grid, point.x, point.y, point.z)) continue
+      total += damageTargetOne(world, other, point, radius, direction)
+    }
+  }
+  return total
 }
 
 /** The single-target carve body damageTarget dispatches to (roof groups
