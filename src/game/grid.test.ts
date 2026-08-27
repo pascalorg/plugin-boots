@@ -1,14 +1,18 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import {
   CELL,
+  gridToWorld,
   isTerrainGrounded,
   parseSlotId,
+  resetGridAnchor,
   resolveTargetSlot,
+  setGridAnchor,
   type Slot,
   slotId,
   slotPose,
   slotsTouching,
   STOREY,
+  worldToGrid,
   yawCardinal,
 } from './grid'
 
@@ -336,6 +340,126 @@ describe('resolveTargetSlot — R-slot ray march (ramp aim-feel)', () => {
     const slot = parseSlotId(result.slotId)!
     expect(slot.kind).toBe('R')
     expect([slot.i, slot.k]).not.toEqual([0, 0])
+  })
+})
+
+describe('grid anchor', () => {
+  afterEach(() => {
+    resetGridAnchor()
+  })
+
+  test('an EXPLICIT identity anchor reproduces the legacy lattice bit-exact', () => {
+    setGridAnchor({ x: 0, z: 0, yaw: 0 })
+    // Pinned copies of expectations from the suites above — the identity
+    // seams must be no-ops, not merely close.
+    const pose = slotPose({ kind: 'Wx', i: 2, k: 1, s: 1 })
+    expect(pose.position).toEqual([6, STOREY, 4.5])
+    expect(pose.yaw).toBeCloseTo(Math.PI / 2)
+    const wall = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'wall', rotState: 0 },
+      OPEN,
+    )
+    expect(wall.slotId).toBe('Wx:1,0,0')
+    expect(wall.pose.position).toEqual([3, 0, 1.5])
+    expect(wall.valid).toBe(true)
+    const stairs = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'stairs', rotState: 0 },
+      OPEN,
+    )
+    expect(stairs.slotId).toBe('R:1,0,0')
+    expect(stairs.pose.yaw).toBeCloseTo(Math.PI / 2)
+  })
+
+  test('worldToGrid / gridToWorld are exact inverses under a rotated anchor', () => {
+    setGridAnchor({ x: 12.3, z: -4.7, yaw: Math.PI / 6 })
+    const w = gridToWorld(7.25, -3.5, 1.1)
+    const g = worldToGrid(w.x, w.z, w.yaw)
+    expect(g.x).toBeCloseTo(7.25, 10)
+    expect(g.z).toBeCloseTo(-3.5, 10)
+    expect(g.yaw).toBeCloseTo(1.1, 10)
+  })
+
+  test('30°-rotated anchor: resolved poses round-trip onto lattice multiples', () => {
+    setGridAnchor({ x: 12.3, z: -4.7, yaw: Math.PI / 6 })
+    // Player standing at GRID (1.5, 1.5) facing grid +X — same scenario as
+    // the identity "wall lands on the shared edge" test, in world clothes.
+    const feet = gridToWorld(1.5, 1.5)
+    const result = resolveTargetSlot(
+      {
+        position: [feet.x, 0, feet.z],
+        yaw: -Math.PI / 2 + Math.PI / 6,
+        pitch: 0,
+        piece: 'wall',
+        rotState: 0,
+      },
+      OPEN,
+    )
+    expect(result.slotId).toBe('Wx:1,0,0')
+    expect(result.valid).toBe(true)
+    // The WORLD pose is off the absolute lattice by design; mapped back into
+    // the grid frame it sits exactly on the slot's lattice coordinates.
+    const g = worldToGrid(result.pose.position[0], result.pose.position[2], result.pose.yaw)
+    expect(g.x).toBeCloseTo(CELL, 10) // the x = CELL·1 plane
+    expect(g.z).toBeCloseTo(CELL / 2, 10) // the edge midpoint
+    expect(g.x - Math.round(g.x / CELL) * CELL).toBeCloseTo(0, 10) // lattice multiple
+    expect(Math.sin(g.yaw)).toBeCloseTo(1, 10) // canonical Wx yaw π/2
+    expect(Math.cos(g.yaw)).toBeCloseTo(0, 10)
+  })
+
+  test('slotPose carries the anchor yaw on top of the canonical slot yaw', () => {
+    setGridAnchor({ x: 12.3, z: -4.7, yaw: Math.PI / 6 })
+    const wz = slotPose({ kind: 'Wz', i: 0, k: 0, s: 0 })
+    expect(wz.yaw).toBeCloseTo(Math.PI / 6, 10)
+    const wx = slotPose({ kind: 'Wx', i: 2, k: 1, s: 1 })
+    expect(wx.yaw).toBeCloseTo(Math.PI / 2 + Math.PI / 6, 10)
+    // Position is the grid pose pushed through the anchor, y untouched.
+    const w = gridToWorld(2 * CELL, CELL + CELL / 2)
+    expect(wx.position[0]).toBeCloseTo(w.x, 10)
+    expect(wx.position[1]).toBe(STOREY)
+    expect(wx.position[2]).toBeCloseTo(w.z, 10)
+  })
+
+  test('y is never transformed: storeys and terrain grounding are anchor-blind', () => {
+    setGridAnchor({ x: 12.3, z: -4.7, yaw: Math.PI / 6 })
+    // Pitch past the band still bumps one storey — baseY stays pure STOREY·s.
+    const feet = gridToWorld(1.5, 1.5)
+    const up = resolveTargetSlot(
+      {
+        position: [feet.x, 0, feet.z],
+        yaw: -Math.PI / 2 + Math.PI / 6,
+        pitch: 0.8,
+        piece: 'wall',
+        rotState: 0,
+      },
+      OPEN,
+    )
+    expect(up.slotId).toBe('Wx:1,0,1')
+    expect(up.pose.position[1]).toBe(STOREY)
+    // Terrain-only support on open ground works exactly like the identity
+    // suite: storey 0 grounds itself, whatever the anchor.
+    const far = gridToWorld(31.5, 31.5)
+    const ramp = resolveTargetSlot(
+      {
+        position: [far.x, 0, far.z],
+        yaw: -Math.PI / 2 + Math.PI / 6,
+        pitch: 0,
+        piece: 'stairs',
+        rotState: 0,
+      },
+      { isOccupied: () => false, isSupported: isTerrainGrounded },
+    )
+    expect(ramp.slotId).toBe('R:11,10,0')
+    expect(ramp.valid).toBe(true)
+    expect(ramp.pose.position[1]).toBe(0)
+    expect(Math.sin(ramp.pose.yaw)).toBeCloseTo(Math.sin(Math.PI / 2 + Math.PI / 6), 10)
+    expect(Math.cos(ramp.pose.yaw)).toBeCloseTo(Math.cos(Math.PI / 2 + Math.PI / 6), 10)
+  })
+
+  test('resetGridAnchor restores the identity grid', () => {
+    setGridAnchor({ x: 12.3, z: -4.7, yaw: Math.PI / 6 })
+    resetGridAnchor()
+    expect(slotPose({ kind: 'Wz', i: -1, k: 0, s: 0 }).position).toEqual([-1.5, 0, 0])
+    expect(worldToGrid(5, 7, 0.4)).toEqual({ x: 5, z: 7, yaw: 0.4 })
   })
 })
 

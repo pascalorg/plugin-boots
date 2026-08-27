@@ -11,6 +11,7 @@ import {
   Vector3,
 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
+import { CELL, type GridAnchor } from './grid'
 
 /**
  * One-shot world snapshot taken when the game starts: which host meshes are
@@ -160,6 +161,11 @@ export type GameWorld = {
    * combat replacement by trees-destruct.tsx. Optional so hand-built test
    * worlds don't carry it; collectWorld always fills it (possibly empty). */
   hostTrees?: HostTreeNode[]
+  /** Session grid anchor — the rigid XZ frame aligning the build lattice to
+   * the building's dominant wall direction (deriveGridAnchor). Optional so
+   * hand-built test worlds don't carry it (identity assumed); collectWorld
+   * always fills it. builder.tsx installs it via grid.setGridAnchor. */
+  gridAnchor?: GridAnchor
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -819,6 +825,125 @@ export function collectHostForestMeshes(
   return found
 }
 
+// ---------------------------------------------------------------------------
+// Grid anchor — the build lattice adopts the building's frame
+// ---------------------------------------------------------------------------
+
+/** Histogram bins over the folded yaw domain [−45°, 45°) — 1° per bin. */
+const ANCHOR_BINS = 90
+/** Snap to exact identity when the dominant yaw sits within this of a
+ * cardinal direction… */
+const ANCHOR_YAW_EPS = (0.5 * Math.PI) / 180
+/** …and the anchor point sits within this of a CELL multiple on both axes —
+ * an already-aligned building keeps the legacy absolute lattice bit-exact
+ * (saves, QA scripts and the identity-fallback tests never move). */
+const ANCHOR_OFFSET_EPS = 0.02
+/** Walls shorter than this are stubs — no vote, never the anchor point
+ * (same degeneracy floor the stud/anatomy builders use). */
+const ANCHOR_MIN_WALL = 0.3
+
+const HALF_PI = Math.PI / 2
+
+/** Fold a wall yaw MOD 90° into [−45°, 45°): perpendicular walls vote
+ * together (the lattice can't tell a wall along X from one along Z), and
+ * the anchor is always the MINIMAL rotation off cardinal. */
+function foldYaw(yaw: number): number {
+  return ((((yaw + HALF_PI / 2) % HALF_PI) + HALF_PI) % HALF_PI) - HALF_PI / 2
+}
+
+/** Y rotation of an object's world matrix, read off its world basis X
+ * (makeRotationY: basisX = (cos, 0, −sin)). Wall roots carry no local
+ * rotation of their own — the host renders walls as level-origin groups
+ * spanning start/end (the wall schema has no position/rotation field) — so
+ * this is the building/level rotation the node coordinates compose with. */
+function matrixWorldYaw(root: Object3D): number {
+  const e = root.matrixWorld.elements
+  return Math.atan2(-e[2]!, e[0]!)
+}
+
+const _anchorStart = new Vector3()
+
+/**
+ * Derive the session grid anchor from the collected walls: the rigid XZ
+ * transform { x, z, yaw } that aligns the build lattice (grid.ts) to the
+ * building's dominant frame.
+ * - yaw: length-weighted histogram over wall world yaws folded MOD 90°
+ *   (perpendicular walls vote together); the winning bin is refined by the
+ *   length-weighted mean of its own cluster so parallel long walls beat a
+ *   short odd one without the 1° bin quantizing the result.
+ * - position: the LONGEST wall's world START point — that wall's start
+ *   lands exactly on a lattice corner, so grid placements run flush along
+ *   the building's strongest edge.
+ * - wall world yaw composes atan2 over (end−start) — node start/end are
+ *   LEVEL-local — with the wall root's matrixWorld yaw (buildings rotate
+ *   wholesale at the level); the start point goes through the root's full
+ *   matrixWorld for the same reason.
+ * - identity snap: yaw ≈ cardinal AND offset ≈ a CELL multiple → exact
+ *   { 0, 0, 0 }, the do-nothing anchor.
+ * No walls (or only stubs) → identity. Pure math over the walls iterable —
+ * exported for the anchor-derivation tests.
+ */
+export function deriveGridAnchor(
+  walls: Iterable<{ node: WallNodeLike; root: Object3D }>,
+): GridAnchor {
+  const votes: Array<{ folded: number; length: number }> = []
+  let longest = 0
+  let anchorX = 0
+  let anchorZ = 0
+  for (const wall of walls) {
+    const { start, end } = wall.node
+    const dx = end[0] - start[0]
+    const dz = end[1] - start[1]
+    const length = Math.hypot(dx, dz)
+    if (length < ANCHOR_MIN_WALL) continue
+    // Object-yaw convention (local +X → (cos yaw, −sin yaw), the codebase's
+    // wall/piece yaw): level-local atan2 composed with the root rotation.
+    const folded = foldYaw(Math.atan2(-dz, dx) + matrixWorldYaw(wall.root))
+    votes.push({ folded, length })
+    if (length > longest) {
+      longest = length
+      _anchorStart.set(start[0], 0, start[1]).applyMatrix4(wall.root.matrixWorld)
+      anchorX = _anchorStart.x
+      anchorZ = _anchorStart.z
+    }
+  }
+  if (votes.length === 0) return { x: 0, z: 0, yaw: 0 }
+
+  const bins = new Float64Array(ANCHOR_BINS)
+  const binWidth = HALF_PI / ANCHOR_BINS
+  for (const vote of votes) {
+    const bin = Math.min(ANCHOR_BINS - 1, Math.floor((vote.folded + HALF_PI / 2) / binWidth))
+    bins[bin]! += vote.length
+  }
+  let winner = 0
+  for (let b = 1; b < ANCHOR_BINS; b++) {
+    if (bins[b]! > bins[winner]!) winner = b
+  }
+
+  // Refine within the winning cluster: length-weighted mean of the votes
+  // within 1.5 bins of the winner's center, measured CIRCULARLY on the 90°
+  // domain (0° and 89° are one degree apart) so the fold seam never splits
+  // a cluster. Votes from losing clusters don't skew the mean.
+  const center = -HALF_PI / 2 + (winner + 0.5) * binWidth
+  let sum = 0
+  let weight = 0
+  for (const vote of votes) {
+    let d = ((((vote.folded - center) % HALF_PI) + HALF_PI) % HALF_PI)
+    if (d > HALF_PI / 2) d -= HALF_PI
+    if (Math.abs(d) > binWidth * 1.5) continue
+    sum += d * vote.length
+    weight += vote.length
+  }
+  const yaw = foldYaw(weight > 0 ? center + sum / weight : center)
+
+  if (Math.abs(yaw) <= ANCHOR_YAW_EPS) {
+    const offX = Math.abs(anchorX - Math.round(anchorX / CELL) * CELL)
+    const offZ = Math.abs(anchorZ - Math.round(anchorZ / CELL) * CELL)
+    if (offX <= ANCHOR_OFFSET_EPS && offZ <= ANCHOR_OFFSET_EPS) return { x: 0, z: 0, yaw: 0 }
+  }
+  return { x: anchorX, z: anchorZ, yaw }
+}
+
 /**
  * Snap every level group to its true stacked Y + visible before the world
  * snapshot. The host LevelSystem LERPS group Y toward baseY every frame —
@@ -984,6 +1109,9 @@ export function collectWorld(): GameWorld {
   const overlayRoots = collectOverlayRoots()
   const roadFootprints = collectRoadFootprints(colliders)
   const hostTrees = collectHostTrees(nodes)
+  // The build lattice adopts the building's frame — identity when nothing
+  // dominates (empty lot) or the building already sits on the legacy grid.
+  const gridAnchor = deriveGridAnchor(walls.values())
 
   // Spawn: outside the building along +X of its center, eye toward it.
   // Y is the LOWEST level's ground (usually 0) — with the whole stacked
@@ -1024,6 +1152,7 @@ export function collectWorld(): GameWorld {
     overlayRoots,
     roadFootprints,
     hostTrees,
+    gridAnchor,
     buildingAabb,
     spawn,
     spawnYaw,
