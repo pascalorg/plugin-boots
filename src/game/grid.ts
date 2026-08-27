@@ -27,6 +27,12 @@
  * the raw crossing height is erratic at mid pitches (p4 ramp QA). Occupancy
  * and support are injected so this module stays pure (grid knows geometry,
  * the game knows state).
+ *
+ * GRID ANCHOR: a session may install a rigid XZ frame (setGridAnchor) that
+ * aligns this lattice to the building's dominant walls — see the anchor
+ * section below. All slot math above stays integer and unchanged; only the
+ * resolveTargetSlot inputs (world→grid) and slotPose outputs (grid→world)
+ * transform, and the default identity anchor keeps both seams no-ops.
  */
 
 export const CELL = 3
@@ -42,6 +48,74 @@ const RAY_START = 0.4
 export type SlotKind = 'Wx' | 'Wz' | 'F' | 'R'
 export type Slot = { kind: SlotKind; i: number; k: number; s: number }
 export type BuildPieceKind = 'wall' | 'floor' | 'stairs' | 'roof'
+
+// ── GRID ANCHOR (session rigid frame) ───────────────────────────────────────
+// Real buildings are rotated arbitrarily and sit off the 3 m lattice, so an
+// absolute world grid can never run flush with their walls. Once per session
+// the game may ANCHOR the grid to the building's dominant frame (derived in
+// world.ts): a rigid XZ transform { x, z, yaw } — the lattice's origin moves
+// to the anchor point and its axes rotate by yaw. Slot math stays 100%
+// integer; only two seams transform: world→grid on the way IN
+// (resolveTargetSlot's player pose — and with it the DDA ray, which is
+// derived from that pose) and grid→world on the way OUT (slotPose). The
+// identity anchor short-circuits both seams to bit-exact no-ops, so existing
+// tests, QA scripts and saves are unaffected. Y is NEVER transformed —
+// storeys and terrain grounding stay pure.
+
+export type GridAnchor = { x: number; z: number; yaw: number }
+
+const TWO_PI = Math.PI * 2
+
+/** Live anchor — mutated in place (setGridAnchor copies) so the per-frame
+ * seams read plain fields with no lookups. */
+const _anchor: GridAnchor = { x: 0, z: 0, yaw: 0 }
+/** True while the anchor is EXACTLY identity — both seams short-circuit. */
+let _identity = true
+
+/** Install the session anchor (copied — the caller keeps its object).
+ * world.ts derives it; builder.tsx wires it alongside the support probe. */
+export function setGridAnchor(anchor: GridAnchor): void {
+  _anchor.x = anchor.x
+  _anchor.z = anchor.z
+  _anchor.yaw = anchor.yaw
+  _identity = anchor.x === 0 && anchor.z === 0 && anchor.yaw === 0
+}
+
+/** The live anchor — a read-only view of module state, never mutate it
+ * (allocation-free so hot paths like the builder's slot box can read it). */
+export function getGridAnchor(): Readonly<GridAnchor> {
+  return _anchor
+}
+
+/** Back to identity — session teardown (lives next to resetPieceSlots). */
+export function resetGridAnchor(): void {
+  _anchor.x = 0
+  _anchor.z = 0
+  _anchor.yaw = 0
+  _identity = true
+}
+
+/** World→grid under the current anchor: rotate by −yaw about the anchor
+ * point, then read coordinates from the anchor as origin. Allocates — for
+ * QA/debug and tests; the IN seam below inlines this math into scratch. */
+export function worldToGrid(x: number, z: number, yaw = 0): { x: number; z: number; yaw: number } {
+  const c = Math.cos(_anchor.yaw)
+  const s = Math.sin(_anchor.yaw)
+  const dx = x - _anchor.x
+  const dz = z - _anchor.z
+  return { x: dx * c - dz * s, z: dx * s + dz * c, yaw: yaw - _anchor.yaw }
+}
+
+/** Grid→world — the exact inverse of worldToGrid (the slotPose OUT seam). */
+export function gridToWorld(x: number, z: number, yaw = 0): { x: number; z: number; yaw: number } {
+  const c = Math.cos(_anchor.yaw)
+  const s = Math.sin(_anchor.yaw)
+  return {
+    x: _anchor.x + x * c + z * s,
+    z: _anchor.z - x * s + z * c,
+    yaw: yaw + _anchor.yaw,
+  }
+}
 
 export type SlotPose = {
   /** [x, baseY, z] — PlacedPiece.position semantics (builder piecePose). */
@@ -82,27 +156,84 @@ export function parseSlotId(id: string): Slot | null {
   return { kind: m[1] as SlotKind, i: Number(m[2]), k: Number(m[3]), s: Number(m[4]) }
 }
 
-/** World pose of a slot. `rotQuarter` only matters for roofs. */
+/** World pose of a slot. `rotQuarter` only matters for roofs. The lattice
+ * pose is computed in the GRID frame, then the anchor OUT seam carries it
+ * grid→world (identity skips the trig — poses stay bit-exact un-anchored).
+ * Y is baseY either way: the anchor never touches elevation. */
 export function slotPose(slot: Slot, rotQuarter = 0): SlotPose {
   const baseY = slot.s * STOREY
+  let x: number
+  let z: number
+  let yaw: number
   switch (slot.kind) {
     case 'Wx':
-      return { position: [slot.i * CELL, baseY, slot.k * CELL + CELL / 2], yaw: Math.PI / 2 }
+      x = slot.i * CELL
+      z = slot.k * CELL + CELL / 2
+      yaw = Math.PI / 2
+      break
     case 'Wz':
-      return { position: [slot.i * CELL + CELL / 2, baseY, slot.k * CELL], yaw: 0 }
+      x = slot.i * CELL + CELL / 2
+      z = slot.k * CELL
+      yaw = 0
+      break
     case 'F':
-      return { position: [slot.i * CELL + CELL / 2, baseY, slot.k * CELL + CELL / 2], yaw: 0 }
+      x = slot.i * CELL + CELL / 2
+      z = slot.k * CELL + CELL / 2
+      yaw = 0
+      break
     case 'R':
-      return {
-        position: [slot.i * CELL + CELL / 2, baseY, slot.k * CELL + CELL / 2],
-        yaw: ((rotQuarter % 4) + 4) % 4 * (Math.PI / 2),
-      }
+      x = slot.i * CELL + CELL / 2
+      z = slot.k * CELL + CELL / 2
+      yaw = ((rotQuarter % 4) + 4) % 4 * (Math.PI / 2)
+      break
+  }
+  if (_identity) return { position: [x, baseY, z], yaw }
+  // OUT seam: rotate the grid pose by +yaw about the anchor point back into
+  // world coordinates; the pose yaw carries the anchor yaw on top, wrapped
+  // to [0, 2π) like the R-quarter expression above.
+  const c = Math.cos(_anchor.yaw)
+  const s = Math.sin(_anchor.yaw)
+  return {
+    position: [_anchor.x + x * c + z * s, baseY, _anchor.z - x * s + z * c],
+    yaw: (((yaw + _anchor.yaw) % TWO_PI) + TWO_PI) % TWO_PI,
   }
 }
 
 const cellOf = (v: number): number => Math.floor(v / CELL)
 /** Feet resting exactly ON a floor plane belong to that storey. */
 const storeyOf = (y: number): number => Math.floor((y + 0.1) / STOREY)
+
+/** IN-seam scratch — one TargetInput reused every call (resolveTargetSlot
+ * runs per frame; fresh objects here would be steady GC — same rationale as
+ * the crossing pool below). Consumed synchronously, never escapes. */
+const _gridInput: TargetInput = {
+  position: [0, 0, 0],
+  yaw: 0,
+  pitch: 0,
+  piece: 'wall',
+  rotState: 0,
+}
+
+/** IN seam: the player pose world→grid. Everything the DDA derives from it
+ * (ray origin at position + EYE, direction from yaw/pitch) lands in the
+ * grid frame automatically — a rigid rotation commutes with that
+ * construction. Y and pitch pass through untouched. Identity returns the
+ * caller's own input: zero cost, bit-exact legacy behavior. */
+function anchorInput(input: TargetInput): TargetInput {
+  if (_identity) return input
+  const c = Math.cos(_anchor.yaw)
+  const s = Math.sin(_anchor.yaw)
+  const dx = input.position[0] - _anchor.x
+  const dz = input.position[2] - _anchor.z
+  _gridInput.position[0] = dx * c - dz * s
+  _gridInput.position[1] = input.position[1]
+  _gridInput.position[2] = dx * s + dz * c
+  _gridInput.yaw = input.yaw - _anchor.yaw
+  _gridInput.pitch = input.pitch
+  _gridInput.piece = input.piece
+  _gridInput.rotState = input.rotState
+  return _gridInput
+}
 
 /** Ground-forward cardinal from camera yaw (camera looks down −Z at yaw 0). */
 export function yawCardinal(yaw: number): [number, number] {
@@ -210,9 +341,14 @@ function rayOverride(input: TargetInput): Slot | null {
  * placeable (its reason drives the HUD status line), or null when the ray
  * exits reach without entering a new cell (caller falls back to the
  * player-anchored default slot).
+ *
+ * `input` is the GRID-frame pose (post anchor IN seam) — the march is pure
+ * lattice math; `worldInput` is the caller's untouched world pose, passed
+ * through to evaluateSlot (reach is measured in world coordinates).
  */
 function resolveRayRSlot(
   input: TargetInput,
+  worldInput: TargetInput,
   quarter: number,
   world: WorldProbe,
 ): TargetResult | null {
@@ -256,7 +392,7 @@ function resolveRayRSlot(
     prevI = i
     prevK = k
     prevS = s
-    const result = evaluateSlot({ kind: 'R', i, k, s }, quarter, input, world)
+    const result = evaluateSlot({ kind: 'R', i, k, s }, quarter, worldInput, world)
     if (result.valid) return result
     if (!first) first = result
   }
@@ -302,6 +438,9 @@ function applyWallFlip(slot: Slot, d: [number, number], rotState: number): Slot 
 const sameSlot = (a: Slot, b: Slot): boolean =>
   a.kind === b.kind && a.i === b.i && a.k === b.k && a.s === b.s
 
+/** `input` here is the WORLD-frame pose: slotPose already returns world
+ * coordinates (anchor OUT seam), so reach is measured world-vs-world — the
+ * transform is rigid, so it equals the grid-frame distance anyway. */
 function evaluateSlot(
   slot: Slot,
   quarter: number,
@@ -322,24 +461,29 @@ function evaluateSlot(
 }
 
 export function resolveTargetSlot(input: TargetInput, world: WorldProbe): TargetResult {
-  const d = yawCardinal(input.yaw)
-  const wall = input.piece === 'wall'
+  // IN seam: slot RESOLUTION runs entirely in the grid frame — one rigid
+  // world→grid transform of the player pose (anchorInput). The original
+  // `input` stays the world pose for evaluateSlot's reach test. Identity
+  // anchor: `grid === input`, nothing moves.
+  const grid = anchorInput(input)
+  const d = yawCardinal(grid.yaw)
+  const wall = grid.piece === 'wall'
 
   // Stairs: R adds ascent quarter-turns on top of the facing. Roof: R
   // cycles SHAPE presets instead (builder-side), so the yaw stays aimed
   // by the facing alone — the preset's high side always rises away.
   const quarter =
-    input.piece === 'stairs'
-      ? roofQuarter(d) + input.rotState
-      : input.piece === 'roof'
+    grid.piece === 'stairs'
+      ? roofQuarter(d) + grid.rotState
+      : grid.piece === 'roof'
         ? roofQuarter(d)
         : 0
 
   // R slots (stairs/roofs): world-aware ray march — same first-valid-wins /
   // nearest-failure-reports contract as the wall/floor path below.
-  if (input.piece === 'stairs' || input.piece === 'roof') {
-    const primary = resolveRayRSlot(input, quarter, world)
-    const base = defaultSlot(input)
+  if (grid.piece === 'stairs' || grid.piece === 'roof') {
+    const primary = resolveRayRSlot(grid, input, quarter, world)
+    const base = defaultSlot(grid)
     if (primary) {
       if (primary.valid || sameSlot(primary.slot, base)) return primary
       const secondary = evaluateSlot(base, quarter, input, world)
@@ -348,10 +492,10 @@ export function resolveTargetSlot(input: TargetInput, world: WorldProbe): Target
     return evaluateSlot(base, quarter, input, world)
   }
 
-  const raw = rayOverride(input)
-  const override = raw && wall ? applyWallFlip(raw, d, input.rotState) : raw
-  const base = defaultSlot(input)
-  const fallback = wall ? applyWallFlip(base, d, input.rotState) : base
+  const raw = rayOverride(grid)
+  const override = raw && wall ? applyWallFlip(raw, d, grid.rotState) : raw
+  const base = defaultSlot(grid)
+  const fallback = wall ? applyWallFlip(base, d, grid.rotState) : base
 
   // Ray override first, player-anchored fallback second (skipped when it is
   // the same slot); first valid wins, else the FIRST failing result reports.

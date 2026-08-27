@@ -12,12 +12,17 @@ import { dropTarget, ensureVoxelTarget, useDestruction } from './destruction'
 import { CornerEditOverlay, EditOverlay } from './edit-overlay'
 import {
   CELL,
+  getGridAnchor,
+  type GridAnchor,
   parseSlotId,
+  resetGridAnchor,
   resolveTargetSlot,
+  setGridAnchor,
   type Slot,
   STOREY,
   type TargetInput,
   type TargetResult,
+  worldToGrid,
 } from './grid'
 import { itemGhostActive } from './item-place'
 import { perfEvent } from './perf-monitor'
@@ -647,11 +652,23 @@ const _debugGhost: GhostState = {
  * (slotId + pose + valid + reason — QA asserts the pose is ∈ the discrete
  * slot set). `isEditing` mirrors the F edit mode each frame — viewmodel.tsx
  * feature-detects it to keep Q piece-cycling out of an open edit.
+ * `anchor()` snapshots the session grid anchor and `worldToGrid(x, z, yaw?)`
+ * maps a world pose under it — with a non-identity anchor the ghost pose is
+ * OFF the absolute lattice by design, so QA asserts lattice membership in
+ * the GRID frame instead.
  */
-export const builderDebug: { holdFire: boolean; isEditing: boolean; ghost: () => GhostState } = {
+export const builderDebug: {
+  holdFire: boolean
+  isEditing: boolean
+  ghost: () => GhostState
+  anchor: () => GridAnchor
+  worldToGrid: (x: number, z: number, yaw?: number) => { x: number; z: number; yaw: number }
+} = {
   holdFire: false,
   isEditing: false,
   ghost: () => ({ ..._debugGhost }),
+  anchor: () => ({ ...getGridAnchor() }),
+  worldToGrid: (x, z, yaw = 0) => worldToGrid(x, z, yaw),
 }
 
 /** Closure-free placed lookup — the edit-mode frame path scans per frame. */
@@ -686,6 +703,9 @@ const _targetInput: TargetInput = {
  * occupancy/support authority (registry + support graph + scene probe). */
 const slotWorldProbe = { isOccupied: slotIsOccupied, isSupported: slotIsSupported }
 
+/** The do-nothing anchor — worlds that derived none run the legacy grid. */
+const IDENTITY_ANCHOR: GridAnchor = { x: 0, z: 0, yaw: 0 }
+
 // --- Scene-support probe + collapse wiring ----------------------------------
 
 /** Collider nodeId prefix for placed pieces (PlacedPieceMesh entries). */
@@ -696,28 +716,40 @@ const _probeBox = new Box3()
 
 /** AABB of the piece volume a slot holds (walls are planes, floors faces,
  * R slots — stairs/roofs — the whole cell) — the box scene geometry must
- * touch to prop it. */
+ * touch to prop it. Under a non-identity GRID ANCHOR the slot volume is an
+ * OBB in world space; v1 takes the world AABB of the rotated grid box.
+ * Conservative in the SAFE direction: AABB ⊇ OBB, so a slot really touching
+ * scene geometry can never read unsupported — the cost is extra support
+ * leniency (a 45°-worst-case wall plane reads ~1 m deep instead of 0),
+ * which is the same class of slop PROBE_MARGIN (0.35) already grants by
+ * design, just wider. Identity keeps the legacy exact box. */
 function setSlotBox(slot: Slot, box: Box3): void {
   const x0 = slot.i * CELL
   const z0 = slot.k * CELL
   const y0 = slot.s * STOREY
-  switch (slot.kind) {
-    case 'Wx':
-      box.min.set(x0, y0, z0)
-      box.max.set(x0, y0 + STOREY, z0 + CELL)
-      break
-    case 'Wz':
-      box.min.set(x0, y0, z0)
-      box.max.set(x0 + CELL, y0 + STOREY, z0)
-      break
-    case 'F':
-      box.min.set(x0, y0, z0)
-      box.max.set(x0 + CELL, y0, z0 + CELL)
-      break
-    case 'R':
-      box.min.set(x0, y0, z0)
-      box.max.set(x0 + CELL, y0 + STOREY, z0 + CELL)
-      break
+  // Grid-frame extents (Wx/Wz are zero-thickness planes, F a face).
+  const x1 = slot.kind === 'Wx' ? x0 : x0 + CELL
+  const z1 = slot.kind === 'Wz' ? z0 : z0 + CELL
+  const y1 = slot.kind === 'F' ? y0 : y0 + STOREY
+  const anchor = getGridAnchor()
+  if (anchor.x === 0 && anchor.z === 0 && anchor.yaw === 0) {
+    box.min.set(x0, y0, z0)
+    box.max.set(x1, y1, z1)
+  } else {
+    // Rotate the four grid XZ corners grid→world (the slotPose OUT math)
+    // and wrap them; Y never transforms.
+    const c = Math.cos(anchor.yaw)
+    const s = Math.sin(anchor.yaw)
+    const wx00 = anchor.x + x0 * c + z0 * s
+    const wz00 = anchor.z - x0 * s + z0 * c
+    const wx01 = anchor.x + x0 * c + z1 * s
+    const wz01 = anchor.z - x0 * s + z1 * c
+    const wx10 = anchor.x + x1 * c + z0 * s
+    const wz10 = anchor.z - x1 * s + z0 * c
+    const wx11 = anchor.x + x1 * c + z1 * s
+    const wz11 = anchor.z - x1 * s + z1 * c
+    box.min.set(Math.min(wx00, wx01, wx10, wx11), y0, Math.min(wz00, wz01, wz10, wz11))
+    box.max.set(Math.max(wx00, wx01, wx10, wx11), y1, Math.max(wz00, wz01, wz10, wz11))
   }
   box.expandByScalar(PROBE_MARGIN)
 }
@@ -947,6 +979,10 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
 
   useEffect(() => {
     setSceneSupportProbe(makeSceneSupportProbe(world))
+    // GRID ANCHOR: the build lattice adopts the building's frame for the
+    // whole session — same lifecycle as the scene-support probe. Hand-built
+    // worlds without one run the legacy identity grid.
+    setGridAnchor(world.gridAnchor ?? IDENTITY_ANCHOR)
     for (const p of useBoots.getState().placed) {
       if (p.slotId) registerPlacement(p.slotId, p.id)
     }
@@ -969,6 +1005,7 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     return () => {
       off()
       resetPieceSlots() // cancels pending rings; probe + registry die with the session
+      resetGridAnchor() // the lattice frame dies with the session — back to identity
       resetCladQueue() // pending clads die too (their meshes just unmounted)
     }
   }, [world])
