@@ -379,6 +379,9 @@ function TableSign({
     g.fillText(text, 384, 50)
     return new CanvasTexture(canvas)
   }, [text])
+  // R3F disposes the JSX material, never this externally created texture —
+  // release it on unmount AND on every text flip or each session leaks one.
+  useEffect(() => () => texture?.dispose(), [texture])
   return (
     <group position={position} rotation={rotation} scale={scale}>
       {[-0.42, 0.42].map((x) => (

@@ -125,6 +125,39 @@ function roofQuarter(d: [number, number]): number {
  * first HORIZONTAL plane, stairs/roofs the first cell entered beyond the
  * player's (both live on R slots).
  */
+type Crossing = { t: number; axis: 'x' | 'z' | 'y'; plane: number }
+/** March scratch — ≤ 8 crossings per axis, reused every call (the builder
+ * resolves a target every frame; fresh objects here were the loop's main
+ * steady GC source). Entries are pooled; `_crossings` is consumed
+ * synchronously inside rayOverride and never escapes. */
+const _crossings: Crossing[] = []
+const _crossingPool: Crossing[] = []
+const byT = (a: Crossing, b: Crossing): number => a.t - b.t
+
+function pushCrossing(t: number, axis: 'x' | 'z' | 'y', plane: number): void {
+  let c = _crossingPool[_crossings.length]
+  if (!c) {
+    c = { t: 0, axis: 'x', plane: 0 }
+    _crossingPool[_crossings.length] = c
+  }
+  c.t = t
+  c.axis = axis
+  c.plane = plane
+  _crossings.push(c)
+}
+
+function marchAxis(o: number, d: number, step: number, axis: 'x' | 'z' | 'y'): void {
+  if (Math.abs(d) < 1e-9) return
+  const dir = Math.sign(d)
+  let plane = dir > 0 ? Math.ceil((o + d * RAY_START) / step) : Math.floor((o + d * RAY_START) / step)
+  for (let guard = 0; guard < 8; guard++) {
+    const t = (plane * step - o) / d
+    if (t > REACH) return
+    if (t >= RAY_START) pushCrossing(t, axis, plane)
+    plane += dir
+  }
+}
+
 function rayOverride(input: TargetInput): Slot | null {
   const [px, py, pz] = input.position
   const ox = px
@@ -138,25 +171,13 @@ function rayOverride(input: TargetInput): Slot | null {
   const startCellI = cellOf(ox + dx * RAY_START)
   const startCellK = cellOf(oz + dz * RAY_START)
 
-  type Crossing = { t: number; axis: 'x' | 'z' | 'y'; plane: number }
-  const crossings: Crossing[] = []
-  const march = (o: number, d: number, step: number, axis: 'x' | 'z' | 'y') => {
-    if (Math.abs(d) < 1e-9) return
-    const dir = Math.sign(d)
-    let plane = dir > 0 ? Math.ceil((o + d * RAY_START) / step) : Math.floor((o + d * RAY_START) / step)
-    for (let guard = 0; guard < 8; guard++) {
-      const t = (plane * step - o) / d
-      if (t > REACH) return
-      if (t >= RAY_START) crossings.push({ t, axis, plane })
-      plane += dir
-    }
-  }
-  march(ox, dx, CELL, 'x')
-  march(oz, dz, CELL, 'z')
-  march(oy, dy, STOREY, 'y')
-  crossings.sort((a, b) => a.t - b.t)
+  _crossings.length = 0
+  marchAxis(ox, dx, CELL, 'x')
+  marchAxis(oz, dz, CELL, 'z')
+  marchAxis(oy, dy, STOREY, 'y')
+  _crossings.sort(byT)
 
-  for (const c of crossings) {
+  for (const c of _crossings) {
     const x = ox + dx * c.t
     const y = oy + dy * c.t
     const z = oz + dz * c.t
@@ -218,15 +239,35 @@ function applyWallFlip(slot: Slot, d: [number, number], rotState: number): Slot 
   return slot
 }
 
+const sameSlot = (a: Slot, b: Slot): boolean =>
+  a.kind === b.kind && a.i === b.i && a.k === b.k && a.s === b.s
+
+function evaluateSlot(
+  slot: Slot,
+  quarter: number,
+  input: TargetInput,
+  world: WorldProbe,
+): TargetResult {
+  const id = slotId(slot)
+  const pose = slotPose(slot, quarter)
+  const dx = pose.position[0] - input.position[0]
+  const dy = pose.position[1] - input.position[1]
+  const dz = pose.position[2] - input.position[2]
+  const reach = Math.hypot(dx, dy, dz) <= REACH + CELL / 2
+  let reason: TargetResult['reason'] = 'ok'
+  if (!reach) reason = 'out-of-reach'
+  else if (world.isOccupied(id)) reason = 'occupied'
+  else if (!world.isSupported(id)) reason = 'unsupported'
+  return { slotId: id, slot, pose, valid: reason === 'ok', reason }
+}
+
 export function resolveTargetSlot(input: TargetInput, world: WorldProbe): TargetResult {
   const d = yawCardinal(input.yaw)
-  const flip = (slot: Slot): Slot =>
-    input.piece === 'wall' ? applyWallFlip(slot, d, input.rotState) : slot
-  const candidates: Slot[] = []
-  const override = rayOverride(input)
-  if (override) candidates.push(flip(override))
-  const fallback = flip(defaultSlot(input))
-  if (!override || slotId(candidates[0]!) !== slotId(fallback)) candidates.push(fallback)
+  const wall = input.piece === 'wall'
+  const raw = rayOverride(input)
+  const override = raw && wall ? applyWallFlip(raw, d, input.rotState) : raw
+  const base = defaultSlot(input)
+  const fallback = wall ? applyWallFlip(base, d, input.rotState) : base
 
   // Stairs: R adds ascent quarter-turns on top of the facing. Roof: R
   // cycles SHAPE presets instead (builder-side), so the yaw stays aimed
@@ -238,23 +279,15 @@ export function resolveTargetSlot(input: TargetInput, world: WorldProbe): Target
         ? roofQuarter(d)
         : 0
 
-  let firstFailing: TargetResult | null = null
-  for (const slot of candidates) {
-    const id = slotId(slot)
-    const pose = slotPose(slot, quarter)
-    const dx = pose.position[0] - input.position[0]
-    const dy = pose.position[1] - input.position[1]
-    const dz = pose.position[2] - input.position[2]
-    const reach = Math.hypot(dx, dy, dz) <= REACH + CELL / 2
-    let reason: TargetResult['reason'] = 'ok'
-    if (!reach) reason = 'out-of-reach'
-    else if (world.isOccupied(id)) reason = 'occupied'
-    else if (!world.isSupported(id)) reason = 'unsupported'
-    const result: TargetResult = { slotId: id, slot, pose, valid: reason === 'ok', reason }
-    if (result.valid) return result
-    firstFailing ??= result
+  // Ray override first, player-anchored fallback second (skipped when it is
+  // the same slot); first valid wins, else the FIRST failing result reports.
+  if (override) {
+    const primary = evaluateSlot(override, quarter, input, world)
+    if (primary.valid || sameSlot(override, fallback)) return primary
+    const secondary = evaluateSlot(fallback, quarter, input, world)
+    return secondary.valid ? secondary : primary
   }
-  return firstFailing!
+  return evaluateSlot(fallback, quarter, input, world)
 }
 
 /**

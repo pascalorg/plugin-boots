@@ -5,6 +5,7 @@ import {
   classifyRoofShape,
   CORNER_RISE,
   cornerRoofGeometry,
+  cornersEqual,
   nearestCorner,
   presetCorners,
   raycastRoofCorner,
@@ -37,6 +38,12 @@ describe('corner ring math', () => {
     expect(nearestCorner(1, -1)).toBe(1)
     expect(nearestCorner(1, 1)).toBe(2)
     expect(nearestCorner(-1, 1)).toBe(3)
+  })
+
+  test('cornersEqual is element-wise (frame-loop change gates)', () => {
+    expect(cornersEqual([0, 0, 1, 1], SLOPE_CORNERS)).toBe(true)
+    expect(cornersEqual([0, 0, 1, 0], SLOPE_CORNERS)).toBe(false)
+    expect(cornersEqual([1, 0, 1, 1], [1, 0, 1, 0])).toBe(false)
   })
 
   test('bilinear heights hit corners exactly and blend the center', () => {

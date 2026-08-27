@@ -34,8 +34,9 @@ import {
 import { playerRig } from './player'
 import {
   cornerRoofGeometry,
-  presetCorners,
+  cornersEqual,
   raycastRoofCorner,
+  ROOF_PRESETS,
   type RoofCorners,
   SLOPE_CORNERS,
   toggleCorner,
@@ -645,6 +646,14 @@ export const builderDebug: { holdFire: boolean; isEditing: boolean; ghost: () =>
   ghost: () => ({ ..._debugGhost }),
 }
 
+/** Closure-free placed lookup — the edit-mode frame path scans per frame. */
+function findPlaced(placed: readonly PlacedPiece[], id: number): PlacedPiece | null {
+  for (let i = 0; i < placed.length; i++) {
+    if (placed[i]!.id === id) return placed[i]!
+  }
+  return null
+}
+
 /**
  * Pure R-rotate math: the ghost's auto-facing yaw plus `quarterTurns` manual
  * 90° presses, wrapped to [−π, π) so repeated pressing never grows the
@@ -1169,7 +1178,7 @@ export function Builder() {
       prevUndo.current = session.input.state.keys.has('KeyU')
       prevRotate.current = session.input.state.keys.has('KeyR')
       const altFiringNow = session.input.state.altFiring
-      const piece = useBoots.getState().placed.find((p) => p.id === edit.id)
+      const piece = findPlaced(useBoots.getState().placed, edit.id)
       const hit = piece ? raycastEditTarget(piece, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE) : null
       // Exit: F again, the piece is gone, or the aim left it. Exit-time is
       // the confirm: the final mask classifies, exact stair silhouettes
@@ -1191,23 +1200,24 @@ export function Builder() {
         // Corner roof: LMB toggles the aimed corner's height, RMB snaps the
         // shape back to the classic slope. An armed item ghost owns the
         // click (itemGhostActive — same gate as the viewmodel's trigger).
+        let wrote = false
         if (firingNow && !prevFire.current && !staggered && !itemGhostActive()) {
           useBoots.getState().setPlacedCorners(piece.id, toggleCorner(piece.corners, hit.bit))
           sfx.place()
+          wrote = true
         }
-        if (
-          altFiringNow &&
-          !prevAltFire.current &&
-          piece.corners.join('') !== SLOPE_CORNERS.join('')
-        ) {
+        if (altFiringNow && !prevAltFire.current && !cornersEqual(piece.corners, SLOPE_CORNERS)) {
           useBoots.getState().setPlacedCorners(piece.id, SLOPE_CORNERS)
           sfx.place()
+          wrote = true
         }
         prevFire.current = firingNow
         prevAltFire.current = altFiringNow
-        const live = useBoots.getState().placed.find((p) => p.id === edit.id)
-        const corners = live?.corners ?? piece.corners
-        if (edit.hover !== hit.bit || edit.corners?.join('') !== corners.join('')) {
+        // Re-read only after a write this frame — `piece` is already fresh.
+        const corners = wrote
+          ? (findPlaced(useBoots.getState().placed, edit.id)?.corners ?? piece.corners)
+          : piece.corners
+        if (edit.hover !== hit.bit || !edit.corners || !cornersEqual(edit.corners, corners)) {
           setEdit({ ...edit, hover: hit.bit, corners })
         }
         return
@@ -1226,20 +1236,26 @@ export function Builder() {
         editSwiped.current.has(hit.bit),
       )
       swipeActive.current = step.active
+      let wrote = false
       if (step.carve) {
         editSwiped.current.add(hit.bit)
         useBoots.getState().setPlacedMask(piece.id, piece.mask ^ (1 << hit.bit))
         sfx.place()
+        wrote = true
       }
       // RMB resets the edit — the piece snaps back to intact (511). ADS is
       // pistol/rifle-only, so the builder owns RMB freely.
       if (altFiringNow && !prevAltFire.current && piece.mask !== FULL_MASK) {
         useBoots.getState().setPlacedMask(piece.id, FULL_MASK)
         sfx.place()
+        wrote = true
       }
       prevFire.current = firingNow
       prevAltFire.current = altFiringNow
-      const mask = useBoots.getState().placed.find((p) => p.id === edit.id)?.mask ?? piece.mask
+      // Re-read only after a write this frame — `piece` is already fresh.
+      const mask = wrote
+        ? (findPlaced(useBoots.getState().placed, edit.id)?.mask ?? piece.mask)
+        : piece.mask
       if (edit.hover !== hit.bit || edit.mask !== mask) {
         setEdit({ ...edit, hover: hit.bit, mask })
       }
@@ -1315,8 +1331,11 @@ export function Builder() {
     const pose = target.pose
     const occupied = target.reason === 'occupied'
     // Roof ghost previews the R-cycled shape preset (the exact patch the
-    // click will place); other pieces carry no corner pattern.
-    const ghostCorners = buildPiece === 'roof' ? presetCorners(rotateTurns.current) : null
+    // click will place); other pieces carry no corner pattern. The CANONICAL
+    // preset reference (read-only here) keeps the change gate an identity
+    // compare — placement below still spreads its own copy.
+    const ghostCorners =
+      buildPiece === 'roof' ? ROOF_PRESETS[((rotateTurns.current % 4) + 4) % 4]! : null
 
     if (
       !ghost ||
@@ -1325,7 +1344,7 @@ export function Builder() {
       ghost.yaw !== pose.yaw ||
       ghost.valid !== target.valid ||
       ghost.reason !== target.reason ||
-      (ghost.corners?.join('') ?? '') !== (ghostCorners?.join('') ?? '')
+      ghost.corners !== ghostCorners
     ) {
       setGhost({
         slotId: target.slotId,

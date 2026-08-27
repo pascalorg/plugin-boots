@@ -103,6 +103,11 @@ export function itemGhostActive(): boolean {
   return useItems.getState().armed !== null && !isItemMenuOpen()
 }
 
+/** Placement budget — every other lane has one (turbo clad FIFO, debris
+ * caps); each placement is a full GLB clone worth of draw calls. The ghost
+ * refuses ('occupied') at the cap; Save/Discard resets the count. */
+export const MAX_PLACED_ITEMS = 64
+
 /** Max anchor distance from the player (matches the builder's edit reach). */
 export const ITEM_REACH = 6
 /** Level-gaze anchor: this far ahead when the aim never meets the floor. */
@@ -257,6 +262,37 @@ function loadModel(asset: CatalogEntry): Promise<Group> {
     })
   modelCache.set(asset.id, { status: 'loading', promise })
   return promise
+}
+
+/**
+ * Session teardown: release every cached template's GPU resources —
+ * geometries, materials and their texture maps — plus the proxy label
+ * textures, then forget both caches. Without this the module caches are
+ * page-lifetime (a catalog browsing spree pins tens of MB of GLB data
+ * across Esc). Unmount ordering is safe: holders being torn down in the
+ * same commit never render again, and their own cleanups dispose nothing
+ * template-owned (disposeItemContent). Re-entry refetches on demand.
+ */
+export function disposeItemModels(): void {
+  for (const slot of modelCache.values()) {
+    if (slot.status !== 'ready') continue
+    slot.template.traverse((object) => {
+      const mesh = object as Mesh
+      if (!mesh.isMesh) return
+      mesh.geometry.dispose()
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+      for (const material of materials) {
+        for (const value of Object.values(material as unknown as Record<string, unknown>)) {
+          const texture = value as { isTexture?: boolean; dispose?: () => void }
+          if (texture?.isTexture) texture.dispose?.()
+        }
+        ;(material as MeshStandardMaterial).dispose()
+      }
+    })
+  }
+  modelCache.clear()
+  for (const texture of labelCache.values()) texture.dispose()
+  labelCache.clear()
 }
 
 /** QA/debug: which catalog ids fell back to proxies, and why. */
@@ -484,6 +520,11 @@ export function GameItems({ world }: { world: GameWorld }) {
   /** Armed item's footprint, refreshed per arm — the frame loop's player-
    * overlap check stays allocation-free. */
   const armedFootprint = useRef<[number, number, number]>([1, 1, 1])
+  /** probeLandingY memo — the probe walks every collider plus every live
+   * grid and is documented "never per frame"; re-probe only when the
+   * quantized (1 cm) anchor, floor plane or collider census moves, with a
+   * 10-frame fallback so destruction under a frozen aim still settles. */
+  const probeCache = useRef({ qx: NaN, qz: NaN, qf: NaN, colliders: -1, frame: -1e9, y: 0 })
 
   // Ghost content tracks the armed asset (proxy first, GLB when cached).
   useEffect(() => {
@@ -493,12 +534,14 @@ export function GameItems({ world }: { world: GameWorld }) {
     return mountItemVisual(holder, armed, true)
   }, [armed])
 
-  // Session teardown: the menu (if open) dies with the game tree, and the
-  // ghost stows — placements themselves persist for the panel's decision.
+  // Session teardown: the menu (if open) dies with the game tree, the
+  // ghost stows, and the model/label caches release their GPU resources —
+  // placements themselves persist for the panel's decision.
   useEffect(
     () => () => {
       closeItemMenu(false)
       useItems.getState().disarm()
+      disposeItemModels()
     },
     [],
   )
@@ -601,7 +644,25 @@ export function GameItems({ world }: { world: GameWorld }) {
       prevFire.current = session.input.state.firing
       return
     }
-    const snapped = probeLandingY(world, _anchor.x, floorY + 1, _anchor.z)
+    const probe = probeCache.current
+    const qx = Math.round(_anchor.x * 100)
+    const qz = Math.round(_anchor.z * 100)
+    const qf = Math.round(floorY * 100)
+    if (
+      probe.qx !== qx ||
+      probe.qz !== qz ||
+      probe.qf !== qf ||
+      probe.colliders !== world.colliders.length ||
+      frame.current - probe.frame >= 10
+    ) {
+      probe.qx = qx
+      probe.qz = qz
+      probe.qf = qf
+      probe.colliders = world.colliders.length
+      probe.frame = frame.current
+      probe.y = probeLandingY(world, _anchor.x, floorY + 1, _anchor.z)
+    }
+    const snapped = probe.y
     const y = snapped > _anchor.y ? snapped : _anchor.y
     const yaw = ghostYaw(playerRig.yaw, yawTurns.current)
     ghost.visible = true
@@ -610,16 +671,19 @@ export function GameItems({ world }: { world: GameWorld }) {
     // The anchor reaches ~0.32 m from the player axis — a placement whose
     // box would swallow the capsule is refused (the solid fixture collider
     // would wedge the player inside, with no in-game item undo to escape).
-    const blocked = itemOverlapsPlayer(
-      _anchor.x,
-      y,
-      _anchor.z,
-      yaw,
-      armedFootprint.current,
-      playerRig.position.x,
-      floorY,
-      playerRig.position.z,
-    )
+    // The session budget refuses the same way once the cap is hit.
+    const blocked =
+      state.items.length >= MAX_PLACED_ITEMS ||
+      itemOverlapsPlayer(
+        _anchor.x,
+        y,
+        _anchor.z,
+        yaw,
+        armedFootprint.current,
+        playerRig.position.x,
+        floorY,
+        playerRig.position.z,
+      )
     session.hud.ghostStatus?.(
       _anchor.valid ? (blocked ? 'occupied' : null) : 'out-of-reach',
       'items',

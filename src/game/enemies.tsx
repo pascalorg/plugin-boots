@@ -171,7 +171,9 @@ function meleeBlocked(world: GameWorld, bot: Bot): boolean {
 
 export function Enemies({ world }: { world: GameWorld }) {
   const [tick, setTick] = useState(0)
-  const signature = useRef('')
+  /** Rolling hash of (id, state) per bot — the remount change gate below
+   * stays allocation-free (no per-frame signature strings). */
+  const signature = useRef(0)
   const buzz = useRef<ReturnType<typeof sfx.droneBuzz>>(null)
   /** Gear-up voice under the countdown (null without WebAudio). */
   const spinup = useRef<ReturnType<typeof sfx.machineSpinup>>(null)
@@ -490,7 +492,14 @@ export function Enemies({ world }: { world: GameWorld }) {
 
     buzz.current?.setIntensity(nearestDrone === Infinity ? 0 : Math.max(0, 1 - nearestDrone / 22) * 0.09)
 
-    const sig = bots.map((b) => `${b.id}:${b.state}`).join(',')
+    // Order-sensitive id+state hash — same change-detection semantics as a
+    // joined signature string, zero allocations.
+    let sig = bots.length | 0
+    for (let i = 0; i < bots.length; i++) {
+      const bot = bots[i]!
+      sig = (sig * 33 + bot.id) | 0
+      sig = (sig * 33 + (bot.state === 'dying' ? 1 : 0)) | 0
+    }
     if (sig !== signature.current) {
       signature.current = sig
       setTick((t) => t + 1)

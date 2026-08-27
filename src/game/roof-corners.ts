@@ -64,6 +64,12 @@ export function rotateQuarter(corners: RoofCorners): RoofCorners {
   return [corners[1], corners[2], corners[3], corners[0]]
 }
 
+/** Element-wise pattern equality — frame-loop change gates compare without
+ * allocating join strings. */
+export function cornersEqual(a: RoofCorners, b: RoofCorners): boolean {
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3]
+}
+
 export function toggleCorner(corners: RoofCorners, index: number): RoofCorners {
   const next = [...corners] as RoofCorners
   next[index & 3] = next[index & 3] ? 0 : 1
@@ -196,6 +202,24 @@ export function cornerRoofGeometry(corners: RoofCorners): BufferGeometry {
 
 export type RoofCornerHit = { t: number; corner: number }
 
+/** raycastRoofCorner lattice scratch — the F-edit hover raycasts every
+ * frame; the corner points are consumed synchronously per triangle pair. */
+const _pA: [number, number, number] = [0, 0, 0]
+const _pB: [number, number, number] = [0, 0, 0]
+const _pC: [number, number, number] = [0, 0, 0]
+const _pD: [number, number, number] = [0, 0, 0]
+
+function patchPoint(
+  out: [number, number, number],
+  corners: RoofCorners,
+  u: number,
+  v: number,
+): void {
+  out[0] = -HALF + u * 2 * HALF
+  out[1] = bilinearHeight(corners, u, v) * CORNER_RISE + THICK
+  out[2] = -HALF + v * 2 * HALF
+}
+
 /**
  * Ray vs the patch's TOP sheet (Möller–Trumbore over the 18 lattice
  * triangles), in WORLD space given the piece pose. Returns the nearest hit
@@ -217,34 +241,33 @@ export function raycastRoofCorner(
   // keep.ts' local→world corner map).
   const cos = Math.cos(pose.yaw)
   const sin = Math.sin(pose.yaw)
-  const toLocal = (wx: number, wy: number, wz: number): [number, number, number] => {
-    const tx = wx - pose.x
-    const tz = wz - pose.z
-    return [tx * cos - tz * sin, wy - pose.y, tx * sin + tz * cos]
-  }
-  const [lox, loy, loz] = toLocal(ox, oy, oz)
+  const tx = ox - pose.x
+  const tz = oz - pose.z
+  const lox = tx * cos - tz * sin
+  const loy = oy - pose.y
+  const loz = tx * sin + tz * cos
   // Directions rotate without translation.
   const ldx = dx * cos - dz * sin
   const ldy = dy
   const ldz = dx * sin + dz * cos
 
-  const at = (u: number, v: number): [number, number, number] => [
-    -HALF + u * 2 * HALF,
-    bilinearHeight(corners, u, v) * CORNER_RISE + THICK,
-    -HALF + v * 2 * HALF,
-  ]
-  let best: RoofCornerHit | null = null
+  let bestT = Infinity
+  let bestCorner = 0
   const tri = (
     a: [number, number, number],
     b: [number, number, number],
     c: [number, number, number],
   ) => {
-    const e1: [number, number, number] = [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
-    const e2: [number, number, number] = [c[0] - a[0], c[1] - a[1], c[2] - a[2]]
-    const px = ldy * e2[2] - ldz * e2[1]
-    const py = ldz * e2[0] - ldx * e2[2]
-    const pz = ldx * e2[1] - ldy * e2[0]
-    const det = e1[0] * px + e1[1] * py + e1[2] * pz
+    const e1x = b[0] - a[0]
+    const e1y = b[1] - a[1]
+    const e1z = b[2] - a[2]
+    const e2x = c[0] - a[0]
+    const e2y = c[1] - a[1]
+    const e2z = c[2] - a[2]
+    const px = ldy * e2z - ldz * e2y
+    const py = ldz * e2x - ldx * e2z
+    const pz = ldx * e2y - ldy * e2x
+    const det = e1x * px + e1y * py + e1z * pz
     if (Math.abs(det) < 1e-9) return
     const inv = 1 / det
     const sx = lox - a[0]
@@ -252,27 +275,28 @@ export function raycastRoofCorner(
     const sz = loz - a[2]
     const u = (sx * px + sy * py + sz * pz) * inv
     if (u < -1e-6 || u > 1 + 1e-6) return
-    const qx = sy * e1[2] - sz * e1[1]
-    const qy = sz * e1[0] - sx * e1[2]
-    const qz = sx * e1[1] - sy * e1[0]
+    const qx = sy * e1z - sz * e1y
+    const qy = sz * e1x - sx * e1z
+    const qz = sx * e1y - sy * e1x
     const v = (ldx * qx + ldy * qy + ldz * qz) * inv
     if (v < -1e-6 || u + v > 1 + 1e-6) return
-    const t = (e2[0] * qx + e2[1] * qy + e2[2] * qz) * inv
+    const t = (e2x * qx + e2y * qy + e2z * qz) * inv
     if (t < 0.01 || t > maxT) return
-    if (best && t >= best.t) return
+    if (t >= bestT) return
     const hx = lox + ldx * t
     const hz = loz + ldz * t
-    best = { t, corner: nearestCorner(hx, hz) }
+    bestT = t
+    bestCorner = nearestCorner(hx, hz)
   }
   for (let i = 0; i < SEGS; i++) {
     for (let j = 0; j < SEGS; j++) {
-      const a = at(i / SEGS, j / SEGS)
-      const b = at(i / SEGS, (j + 1) / SEGS)
-      const c = at((i + 1) / SEGS, (j + 1) / SEGS)
-      const d = at((i + 1) / SEGS, j / SEGS)
-      tri(a, b, c)
-      tri(a, c, d)
+      patchPoint(_pA, corners, i / SEGS, j / SEGS)
+      patchPoint(_pB, corners, i / SEGS, (j + 1) / SEGS)
+      patchPoint(_pC, corners, (i + 1) / SEGS, (j + 1) / SEGS)
+      patchPoint(_pD, corners, (i + 1) / SEGS, j / SEGS)
+      tri(_pA, _pB, _pC)
+      tri(_pA, _pC, _pD)
     }
   }
-  return best
+  return bestT === Infinity ? null : { t: bestT, corner: bestCorner }
 }
