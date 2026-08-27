@@ -19,6 +19,7 @@ import {
   type TargetInput,
   type TargetResult,
 } from './grid'
+import { itemGhostActive } from './item-place'
 import {
   isDeathLocked,
   isOccupied as slotIsOccupied,
@@ -298,6 +299,23 @@ export function turboStamp(
   if (cooldownLeft > 0) return null
   if (!valid || attempted || locked) return null
   return freshPress ? TURBO_FIRST : TURBO_NEXT
+}
+
+/**
+ * Pure swipe-carve gate for one edit-mode frame: a swipe STARTS only on a
+ * fresh press edge — a fire hold carried INTO edit mode (turbo-chaining
+ * pieces, then tapping F) must never carve on entry — and stays live until
+ * the button releases; a live swipe carves each cell once per hold
+ * (`swipedBit`, the caller's per-hold dedupe Set).
+ */
+export function swipeStep(
+  firing: boolean,
+  prevFiring: boolean,
+  active: boolean,
+  swipedBit: boolean,
+): { active: boolean; carve: boolean } {
+  const next = firing && (active || !prevFiring)
+  return { active: next, carve: next && !swipedBit }
 }
 
 // --- Edit-mode cell picking -------------------------------------------------
@@ -1043,6 +1061,9 @@ export function Builder() {
   /** Cells already toggled during the CURRENT edit-mode fire hold — swipe
    * carving toggles each NEW cell the crosshair enters, once per hold. */
   const editSwiped = useRef<Set<number>>(new Set())
+  /** True while a swipe hold is live — armed by a fresh press edge only
+   * (swipeStep), never by a fire hold carried into edit mode. */
+  const swipeActive = useRef(false)
 
   const weapon = useBoots((s) => s.weapon)
   const buildPiece = useBoots((s) => s.buildPiece)
@@ -1093,6 +1114,8 @@ export function Builder() {
       session.hud.ghostStatus?.(null, 'builder')
       builderDebug.isEditing = false
       holdAttempted.current.clear()
+      editSwiped.current.clear()
+      swipeActive.current = false
       prevFire.current = session.input.state.firing || builderDebug.holdFire
       prevAltFire.current = session.input.state.altFiring
       prevEditKey.current = session.input.state.keys.has('KeyF')
@@ -1154,6 +1177,10 @@ export function Builder() {
       if (!piece || !hit || editKeyEdge) {
         if (piece) applyEditExitTransform(piece.id)
         setEdit(null)
+        // The per-hold swipe set dies with the edit — a bit swiped in the
+        // LAST edit must not refuse the same cell in the next one.
+        editSwiped.current.clear()
+        swipeActive.current = false
         builderDebug.isEditing = false
         placeCooldown.current = TURBO_FIRST // a beat before hold-place resumes
         prevFire.current = firingNow
@@ -1162,8 +1189,9 @@ export function Builder() {
       }
       if (piece.piece === 'roof' && piece.corners) {
         // Corner roof: LMB toggles the aimed corner's height, RMB snaps the
-        // shape back to the classic slope.
-        if (firingNow && !prevFire.current && !staggered) {
+        // shape back to the classic slope. An armed item ghost owns the
+        // click (itemGhostActive — same gate as the viewmodel's trigger).
+        if (firingNow && !prevFire.current && !staggered && !itemGhostActive()) {
           useBoots.getState().setPlacedCorners(piece.id, toggleCorner(piece.corners, hit.bit))
           sfx.place()
         }
@@ -1184,18 +1212,24 @@ export function Builder() {
         }
         return
       }
-      // SWIPE CARVE: the press toggles the aimed cell; while the hold lasts,
-      // each NEW cell the crosshair enters toggles once (per-hold dedupe,
-      // cleared on release — matches holdAttempted's per-hold contract).
-      if (firingNow && !staggered) {
-        if (!prevFire.current) editSwiped.current.clear()
-        if (!editSwiped.current.has(hit.bit)) {
-          editSwiped.current.add(hit.bit)
-          useBoots.getState().setPlacedMask(piece.id, piece.mask ^ (1 << hit.bit))
-          sfx.place()
-        }
-      } else if (!firingNow && editSwiped.current.size > 0) {
-        editSwiped.current.clear()
+      // SWIPE CARVE: a FRESH press toggles the aimed cell and arms the
+      // swipe; while that hold lasts, each NEW cell the crosshair enters
+      // toggles once (per-hold dedupe — matches holdAttempted's per-hold
+      // contract). A hold carried into the edit never carves (swipeStep),
+      // and an armed item ghost owns the click (itemGhostActive).
+      const fireForCarve = firingNow && !staggered && !itemGhostActive()
+      if (fireForCarve && !swipeActive.current && !prevFire.current) editSwiped.current.clear()
+      const step = swipeStep(
+        fireForCarve,
+        prevFire.current,
+        swipeActive.current,
+        editSwiped.current.has(hit.bit),
+      )
+      swipeActive.current = step.active
+      if (step.carve) {
+        editSwiped.current.add(hit.bit)
+        useBoots.getState().setPlacedMask(piece.id, piece.mask ^ (1 << hit.bit))
+        sfx.place()
       }
       // RMB resets the edit — the piece snaps back to intact (511). ADS is
       // pistol/rifle-only, so the builder owns RMB freely.
@@ -1256,8 +1290,11 @@ export function Builder() {
       rotatePiece.current = buildPiece
       rotateTurns.current = 0
     }
+    // While an item ghost is armed, R turns the FURNITURE (GameItems strips
+    // the action queue, but R here reads the held-keys set — skip the edge,
+    // keep the tracker warm).
     const rotateDown = session.input.state.keys.has('KeyR')
-    if (rotateDown && !prevRotate.current && buildPiece !== 'floor') {
+    if (rotateDown && !prevRotate.current && buildPiece !== 'floor' && !itemGhostActive()) {
       rotateTurns.current = (rotateTurns.current + 1) % 4
       sfx.weaponSwitch() // audible detent per accepted quarter turn
     }
@@ -1323,11 +1360,13 @@ export function Builder() {
     // held, every NEW slot this hold stamps at TURBO_NEXT cadence. Dedupe:
     // one attempt per slotId per hold; died slots are locked out 0.15 s
     // (piece-slots stamps them on ANY removal — undo, cascade, weapon).
-    // Invalid targets are skipped silently. Staggered hands can't stamp
-    // (matches the viewmodel's fire block); prevFire still tracks the raw
-    // button so recovery doesn't edge-place.
+    // Invalid targets are skipped silently. Staggered hands can't stamp,
+    // and an armed item ghost owns the click — the viewmodel's fire gate
+    // excludes 'builder', so this loop must gate itself (a single LMB was
+    // dropping furniture AND stamping a piece); prevFire still tracks the
+    // raw button so recovery doesn't edge-place.
     const firing = session.input.state.firing || builderDebug.holdFire
-    if (firing && !useBoots.getState().staggered) {
+    if (firing && !useBoots.getState().staggered && !itemGhostActive()) {
       const freshPress = !prevFire.current
       if (freshPress) holdAttempted.current.clear()
       const arm = turboStamp(

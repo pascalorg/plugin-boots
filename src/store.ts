@@ -165,5 +165,9 @@ export const useBoots = create<BootsState>((set, get) => ({
       health: 100,
       staggered: false,
       buildPiece: 'wall',
+      // `placed` deliberately survives re-entry (an undecided Keep/Discard
+      // resumes), but the sidebar's decision UI must not — a mid-game Save
+      // click would write the scene store during play.
+      pendingDecision: false,
     }),
 }))

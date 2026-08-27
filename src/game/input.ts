@@ -63,8 +63,10 @@ export class GameInput {
 
   /** Item-catalog latch (inventory.tsx): while set, every keydown routes to
    * onMenuKey instead of the game state and pointer/wheel events pass
-   * through to the DOM menu untouched (no preventDefault, no relock). The
-   * menu clears held keys/buttons when it opens, so nothing sticks. */
+   * through UNTOUCHED only inside the session container (the menu's home;
+   * anything outside — host editor UI in a windowed session — stays
+   * swallowed). The menu clears held keys/buttons when it opens, so
+   * nothing sticks. */
   menuOpen = false
   onMenuKey: ((code: string) => void) | null = null
 
@@ -85,6 +87,21 @@ export class GameInput {
       const wrapped = handler as EventListener
       window.addEventListener(type, wrapped, { capture: true })
       this.detachFns.push(() => window.removeEventListener(type, wrapped, { capture: true }))
+    }
+
+    // While the item catalog is open, pointer/wheel events belong to the
+    // menu DOM — which lives INSIDE the session container. In a windowed
+    // session (fullscreen denied/rejected) host editor UI outside the
+    // container is still on screen; those events stay swallowed so the
+    // editor never sees a click mid-game.
+    const menuPasses = (e: Event): boolean => {
+      const container = this.canvas?.parentElement
+      return container != null && e.target instanceof Node && container.contains(e.target)
+    }
+    const menuGate = (e: Event): void => {
+      if (menuPasses(e)) return
+      e.preventDefault()
+      e.stopImmediatePropagation()
     }
 
     on('keydown', (e) => {
@@ -134,7 +151,10 @@ export class GameInput {
       syncButtons(e.buttons)
     })
     on('pointerdown', (e) => {
-      if (this.menuOpen) return
+      if (this.menuOpen) {
+        menuGate(e)
+        return
+      }
       e.preventDefault()
       e.stopImmediatePropagation()
       if (!this.pointerLocked) {
@@ -144,7 +164,10 @@ export class GameInput {
       syncButtons(e.buttons)
     })
     on('pointerup', (e) => {
-      if (this.menuOpen) return
+      if (this.menuOpen) {
+        menuGate(e)
+        return
+      }
       e.preventDefault()
       e.stopImmediatePropagation()
       syncButtons(e.buttons)
@@ -155,7 +178,10 @@ export class GameInput {
     // ADS click ("multiple clicks per shot" bug, 2026-08-25).
     for (const type of ['mousedown', 'mouseup'] as const) {
       on(type, (e) => {
-        if (this.menuOpen) return
+        if (this.menuOpen) {
+          menuGate(e)
+          return
+        }
         e.preventDefault()
         e.stopImmediatePropagation()
         if (this.pointerLocked) syncButtons(e.buttons)
@@ -163,13 +189,19 @@ export class GameInput {
     }
     for (const type of ['click', 'dblclick', 'contextmenu'] as const) {
       on(type, (e) => {
-        if (this.menuOpen) return
+        if (this.menuOpen) {
+          menuGate(e)
+          return
+        }
         e.preventDefault()
         e.stopImmediatePropagation()
       })
     }
     on('wheel', (e) => {
-      if (this.menuOpen) return
+      if (this.menuOpen) {
+        menuGate(e)
+        return
+      }
       e.preventDefault()
       e.stopImmediatePropagation()
       this.state.actions.push(e.deltaY > 0 ? 'WheelDown' : 'WheelUp')

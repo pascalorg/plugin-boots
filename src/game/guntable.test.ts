@@ -5,6 +5,7 @@ import {
   buildTablePosition,
   GRAB_RANGE,
   minigunTablePosition,
+  nearestGrabbable,
   TABLE_SIZE,
   tablePosition,
 } from './guntable'
@@ -59,6 +60,43 @@ describe('spawn table layout', () => {
       expect(gearFwd).toBeGreaterThan(0)
       expect(buildLat * gearLat).toBeLessThan(0)
     }
+  })
+
+  test('one E press serves ONE table: nearest untaken wins the overlap', () => {
+    for (const yaw of YAWS) {
+      const world = fakeWorld(new Vector3(3, 0, -2), yaw)
+      // 0.4 m forward of spawn — inside BOTH the build and gear grab discs
+      // (regression: a single E here granted builder + pistol + rifle and
+      // tripped the wave director, killing the peaceful entry).
+      const px = world.spawn.x - Math.sin(yaw) * 0.4
+      const pz = world.spawn.z - Math.cos(yaw) * 0.4
+      const at = new Vector3(px, 0, pz)
+      expect(buildTablePosition(world).distanceTo(at)).toBeLessThan(GRAB_RANGE)
+      expect(tablePosition(world).distanceTo(at)).toBeLessThan(GRAB_RANGE)
+      const tables = (builderTaken: boolean) =>
+        new Map([
+          ['build', { x: buildTablePosition(world).x, z: buildTablePosition(world).z, taken: builderTaken }],
+          ['gear', { x: tablePosition(world).x, z: tablePosition(world).z, taken: false }],
+          ['rear', { x: minigunTablePosition(world).x, z: minigunTablePosition(world).z, taken: false }],
+        ])
+      // The nearest untaken table alone answers the press…
+      expect(nearestGrabbable(px, pz, tables(false))).toBe('build')
+      // …and once the builder is taken the SAME spot serves the gear table.
+      expect(nearestGrabbable(px, pz, tables(true))).toBe('gear')
+    }
+  })
+
+  test('nearestGrabbable: out of every disc → null; all taken → null', () => {
+    const world = fakeWorld(new Vector3(0, 0, 0), 0)
+    const tables = new Map([
+      ['build', { x: buildTablePosition(world).x, z: buildTablePosition(world).z, taken: false }],
+      ['gear', { x: tablePosition(world).x, z: tablePosition(world).z, taken: false }],
+    ])
+    expect(nearestGrabbable(50, 50, tables)).toBeNull()
+    const taken = new Map(
+      [...tables].map(([id, t]) => [id, { ...t, taken: true }] as const),
+    )
+    expect(nearestGrabbable(0, 0, taken)).toBeNull()
   })
 
   test('build and gear footprints never overlap', () => {

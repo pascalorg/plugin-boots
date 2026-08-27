@@ -20,7 +20,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { create } from 'zustand'
 import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
-import { EYE_HEIGHT } from './collision'
+import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
 import { probeLandingY } from './destruction'
 import { type CatalogEntry, closeItemMenu, isItemMenuOpen, openItemMenu } from './inventory'
 import { playerRig } from './player'
@@ -191,6 +191,32 @@ export function itemFootprint(asset: CatalogEntry): [number, number, number] {
   ]
 }
 
+/**
+ * Would this placement wedge the player inside the item? The item's world
+ * AABB (footprint at the anchor; yaw is snapped to 90°, so odd quarter
+ * turns swap w/d) expanded by the capsule radius must not contain the
+ * player's capsule axis — the fixture collider is solid, collision.ts
+ * pushes an EMBEDDED capsule toward the box center, and there is no
+ * in-game item undo. Pure, exported for tests.
+ */
+export function itemOverlapsPlayer(
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+  footprint: [number, number, number],
+  playerX: number,
+  playerFootY: number,
+  playerZ: number,
+  capsule = PLAYER_CAPSULE,
+): boolean {
+  const swapped = Math.round(yaw / HALF_PI) & 1
+  const halfW = (swapped ? footprint[2] : footprint[0]) / 2 + capsule.radius
+  const halfD = (swapped ? footprint[0] : footprint[2]) / 2 + capsule.radius
+  if (Math.abs(playerX - x) >= halfW || Math.abs(playerZ - z) >= halfD) return false
+  return playerFootY < y + footprint[1] && playerFootY + capsule.height > y
+}
+
 // --- Model cache (one GLB template per catalog id, session-agnostic) --------
 
 type ModelSlot =
@@ -298,13 +324,16 @@ function buildProxy(asset: CatalogEntry): Group {
 }
 
 /** Ghost styling: clone every mesh's material at half opacity so the
- * template (shared with real placements) stays untouched. */
-function makeGhostly(root: Object3D): void {
+ * template (shared with real placements) stays untouched. `disposeSource`
+ * is the proxy path — its pre-clone materials are mount-owned, and the
+ * clone orphans them right here. */
+function makeGhostly(root: Object3D, disposeSource = false): void {
   root.traverse((object) => {
     const mesh = object as Mesh
     if (!mesh.isMesh) return
     const clone = (material: { clone: () => unknown }) => {
       const m = material.clone() as MeshStandardMaterial
+      if (disposeSource) (material as MeshStandardMaterial).dispose()
       m.transparent = true
       m.opacity = 0.5
       m.depthWrite = false
@@ -317,26 +346,49 @@ function makeGhostly(root: Object3D): void {
 }
 
 /**
+ * Dispose the three resources one holder content OWNS before it drops
+ * (exported for tests): a proxy's geometry + materials are built per
+ * mount, ghost materials are per-arm clones (makeGhostly). GLB clones
+ * share the template's geometry/materials and the proxy label is a cached
+ * CanvasTexture — neither is ever disposed here.
+ */
+export function disposeItemContent(content: Object3D, proxy: boolean, ghost: boolean): void {
+  if (!proxy && !ghost) return
+  content.traverse((object) => {
+    const mesh = object as Mesh
+    if (!mesh.isMesh) return
+    if (proxy) mesh.geometry.dispose()
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    for (const material of materials) (material as MeshStandardMaterial).dispose()
+  })
+}
+
+/**
  * Build the visual for one asset into `holder` (ghost or placement):
  * proxy immediately, swapped for the GLB clone when the cached load lands.
- * Returns a cancel fn — a disposed holder never receives a late swap.
+ * Returns a cleanup fn — a torn-down holder never receives a late swap,
+ * and every mount-owned resource is disposed (here AND on each swap;
+ * imperative children never reach R3F's auto-dispose).
  */
 function mountItemVisual(holder: Group, asset: CatalogEntry, ghost: boolean): () => void {
   let dead = false
-  const show = (content: Object3D) => {
-    if (ghost) makeGhostly(content)
+  let disposeCurrent: (() => void) | null = null
+  const show = (content: Object3D, proxy: boolean) => {
+    if (ghost) makeGhostly(content, proxy)
+    disposeCurrent?.()
     holder.clear()
     holder.add(content)
+    disposeCurrent = () => disposeItemContent(content, proxy, ghost)
   }
   const cached = modelCache.get(asset.id)
   if (cached?.status === 'ready') {
-    show(withCorrective(asset, cached.template.clone(true)))
+    show(withCorrective(asset, cached.template.clone(true)), false)
   } else {
-    show(buildProxy(asset))
+    show(buildProxy(asset), true)
     loadModel(asset)
       .then((template) => {
         if (dead) return
-        show(withCorrective(asset, template.clone(true)))
+        show(withCorrective(asset, template.clone(true)), false)
       })
       .catch(() => {
         // Failure class recorded in the cache; the proxy stays.
@@ -344,6 +396,9 @@ function mountItemVisual(holder: Group, asset: CatalogEntry, ghost: boolean): ()
   }
   return () => {
     dead = true
+    disposeCurrent?.()
+    disposeCurrent = null
+    holder.clear()
   }
 }
 
@@ -366,11 +421,7 @@ function PlacedItemMesh({ item, world }: { item: PlacedItem; world: GameWorld })
   useEffect(() => {
     const holder = holderRef.current
     if (!holder) return
-    const cancel = mountItemVisual(holder, item.asset, false)
-    return () => {
-      cancel()
-      holder.clear()
-    }
+    return mountItemVisual(holder, item.asset, false)
   }, [item])
 
   useLayoutEffect(() => {
@@ -430,16 +481,16 @@ export function GameItems({ world }: { world: GameWorld }) {
   const armedWeapon = useRef<WeaponId | null>(null)
   const promptShown = useRef(false)
   const frame = useRef(0)
+  /** Armed item's footprint, refreshed per arm — the frame loop's player-
+   * overlap check stays allocation-free. */
+  const armedFootprint = useRef<[number, number, number]>([1, 1, 1])
 
   // Ghost content tracks the armed asset (proxy first, GLB when cached).
   useEffect(() => {
+    if (armed) armedFootprint.current = itemFootprint(armed)
     const holder = ghostHolderRef.current
     if (!holder || !armed) return
-    const cancel = mountItemVisual(holder, armed, true)
-    return () => {
-      cancel()
-      holder.clear()
-    }
+    return mountItemVisual(holder, armed, true)
   }, [armed])
 
   // Session teardown: the menu (if open) dies with the game tree, and the
@@ -556,12 +607,35 @@ export function GameItems({ world }: { world: GameWorld }) {
     ghost.visible = true
     ghost.position.set(_anchor.x, y, _anchor.z)
     ghost.rotation.set(0, yaw, 0)
-    session.hud.ghostStatus?.(_anchor.valid ? null : 'out-of-reach', 'items')
+    // The anchor reaches ~0.32 m from the player axis — a placement whose
+    // box would swallow the capsule is refused (the solid fixture collider
+    // would wedge the player inside, with no in-game item undo to escape).
+    const blocked = itemOverlapsPlayer(
+      _anchor.x,
+      y,
+      _anchor.z,
+      yaw,
+      armedFootprint.current,
+      playerRig.position.x,
+      floorY,
+      playerRig.position.z,
+    )
+    session.hud.ghostStatus?.(
+      _anchor.valid ? (blocked ? 'occupied' : null) : 'out-of-reach',
+      'items',
+    )
 
-    // LMB edge on a valid anchor = drop a copy (viewmodel's fire gate keeps
-    // the held gun quiet while itemGhostActive()).
+    // LMB edge on a valid, unblocked anchor = drop a copy (viewmodel's fire
+    // gate keeps the held gun quiet while itemGhostActive()). Staggered
+    // hands can't place — the same gate every other trigger lane has.
     const firing = session.input.state.firing
-    if (firing && !prevFire.current && _anchor.valid) {
+    if (
+      firing &&
+      !prevFire.current &&
+      _anchor.valid &&
+      !blocked &&
+      !useBoots.getState().staggered
+    ) {
       useItems.getState().addItem(state.armed, [_anchor.x, y, _anchor.z], yaw)
       sfx.place()
     }

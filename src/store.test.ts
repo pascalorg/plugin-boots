@@ -93,3 +93,16 @@ describe('slotId survives every piece-mutating action', () => {
     expect(after.slotId).toBe('Wz:0,0,0')
   })
 })
+
+describe('resetSession: re-entry must retract the Save/Discard offer', () => {
+  test('clears pendingDecision, keeps placed for the resumed session', () => {
+    // Regression: exit with pieces placed (pendingDecision true), re-enter
+    // without deciding — the sidebar Save button stayed clickable DURING
+    // play, and keepPlaced() mid-game is a scene-store invariant violation.
+    const a = useBoots.getState().addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
+    useBoots.getState().setPendingDecision(true)
+    useBoots.getState().resetSession()
+    expect(useBoots.getState().pendingDecision).toBe(false)
+    expect(useBoots.getState().placed).toEqual([a])
+  })
+})

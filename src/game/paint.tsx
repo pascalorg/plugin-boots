@@ -15,6 +15,7 @@ import {
 import { useBoots } from '../store'
 import { sfx, type SprayHandle } from './audio'
 import { ensureVoxelTarget, raycastVoxelTargets, useDestruction, type VoxelTarget } from './destruction'
+import { itemGhostActive } from './item-place'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { aimDirection } from './shooting'
@@ -413,9 +414,14 @@ export function PaintTool({ world }: { world: GameWorld }) {
       else hud.prompt(active ? `PAINT · ${color.name} — R next color` : null, 'paint')
     }
 
-    // Held trigger: soft hiss while spraying, splats at PAINT_RATE.
+    // Held trigger: soft hiss while spraying, splats at PAINT_RATE. An
+    // armed item ghost owns the click (itemGhostActive — the viewmodel's
+    // fire gate excludes 'paint', so this loop gates itself).
     const wants =
-      active && (session.input.state.firing || paintDebug.holdFire) && !state.staggered
+      active &&
+      (session.input.state.firing || paintDebug.holdFire) &&
+      !state.staggered &&
+      !itemGhostActive()
     if (wants !== spraying.current) {
       spraying.current = wants
       if (wants) {

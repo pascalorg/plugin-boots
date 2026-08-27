@@ -51,6 +51,35 @@ const TABLE_HEIGHT = 0.82
 const TABLE_TOP = TABLE_HEIGHT + 0.03
 export const GRAB_RANGE = 2.4
 
+/** Live tables' grab candidacy, keyed by nodeId — each WeaponTable
+ * registers on mount and mirrors `taken`. The build and gear grab discs
+ * overlap almost everywhere on the spawn approach, so one E press must
+ * serve exactly ONE table: the nearest untaken one (a double grant would
+ * hand out the rifle alongside the builder and trip the wave director,
+ * destroying the peaceful entry). */
+const grabTables = new Map<string, { x: number; z: number; taken: boolean }>()
+
+/** Nearest untaken table within grab range — pure, exported for tests.
+ * Ties keep the first-registered entry (map order, deterministic). */
+export function nearestGrabbable(
+  px: number,
+  pz: number,
+  tables: ReadonlyMap<string, { x: number; z: number; taken: boolean }>,
+  range = GRAB_RANGE,
+): string | null {
+  let best: string | null = null
+  let bestDist = range
+  for (const [id, table] of tables) {
+    if (table.taken) continue
+    const dist = Math.hypot(px - table.x, pz - table.z)
+    if (dist < bestDist) {
+      best = id
+      bestDist = dist
+    }
+  }
+  return best
+}
+
 export function tablePosition(world: GameWorld): Vector3 {
   const fwdX = -Math.sin(world.spawnYaw)
   const fwdZ = -Math.cos(world.spawnYaw)
@@ -457,6 +486,16 @@ function WeaponTable({
   const prevE = useRef(false)
   const promptShown = useRef(false)
 
+  // Grab arbitration entry (see grabTables): prompt and pickup only engage
+  // on the table nearestGrabbable elects, so overlapping discs never serve
+  // one E press twice.
+  useEffect(() => {
+    grabTables.set(nodeId, { x: position.x, z: position.z, taken })
+    return () => {
+      grabTables.delete(nodeId)
+    }
+  }, [nodeId, position, taken])
+
   // Once the table voxelizes its solid meshes are ledger-hidden; the display
   // guns aren't colliders, so drop them here (blown off with the first hit).
   const broken = useDestruction((s) => s.targets.has(nodeId))
@@ -494,8 +533,7 @@ function WeaponTable({
 
     const near =
       !taken &&
-      Math.hypot(playerRig.position.x - position.x, playerRig.position.z - position.z) <
-        GRAB_RANGE
+      nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) === nodeId
     if (near !== promptShown.current) {
       promptShown.current = near
       session.hud.prompt(near ? prompt : null, promptOwner)

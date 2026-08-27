@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
+import { BoxGeometry, Group, Mesh, MeshStandardMaterial } from 'three'
+import { PLAYER_CAPSULE } from './collision'
 import type { CatalogEntry } from './inventory'
 import {
   anchorOnFloor,
+  disposeItemContent,
   ghostYaw,
   ITEM_REACH,
   type ItemAnchor,
   itemFootprint,
   itemGhostActive,
+  itemOverlapsPlayer,
   useItems,
 } from './item-place'
 
@@ -146,5 +150,65 @@ describe('useItems store', () => {
     expect(itemGhostActive()).toBe(true)
     useItems.getState().disarm()
     expect(itemGhostActive()).toBe(false)
+  })
+})
+
+describe('itemOverlapsPlayer: placement must never entomb the player', () => {
+  const WARDROBE: [number, number, number] = [1.2, 1.9, 0.6]
+
+  test('anchor at the near-look limit (~0.32 m) is blocked', () => {
+    // Regression: looking down near your feet, anchorOnFloor permits
+    // anchors ~0.32 m out — a wardrobe there swallowed the capsule with
+    // no in-game item undo to escape.
+    expect(itemOverlapsPlayer(0.32, 0, 0, 0, WARDROBE, 0, 0, 0)).toBe(true)
+  })
+
+  test('clear of the expanded AABB → allowed', () => {
+    const clearance = WARDROBE[2] / 2 + PLAYER_CAPSULE.radius + 0.01
+    expect(itemOverlapsPlayer(0, 0, clearance, 0, WARDROBE, 0, 0, 0)).toBe(false)
+  })
+
+  test('odd quarter-turns swap the footprint axes', () => {
+    // 0.9 m out along z clears the wardrobe's 0.6 depth at yaw 0 but not
+    // its 1.2 width once a quarter-turn swings it across the aim line.
+    expect(itemOverlapsPlayer(0, 0, 0.9, 0, WARDROBE, 0, 0, 0)).toBe(false)
+    expect(itemOverlapsPlayer(0, 0, 0.9, Math.PI / 2, WARDROBE, 0, 0, 0)).toBe(true)
+    expect(itemOverlapsPlayer(0, 0, 0.9, -Math.PI / 2, WARDROBE, 0, 0, 0)).toBe(true)
+  })
+
+  test('vertical separation clears: a lamp on a shelf above the head', () => {
+    const lamp: [number, number, number] = [0.3, 0.4, 0.3]
+    expect(itemOverlapsPlayer(0, PLAYER_CAPSULE.height + 0.05, 0, 0, lamp, 0, 0, 0)).toBe(false)
+    expect(itemOverlapsPlayer(0, PLAYER_CAPSULE.height - 0.05, 0, 0, lamp, 0, 0, 0)).toBe(true)
+  })
+})
+
+describe('disposeItemContent: mount-owned three resources are released', () => {
+  const build = () => {
+    const content = new Group()
+    const mesh = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial())
+    content.add(mesh)
+    const disposed = { geometry: 0, material: 0 }
+    mesh.geometry.addEventListener('dispose', () => disposed.geometry++)
+    ;(mesh.material as MeshStandardMaterial).addEventListener('dispose', () => disposed.material++)
+    return { content, disposed }
+  }
+
+  test('proxy content owns geometry + material', () => {
+    const { content, disposed } = build()
+    disposeItemContent(content, true, false)
+    expect(disposed).toEqual({ geometry: 1, material: 1 })
+  })
+
+  test('ghost GLB clone owns its material clones, never the geometry', () => {
+    const { content, disposed } = build()
+    disposeItemContent(content, false, true)
+    expect(disposed).toEqual({ geometry: 0, material: 1 })
+  })
+
+  test('real GLB placement shares everything with the template — no-op', () => {
+    const { content, disposed } = build()
+    disposeItemContent(content, false, false)
+    expect(disposed).toEqual({ geometry: 0, material: 0 })
   })
 })

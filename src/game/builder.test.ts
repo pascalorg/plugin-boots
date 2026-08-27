@@ -24,6 +24,7 @@ import {
   rotatedYaw,
   STAIR_DOWN_MASK,
   STAIR_UP_MASK,
+  swipeStep,
   trimmedWallSpan,
   TURBO_FIRST,
   TURBO_NEXT,
@@ -569,6 +570,28 @@ describe('turboStamp: slot-keyed hold-to-place cadence', () => {
     }
     // Press stamp at 0 → 0.15 s lockout → stamp at frame 15, then every 5.
     expect(stamps).toEqual([0, 15, 20, 25, 30])
+  })
+})
+
+describe('swipeStep: edit-mode carve needs a fresh press edge', () => {
+  test('fresh press arms the swipe and carves the aimed cell', () => {
+    expect(swipeStep(true, false, false, false)).toEqual({ active: true, carve: true })
+  })
+
+  test('a fire hold carried into edit mode never carves (regression)', () => {
+    // Turbo-chaining pieces with LMB held, then tapping F: the carried
+    // hold used to carve the aimed cell instantly with no fresh press.
+    expect(swipeStep(true, true, false, false)).toEqual({ active: false, carve: false })
+  })
+
+  test('a live swipe carves each NEW cell once per hold', () => {
+    expect(swipeStep(true, true, true, false)).toEqual({ active: true, carve: true })
+    expect(swipeStep(true, true, true, true)).toEqual({ active: true, carve: false })
+  })
+
+  test('release disarms; re-arming needs another fresh edge', () => {
+    expect(swipeStep(false, true, true, false)).toEqual({ active: false, carve: false })
+    expect(swipeStep(true, true, false, false)).toEqual({ active: false, carve: false })
   })
 })
 
