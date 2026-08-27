@@ -61,6 +61,13 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   quadrant masks are SUPERSEDED by the finer 3×3 F-edit that already
   shipped. transformPlaced slotId retention pinned by test as deliberate
   (folded ramps inherit the wall slot's structural role).
+- Corner-roof QA (2026-08-27): 5/5 after the shed-parent fix — placement,
+  F-corner toggle, flat→slab terrace (node-level), slope→shed now REAL
+  (Keep mints one 'roof' container per save; segments under it grow
+  shells — saved sheds had been invisible zero-size ghosts since phase
+  3). Undo flag → backlog: a saved roof is 2 history steps (container +
+  segment); batch Keep's creates into one transaction someday (same
+  behavior as wall+pocket saves today).
 
 ## Next (phase 6 — the shape-preserving pass)
 
