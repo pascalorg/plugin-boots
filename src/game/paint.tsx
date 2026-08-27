@@ -252,11 +252,18 @@ export function sprayPaint(world: GameWorld): boolean {
     return false
   }
   lastHitDistance = bestDist
+  let ensured: VoxelTarget | null = null
   if (needsVoxelize) {
     if (!solidType || !PAINTABLE.has(solidType)) return false
-    if (!ensureVoxelTarget(world, nodeId)) return false // degenerate grid
+    ensured = ensureVoxelTarget(world, nodeId)
+    if (!ensured) return false // degenerate grid
   }
-  const target = useDestruction.getState().targets.get(nodeId)
+  // Roof groups voxelize into per-plane targets keyed `nodeId#pN` — the
+  // bare-id lookup misses them on the very first tick (QA r2v finding 2),
+  // so fall back to the member ensureVoxelTarget just returned. If it is
+  // not the aimed plane, selectSplatCells finds nothing and the next tick
+  // resolves through the voxel-skin raycast as usual.
+  const target = useDestruction.getState().targets.get(nodeId) ?? ensured
   if (!target) return false
 
   const cells = selectSplatCells(target.grid, _point.x, _point.y, _point.z, splatRadiusAt(bestDist))
