@@ -23,11 +23,11 @@ import { create } from 'zustand'
 import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
-import { probeLandingY } from './destruction'
+import { dropTarget, probeLandingY } from './destruction'
 import { type CatalogEntry, closeItemMenu, isItemMenuOpen, openItemMenu } from './inventory'
 import { playerRig } from './player'
 import { getSession } from './session'
-import { bvhFor, type ColliderEntry, type GameWorld } from './world'
+import { bvhFor, type ColliderEntry, type GameWorld, isGlassLikeMesh } from './world'
 
 /**
  * Item placement — the ghost-and-drop half of the creative catalog
@@ -48,12 +48,18 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * proxy box sized from the catalog dimensions; placement and Keep still
  * work.
  *
- * COLLIDERS: each placement registers ONE Box3-shaped collider (BoxGeometry
- * sized from catalog dimensions × scale — 12 triangles, never a BVH over
- * an arbitrary GLB) with nodeType 'fixture': not in shooting.ts's
- * DESTRUCTIBLE set nor the grenade fallback set, so bullets spark and stop
- * (no voxelization of an invisible box) while the player, bots, debris and
- * the landing probe treat furniture as solid.
+ * COLLIDERS: each placement registers its REAL sub-meshes (GLB clone, or
+ * the proxy box while the load is pending/failed) with nodeType 'item' —
+ * the collectWorld convention for saved item nodes, minus the glass-like
+ * sub-meshes (never colliders there either; the in-game glass lane is the
+ * phase-6 open item). BVHs are LAZY (bvhFor getter), so a placement never
+ * builds trees synchronously. 'item' is in shooting.ts's DESTRUCTIBLE set
+ * and the grenade fallback set, so a shot placement voxelizes through the
+ * SAME silhouette + per-cell-palette lane as a saved item node
+ * (QA P6R1 fix 1: 'fixture' box colliders only sparked — and voxelizing
+ * the invisible box would have worn no real colors anyway). Entries swap
+ * when the GLB lands (proxy target dropped with them); player, bots,
+ * debris and the landing probe treat furniture as solid either way.
  *
  * FIRE OWNERSHIP: while a ghost is armed the CLICK belongs to placement —
  * viewmodel.tsx's trigger block must skip weapon fire when
@@ -203,7 +209,7 @@ export function itemFootprint(asset: CatalogEntry): [number, number, number] {
  * Would this placement wedge the player inside the item? The item's world
  * AABB (footprint at the anchor; yaw is snapped to 90°, so odd quarter
  * turns swap w/d) expanded by the capsule radius must not contain the
- * player's capsule axis — the fixture collider is solid, collision.ts
+ * player's capsule axis — the item colliders are solid, collision.ts
  * pushes an EMBEDDED capsule toward the box center, and there is no
  * in-game item undo. Pure, exported for tests.
  */
@@ -427,9 +433,16 @@ export function disposeItemContent(content: Object3D, proxy: boolean, ghost: boo
  * proxy immediately, swapped for the GLB clone when the cached load lands.
  * Returns a cleanup fn — a torn-down holder never receives a late swap,
  * and every mount-owned resource is disposed (here AND on each swap;
- * imperative children never reach R3F's auto-dispose).
+ * imperative children never reach R3F's auto-dispose). `onContent` fires
+ * after every show (proxy AND the GLB swap) — PlacedItemMesh hangs its
+ * collider (re)registration off it; the ghost passes nothing.
  */
-function mountItemVisual(holder: Group, asset: CatalogEntry, ghost: boolean): () => void {
+function mountItemVisual(
+  holder: Group,
+  asset: CatalogEntry,
+  ghost: boolean,
+  onContent?: (content: Object3D) => void,
+): () => void {
   let dead = false
   let disposeCurrent: (() => void) | null = null
   const show = (content: Object3D, proxy: boolean) => {
@@ -438,6 +451,7 @@ function mountItemVisual(holder: Group, asset: CatalogEntry, ghost: boolean): ()
     holder.clear()
     holder.add(content)
     disposeCurrent = () => disposeItemContent(content, proxy, ghost)
+    onContent?.(content)
   }
   const cached = modelCache.get(asset.id)
   if (cached?.status === 'ready') {
@@ -467,50 +481,68 @@ function mountItemVisual(holder: Group, asset: CatalogEntry, ghost: boolean): ()
  * demolition / paint capture paths all skip it). */
 const ITEM_NODE_PREFIX = '__boots-item-'
 
-/** One placed item: the GLB clone (or proxy) plus its invisible Box3
- * collider. The collider mesh never renders, so its world matrix is
- * computed once here — items don't move. Entries are appended after the
- * world's build-time colliders and spliced by identity on unmount, the
- * PlacedPieceMesh convention. */
+/** One placed item: the GLB clone (or proxy) whose own solid sub-meshes
+ * ARE the colliders (nodeType 'item' — the collectWorld convention, so
+ * shooting/grenades voxelize the placement through the same
+ * silhouette + material-palette lane as a saved item node; glass-like
+ * sub-meshes are skipped exactly like collectWorld skips them). World
+ * matrices are computed once per show — items don't move. Entries are
+ * appended after the world's build-time colliders, spliced by identity
+ * and their voxel target dropped on every swap/unmount, the
+ * PlacedPieceMesh convention (ensureVoxelTarget disables the entries
+ * itself when a shot voxelizes the item). */
 function PlacedItemMesh({ item, world }: { item: PlacedItem; world: GameWorld }) {
   const holderRef = useRef<Group>(null)
-  const colliderRef = useRef<Mesh>(null)
-  const [w, h, d] = itemFootprint(item.asset)
-
-  useEffect(() => {
-    const holder = holderRef.current
-    if (!holder) return
-    return mountItemVisual(holder, item.asset, false)
-  }, [item])
 
   useLayoutEffect(() => {
-    const mesh = colliderRef.current
-    if (!mesh) return
-    mesh.updateWorldMatrix(true, false)
-    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
-    const entry: ColliderEntry = {
-      mesh,
-      bvh: bvhFor(mesh),
-      inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
-      worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
-      root: mesh,
-      nodeId: `${ITEM_NODE_PREFIX}${item.id}`,
-      nodeType: 'fixture',
+    const holder = holderRef.current
+    if (!holder) return
+    const nodeId = `${ITEM_NODE_PREFIX}${item.id}`
+    const entries: ColliderEntry[] = []
+    const release = () => {
+      for (const entry of entries) {
+        entry.disabled = true
+        const index = world.colliders.indexOf(entry)
+        if (index !== -1) world.colliders.splice(index, 1)
+      }
+      entries.length = 0
+      // Drop the voxel replica too (a GLB landing over a shot proxy — or
+      // Save/Discard — must not leave carved voxels of the old shape).
+      dropTarget(nodeId)
     }
-    world.colliders.push(entry)
+    const cleanupVisual = mountItemVisual(holder, item.asset, false, (content) => {
+      release()
+      content.updateWorldMatrix(true, true)
+      content.traverse((object) => {
+        const mesh = object as Mesh
+        if (!mesh.isMesh || isGlassLikeMesh(mesh)) return
+        if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+        const entry: ColliderEntry = {
+          mesh,
+          // LAZY, the collectWorld idiom — never build GLB trees at
+          // placement time; bvhFor caches per geometry.
+          get bvh() {
+            return bvhFor(this.mesh)
+          },
+          inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+          worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+          root: mesh,
+          nodeId,
+          nodeType: 'item',
+        }
+        entries.push(entry)
+        world.colliders.push(entry)
+      })
+    })
     return () => {
-      const index = world.colliders.indexOf(entry)
-      if (index !== -1) world.colliders.splice(index, 1)
+      cleanupVisual()
+      release()
     }
   }, [world, item])
 
   return (
     <group position={item.position} rotation={[0, item.yaw, 0]}>
       <group ref={holderRef} />
-      <mesh position={[0, h / 2, 0]} ref={colliderRef} visible={false}>
-        <boxGeometry args={[w, h, d]} />
-        <meshBasicMaterial />
-      </mesh>
     </group>
   )
 }
@@ -692,7 +724,7 @@ export function GameItems({ world }: { world: GameWorld }) {
     ghost.position.set(_anchor.x, y, _anchor.z)
     ghost.rotation.set(0, yaw, 0)
     // The anchor reaches ~0.32 m from the player axis — a placement whose
-    // box would swallow the capsule is refused (the solid fixture collider
+    // box would swallow the capsule is refused (the solid item colliders
     // would wedge the player inside, with no in-game item undo to escape).
     // The session budget refuses the same way once the cap is hit.
     const blocked =

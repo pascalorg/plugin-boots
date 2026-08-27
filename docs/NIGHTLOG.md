@@ -1026,3 +1026,39 @@ STOREY 2.8 vs real 2.5 m host levels + world-aligned grid vs rotated
 buildings (design-level); community `file:` dep can nest npm 0.9.1 under
 the plugin locally (prod unaffected); QA scripts that gear up and wait
 for waves must now throw the breaker (`armWaves()` from enemies-state).
+
+## Phase 6 fix round 1 — in-game placements break for real (2026-08-27, manager)
+
+QA P6R1 was GREEN except Gate D as literally specified: shooting a
+just-placed catalog item only sparked. Root cause: PlacedItemMesh
+registered ONE invisible Box3 proxy collider with nodeType 'fixture'
+(not destructible). QA's suggested one-word flip ('fixture'→'item')
+would have been WRONG twice over: ensureVoxelTarget collects a node's
+collider meshes as its voxel sources, so it would have voxelized the
+featureless invisible box (box silhouette, palette sampled from the
+box's blank material) while the real GLB stayed visible next to the
+voxels.
+
+Real fix (item-place.tsx only): placements now register their REAL
+sub-meshes as colliders — the collectWorld convention for saved item
+nodes. mountItemVisual grew an `onContent` callback (fires on the
+immediate proxy show AND the async GLB swap; ghost passes nothing);
+PlacedItemMesh (re)registers one ColliderEntry per solid sub-mesh with
+nodeType 'item', LAZY `get bvh()` (never builds GLB trees at placement
+time), glass-like sub-meshes skipped exactly like collectWorld (the
+in-game glass lane stays the phase-6 open item). Swap/unmount releases
+entries by identity + dropTarget(nodeId) — a GLB landing over a shot
+proxy, or Save/Discard, never leaves carved voxels of the old shape.
+The invisible box mesh is gone; the proxy box (load pending/failed) is
+itself the collider, so degraded placements stay solid and shootable.
+Result: shooting an in-game placement voxelizes through the SAME
+silhouette + per-cell material-palette lane QA already proved on saved
+item nodes (hideHostNode hides the GLB and disables the entries in the
+same tick).
+
+Non-blocking QA notes carried, not changed: wall-top R-slot pitch-band
+feel (mid-pitch aims resolve ground slots beside a wall top) and the
+gear/build/switch grab-disc proximity (~1.0–1.5 m, nearest-untaken
+arbitration held) — both logged for the owner's feel pass.
+
+610 tests / 19.8k assertions green; tsc clean.
