@@ -275,7 +275,14 @@ function carve(
     ? (weapon.smashRadius ?? weapon.tearRadius ?? weapon.holeRadius)
     : (weapon.smashRadius ?? weapon.holeRadius)
   let removed = carveTarget(world, nodeId, point, radius, direction)
-  if (removed === 0) return 0
+  if (removed === 0) {
+    // Impact fallback (QA phase-6 round 3): a hit that carves nothing must
+    // still READ — one small chip puff at the impact point (destruction.ts
+    // emitted nothing, so this can't double) and a light crunch.
+    chip(point, 0.25)
+    sfx.voxelCrunch(0.2)
+    return 0
+  }
   if (weapon.smashRadius !== undefined) {
     // Ragged edge: nibble the crater rim with 4-6 small off-center spheres.
     const nibbles = 4 + Math.floor(Math.random() * 3)

@@ -186,6 +186,85 @@ describe('buildRafters — gable plane layout', () => {
   })
 })
 
+describe('buildRafters — footprint clipping (QA phase-6 round 3)', () => {
+  const E = EAVE_LEN
+  const S = SLOPE_LEN
+
+  test('a rectangular footprint reproduces the unclipped layout exactly', () => {
+    const rect: RoofPlaneBasis = {
+      ...frontPlane(),
+      polyTris: [-E / 2, 0, E / 2, 0, E / 2, S, -E / 2, 0, E / 2, S, -E / 2, S],
+    }
+    const clipped = buildRafters(null, [{ roofType: 'shed' }], [rect])
+    const plain = buildRafters(null, [{ roofType: 'shed' }], [frontPlane()])
+    expect(clipped.length).toBe(plain.length)
+    clipped.forEach((m, i) => {
+      expect(m.center[0]).toBeCloseTo(plain[i]!.center[0], 6)
+      expect(m.center[1]).toBeCloseTo(plain[i]!.center[1], 6)
+      expect(m.center[2]).toBeCloseTo(plain[i]!.center[2], 6)
+      expect(m.size[0]).toBeCloseTo(plain[i]!.size[0], 9)
+    })
+  })
+
+  test('a triangular hip-end plane shortens its jacks and drops the rake lines', () => {
+    const hip: RoofPlaneBasis = {
+      ...frontPlane(),
+      polyTris: [-E / 2, 0, E / 2, 0, 0, S], // apex on the ridge line
+    }
+    const members = buildRafters(null, [{ roofType: 'hip' }], [hip])
+    const rafters = members.filter((m) => m.role === 'rafter')
+    const plain = buildRafters(null, [{ roofType: 'hip' }], [frontPlane()]).filter(
+      (m) => m.role === 'rafter',
+    )
+    // Rake-edge lines vanish, corner jacks lose sticks — strictly fewer.
+    expect(rafters.length).toBeGreaterThan(0)
+    expect(rafters.length).toBeLessThan(plain.length)
+    const { across, upSlope } = roofPlaneFrame(PSI, THETA)
+    const a = new Vector3(...across)
+    const u = new Vector3(...upSlope)
+    const eave = new Vector3(...EAVE_CENTER)
+    const rel = new Vector3()
+    const runs = new Set<number>()
+    for (const m of rafters) {
+      rel.set(m.center[0], m.center[1], m.center[2]).sub(eave)
+      const off = rel.dot(a)
+      const top = rel.dot(u) + m.size[0] / 2
+      // Every stick stays INSIDE the triangle: its top never passes the
+      // hip edge for its line (and so never pokes past the ridge apex).
+      const lineMax = S * (1 - Math.abs(off) / (E / 2))
+      expect(top).toBeLessThanOrEqual(lineMax + 1e-6)
+      expect(top).toBeLessThan(S)
+      runs.add(+m.size[0].toFixed(4))
+    }
+    // Jack rafters really do vary in length across the triangle.
+    expect(runs.size).toBeGreaterThan(2)
+  })
+
+  test('hip trapezoids clip the ridge board to the REAL ridge, not the eave', () => {
+    const R = 3 // ridge length ≪ eave length
+    const trapezoid = (base: RoofPlaneBasis): RoofPlaneBasis => ({
+      ...base,
+      polyTris: [-E / 2, 0, E / 2, 0, R / 2, S, -E / 2, 0, R / 2, S, -R / 2, S],
+    })
+    const members = buildRafters(
+      null,
+      [{ roofType: 'hip' }],
+      [trapezoid(frontPlane()), trapezoid(backPlane())],
+    )
+    const ridge = members.filter((m) => m.role === 'ridge')
+    expect(ridge.length).toBe(Math.max(1, Math.round((R - 0.04) / RAFTER_RUN)))
+    const { across, upSlope } = roofPlaneFrame(PSI, THETA)
+    const a = new Vector3(...across)
+    const mid = new Vector3(...EAVE_CENTER).addScaledVector(new Vector3(...upSlope), SLOPE_LEN)
+    const rel = new Vector3()
+    for (const m of ridge) {
+      rel.set(m.center[0], m.center[1], m.center[2]).sub(mid)
+      // Board ends stay within the trapezoid's upper edge.
+      expect(Math.abs(rel.dot(a)) + m.size[0] / 2).toBeLessThanOrEqual(R / 2 + 1e-6)
+    }
+  })
+})
+
 describe('buildRafters — ridge boards + eave plates', () => {
   test('a gable pair grows ONE ridge board run, seated under the seam', () => {
     const members = gableMembers()

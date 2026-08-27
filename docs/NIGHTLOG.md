@@ -1107,3 +1107,54 @@ LAG-RECORDER (perf-monitor.ts + 16 tests):
   item-place.tsx (item-load, on GLB ready), enemies.tsx (wave-spawn).
 
 634 tests / 19,948 assertions green; tsc clean; both real exit codes 0.
+
+## Phase 6 fix round 2 — roof clip / roof color / ceiling carve (2026-08-27, manager)
+
+QA round post-50bceea: A/E/F PASS, B/C/D FAIL — the three dead-lane
+features. Manager fixed all three directly (minimal diffs):
+
+ROOF CLIP (B — roof-framing.ts + roof-planes.ts):
+- enumerateRoofPlanes now packs each plane's FOOTPRINT triangles into
+  `polyTris` (plane space, across from the eave center / upSlope from
+  the eave — re-based after the extents pass).
+- buildRafters clips every rafter line to that polygon: per-line
+  eave→ridge span via `footprintSpan` (edge crossings of the vertical
+  line, rake lines sampled 1 mm inside), lines shorter than 0.15 m
+  dropped. Hip triangles get varying jacks and NO rake-edge lines; no
+  stick top can pass the polygon's upper edge (the QA "tops 2.24 m vs
+  ridge 2.01 m" overshoot is structurally impossible now). Ridge boards
+  clip to the footprint's upper-edge across-span (`topLen`/`topMid`) —
+  hip ridges stop floating past both hip ends. No polyTris = the old
+  rectangle, bit-identical (pinned by test).
+
+ROOF COLOR (C — destruction.ts + voxel-walls.tsx):
+- The dead lane's roof-planes.ts tone rig existed but nothing wired it:
+  voxel-walls now registers the live renderer (setRoofTextureRenderer
+  via useThree gl), and buildRoofPlaneTargets calls resolveRoofSkinTone
+  — the async GPU readback that covers the host's compressed KTX2
+  shingle maps (white base color, so the sync sample stayed white).
+- New VoxelTarget.skinRevision: tone lands → baseColor.copy + bump;
+  VoxelWallMesh re-primes the skin layer once (primeSkin extracted from
+  the mount effect; one number compare per target per frame otherwise)
+  and clears the mesh-side paint gates so drainPaintTints re-coats
+  painted cells from the ledger — paint serials never move.
+
+CEILING CARVE (D — destruction.ts entrySkin + shooting.ts):
+- Root cause: a synthesized ceiling plate holds ALL its cells in the
+  top thickness layer, so an upward shot's DDA point lands EXACTLY on
+  the skin-halves boundary — float noise picked the empty bottom half
+  and the skin-limited removeSphere deleted nothing (QA: 6/8 silent).
+  entrySkin now takes the shot direction and steps half a thickness
+  cell INTO the grid before picking the side (grazing shots keep the
+  raw halves test). Pinned by a test that fails without the nudge.
+- Impact fallback: shooting.ts carve() emits one small chip puff + a
+  light voxelCrunch when a voxel hit removes 0 cells (destruction.ts
+  emitted nothing on that path, so no double-voicing).
+
+QA recipe corrections for the next round's contract: build palette =
+LEFT RAIL (28,78) then img[src*="roof.webp"] at (99,246); roof draft
+corners must move down-LEFT/down on screen ((700,420)→(807,683) gives
+6.5×3 m); the (1365,107) chevron step is unnecessary — select the roof
+then click the visible "Hip" text after the two-click draft.
+
+639 tests / 20,115 assertions green; tsc clean; real exit codes 0.

@@ -8,7 +8,7 @@ import { spawnDust, spawnHaze } from './dust'
 import { perfEvent } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
-import { enumerateRoofPlanes, roofSurfaceColor } from './roof-planes'
+import { enumerateRoofPlanes, resolveRoofSkinTone, roofSurfaceColor } from './roof-planes'
 import { hideForGameKeepingRoots } from './session'
 import {
   dropStructureTarget,
@@ -261,6 +261,12 @@ export type VoxelTarget = {
   removedQueue: number[]
   /** Bumped on every change so the renderer knows to re-upload. */
   revision: number
+  /** Bumped when `baseColor` changes AFTER voxelize (async roof skin tone —
+   * compressed shingle maps only resolve through a GPU readback a frame or
+   * two later). voxel-walls.tsx re-primes the whole skin layer's colors on
+   * a bump; paint coats re-apply on top via drainPaintTints (the paint
+   * ledger's own serials never move). */
+  skinRevision?: number
   /** True for roof nodes (Phase C): the target frames RAFTERS instead of
    * studs/joists, sheet fly-offs voice shingleRip, and torn shards wear the
    * shingle debris tone. */
@@ -1386,6 +1392,23 @@ function buildRoofPlaneTargets(
   }
   roofGroups.set(nodeId, ids)
   state.bump()
+  // Async skin tone (QA phase-6 round 3: post-vox roofs rendered WHITE —
+  // host shingle materials are white-base + compressed KTX2 map, so the
+  // synchronous sample above can't see the real tone). resolveRoofSkinTone
+  // reads the map through the live renderer and retints every plane target
+  // when it lands; skinRevision tells voxel-walls to re-prime colors (paint
+  // ledger serials stay untouched — coats re-apply via drainPaintTints).
+  resolveRoofSkinTone(meshes, (tone) => {
+    const live = useDestruction.getState().targets
+    const group = roofGroups.get(nodeId)
+    if (!group) return // roof dropped before the readback landed
+    for (const id of group) {
+      const member = live.get(id)
+      if (!member) continue
+      member.baseColor.copy(tone)
+      member.skinRevision = (member.skinRevision ?? 0) + 1
+    }
+  })
   return built[0]!
 }
 
@@ -2092,10 +2115,17 @@ const WALL_PIERCE_RADIUS = 0.6
  * and carve the full volume as before.
  */
 const _skin: SkinLimit = { axis: 0, side: 0 }
-/** Scratch for entrySkin's basis-rotated query point. */
+/** Scratch for entrySkin's basis-rotated query point / direction. */
 const _skinPoint = { x: 0, y: 0, z: 0 }
+const _skinDir = { x: 0, y: 0, z: 0 }
 
-function entrySkin(grid: VoxelGridData, x: number, y: number, z: number): SkinLimit | null {
+function entrySkin(
+  grid: VoxelGridData,
+  x: number,
+  y: number,
+  z: number,
+  direction?: Vector3,
+): SkinLimit | null {
   if (grid.cellX === grid.cellZ && grid.cellY === grid.cellX) return null
   const axis = thicknessAxisOf(grid)
   // Rotated grids index in their local frame — rotate the query point in.
@@ -2104,22 +2134,44 @@ function entrySkin(grid: VoxelGridData, x: number, y: number, z: number): SkinLi
   let px = x
   let py = y
   let pz = z
+  let dx = direction?.x ?? 0
+  let dy = direction?.y ?? 0
+  let dz = direction?.z ?? 0
   if (grid.q.x !== 0 || grid.q.z !== 0) {
     rotateByBasis(grid.q, x, y, z, _skinPoint)
     px = _skinPoint.x
     py = _skinPoint.y
     pz = _skinPoint.z
+    if (direction) {
+      rotateByBasis(grid.q, dx, dy, dz, _skinDir)
+      dx = _skinDir.x
+      dy = _skinDir.y
+      dz = _skinDir.z
+    }
   } else if (grid.yaw !== 0) {
     const cos = Math.cos(grid.yaw)
     const sin = Math.sin(grid.yaw)
     px = x * cos + z * sin
     pz = -x * sin + z * cos
+    const ldx = dx * cos + dz * sin
+    dz = -dx * sin + dz * cos
+    dx = ldx
   }
   const p = axis === 0 ? px : axis === 1 ? py : pz
   const origin = axis === 0 ? grid.origin.x : axis === 1 ? grid.origin.y : grid.origin.z
   const cell = axis === 0 ? grid.cellX : axis === 1 ? grid.cellY : grid.cellZ
   const span = axis === 0 ? grid.nx : axis === 1 ? grid.ny : grid.nz
-  const c = (p - origin) / cell
+  let c = (p - origin) / cell
+  // The hit point sits ON the struck face — often EXACTLY on a layer
+  // boundary (a synthesized ceiling plate holds all its cells in the top
+  // half, so an upward shot's entry point lands on the halves split and
+  // float noise picked the EMPTY side: QA phase-6 round-3, 6/8 zero-carve
+  // ceiling shots). Step half a thickness cell INTO the grid along the
+  // shot so the sample sits inside the first cell layer the ray actually
+  // crosses; grazing shots (no thickness-axis travel) keep the raw halves.
+  const d = axis === 0 ? dx : axis === 1 ? dy : dz
+  if (d > 1e-6) c += 0.5
+  else if (d < -1e-6) c -= 0.5
   _skin.axis = axis
   _skin.side = c * 2 < span ? 0 : 1
   return _skin
@@ -2286,7 +2338,7 @@ function damageTargetOne(
   const layered = target.kind !== 'volume'
   const skin =
     layered && radius < WALL_PIERCE_RADIUS
-      ? entrySkin(target.grid, point.x, point.y, point.z)
+      ? entrySkin(target.grid, point.x, point.y, point.z, direction)
       : null
   const removed = removeSphere(
     target.grid,

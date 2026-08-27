@@ -63,9 +63,19 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   audio prime, probeLandingY memo, settle-timer de-coalescing · ramp
   targeting ray-march fix + weapon-tracked HUD keybar with AZERTY
   captions. 610 tests / 19.8k assertions green.
+- Phase 6 fix round 2 (2026-08-27, manager, post-QA): the two dead
+  lanes landed by hand — roof framing clips to each plane's FOOTPRINT
+  polygon (polyTris from enumerateRoofPlanes; hip jacks shorten, rake
+  lines drop, no stick past the ridge, ridge boards stop at the real
+  hip ridge) · roof voxels wear the real shingle tone (async GPU
+  readback wired: setRoofTextureRenderer + resolveRoofSkinTone →
+  skinRevision re-prime, paint ledger intact) · ceiling plates carve on
+  EVERY upward hit (entrySkin steps half a cell along the shot — the
+  halves-boundary float-noise bug) + zero-carve hits puff a chip
+  fallback. 639 tests / 20.1k assertions green. See NIGHTLOG.
 - Phase 6 round 2 (2026-08-27 night, fleet round 3: 2 lanes landed, 2
-  died with zero output — roof-clip + colors/ceiling requeue next
-  round): paint FEEL — splat radius is distance-driven (`splatRadiusAt`,
+  died with zero output — roof-clip + colors/ceiling landed by the
+  manager in fix round 2 above): paint FEEL — splat radius is distance-driven (`splatRadiusAt`,
   clamped quadratic ease 0.12 m at ≤1 m → 1.4 m at ≥8 m; one wall cell
   up close for legible writing, exaggerated late-bloom cone far out;
   PAINT_RANGE 7→9 m so the 8 m anchor is reachable), the spray can wears

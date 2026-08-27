@@ -167,6 +167,31 @@ describe('enumerateRoofPlanes', () => {
     }
   })
 
+  test('planes carry their plane-space footprint triangles, re-based to the eave frame', () => {
+    const planes = enumerateRoofPlanes([gableShellMesh()])
+    for (const plane of planes) {
+      const tris = plane.polyTris!
+      expect(tris.length % 6).toBe(0)
+      expect(tris.length).toBeGreaterThanOrEqual(6)
+      let minA = Number.POSITIVE_INFINITY
+      let maxA = Number.NEGATIVE_INFINITY
+      let minU = Number.POSITIVE_INFINITY
+      let maxU = Number.NEGATIVE_INFINITY
+      for (let k = 0; k < tris.length; k += 2) {
+        minA = Math.min(minA, tris[k]!)
+        maxA = Math.max(maxA, tris[k]!)
+        minU = Math.min(minU, tris[k + 1]!)
+        maxU = Math.max(maxU, tris[k + 1]!)
+      }
+      // Across measured from the eave CENTER, upSlope from the eave — the
+      // exact frame buildRafters clips its lines in.
+      expect(minA).toBeCloseTo(-plane.eaveLength / 2, 5)
+      expect(maxA).toBeCloseTo(plane.eaveLength / 2, 5)
+      expect(minU).toBeCloseTo(0, 5)
+      expect(maxU).toBeCloseTo(plane.slopeLength, 5)
+    }
+  })
+
   test('recovered yaw/pitch reproduce the outward normal', () => {
     const planes = enumerateRoofPlanes([gableShellMesh()])
     for (const plane of planes) {

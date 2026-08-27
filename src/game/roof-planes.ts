@@ -31,11 +31,14 @@ import { type RoofPlaneBasis, roofPlaneFrame } from './roof-framing'
  *      `eaveCenter` lands on the INNER surface — exactly the
  *      RoofPlaneBasis contract buildRafters (roof-framing.ts) consumes.
  *
- * Limitations (documented, acceptable for the framing reveal): two
- * DISJOINT coplanar faces of one node merge into one plane (rafters bridge
- * the gap), and triangular hip faces frame with full-length rafter lines
- * (real hips shorten jacks toward the corners) — both invisible until the
- * roof is shot open, both strictly better than no framing.
+ * Each plane also carries its plane-space footprint triangles (`polyTris`)
+ * so buildRafters clips every rafter line to the REAL polygon — hip
+ * triangles shorten their jacks toward the corners and no stick top pokes
+ * past the ridge (QA phase-6 round-3 fix).
+ *
+ * Limitation (documented, acceptable for the framing reveal): two DISJOINT
+ * coplanar faces of one node merge into one plane (rafters bridge the gap)
+ * — invisible until the roof is shot open, strictly better than no framing.
  */
 
 /** Planes flatter than this never frame (mirror of roof-framing's gate). */
@@ -234,6 +237,9 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
     let maxU = Number.NEGATIVE_INFINITY
     let nSum = 0
     let nArea = 0
+    // Plane-space footprint triangles, packed [a,u]×3 per tri (absolute
+    // projections here; re-based to the eave-center frame below).
+    const polyTris: number[] = []
     for (const tri of up) {
       if (tri.nx * nx + tri.ny * ny + tri.nz * nz <= CLUSTER_DOT) continue
       for (let k = 0; k < 9; k += 3) {
@@ -242,6 +248,7 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
         const z = tri.v[k + 2]!
         const a = x * across[0] + y * across[1] + z * across[2]
         const u = x * upSlope[0] + y * upSlope[1] + z * upSlope[2]
+        polyTris.push(a, u)
         if (a < minA) minA = a
         if (a > maxA) maxA = a
         if (u < minU) minU = u
@@ -269,6 +276,13 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
 
     const midA = (minA + maxA) / 2
     const nInner = nOuter - thickness
+    // Re-base the footprint into the RoofPlaneBasis frame: across measured
+    // from the eave CENTER, upSlope from the eave — buildRafters clips its
+    // rafter lines (and the ridge run) to these triangles.
+    for (let k = 0; k < polyTris.length; k += 2) {
+      polyTris[k]! -= midA
+      polyTris[k + 1]! -= minU
+    }
     planes.push({
       yaw,
       pitch,
@@ -280,6 +294,7 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
       eaveLength: maxA - minA,
       slopeLength: maxU - minU,
       thickness,
+      polyTris,
     })
   }
   return planes

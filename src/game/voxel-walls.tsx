@@ -1,7 +1,7 @@
 'use client'
 
-import { useFrame } from '@react-three/fiber'
-import { useLayoutEffect, useMemo, useRef } from 'react'
+import { useFrame, useThree } from '@react-three/fiber'
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
   Color,
   DynamicDrawUsage,
@@ -11,6 +11,7 @@ import {
   Vector3,
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
+import { type RoofToneRenderer, setRoofTextureRenderer } from './roof-planes'
 
 /**
  * Renders every voxelized target as the phase-3 WALL SANDWICH, one
@@ -225,9 +226,88 @@ const _ceilingTone = new Color()
 const _courseTone = new Color()
 const _underTone = new Color()
 
+/** Prime (or re-prime) the skin layer's matrices + colors from the grid.
+ * Runs on mount and again whenever `skinRevision` bumps (async roof tone).
+ * Clears the mesh's paint gates afterwards so drainPaintTints re-applies
+ * any painted cells on top — the paint LEDGER's serials never move. */
+function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
+  const { grid } = wall
+  // Per-axis scale with a 1.5% inset: anisotropic wall grids have thin
+  // skin cells along the thickness axis (a uniform grid.cell cube would
+  // visually fill the cavity), and the inset keeps each cube's face from
+  // merging with its neighbors — the clean "block" read walls now wear
+  // from session start.
+  _scale.set(grid.cellX * 0.985, grid.cellY * 0.985, grid.cellZ * 0.985)
+  // Rotated grids: cells are axis-aligned in the grid's own frame —
+  // rotate each instance out to world. Yaw-local grids (diagonal walls)
+  // keep the legacy Y axis-angle; FULL-basis grids (pitched roof planes,
+  // Phase C2 — grid.yaw parks at 0 there) use the quaternion conjugate
+  // (grid → world), which is what fixes the stair-stepped roof
+  // silhouette: the cubes lie IN the slope plane instead of climbing it
+  // in axis-aligned steps. World-aligned grids keep identity.
+  if (grid.q.x !== 0 || grid.q.z !== 0) {
+    _quat.set(-grid.q.x, -grid.q.y, -grid.q.z, grid.q.w)
+  } else if (grid.yaw === 0) _quat.identity()
+  else _quat.setFromAxisAngle(UP, -grid.yaw)
+  // Slab sandwiches wear TWO tones: the top skin keeps the host's floor
+  // tone (baseColor) while the bottom skin — the ceiling face a player
+  // looks up at — renders as slightly lighter, desaturated drywall.
+  const isSlab = wall.kind === 'slab'
+  if (isSlab) _ceilingTone.copy(wall.baseColor).offsetHSL(0, -0.06, 0.14)
+  // Roof planes wear the shingle read: outer skin (min-z layer) in the
+  // roof surface tone with course striping, inner skin as pale deck.
+  const isRoof = wall.kind === 'roof'
+  if (isRoof) {
+    _courseTone.copy(wall.baseColor).offsetHSL(0, 0, -0.055)
+    _underTone.copy(wall.baseColor).offsetHSL(0, -0.08, 0.16)
+  }
+  const cellColors = wall.cellColors
+  for (let i = 0; i < grid.count; i++) {
+    if (grid.alive[i]) {
+      _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
+      _matrix.compose(_pos, _quat, _scale)
+      mesh.setMatrixAt(i, _matrix)
+    } else {
+      mesh.setMatrixAt(i, ZERO)
+    }
+    // Per-voxel shade jitter — the "block" read. Two independent hashes:
+    // a value spread plus a whisper of saturation drift so runs of voxels
+    // never band into flat stripes. Roof outer skins push the value
+    // spread harder — per-shingle tonal scatter.
+    const j1 = ((i * 2654435761) % 97) / 97
+    const j2 = ((i * 1597334677) % 89) / 89
+    let base = wall.baseColor
+    let jitter = 0.1
+    if (cellColors) {
+      // Item palette (destruction.ts sampleItemCellColors): each voxel
+      // wears its sub-mesh region tone; keep the gentle wall jitter below.
+      base = _cellTone.setRGB(cellColors[i * 3]!, cellColors[i * 3 + 1]!, cellColors[i * 3 + 2]!)
+    } else if (isSlab && grid.coords[i * 3 + 1] === 0) base = _ceilingTone
+    else if (isRoof) {
+      if (grid.coords[i * 3 + 2] !== 0) base = _underTone
+      else {
+        // Outer skin: every ~3rd in-plane row (grid Y = up the slope)
+        // darkens slightly — the shingle course striping.
+        base = grid.coords[i * 3 + 1]! % 3 === 2 ? _courseTone : wall.baseColor
+        jitter = 0.16
+      }
+    }
+    _color.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * jitter)
+    mesh.setColorAt(i, _color)
+  }
+  mesh.instanceMatrix.needsUpdate = true
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+  // Paint gate reset (paint.tsx drainPaintTints): the wholesale color prime
+  // just overwrote any painted cells — dropping the mesh-side gates makes
+  // the next drain re-coat them from the ledger (serials stay intact).
+  mesh.userData.__bootsPaintSerial = undefined
+  mesh.userData.__bootsPaintTarget = undefined
+}
+
 function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
   const revision = useRef(-1)
+  const skinRevision = useRef(0)
   const sandwich = wall as SandwichTarget
   const boards = sandwich.boards
   // Until destruction-core lands `segments`, the studs render as the wood
@@ -237,75 +317,11 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
-    const { grid } = wall
     mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    // Per-axis scale with a 1.5% inset: anisotropic wall grids have thin
-    // skin cells along the thickness axis (a uniform grid.cell cube would
-    // visually fill the cavity), and the inset keeps each cube's face from
-    // merging with its neighbors — the clean "block" read walls now wear
-    // from session start.
-    _scale.set(grid.cellX * 0.985, grid.cellY * 0.985, grid.cellZ * 0.985)
-    // Rotated grids: cells are axis-aligned in the grid's own frame —
-    // rotate each instance out to world. Yaw-local grids (diagonal walls)
-    // keep the legacy Y axis-angle; FULL-basis grids (pitched roof planes,
-    // Phase C2 — grid.yaw parks at 0 there) use the quaternion conjugate
-    // (grid → world), which is what fixes the stair-stepped roof
-    // silhouette: the cubes lie IN the slope plane instead of climbing it
-    // in axis-aligned steps. World-aligned grids keep identity.
-    if (grid.q.x !== 0 || grid.q.z !== 0) {
-      _quat.set(-grid.q.x, -grid.q.y, -grid.q.z, grid.q.w)
-    } else if (grid.yaw === 0) _quat.identity()
-    else _quat.setFromAxisAngle(UP, -grid.yaw)
-    // Slab sandwiches wear TWO tones: the top skin keeps the host's floor
-    // tone (baseColor) while the bottom skin — the ceiling face a player
-    // looks up at — renders as slightly lighter, desaturated drywall.
-    const isSlab = wall.kind === 'slab'
-    if (isSlab) _ceilingTone.copy(wall.baseColor).offsetHSL(0, -0.06, 0.14)
-    // Roof planes wear the shingle read: outer skin (min-z layer) in the
-    // roof surface tone with course striping, inner skin as pale deck.
-    const isRoof = wall.kind === 'roof'
-    if (isRoof) {
-      _courseTone.copy(wall.baseColor).offsetHSL(0, 0, -0.055)
-      _underTone.copy(wall.baseColor).offsetHSL(0, -0.08, 0.16)
-    }
-    const cellColors = wall.cellColors
-    for (let i = 0; i < grid.count; i++) {
-      if (grid.alive[i]) {
-        _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
-        _matrix.compose(_pos, _quat, _scale)
-        mesh.setMatrixAt(i, _matrix)
-      } else {
-        mesh.setMatrixAt(i, ZERO)
-      }
-      // Per-voxel shade jitter — the "block" read. Two independent hashes:
-      // a value spread plus a whisper of saturation drift so runs of voxels
-      // never band into flat stripes. Roof outer skins push the value
-      // spread harder — per-shingle tonal scatter.
-      const j1 = ((i * 2654435761) % 97) / 97
-      const j2 = ((i * 1597334677) % 89) / 89
-      let base = wall.baseColor
-      let jitter = 0.1
-      if (cellColors) {
-        // Item palette (destruction.ts sampleItemCellColors): each voxel
-        // wears its sub-mesh region tone; keep the gentle wall jitter below.
-        base = _cellTone.setRGB(cellColors[i * 3]!, cellColors[i * 3 + 1]!, cellColors[i * 3 + 2]!)
-      } else if (isSlab && grid.coords[i * 3 + 1] === 0) base = _ceilingTone
-      else if (isRoof) {
-        if (grid.coords[i * 3 + 2] !== 0) base = _underTone
-        else {
-          // Outer skin: every ~3rd in-plane row (grid Y = up the slope)
-          // darkens slightly — the shingle course striping.
-          base = grid.coords[i * 3 + 1]! % 3 === 2 ? _courseTone : wall.baseColor
-          jitter = 0.16
-        }
-      }
-      _color.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * jitter)
-      mesh.setColorAt(i, _color)
-    }
-    mesh.instanceMatrix.needsUpdate = true
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    primeSkin(mesh, wall)
     mesh.frustumCulled = false
     revision.current = wall.revision
+    skinRevision.current = wall.skinRevision ?? 0
   }, [wall])
 
   useFrame(() => {
@@ -317,6 +333,13 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
       for (let i = 0; i < queue.length; i++) mesh.setMatrixAt(queue[i]!, ZERO)
       queue.length = 0
       mesh.instanceMatrix.needsUpdate = true
+    }
+    // Async skin tone landed (roof shingle GPU readback — destruction.ts
+    // bumps skinRevision after retinting baseColor): re-prime the whole
+    // layer once. Idles at one number compare per target per frame.
+    if (skinRevision.current !== (wall.skinRevision ?? 0)) {
+      skinRevision.current = wall.skinRevision ?? 0
+      primeSkin(mesh, wall)
     }
   })
 
@@ -354,6 +377,13 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
 
 export function VoxelWalls() {
   const version = useDestruction((s) => s.version)
+  // Roof skin tone rig (roof-planes.ts): the async shingle-tone readback
+  // needs the LIVE renderer — register it for the session, clear on unmount.
+  const gl = useThree((s) => s.gl)
+  useEffect(() => {
+    setRoofTextureRenderer(gl as unknown as RoofToneRenderer)
+    return () => setRoofTextureRenderer(null)
+  }, [gl])
   const walls = useMemo(() => {
     void version
     return Array.from(useDestruction.getState().targets.values())

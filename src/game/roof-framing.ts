@@ -108,6 +108,13 @@ export type RoofPlaneBasis = {
   eaveLength: number
   /** Eave→ridge length (m) measured along the plane. */
   slopeLength: number
+  /** Optional plane-space FOOTPRINT triangles, packed [a0,u0,a1,u1,a2,u2,…]
+   * where `a` is metres along `across` from the eave CENTER and `u` metres
+   * along `upSlope` from the eave. When present, every rafter line clips to
+   * the real polygon (hip triangles lose their full-length edge lines and
+   * no stick top ever pokes past the ridge); absent keeps the rectangular
+   * eaveLength × slopeLength layout. */
+  polyTris?: readonly number[]
 }
 
 export type RafterRole = 'rafter' | 'ridge' | 'plate'
@@ -164,6 +171,59 @@ export function rafterObbBasis(yaw: number, pitch: number, out?: VoxelBasis): Vo
   q.z = -sp * cy
   q.w = cp * cy
   return q
+}
+
+/** Rafter/ridge runs shorter than this never mint a stick (hip-corner
+ * slivers read as debris, not framing). */
+const MIN_LINE_RUN = 0.15
+
+/** Scratch interval for the footprint clippers. */
+const _span = { lo: 0, hi: 0 }
+
+/**
+ * Interval of the plane footprint crossed by the line `axis = value` in
+ * plane space — `axis` 0 clips a rafter LINE (across = value, returns the
+ * up-slope span), `axis` 1 clips the RIDGE (upSlope = value, returns the
+ * across span). Min/max over every edge crossing of every packed triangle
+ * (roof planes are convex-ish, so the union is one interval). False when
+ * the line misses the footprint entirely.
+ */
+function footprintSpan(
+  tris: readonly number[],
+  axis: 0 | 1,
+  value: number,
+  out: { lo: number; hi: number },
+): boolean {
+  const other = axis === 0 ? 1 : 0
+  let lo = Number.POSITIVE_INFINITY
+  let hi = Number.NEGATIVE_INFINITY
+  for (let t = 0; t + 5 < tris.length; t += 6) {
+    for (let e = 0; e < 3; e++) {
+      const f = (e + 1) % 3
+      const pa = tris[t + e * 2 + axis]!
+      const qa = tris[t + e * 2 + other]!
+      const pb = tris[t + f * 2 + axis]!
+      const qb = tris[t + f * 2 + other]!
+      const da = pa - value
+      const db = pb - value
+      if (da === 0 && db === 0) {
+        // Edge lies ON the line — both ends bound the span.
+        if (qa < lo) lo = qa
+        if (qa > hi) hi = qa
+        if (qb < lo) lo = qb
+        if (qb > hi) hi = qb
+        continue
+      }
+      if (da * db > 0) continue
+      const q = qa + ((value - pa) / (pb - pa)) * (qb - qa)
+      if (q < lo) lo = q
+      if (q > hi) hi = q
+    }
+  }
+  if (hi < lo) return false
+  out.lo = lo
+  out.hi = hi
+  return true
 }
 
 /** Wrap into (−π, π] so stored yaws stay in the stud convention's range. */
@@ -233,6 +293,10 @@ export function buildRafters(
     z: number
     yaw: number
     eaveLength: number
+    /** Across-offset midpoint + length of the footprint's upper edge (the
+     * ridge extent) — eaveLength/0 when the plane has no footprint data. */
+    topMid: number
+    topLen: number
   }> = []
 
   for (let p = 0; p < planeBases.length; p++) {
@@ -243,16 +307,32 @@ export function buildRafters(
     const { across, normal, upSlope } = roofPlaneFrame(yaw, pitch)
     // Rafter center line sits (top drop + half depth) under the inner skin.
     const drop = RAFTER_TOP_DROP + RAFTER_D / 2
-    const runLen = slopeLength - 2 * END_GAP
-    const pieces = Math.max(1, Math.round(runLen / RAFTER_RUN))
-    const stickLen = runLen / pieces
     const memberYaw = yaw + Math.PI / 2 // up-slope heading (ψ ± π/2)
     const lines = Math.max(2, Math.floor(eaveLength / RAFTER_SPACING) + 1)
+    const poly = plane.polyTris && plane.polyTris.length >= 6 ? plane.polyTris : null
     for (let i = 0; i < lines; i++) {
       const t = Math.min(1, (i * RAFTER_SPACING) / eaveLength)
       const s = (t - 0.5) * eaveLength
+      // Clip the line to the plane FOOTPRINT: hip triangles shorten their
+      // lines toward the corners (and lose the rake-edge lines entirely),
+      // and no stick top ever climbs past the polygon's real upper edge.
+      // Rake lines sample a hair inside so a boundary-exact line still
+      // reads its own edge instead of missing by float noise.
+      let lineLo = 0
+      let lineHi = slopeLength
+      if (poly) {
+        const half = eaveLength / 2
+        const sEval = s < -half + 1e-3 ? -half + 1e-3 : s > half - 1e-3 ? half - 1e-3 : s
+        if (!footprintSpan(poly, 0, sEval, _span)) continue
+        if (_span.lo > lineLo) lineLo = _span.lo
+        if (_span.hi < lineHi) lineHi = _span.hi
+      }
+      const runLen = lineHi - lineLo - 2 * END_GAP
+      if (runLen < MIN_LINE_RUN) continue
+      const pieces = Math.max(1, Math.round(runLen / RAFTER_RUN))
+      const stickLen = runLen / pieces
       for (let k = 0; k < pieces; k++) {
-        const d = END_GAP + (k + 0.5) * stickLen
+        const d = lineLo + END_GAP + (k + 0.5) * stickLen
         push(
           'rafter',
           p,
@@ -290,6 +370,15 @@ export function buildRafters(
       )
     }
 
+    // Ridge extent: the footprint's across span just under its upper edge —
+    // a hip trapezoid's ridge is much shorter than its eave, so the board
+    // must not run the full eave length (it floated past both hip ends).
+    let topMid = 0
+    let topLen = eaveLength
+    if (poly && footprintSpan(poly, 1, Math.max(0, slopeLength - 0.01), _span)) {
+      topMid = (_span.lo + _span.hi) / 2
+      topLen = _span.hi - _span.lo
+    }
     ridgePoints.push({
       plane: p,
       x: ex + upSlope[0] * slopeLength,
@@ -297,6 +386,8 @@ export function buildRafters(
       z: ez + upSlope[2] * slopeLength,
       yaw,
       eaveLength,
+      topMid,
+      topLen,
     })
   }
 
@@ -317,14 +408,18 @@ export function buildRafters(
       if (dyaw > RIDGE_MATCH_YAW) continue
       used.add(i)
       used.add(j)
-      const cx = (a.x + b.x) / 2
-      const cy = (a.y + b.y) / 2 - RIDGE_D / 2 // board top touches the seam
-      const cz = (a.z + b.z) / 2
-      const run = Math.min(a.eaveLength, b.eaveLength) - 2 * END_GAP
-      const pieces = Math.max(1, Math.round(run / RAFTER_RUN))
-      const len = run / pieces
       const ax = Math.cos(a.yaw)
       const az = Math.sin(a.yaw)
+      // Board run = the SHORTER footprint ridge extent of the pair, centered
+      // on plane a's upper-edge midpoint (hip trapezoids: the real ridge,
+      // not the full eave).
+      const run = Math.min(a.topLen, b.topLen) - 2 * END_GAP
+      if (run < MIN_LINE_RUN) break
+      const cx = (a.x + b.x) / 2 + ax * a.topMid
+      const cy = (a.y + b.y) / 2 - RIDGE_D / 2 // board top touches the seam
+      const cz = (a.z + b.z) / 2 + az * a.topMid
+      const pieces = Math.max(1, Math.round(run / RAFTER_RUN))
+      const len = run / pieces
       for (let k = 0; k < pieces; k++) {
         const s = ((k + 0.5) / pieces - 0.5) * run
         push(

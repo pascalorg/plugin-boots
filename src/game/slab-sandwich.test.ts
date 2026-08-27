@@ -211,6 +211,31 @@ describe('zero-thickness ceiling planes (host levels emit 0 m plates)', () => {
     expect(probeTargetSupport(wallUp, { ...ctx, targets: () => [] })).toBe(false)
   })
 
+  test('upward fire into a ceiling plate carves on EVERY hit (entry-face boundary noise)', () => {
+    // QA phase-6 round 3: 6/8 upward rifle shots at a ceiling plate removed
+    // ZERO voxels. The plate's cells all live in its TOP thickness layer, so
+    // an upward shot's DDA point lands EXACTLY on the halves boundary of the
+    // entry-skin test — float noise picked the empty bottom half and the
+    // skin-limited carve deleted nothing. entrySkin now steps half a cell
+    // INTO the grid along the shot before picking the side.
+    const world = makeWorld()
+    world.colliders.push(boxCollider('ceil-1', 'ceiling', [6.5, 0.0002, 5], [0, 2.48, 0]))
+    const target = ensureVoxelTarget(world, 'ceil-1')!
+    const { grid } = target
+    const up = new Vector3(0, 1, 0)
+    // Entry face of the populated top layer, a hair LOW (the noisy side).
+    const entryY = grid.origin.y + grid.cellY - 1e-4
+    const spots: Array<[number, number]> = [
+      [0.2, 0.3],
+      [-1.1, 0.8],
+      [1.4, -0.9],
+      [-0.6, -1.2],
+    ]
+    for (const [x, z] of spots) {
+      expect(damageTarget(world, 'ceil-1', new Vector3(x, entryY, z), 0.45, up)).toBeGreaterThan(0)
+    }
+  })
+
   test('the plate is CONTACT-ONLY support — it never props a wall floating higher in the gap band', () => {
     // Host scenes stack a real slab (2.5–2.55) on top of the ceiling plane
     // (2.48); L2 walls bear on the SLAB at 2.55. Carving the slab strip
