@@ -143,7 +143,11 @@ function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number)
  *                                kept, but counted as approximated
  *                                (`exact: false`), same convention as
  *                                non-exact wall masks. */
-function createRoofNode(piece: PlacedPiece, levelId: string): { ok: boolean; exact: boolean } {
+function createRoofNode(
+  piece: PlacedPiece,
+  levelId: string,
+  shedParent: () => string,
+): { ok: boolean; exact: boolean } {
   const corners = piece.corners as RoofCorners | undefined
   if (corners) {
     const shape = classifyRoofShape(corners)
@@ -152,14 +156,41 @@ function createRoofNode(piece: PlacedPiece, levelId: string): { ok: boolean; exa
       return { ok: createSlabNode(piece, levelId, elevation), exact: true }
     }
     const quarter = shape.kind === 'saddle' ? 0 : shape.quarter
-    const ok = createShedNode(piece, levelId, piece.yaw + (quarter * Math.PI) / 2)
+    const ok = createShedNode(piece, shedParent(), piece.yaw + (quarter * Math.PI) / 2)
     return { ok, exact: shape.kind === 'slope' }
   }
-  return { ok: createShedNode(piece, levelId, piece.yaw), exact: true }
+  return { ok: createShedNode(piece, shedParent(), piece.yaw), exact: true }
+}
+
+/** The host's roof system only BUILDS geometry for 'roof-segment' children
+ * of a 'roof' node (viewer roof-system merges shells per roof parent —
+ * segments parented straight to the level stay empty zero-size
+ * placeholders; the corner-roof QA round proved saved sheds were
+ * invisible). Keep therefore mints ONE 'roof' container under the level
+ * per save and parents every shed segment to it. A missing/throwing
+ * 'roof' registry kind degrades to the old level parenting — worst case
+ * is the previous (invisible) behavior, never a lost save. */
+function createRoofParentNode(levelId: string): string | null {
+  const def = nodeRegistry.get('roof') as RegistryDef | undefined
+  if (!def?.schema) return null
+  try {
+    const roof = def.schema.parse({
+      ...safeDefaults(def),
+      object: 'node',
+      parentId: levelId,
+      visible: true,
+      metadata: {},
+    })
+    useScene.getState().createNode(roof as AnyNode, levelId as AnyNodeId)
+    const id = (roof as { id?: unknown }).id
+    return typeof id === 'string' ? id : null
+  } catch {
+    return null
+  }
 }
 
 /** The classic shed 'roof-segment' attempt (3 m plan run rising WALL_H). */
-function createShedNode(piece: PlacedPiece, levelId: string, rotation: number): boolean {
+function createShedNode(piece: PlacedPiece, parentId: string, rotation: number): boolean {
   const def = nodeRegistry.get('roof-segment') as RegistryDef | undefined
   if (!def?.schema) return false
   const run = PIECE_DIMS.wall[0] // roofs rise WALL_H over a 3 m plan run
@@ -168,7 +199,7 @@ function createShedNode(piece: PlacedPiece, levelId: string, rotation: number): 
     const segment = def.schema.parse({
       ...safeDefaults(def),
       object: 'node',
-      parentId: levelId,
+      parentId,
       visible: true,
       metadata: {},
       position: [piece.position[0], piece.position[1], piece.position[2]],
@@ -180,7 +211,7 @@ function createShedNode(piece: PlacedPiece, levelId: string, rotation: number): 
       overhang: 0,
       pitch: pitchDeg,
     })
-    useScene.getState().createNode(segment as AnyNode, levelId as AnyNodeId)
+    useScene.getState().createNode(segment as AnyNode, parentId as AnyNodeId)
     return true
   } catch {
     return false
@@ -234,9 +265,17 @@ export function keepPlaced(): KeepResult {
     useBoots.getState().resolvePlaced()
     return { ...result, skipped: placed.length }
   }
+  // One 'roof' container per save, minted lazily on the first shed attempt
+  // (see createRoofParentNode) — flat caps and roofless saves never mint it.
+  let roofParent: string | null | undefined
+  const shedParent = () => {
+    if (roofParent === undefined) roofParent = createRoofParentNode(levelId)
+    return roofParent ?? levelId
+  }
   for (const piece of placed) {
     if (piece.piece === 'roof') {
-      const made = (piece.mask & FULL_MASK) !== 0 ? createRoofNode(piece, levelId) : null
+      const made =
+        (piece.mask & FULL_MASK) !== 0 ? createRoofNode(piece, levelId, shedParent) : null
       if (made?.ok) {
         result.kept++
         result.roofs++
