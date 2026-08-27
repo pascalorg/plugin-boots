@@ -113,8 +113,16 @@ function FrameBooster() {
     gl.setSize(size.width, size.height, false)
   }, [gl, size, dpr])
   useEffect(() => {
-    const prevPaused = useViewer.getState().renderPaused
-    useViewer.setState({ renderPaused: true })
+    // The plugin's pinned viewer typings predate the renderPaused flag —
+    // resolve it structurally (same defensive idiom as the core history
+    // transaction in panel.tsx); the live host store has carried it since
+    // the gallery-cover feature.
+    const viewerStore = useViewer as unknown as {
+      getState: () => { renderPaused?: boolean }
+      setState: (partial: { renderPaused: boolean }) => void
+    }
+    const prevPaused = viewerStore.getState().renderPaused ?? false
+    viewerStore.setState({ renderPaused: true })
     let frameTime = clock.elapsedTime
     let lastNow = 0
     let raf = 0
@@ -128,7 +136,7 @@ function FrameBooster() {
     raf = requestAnimationFrame(tick)
     return () => {
       cancelAnimationFrame(raf)
-      useViewer.setState({ renderPaused: prevPaused })
+      viewerStore.setState({ renderPaused: prevPaused })
     }
   }, [advance, clock])
   return null
