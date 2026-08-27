@@ -902,3 +902,56 @@ shots through open front door carve ZERO wall_s voxels. Residual blockage
 at door_bed1/door_bed2 there is fixture authoring (doors centered exactly
 on wall junctions — the neighbor wall's uncut end owns half the aperture),
 not a game bug.
+
+## Phase 5.5, night round — pieces / overlays / build table / catalog (2026-08-27, manager stitch)
+
+Four disjoint lanes integrated in one pass; full suite 563 pass / 0 fail
+(18,225 assertions), `tsc --noEmit` clean.
+
+- PIECES (store/grid/builder/keep/roof-corners): `BuildPiece` split into
+  wall | floor | stairs | roof. 'stairs' is the old walkable plank
+  (STAIR_TILT pose, R = ascent quarter, chains storey-per-cell, Keep →
+  shed roof-segment); 'roof' is the 2×2 corner patch — the ghost now
+  renders the real bilinear preset and R cycles SHAPE presets (slope →
+  corner-tip → valley → flat cap) with yaw pinned to the facing. Direct
+  hotkeys Z/X/C/V pick pieces while the builder is held; undo moved to U.
+  Real bug fixed: grid.roofQuarter had the ±Z quarters swapped — ramps
+  facing ±Z rose TOWARD the player; all four cardinals now test-pinned.
+- EDIT-OVERLAY (edit-overlay.tsx, new): the F-edit 3×3 ghost boxes became
+  outlined lattices floating off BOTH piece faces (inset tiles, live blue
+  fill / dead red outline, hovered gold with a change-gated pulse);
+  corner roofs get a 12-edge wireframe marker set. Manager wired the
+  builder.tsx swap + SWIPE CARVING: holding LMB in cell-edit toggles each
+  NEW cell the crosshair enters (per-hold dedupe, corner roofs stay
+  press-edge).
+- BUILD-TABLE (guntable.tsx): third table 2.37 m from spawn, opposite
+  side from the gear table — a blueprint-blue display hammer and a
+  "START BUILDING" sign ("BUILD AWAY" after pickup). E gives + equips the
+  builder only; the wave director keys off pistol/rifle/minigun ownership
+  so building stays peaceful. interact.tsx E-ownership extended to the
+  third table (the door double-fire class); viewmodel wheel list deduped
+  ('builder' entering `owned` used to trap the wheel on it).
+- INVENTORY (inventory.tsx / item-place.tsx / item-keep.ts, new): I opens
+  the creative-mode catalog over the host's bundled CATALOG_ITEMS (~92
+  floor-standing rows, 5 category tabs, ≤32 cards each; mouse + keyboard).
+  Picking arms an aim-anchored half-ghost GLB (R turns, LMB places, RMB
+  stows, weapon switch stows); placements are game-only fixtures (one
+  box collider each — bullets spark, never voxelize) until the sidebar
+  Save runs item-keep's schema-parsed createNode pass (Discard forgets).
+  Failed GLB loads degrade to labeled proxy boxes. input.ts gained the
+  menuOpen latch (keydowns route to the menu, pointer/wheel pass through
+  to the DOM; the backdrop swallows clicks so the host still sees none);
+  session.ts skips the deliberate pointer-lock release while the menu is
+  open and folds placed items into pendingDecision.
+- Manager wiring beyond the lane diffs: hud.ts keybind bar (R rotate/
+  shape · U undo · I catalog), panel decision copy + Save/Discard call
+  sites + controls text, GameItems mounted in game-root.
+
+Deferred / follow-ups: docs/BUILD-GRAMMAR-V2.md still describes the
+3-piece grammar + the old roofQuarter comment (refresh next round);
+KeepResult.roofs counts stairs+roofs together (split counter someday);
+legacy corner-less 'roof' pieces keep the plank fallback; Draco/KTX2
+catalog GLBs fall back to proxies until host decoders are wired; QA
+should sight-check the build-table hammer rake and the overlapping
+build/gear prompt circles; optional makeSceneSupportProbe '__boots-'
+prefix widen (tall furniture can prop an upper build slot) left as-is.

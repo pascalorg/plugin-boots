@@ -22,8 +22,26 @@ import { BufferAttribute, BufferGeometry } from 'three'
 
 export type RoofCorners = [number, number, number, number]
 
-/** The classic placed-roof shape: low at −Z, high at +Z (ROOF_TILT). */
+/** The classic placed-roof shape: low at −Z, high at +Z (STAIR_TILT). */
 export const SLOPE_CORNERS: RoofCorners = [0, 0, 1, 1]
+
+/** R-cycle shape presets for the roof GHOST: slope → corner-tip (one high
+ * corner — the low-cone read) → valley (three high) → flat cap (all high,
+ * Keep maps it to a ridge-level slab terrace). Canonical patterns keep the
+ * high side at local +Z/c2; the ghost's yaw (from the facing cardinal) aims
+ * it, so every preset rises away from the player. */
+export const ROOF_PRESETS: ReadonlyArray<RoofCorners> = [
+  SLOPE_CORNERS,
+  [0, 0, 1, 0],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+]
+
+/** Corner pattern for preset index `preset` (wraps mod 4, negatives too).
+ * Returns a fresh array — placements own their corners. */
+export function presetCorners(preset: number): RoofCorners {
+  return [...ROOF_PRESETS[((preset % 4) + 4) % 4]!] as RoofCorners
+}
 
 /** Footprint half-extent (matches the 3 m floor/roof plan span). */
 const HALF = 1.5

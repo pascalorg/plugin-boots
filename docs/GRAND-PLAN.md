@@ -39,6 +39,18 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   rings, died-slot turbo lockout), whole-building stacked-levels
   presence, E-interact on doors/windows/cabinets, quaternion voxel grids,
   turbo clad FIFO budget. 375 tests / 12.4k assertions green.
+- Night round 2026-08-27 (fleet, 4 lanes + manager stitch): piece split
+  wall/floor/STAIRS/roof (stairs = the walkable plank; roof = the 2×2
+  corner patch, ghost previews the real bilinear preset, R cycles shape
+  presets; grid.roofQuarter ±Z ascent fix) · direct piece hotkeys Z/X/C/V
+  (undo → U) · F-edit overlays rebuilt as outlined lattices + corner
+  wireframes (edit-overlay.tsx) with SWIPE carving on cell edits · third
+  BUILD table at spawn ("START BUILDING" → builder pickup, no wave
+  trigger) · in-game creative catalog (I → inventory.tsx menu →
+  item-place.tsx ghost/fixture placements → item-keep.ts Save bridge;
+  input.ts menuOpen latch, session lock-release guard, panel
+  Save/Discard). 563 tests / 18.2k assertions green. Doc debt:
+  BUILD-GRAMMAR-V2.md still says 3-piece grammar — refresh next round.
 
 ## In flight
 

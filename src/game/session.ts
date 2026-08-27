@@ -6,6 +6,8 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { Hud } from './hud'
 import { GameInput } from './input'
+import { closeItemMenu, isItemMenuOpen } from './inventory'
+import { placedItemCount } from './item-keep'
 import { capturePaint } from './paint-keep'
 import { captureDemolition } from './save-demolition'
 
@@ -239,6 +241,9 @@ export function enterGame(): boolean {
   void container.requestFullscreen?.().catch(() => {})
   input.attach(canvas)
   input.onEscape = () => {
+    // Esc with the catalog up closes the menu, not the game (this path only
+    // fires with the pointer lock already released — exactly the menu case).
+    if (closeItemMenu()) return
     if (current === session) exitGame()
   }
   hud.mount(container)
@@ -251,7 +256,9 @@ export function enterGame(): boolean {
       hadLock = true
       return
     }
-    if (hadLock && current === session) exitGame()
+    // The item catalog releases the lock deliberately (mouse becomes a
+    // cursor over the menu) — that release is not an exit.
+    if (hadLock && current === session && !isItemMenuOpen()) exitGame()
   }
   let hadFullscreen = false
   const onFullscreenChange = () => {
@@ -300,6 +307,7 @@ export function exitGame(): void {
 
   useBoots.getState().setPhase('editor')
 
+  closeItemMenu(false)
   session.input.detach()
   session.hud.unmount()
   for (const { object, visible } of session.hiddenObjects) object.visible = visible
@@ -325,5 +333,7 @@ export function exitGame(): void {
   const leveled = captureDemolition()
   // Same deal for paint: snapshot sprayed coats before the ledger resets.
   const painted = capturePaint()
-  useBoots.getState().setPendingDecision(placed.length > 0 || leveled > 0 || painted > 0)
+  useBoots
+    .getState()
+    .setPendingDecision(placed.length > 0 || leveled > 0 || painted > 0 || placedItemCount() > 0)
 }

@@ -35,12 +35,17 @@ import { classifyRoofShape, CORNER_RISE, type RoofCorners } from './roof-corners
  * builder.tsx so headless tests can import it without this module's
  * viewer dependency; it is re-exported here for keep-side callers.
  *
- * ROOFS: a game roof piece (3 m plank rising WALL_H over a 3 m run) maps
- * best-effort onto a 'roof-segment' node — shed type, 3 × 3 footprint,
- * pitch atan(WALL_H/3) in degrees, no walls below, rotated to the piece
- * yaw. The mask is ignored for roofs (partial roofs keep the full quad);
- * fully-dead roofs are skipped, schema failures fall back to skipped so
- * they stay game-only.
+ * STAIRS (the walkable 3 m plank rising WALL_H over a 3 m run — the piece
+ * the pre-split code called 'roof') map best-effort onto a 'roof-segment'
+ * node — shed type, 3 × 3 footprint, pitch atan(WALL_H/3) in degrees, no
+ * walls below, rotated to the piece yaw, parented to the per-save 'roof'
+ * container (see createRoofParentNode). The mask is ignored for stairs
+ * (partial stairs keep the full quad); fully-dead stairs are skipped,
+ * schema failures fall back to skipped so they stay game-only.
+ *
+ * ROOFS (the 2×2 corner-height patch) map by shape — see createRoofNode:
+ * flat → 'slab' terrace, slope → the exact shed above, corner/valley/
+ * saddle → the closest single-plane shed, counted as approximated.
  *
  * HOST DEFAULTS ARE UNTRUSTED (p5r1 QA gate g): registry `defaults()` is
  * host code and CAN throw — the live editor's roof-segment definition
@@ -71,6 +76,8 @@ export type KeepResult = {
   /** Pocket/extra nodes actually created (not counted in `kept`). */
   windows: number
   doors: number
+  /** Stairs AND roof pieces kept as roof-segment/slab nodes (each also
+   * counts in `kept`) — the R-slot family shares one counter. */
   roofs: number
   /** Floor pieces kept as real 'slab' nodes (each also counts in `kept`). */
   floors: number
@@ -131,9 +138,9 @@ function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number)
   }
 }
 
-/** Best-effort roof piece → node(s). Legacy planks and slope corner
- * patterns map to a shed 'roof-segment' exactly as before; corner patterns
- * widen the family (pyramid grammar):
+/** Best-effort R-slot piece → node(s). Stairs (and legacy corner-less
+ * planks) map to a shed 'roof-segment' exactly as before; roof corner
+ * patterns widen the family (pyramid grammar):
  *   flat (0 or 4 high corners) → a 'slab' node at eave/ridge elevation
  *                                (a roof terrace) — exact.
  *   slope (2 adjacent high)    → shed rotated so it ascends toward the
@@ -273,7 +280,7 @@ export function keepPlaced(): KeepResult {
     return roofParent ?? levelId
   }
   for (const piece of placed) {
-    if (piece.piece === 'roof') {
+    if (piece.piece === 'stairs' || piece.piece === 'roof') {
       const made =
         (piece.mask & FULL_MASK) !== 0 ? createRoofNode(piece, levelId, shedParent) : null
       if (made?.ok) {

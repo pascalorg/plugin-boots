@@ -14,6 +14,7 @@ import {
   isOccupied,
   maskBit,
   PIECE_DIMS,
+  PIECE_KEYS,
   piecePose,
   planEditExitTransform,
   planWallMask,
@@ -61,7 +62,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * wired to piece-slots occupancy/support — the pose can never leave the
  * discrete slot set), the two flows (ceiling = floor one storey up, ramps
  * chain a storey per cell), R semantics (wall far-edge flip / floor no-op /
- * roof ascent cycle), the slot-keyed turbo cadence (press → 0.15 s, new
+ * stairs ascent cycle / roof preset-stable yaw), the slot-keyed turbo
+ * cadence (press → 0.15 s, new
  * slots ≥ 0.05 s, per-hold dedupe, died-slot lockout), identical-pose
  * occupancy (edit transforms), the 3×3 cell-mask math (cell picking, Keep's
  * mask → node planning with height trims + off-center pockets), the
@@ -111,7 +113,7 @@ describe('slot-locked ghost: the pose can never leave the discrete slot set', ()
   })
 
   test('any rig input resolves to a lattice pose (the ghost never floats)', () => {
-    const pieces: TargetInput['piece'][] = ['wall', 'floor', 'roof']
+    const pieces: TargetInput['piece'][] = ['wall', 'floor', 'stairs', 'roof']
     const positions: [number, number, number][] = [
       [1.5, 0, 1.5],
       [2.9, 0, 0.13],
@@ -171,18 +173,18 @@ describe('slot-locked ghost: the pose can never leave the discrete slot set', ()
   test('ramp chain: every cell you climb targets the next ramp a storey up', () => {
     // On the ground, facing +X: the first ramp fills the neighbor cell,
     // ascending away from the player (quarter 1 → pose yaw π/2).
-    const first = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'roof'), OPEN)
+    const first = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'stairs'), OPEN)
     expect(first.slotId).toBe('R:1,0,0')
     expect(first.pose.yaw).toBeCloseTo(Math.PI / 2)
     // Standing at the top of that ramp (feet one storey up, inside its
     // cell), still facing +X: the NEXT cell, one storey higher.
-    const second = resolveTargetSlot(rig(4.5, STOREY, 1.5, -Math.PI / 2, 0, 'roof'), OPEN)
+    const second = resolveTargetSlot(rig(4.5, STOREY, 1.5, -Math.PI / 2, 0, 'stairs'), OPEN)
     expect(second.slotId).toBe('R:2,0,1')
     expect(second.pose.position[1]).toBeCloseTo(STOREY)
     expect(second.pose.yaw).toBeCloseTo(Math.PI / 2)
   })
 
-  test('R semantics: wall far-edge flip parity, floor no-op, roof quarter', () => {
+  test('R semantics: wall flip parity, floor no-op, stairs quarter, roof preset-stable', () => {
     // Wall: rotState 1 flips to the far edge of the target cell.
     expect(resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'wall', 1), OPEN).slotId).toBe(
       'Wx:2,0,0',
@@ -195,10 +197,15 @@ describe('slot-locked ghost: the pose can never leave the discrete slot set', ()
     const f3 = resolveTargetSlot(rig(1.5, 0, 1.5, 0, 0, 'floor', 3), OPEN)
     expect(f3.slotId).toBe(f0.slotId)
     expect(f3.pose.yaw).toBe(f0.pose.yaw)
-    // Roof: each rotState adds a quarter to the ascent.
-    const r1 = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'roof', 1), OPEN)
+    // Stairs: each rotState adds a quarter to the ascent.
+    const r1 = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'stairs', 1), OPEN)
     expect(r1.slotId).toBe('R:1,0,0')
     expect(r1.pose.yaw).toBeCloseTo(Math.PI) // quarter 2: descent back at you
+    // Roof: rotState cycles the SHAPE preset builder-side; the grid keeps
+    // the yaw aimed by the facing.
+    const roof1 = resolveTargetSlot(rig(1.5, 0, 1.5, -Math.PI / 2, 0, 'roof', 1), OPEN)
+    expect(roof1.slotId).toBe('R:1,0,0')
+    expect(roof1.pose.yaw).toBeCloseTo(Math.PI / 2)
   })
 
   test('support flows through the registry: a floor a storey up needs a wall', () => {
@@ -220,14 +227,14 @@ describe('slot-locked ghost: the pose can never leave the discrete slot set', ()
 })
 
 describe('isOccupied: identical poses up to piece symmetry', () => {
-  test('walls match modulo π, roofs are direction-sensitive', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0), placed('roof', 6, 0, 0, 0)]
+  test('walls match modulo π, stairs are direction-sensitive', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0), placed('stairs', 6, 0, 0, 0)]
     expect(isOccupied(pieces, 'wall', 0, 0, 0, 0)).toBe(true)
     expect(isOccupied(pieces, 'wall', 0, 0, 0, Math.PI)).toBe(true) // same box
     expect(isOccupied(pieces, 'wall', 0, 2.8, 0, 0)).toBe(false) // stacked level is free
     expect(isOccupied(pieces, 'floor', 0, 0, 0, 0)).toBe(false) // other piece kind
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, Math.PI)).toBe(false) // reversed roof differs
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, -0.0)).toBe(true)
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, Math.PI)).toBe(false) // reversed ramp differs
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, -0.0)).toBe(true)
   })
 
   test('floors match modulo π/2 (square footprint)', () => {
@@ -266,17 +273,17 @@ describe('rotatedYaw: quarter-turn offset math', () => {
     expect(rotatedYaw(0, -3)).toBeCloseTo(rotatedYaw(0, 1))
   })
 
-  test('walls: two presses land on the same box (π symmetry); roofs: all 4 turns are distinct ascents', () => {
-    const pieces = [placed('wall', 0, 0, 0, 0), placed('roof', 6, 0, 0, 0)]
+  test('walls: two presses land on the same box (π symmetry); stairs: all 4 turns are distinct ascents', () => {
+    const pieces = [placed('wall', 0, 0, 0, 0), placed('stairs', 6, 0, 0, 0)]
     expect(isOccupied(pieces, 'wall', 0, 0, 0, rotatedYaw(0, 2))).toBe(true)
     expect(isOccupied(pieces, 'wall', 0, 0, 0, rotatedYaw(0, 1))).toBe(false)
-    // Roof yaw symmetry is 2π: R cycles the 4 ascent orientations, only a
+    // Stair yaw symmetry is 2π: R cycles the 4 ascent orientations, only a
     // full cycle returns to the occupied pose.
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 0))).toBe(true)
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 1))).toBe(false)
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 2))).toBe(false)
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 3))).toBe(false)
-    expect(isOccupied(pieces, 'roof', 6, 0, 0, rotatedYaw(0, 4))).toBe(true)
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, rotatedYaw(0, 0))).toBe(true)
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, rotatedYaw(0, 1))).toBe(false)
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, rotatedYaw(0, 2))).toBe(false)
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, rotatedYaw(0, 3))).toBe(false)
+    expect(isOccupied(pieces, 'stairs', 6, 0, 0, rotatedYaw(0, 4))).toBe(true)
   })
 
 })
@@ -297,7 +304,7 @@ describe('cell grid: bits, dims, centers', () => {
     expect(cellDims('wall')[1]).toBeCloseTo(2.8 / 3)
     expect(cellDims('wall')[2]).toBeCloseTo(0.12)
     expect(cellDims('floor')).toEqual([1, 0.12, 1])
-    expect(cellDims('roof')[2]).toBeCloseTo(4.1 / 3)
+    expect(cellDims('stairs')[2]).toBeCloseTo(4.1 / 3)
   })
 
   test('cell centers: wall row 0 is the bottom, floor row 0 is local −Z', () => {
@@ -335,13 +342,13 @@ describe('raycastPieceCell: crosshair → cell', () => {
     expect(hit!.bit).toBe(5)
   })
 
-  test('beyond maxDist misses; tilted roof rows follow the incline', () => {
+  test('beyond maxDist misses; tilted stair rows follow the incline', () => {
     const wall = placed('wall', 0, 0, 0, 0)
     expect(raycastPieceCell(wall, 0, 1.4, 5, 0, 0, -1, 3)).toBeNull()
-    // Roof at yaw 0: low edge at world z −1.5, rising to +1.5. A straight
+    // Stairs at yaw 0: low edge at world z −1.5, rising to +1.5. A straight
     // -down ray over the low third must land in row 0, center column.
-    const roof = placed('roof', 0, 0, 0, 0)
-    const hit = raycastPieceCell(roof, 0, 5, -1.04, 0, -1, 0, 10)
+    const stairs = placed('stairs', 0, 0, 0, 0)
+    const hit = raycastPieceCell(stairs, 0, 5, -1.04, 0, -1, 0, 10)
     expect(hit).not.toBeNull()
     expect(hit!.col).toBe(1)
     expect(hit!.row).toBe(0)
@@ -582,20 +589,20 @@ describe('wall mask constants', () => {
 })
 
 describe('wallExitTransform: exact-only stair classification', () => {
-  test('311 rises toward local +X → roof yaw = wall yaw + 90°', () => {
+  test('311 rises toward local +X → stairs yaw = wall yaw + 90°', () => {
     for (const wallYaw of [0, Math.PI / 2, -Math.PI / 2]) {
       const t = wallExitTransform(STAIR_UP_MASK, wallYaw)
       expect(t).not.toBeNull()
-      expect(t!.piece).toBe('roof')
+      expect(t!.piece).toBe('stairs')
       expect(t!.yaw).toBeCloseTo(rotatedYaw(wallYaw, 1))
     }
   })
 
-  test('95 rises toward local −X → roof yaw = wall yaw − 90°', () => {
+  test('95 rises toward local −X → stairs yaw = wall yaw − 90°', () => {
     for (const wallYaw of [0, Math.PI / 2, -Math.PI / 2]) {
       const t = wallExitTransform(STAIR_DOWN_MASK, wallYaw)
       expect(t).not.toBeNull()
-      expect(t!.piece).toBe('roof')
+      expect(t!.piece).toBe('stairs')
       expect(t!.yaw).toBeCloseTo(rotatedYaw(wallYaw, -1))
     }
   })
@@ -616,24 +623,24 @@ describe('planEditExitTransform: occupancy guard + piece gating', () => {
     const wall = placed('wall', 3, 0, 0, Math.PI / 2, STAIR_UP_MASK)
     const plan = planEditExitTransform(wall, [wall])
     expect(plan).not.toBeNull()
-    expect(plan!.piece).toBe('roof')
+    expect(plan!.piece).toBe('stairs')
     expect(plan!.yaw).toBeCloseTo(rotatedYaw(Math.PI / 2, 1))
   })
 
-  test('refused when an identical roof pose already exists among OTHERS', () => {
+  test('refused when an identical stairs pose already exists among OTHERS', () => {
     const wall = placed('wall', 0, 0, 0, 0, STAIR_UP_MASK)
     const targetYaw = rotatedYaw(0, 1)
-    const blocking = placed('roof', 0, 0, 0, targetYaw)
+    const blocking = placed('stairs', 0, 0, 0, targetYaw)
     expect(planEditExitTransform(wall, [wall, blocking])).toBeNull()
-    // A roof in a DIFFERENT ascent (2π symmetry) does not block.
-    const otherFacing = placed('roof', 0, 0, 0, rotatedYaw(0, 3))
+    // Stairs in a DIFFERENT ascent (2π symmetry) do not block.
+    const otherFacing = placed('stairs', 0, 0, 0, rotatedYaw(0, 3))
     expect(planEditExitTransform(wall, [wall, otherFacing])).not.toBeNull()
     // The wall itself never blocks its own transform.
     expect(planEditExitTransform(wall, [wall])).not.toBeNull()
   })
 
   test('only walls transform; carved non-stair masks never do', () => {
-    const roof = placed('roof', 0, 0, 0, 0, STAIR_UP_MASK)
+    const roof = placed('stairs', 0, 0, 0, 0, STAIR_UP_MASK)
     expect(planEditExitTransform(roof, [roof])).toBeNull()
     const floor = placed('floor', 0, 0, 0, 0, STAIR_DOWN_MASK)
     expect(planEditExitTransform(floor, [floor])).toBeNull()
@@ -650,13 +657,13 @@ describe('transformPlaced: in-place piece rebuild (store action)', () => {
     store.addPlaced({ piece: 'floor', position: [6, 0, 0], yaw: 0 })
     const before = useBoots.getState().placed
     const target = before[1]!
-    useBoots.getState().transformPlaced(target.id, 'roof', Math.PI / 2)
+    useBoots.getState().transformPlaced(target.id, 'stairs', Math.PI / 2)
     const after = useBoots.getState().placed
     expect(after.length).toBe(before.length)
     expect(after.map((p) => p.id)).toEqual(before.map((p) => p.id)) // order + ids kept
     const swapped = after[1]!
     expect(swapped.id).toBe(target.id)
-    expect(swapped.piece).toBe('roof')
+    expect(swapped.piece).toBe('stairs')
     expect(swapped.yaw).toBeCloseTo(Math.PI / 2)
     expect(swapped.mask).toBe(FULL_MASK)
     expect(swapped.position).toEqual([3, 0, 0])
@@ -664,6 +671,28 @@ describe('transformPlaced: in-place piece rebuild (store action)', () => {
     expect(after[0]).toBe(before[0]!)
     expect(after[2]).toBe(before[2]!)
     useBoots.getState().resolvePlaced()
+  })
+})
+
+// --- Piece family: the four-piece split + direct hotkeys ---------------------
+
+describe('piece family: stairs vs roof split', () => {
+  test('PIECE_KEYS is the classic PC row (Z/X/C/V), one bind per piece', () => {
+    expect(PIECE_KEYS).toEqual([
+      ['KeyZ', 'wall'],
+      ['KeyX', 'floor'],
+      ['KeyC', 'stairs'],
+      ['KeyV', 'roof'],
+    ])
+  })
+
+  test('stairs keep the plank pose (tilt); roof fallback pose is flat', () => {
+    const stairs = piecePose('stairs', 2.8)
+    expect(stairs.y).toBeCloseTo(2.8 + 1.4)
+    expect(stairs.tilt).toBeCloseTo(-Math.atan2(2.8, 3))
+    const roof = piecePose('roof', 2.8)
+    expect(roof.tilt).toBe(0)
+    expect(PIECE_DIMS.stairs).toEqual([3, 0.12, 4.1])
   })
 })
 

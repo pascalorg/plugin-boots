@@ -7,13 +7,15 @@
  *   walls  → cell EDGES:      Wx:i,k,s = plane x=CELL·i spanning z∈[3k,3k+3]
  *                             Wz:i,k,s = plane z=CELL·k spanning x∈[3i,3i+3]
  *   floors → cell FACES:      F:i,k,s  = the y=STOREY·s face of cell (i,k)
- *   roofs  → cell DIAGONALS:  R:i,k,s  = the cell volume, yaw picks ascent
+ *   stairs/roofs → cell TOPS: R:i,k,s  = the cell volume, yaw picks ascent
+ *                             (one R slot holds stairs OR a roof, never both)
  * A slot's POSE feeds builder.tsx unchanged: `position` is [x, baseY, z]
  * (baseY = STOREY·s; builder's piecePose derives the center height), `yaw`
  * rotates about Y exactly like PlacedPiece.yaw. Wall poses sit at the edge
  * midpoint; canonical wall yaw is 0 for Wz (length along X) and π/2 for Wx
- * (length along Z). Roof yaw = quarter·π/2, quarter counted from −Z
- * clockwise: 0 ascends toward −Z, 1 toward +X, 2 toward +Z, 3 toward −X.
+ * (length along Z). R-slot yaw = quarter·π/2; the quarter's HIGH side lands
+ * along: 0 → +Z, 1 → +X, 2 → −Z, 3 → −X (slotPose yaw carries local +Z,
+ * the plank's high edge / a roof preset's high side, onto (sin, cos)).
  *
  * Targeting (resolveTargetSlot) is player-anchored with a ray override:
  * default target = the neighbor of the player's cell along the yaw
@@ -35,7 +37,7 @@ const RAY_START = 0.4
 
 export type SlotKind = 'Wx' | 'Wz' | 'F' | 'R'
 export type Slot = { kind: SlotKind; i: number; k: number; s: number }
-export type BuildPieceKind = 'wall' | 'floor' | 'roof'
+export type BuildPieceKind = 'wall' | 'floor' | 'stairs' | 'roof'
 
 export type SlotPose = {
   /** [x, baseY, z] — PlacedPiece.position semantics (builder piecePose). */
@@ -105,18 +107,23 @@ export function yawCardinal(yaw: number): [number, number] {
   return Math.abs(fx) >= Math.abs(fz) ? [Math.sign(fx) || 1, 0] : [0, Math.sign(fz) || 1]
 }
 
-/** Roof ascent quarter for a cardinal: −Z→0, +X→1, +Z→2, −X→3. */
+/** Ascent quarter for a facing cardinal — the HIGH side lands ALONG it, so
+ * stairs/roofs always rise away from the player: +Z→0, +X→1, −Z→2, −X→3
+ * (see the header: slotPose yaw q·π/2 maps local +Z onto (sin, cos)). The
+ * pre-split code had the ±Z pair swapped, so Z-facing ramps rose back at
+ * the player; the four-cardinal grid test pins the fix. */
 function roofQuarter(d: [number, number]): number {
   if (d[0] === 1) return 1
   if (d[0] === -1) return 3
-  if (d[1] === 1) return 2
-  return 0
+  if (d[1] === 1) return 0
+  return 2
 }
 
 /**
  * DDA the eye ray over grid planes and return the first slot the PIECE kind
  * cares about: walls take the first VERTICAL plane crossed, floors the
- * first HORIZONTAL plane, roofs the first cell entered beyond the player's.
+ * first HORIZONTAL plane, stairs/roofs the first cell entered beyond the
+ * player's (both live on R slots).
  */
 function rayOverride(input: TargetInput): Slot | null {
   const [px, py, pz] = input.position
@@ -163,7 +170,7 @@ function rayOverride(input: TargetInput): Slot | null {
     if (input.piece === 'floor' && c.axis === 'y') {
       return { kind: 'F', i: cellOf(x), k: cellOf(z), s: Math.max(0, c.plane) }
     }
-    if (input.piece === 'roof' && c.axis !== 'y') {
+    if ((input.piece === 'stairs' || input.piece === 'roof') && c.axis !== 'y') {
       const i = c.axis === 'x' ? (dx > 0 ? c.plane : c.plane - 1) : cellOf(x)
       const k = c.axis === 'z' ? (dz > 0 ? c.plane : c.plane - 1) : cellOf(z)
       if (i !== startCellI || k !== startCellK) {
@@ -190,7 +197,7 @@ function defaultSlot(input: TargetInput): Slot {
     // Looking down builds under your feet; otherwise the neighbor cell.
     return down ? { kind: 'F', i, k, s } : { kind: 'F', i: i + d[0], k: k + d[1], s }
   }
-  if (input.piece === 'roof') {
+  if (input.piece === 'stairs' || input.piece === 'roof') {
     return { kind: 'R', i: i + d[0], k: k + d[1], s }
   }
   // Wall: the NEAR shared edge between P and N. The R far-edge flip is
@@ -221,8 +228,15 @@ export function resolveTargetSlot(input: TargetInput, world: WorldProbe): Target
   const fallback = flip(defaultSlot(input))
   if (!override || slotId(candidates[0]!) !== slotId(fallback)) candidates.push(fallback)
 
+  // Stairs: R adds ascent quarter-turns on top of the facing. Roof: R
+  // cycles SHAPE presets instead (builder-side), so the yaw stays aimed
+  // by the facing alone — the preset's high side always rises away.
   const quarter =
-    input.piece === 'roof' ? roofQuarter(yawCardinal(input.yaw)) + input.rotState : 0
+    input.piece === 'stairs'
+      ? roofQuarter(d) + input.rotState
+      : input.piece === 'roof'
+        ? roofQuarter(d)
+        : 0
 
   let firstFailing: TargetResult | null = null
   for (const slot of candidates) {

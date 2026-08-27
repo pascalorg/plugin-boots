@@ -36,7 +36,7 @@ describe('addPlaced: slotId passthrough + return value', () => {
     const a = useBoots.getState().addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
     const b = useBoots
       .getState()
-      .addPlaced({ piece: 'roof', position: [1.5, 0, 1.5], yaw: 0, slotId: 'R:0,0,0' })
+      .addPlaced({ piece: 'stairs', position: [1.5, 0, 1.5], yaw: 0, slotId: 'R:0,0,0' })
     expect(b.id).toBeGreaterThan(a.id)
   })
 })
@@ -86,9 +86,9 @@ describe('slotId survives every piece-mutating action', () => {
     const a = useBoots
       .getState()
       .addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0, slotId: 'Wz:0,0,0' })
-    useBoots.getState().transformPlaced(a.id, 'roof', Math.PI / 2)
+    useBoots.getState().transformPlaced(a.id, 'stairs', Math.PI / 2)
     const after = useBoots.getState().placed[0]!
-    expect(after.piece).toBe('roof')
+    expect(after.piece).toBe('stairs')
     expect(after.mask).toBe(FULL_MASK)
     expect(after.slotId).toBe('Wz:0,0,0')
   })

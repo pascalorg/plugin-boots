@@ -1,7 +1,11 @@
 import { create } from 'zustand'
 
 export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'minigun' | 'hammer' | 'builder' | 'paint'
-export type BuildPiece = 'wall' | 'floor' | 'roof'
+/** The four fort-builder pieces. 'stairs' is the walkable tilted plank on
+ * R slots (the piece the pre-split code called 'roof'); 'roof' is the 2×2
+ * corner-height patch (roof-corners.ts) sharing the same R slots — a slot
+ * holds one or the other, never both. */
+export type BuildPiece = 'wall' | 'floor' | 'stairs' | 'roof'
 
 /** All nine cells of a piece's 3×3 grid alive (see PlacedPiece.mask). */
 export const FULL_MASK = 0b111111111
@@ -29,9 +33,9 @@ export type PlacedPiece = {
    * counted for occupancy); everything else about them keeps working. */
   slotId?: string
   /** Roof 2×2 corner heights (roof-corners.ts) — pyramid grammar. Set on
-   * every R-slot roof placement (defaults to the classic slope); ABSENT on
-   * fold-transformed ramps (they keep the tilted-plank render and their
-   * wall slot's structural role — see transformPlaced) and legacy roofs. */
+   * every roof placement (the ghost's R-cycled shape preset); ABSENT on
+   * stairs (the tilted plank, including stair-mask wall folds — see
+   * transformPlaced) and legacy pieces. */
   corners?: [number, number, number, number]
 }
 
@@ -75,7 +79,7 @@ type BootsState = {
    * roofs). Same piece-object-swap contract as setPlacedMask. */
   setPlacedCorners: (id: number, corners: [number, number, number, number]) => void
   /** Rebuild one placed piece AS another piece type (edit-exit transform,
-   * e.g. a stair-silhouette wall mask folding into a ramp). Position, id
+   * e.g. a stair-silhouette wall mask folding into 'stairs'). Position, id
    * and list order are preserved; the mask resets to FULL_MASK and any
    * roof corners are dropped (folded ramps render as the classic tilted
    * plank). The piece object is swapped, so its mesh + collider + voxel

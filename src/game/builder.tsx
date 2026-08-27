@@ -9,6 +9,7 @@ import { sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
 import { spawnDebris } from './debris'
 import { dropTarget, ensureVoxelTarget, useDestruction } from './destruction'
+import { CornerEditOverlay, EditOverlay } from './edit-overlay'
 import {
   CELL,
   parseSlotId,
@@ -31,9 +32,8 @@ import {
 } from './piece-slots'
 import { playerRig } from './player'
 import {
-  CORNER_RISE,
-  CORNER_XZ,
   cornerRoofGeometry,
+  presetCorners,
   raycastRoofCorner,
   type RoofCorners,
   SLOPE_CORNERS,
@@ -44,11 +44,14 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
  * Build mode, grid-locked grammar (BUILD-GRAMMAR-V2 + REVIEW): wall / floor
- * / roof (Q cycles), the ghost ONLY ever occupies discrete world-grid slots
- * — it snaps, never floats. Placements are game-only state — the panel's
- * Keep converts walls (and, best-effort, roofs) into real scene nodes
- * afterwards, Discard forgets everything. Z undoes (piece + collider + any
- * voxel replica + support cascade) — G is the grenade now.
+ * / stairs / roof (direct hotkeys Z/X/C/V while the builder is held, Q
+ * still cycles), the ghost ONLY ever occupies discrete world-grid slots —
+ * it snaps, never floats. 'stairs' is the walkable tilted plank; 'roof' is
+ * the 2×2 corner-height patch (both live on R slots — one per slot).
+ * Placements are game-only state — the panel's Keep converts them into real
+ * scene nodes afterwards, Discard forgets everything. U undoes (piece +
+ * collider + any voxel replica + support cascade) — Z selects the wall now,
+ * G is the grenade.
  *
  * ── GRID-LOCKED TARGETING (phase 5) ───────────────────────────────────────
  * Every frame the builder feeds grid.resolveTargetSlot the player rig
@@ -63,8 +66,9 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *
  * R (edge) bumps rotState (0..3), grid semantics: wall = far-edge flip of
  * the target cell (parity — beats the ray), floor = no-op (key ignored),
- * roof = ascent quarter-turn cycle. Persists across placements; resets on
- * piece-TYPE switch only (REVIEW contract).
+ * stairs = ascent quarter-turn cycle, roof = SHAPE-preset cycle (slope →
+ * corner-tip → valley → flat cap; yaw stays aimed by the facing). Persists
+ * across placements; resets on piece-TYPE switch only (REVIEW contract).
  *
  * TURBO hold-to-place: the press edge stamps immediately and arms
  * TURBO_FIRST (0.15 s); while held, every NEW target slot stamps at
@@ -72,7 +76,7 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * (dedupe Set, cleared on release) and never into a slot whose piece died
  * < 0.15 s ago (piece-slots.isDeathLocked, stamped by onPieceRemoved).
  *
- * Undo (Z) and the support cascade share ONE removal path:
+ * Undo (U) and the support cascade share ONE removal path:
  * piece-slots.onPieceRemoved(slotId) → orphaned component collapses in BFS
  * rings (~50 ms apart) → the onCollapse listener (wired in PlacedPieces)
  * removes each piece from the store, so its unmount runs the exact undo
@@ -98,8 +102,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *
  * ── 3×3 CELL MASK (phase 3) ───────────────────────────────────────────────
  * Every placed piece renders as a 3×3 grid of cell boxes honoring its
- * 9-bit `mask` (bit = col + row·3; wall cells 1 × 0.93 × 0.12, floor/roof
- * cells split the plane 3×3). The RENDERED mesh is ONE merged-box geometry
+ * 9-bit `mask` (bit = col + row·3; wall cells 1 × 0.93 × 0.12, floor/stairs
+ * cells split the plane 3×3; corner-roof patches ignore it). The RENDERED mesh is ONE merged-box geometry
  * per (piece, mask) — cached module-wide — and doubles as the piece's
  * collider: on any mask change the piece object is swapped in the store,
  * so the mesh remounts its collider entry (fresh BVH via bvhFor) and any
@@ -125,7 +129,8 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *   turboStamp(cooldownLeft, freshPress, valid, attempted, locked)   pure
  *       slot-locked hold-to-place decision → cooldown to arm, or null.
  *   isOccupied(placed, piece, x, y, z, yaw)   identical-pose test, yaw
- *       compared modulo the piece's symmetry (wall π, floor π/2, roof 2π).
+ *       compared modulo the piece's symmetry (wall π, floor π/2,
+ *       stairs/roof 2π).
  *       Edit-exit transforms still guard on it; SLOT occupancy is
  *       piece-slots.ts's job now.
  *   rotatedYaw(autoYaw, quarterTurns)   pure R-rotate math: auto-facing yaw
@@ -145,18 +150,21 @@ const WALL_H = 2.8
 export const TURBO_FIRST = 0.15
 export const TURBO_NEXT = 0.05
 
+/** Roof dims are the FALLBACK box only (legacy corner-less pieces): placed
+ * roofs render/collide as the bilinear patch (roof-corners.ts). */
 export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   wall: [3, WALL_H, 0.12],
   floor: [3, 0.12, 3],
-  roof: [3, 0.12, 4.1],
+  stairs: [3, 0.12, 4.1],
+  roof: [3, 0.12, 3],
 }
 
-const ROOF_TILT = -Math.atan2(WALL_H, 3)
+const STAIR_TILT = -Math.atan2(WALL_H, 3)
 
 export function piecePose(piece: BuildPiece, baseY: number): { y: number; tilt: number } {
   if (piece === 'wall') return { y: baseY + WALL_H / 2, tilt: 0 }
-  if (piece === 'floor') return { y: baseY + 0.06, tilt: 0 }
-  return { y: baseY + WALL_H / 2, tilt: ROOF_TILT }
+  if (piece === 'stairs') return { y: baseY + WALL_H / 2, tilt: STAIR_TILT }
+  return { y: baseY + 0.06, tilt: 0 }
 }
 
 // --- 3×3 cell grid ----------------------------------------------------------
@@ -170,7 +178,7 @@ export function maskBit(col: number, row: number): number {
 }
 
 /** One cell's box dims in the piece's local frame: walls split width ×
- * height (full thickness), floors/roofs split their plane (full slab). */
+ * height (full thickness), floors/stairs split their plane (full slab). */
 export function cellDims(piece: BuildPiece): [number, number, number] {
   const [w, h, d] = PIECE_DIMS[piece]
   if (piece === 'wall') return [w / CELLS, h / CELLS, d]
@@ -178,8 +186,8 @@ export function cellDims(piece: BuildPiece): [number, number, number] {
 }
 
 /** Local-frame center of grid cell (col, row). Col 0 sits at local −X;
- * wall row 0 is the BOTTOM row, floor/roof row 0 is the local −Z edge
- * (a roof's LOW edge given ROOF_TILT). */
+ * wall row 0 is the BOTTOM row, floor/stairs row 0 is the local −Z edge
+ * (the stairs' LOW edge given STAIR_TILT). */
 export function cellCenter(piece: BuildPiece, col: number, row: number): [number, number, number] {
   const [w, h, d] = PIECE_DIMS[piece]
   const x = -w / 2 + (col + 0.5) * (w / CELLS)
@@ -230,10 +238,12 @@ function geometryForMask(piece: BuildPiece, mask: number): BufferGeometry | null
 // --- Pose equality --------------------------------------------------------
 
 const TWO_PI = Math.PI * 2
-/** Yaw period under which the piece's box is self-identical. */
+/** Yaw period under which the piece's box is self-identical (roof patches
+ * carry direction in their corner pattern, so they compare like stairs). */
 const YAW_SYMMETRY: Record<BuildPiece, number> = {
   wall: Math.PI,
   floor: Math.PI / 2,
+  stairs: TWO_PI,
   roof: TWO_PI,
 }
 
@@ -337,7 +347,7 @@ export function raycastPieceCell(
   tx = ldx * cy - ldz * sy
   ldz = ldx * sy + ldz * cy
   ldx = tx
-  if (piece.piece === 'roof') {
+  if (pose.tilt !== 0) {
     // Rx(−tilt): y' = y·cos + z·sin, z' = −y·sin + z·cos.
     const ct = Math.cos(pose.tilt)
     const st = Math.sin(pose.tilt)
@@ -535,17 +545,17 @@ export type EditTransform = { piece: BuildPiece; yaw: number }
 
 /**
  * Exit-time wall-mask classification: an EXACT staircase silhouette
- * rebuilds the wall as the inclined roof piece rising WALL_H along the
- * wall's own run ("the wall folds down into a ramp"). The roof ascends
- * along its local +Z while wall columns run along local +X, so the tall
+ * rebuilds the wall as the inclined stairs piece rising WALL_H along the
+ * wall's own run ("the wall folds down into a ramp"). The stairs ascend
+ * along their local +Z while wall columns run along local +X, so the tall
  * end at +X (311) needs yaw + π/2 and the tall end at −X (95) needs
  * yaw − π/2. Anything else — including near-misses — stays a free-form
  * carved mask and returns null.
  */
 export function wallExitTransform(mask: number, wallYaw: number): EditTransform | null {
   const m = mask & FULL_MASK
-  if (m === STAIR_UP_MASK) return { piece: 'roof', yaw: rotatedYaw(wallYaw, 1) }
-  if (m === STAIR_DOWN_MASK) return { piece: 'roof', yaw: rotatedYaw(wallYaw, -1) }
+  if (m === STAIR_UP_MASK) return { piece: 'stairs', yaw: rotatedYaw(wallYaw, 1) }
+  if (m === STAIR_DOWN_MASK) return { piece: 'stairs', yaw: rotatedYaw(wallYaw, -1) }
   return null
 }
 
@@ -579,6 +589,9 @@ type GhostState = {
   z: number
   yaw: number
   piece: BuildPiece
+  /** Roof only: the R-cycled shape preset's corner pattern (the ghost
+   * previews the patch the click will place). Null for other pieces. */
+  corners: RoofCorners | null
   valid: boolean
   reason: TargetResult['reason']
   /** Legacy mirror for older E2E scripts: reason === 'occupied'. */
@@ -593,6 +606,7 @@ const _debugGhost: GhostState = {
   z: 0,
   yaw: 0,
   piece: 'wall',
+  corners: null,
   valid: false,
   reason: 'unsupported',
   occupied: false,
@@ -646,7 +660,8 @@ const PROBE_MARGIN = 0.35
 const _probeBox = new Box3()
 
 /** AABB of the piece volume a slot holds (walls are planes, floors faces,
- * roofs the whole cell) — the box scene geometry must touch to prop it. */
+ * R slots — stairs/roofs — the whole cell) — the box scene geometry must
+ * touch to prop it. */
 function setSlotBox(slot: Slot, box: Box3): void {
   const x0 = slot.i * CELL
   const z0 = slot.k * CELL
@@ -873,7 +888,7 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
       geometry={geometry}
       position={[piece.position[0], cornered ? piece.position[1] : pose.y, piece.position[2]]}
       ref={meshRef}
-      rotation={[piece.piece === 'roof' && !cornered ? pose.tilt : 0, piece.yaw, 0, 'YXZ']}
+      rotation={[cornered ? 0 : pose.tilt, piece.yaw, 0, 'YXZ']}
     >
       <meshStandardMaterial color="#9aa8b5" roughness={0.7} metalness={0.15} />
     </mesh>
@@ -931,10 +946,18 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
   )
 }
 
+/** Direct piece hotkeys while the builder is held — the classic PC row:
+ * Z wall · X floor · C stairs · V roof (Q still cycles for one-handed
+ * play; undo lives on U). Every code needs an input.ts GAME_KEYS entry. */
+export const PIECE_KEYS: ReadonlyArray<readonly [string, BuildPiece]> = [
+  ['KeyZ', 'wall'],
+  ['KeyX', 'floor'],
+  ['KeyC', 'stairs'],
+  ['KeyV', 'roof'],
+]
+
 /** Max distance for entering/holding F edit mode on a placed piece. */
 const EDIT_RANGE = 6
-/** Stable bit list for the edit overlay's cells (no per-render allocs). */
-const EDIT_CELL_BITS = [0, 1, 2, 3, 4, 5, 6, 7, 8] as const
 
 type EditState = {
   /** PlacedPiece id under edit. */
@@ -1006,15 +1029,20 @@ export function Builder() {
   const prevUndo = useRef(false)
   const prevEditKey = useRef(false)
   const prevRotate = useRef(false)
-  /** R rotState (0..3) — grid semantics: wall far-edge flip (parity), roof
-   * ascent quarter. Persists across placements and holsters; resets on
-   * piece-TYPE switch ONLY (REVIEW contract). */
+  /** Edge trackers for the Z/X/C/V piece hotkeys (keyed by code). */
+  const prevPieceKeys = useRef<Record<string, boolean>>({})
+  /** R rotState (0..3) — grid semantics: wall far-edge flip (parity),
+   * stairs ascent quarter, roof shape preset. Persists across placements
+   * and holsters; resets on piece-TYPE switch ONLY (REVIEW contract). */
   const rotateTurns = useRef(0)
   const rotatePiece = useRef<BuildPiece>('wall')
   const placeCooldown = useRef(0)
   /** Slots already stamped during the CURRENT hold — one attempt per slot
    * per hold (turbo dedupe); cleared on release. */
   const holdAttempted = useRef<Set<string>>(new Set())
+  /** Cells already toggled during the CURRENT edit-mode fire hold — swipe
+   * carving toggles each NEW cell the crosshair enters, once per hold. */
+  const editSwiped = useRef<Set<number>>(new Set())
 
   const weapon = useBoots((s) => s.weapon)
   const buildPiece = useBoots((s) => s.buildPiece)
@@ -1069,6 +1097,10 @@ export function Builder() {
       prevAltFire.current = session.input.state.altFiring
       prevEditKey.current = session.input.state.keys.has('KeyF')
       prevRotate.current = session.input.state.keys.has('KeyR')
+      prevUndo.current = session.input.state.keys.has('KeyU')
+      for (const [code] of PIECE_KEYS) {
+        prevPieceKeys.current[code] = session.input.state.keys.has(code)
+      }
       return
     }
 
@@ -1078,6 +1110,20 @@ export function Builder() {
     const editKey = session.input.state.keys.has('KeyF')
     const editKeyEdge = editKey && !prevEditKey.current
     prevEditKey.current = editKey
+
+    // Direct piece hotkeys (Z/X/C/V — PIECE_KEYS): fresh edges only, inert
+    // while an F edit is open (same gate as Q cycling), trackers kept warm
+    // so holding a key across an edit never edge-switches on exit.
+    for (const [code, pieceForKey] of PIECE_KEYS) {
+      const down = session.input.state.keys.has(code)
+      if (down && !prevPieceKeys.current[code] && !edit) {
+        if (useBoots.getState().buildPiece !== pieceForKey) {
+          useBoots.getState().setBuildPiece(pieceForKey)
+          sfx.weaponSwitch()
+        }
+      }
+      prevPieceKeys.current[code] = down
+    }
 
     // Aim ray (same convention as shooting.ts): eye origin, yaw/pitch dir.
     const cp = Math.cos(playerRig.pitch)
@@ -1093,11 +1139,11 @@ export function Builder() {
       builderDebug.isEditing = true
       if (ghost) setGhost(null)
       session.hud.ghostStatus?.(null, 'builder') // no ghost while editing cells
-      // Z undo is paused while editing, but keep its edge tracker warm so
-      // holding Z across the exit never fires a stale undo. R's rotState
+      // U undo is paused while editing, but keep its edge tracker warm so
+      // holding U across the exit never fires a stale undo. R's rotState
       // survives an edit (REVIEW: it resets on piece-type switch ONLY);
       // keep its edge tracker warm too.
-      prevUndo.current = session.input.state.keys.has('KeyZ')
+      prevUndo.current = session.input.state.keys.has('KeyU')
       prevRotate.current = session.input.state.keys.has('KeyR')
       const altFiringNow = session.input.state.altFiring
       const piece = useBoots.getState().placed.find((p) => p.id === edit.id)
@@ -1138,9 +1184,18 @@ export function Builder() {
         }
         return
       }
-      if (firingNow && !prevFire.current && !staggered) {
-        useBoots.getState().setPlacedMask(piece.id, piece.mask ^ (1 << hit.bit))
-        sfx.place()
+      // SWIPE CARVE: the press toggles the aimed cell; while the hold lasts,
+      // each NEW cell the crosshair enters toggles once (per-hold dedupe,
+      // cleared on release — matches holdAttempted's per-hold contract).
+      if (firingNow && !staggered) {
+        if (!prevFire.current) editSwiped.current.clear()
+        if (!editSwiped.current.has(hit.bit)) {
+          editSwiped.current.add(hit.bit)
+          useBoots.getState().setPlacedMask(piece.id, piece.mask ^ (1 << hit.bit))
+          sfx.place()
+        }
+      } else if (!firingNow && editSwiped.current.size > 0) {
+        editSwiped.current.clear()
       }
       // RMB resets the edit — the piece snaps back to intact (511). ADS is
       // pistol/rifle-only, so the builder owns RMB freely.
@@ -1191,10 +1246,12 @@ export function Builder() {
     }
 
     // R ROTATE (grid semantics): wall = far-edge flip of the target cell
-    // (parity — beats the ray), roof = ascent quarter-turn cycle, floor =
-    // no-op (the key is ignored, no detent). rotState persists across
-    // placements; it resets when the piece TYPE changes only (a wall's
-    // flip shouldn't secretly re-aim your next roof).
+    // (parity — beats the ray), stairs = ascent quarter-turn cycle, roof =
+    // SHAPE-preset cycle (slope → corner-tip → valley → flat cap; the yaw
+    // stays aimed by the facing), floor = no-op (the key is ignored, no
+    // detent). rotState persists across placements; it resets when the
+    // piece TYPE changes only (a wall's flip shouldn't secretly re-aim
+    // your next stairs).
     if (buildPiece !== rotatePiece.current) {
       rotatePiece.current = buildPiece
       rotateTurns.current = 0
@@ -1220,6 +1277,9 @@ export function Builder() {
     const target = resolveTargetSlot(_targetInput, slotWorldProbe)
     const pose = target.pose
     const occupied = target.reason === 'occupied'
+    // Roof ghost previews the R-cycled shape preset (the exact patch the
+    // click will place); other pieces carry no corner pattern.
+    const ghostCorners = buildPiece === 'roof' ? presetCorners(rotateTurns.current) : null
 
     if (
       !ghost ||
@@ -1227,7 +1287,8 @@ export function Builder() {
       ghost.piece !== buildPiece ||
       ghost.yaw !== pose.yaw ||
       ghost.valid !== target.valid ||
-      ghost.reason !== target.reason
+      ghost.reason !== target.reason ||
+      (ghost.corners?.join('') ?? '') !== (ghostCorners?.join('') ?? '')
     ) {
       setGhost({
         slotId: target.slotId,
@@ -1236,6 +1297,7 @@ export function Builder() {
         z: pose.position[2],
         yaw: pose.yaw,
         piece: buildPiece,
+        corners: ghostCorners,
         valid: target.valid,
         reason: target.reason,
         occupied,
@@ -1247,6 +1309,7 @@ export function Builder() {
     _debugGhost.z = pose.position[2]
     _debugGhost.yaw = pose.yaw
     _debugGhost.piece = buildPiece
+    _debugGhost.corners = ghostCorners
     _debugGhost.valid = target.valid
     _debugGhost.reason = target.reason
     _debugGhost.occupied = occupied
@@ -1281,9 +1344,10 @@ export function Builder() {
           position: [pose.position[0], pose.position[1], pose.position[2]],
           yaw: pose.yaw,
           slotId: target.slotId,
-          // Pyramid grammar: every R-slot roof starts as the classic slope;
-          // F-edit toggles corners afterwards (2×2 corner heights).
-          ...(buildPiece === 'roof' ? { corners: SLOPE_CORNERS } : {}),
+          // Pyramid grammar: a roof lands AS its previewed shape preset;
+          // F-edit toggles corners afterwards (2×2 corner heights). Fresh
+          // array — the placed piece owns its pattern.
+          ...(ghostCorners ? { corners: [...ghostCorners] as RoofCorners } : {}),
         })
         if (registerPlacement(target.slotId, stored.id)) {
           holdAttempted.current.add(target.slotId)
@@ -1300,11 +1364,11 @@ export function Builder() {
     prevFire.current = firing
     prevAltFire.current = session.input.state.altFiring
 
-    // UNDO on KeyZ (G is the grenade everywhere now). onPieceRemoved is the
+    // UNDO on KeyU (Z selects the wall piece now). onPieceRemoved is the
     // ONE removal entry point: it stamps the died-slot lockout and cascades
     // anything the removal orphaned (the collapse listener in PlacedPieces
     // evicts those pieces through the same store path).
-    const undoDown = session.input.state.keys.has('KeyZ')
+    const undoDown = session.input.state.keys.has('KeyU')
     if (undoDown && !prevUndo.current) {
       const removed = useBoots.getState().removeLastPlaced()
       if (removed) {
@@ -1317,67 +1381,62 @@ export function Builder() {
 
   if (!active) return null
 
-  // Corner-roof edit overlay: one marker per corner AT its current height —
-  // hovered corner hot, raised corners cool blue, dropped corners faint red.
+  // Corner-roof edit overlay (edit-overlay.tsx): hovered hot + pulsing,
+  // raised corners cool blue, dropped corners faint red wire.
   if (edit && edit.corners) {
     return (
-      <group
-        position={[edit.x, edit.y, edit.z]}
-        rotation={[0, edit.yaw, 0]}
-        userData={{ __boots: true }}
-      >
-        {edit.corners.map((height, index) => {
-          const [cx, cz] = CORNER_XZ[index]!
-          const hovered = edit.hover === index
-          return (
-            // biome-ignore lint/suspicious/noArrayIndexKey: corners are positional
-            <mesh key={index} position={[cx, height * CORNER_RISE + 0.35, cz]}>
-              <boxGeometry args={[0.5, 0.5, 0.5]} />
-              <meshBasicMaterial
-                color={hovered ? '#ffd34d' : height ? '#59a7ff' : '#ff5a4d'}
-                depthWrite={false}
-                opacity={hovered ? 0.65 : 0.35}
-                transparent
-              />
-            </mesh>
-          )
-        })}
-      </group>
+      <CornerEditOverlay
+        corners={edit.corners}
+        hover={edit.hover}
+        x={edit.x}
+        y={edit.y}
+        z={edit.z}
+        yaw={edit.yaw}
+      />
     )
   }
 
-  // Edit-mode overlay: a 3×3 ghost grid over the piece — hovered cell hot,
-  // live cells cool blue, dead cells faint red (click resurrects them).
+  // Cell-edit overlay (edit-overlay.tsx): outlined 3×3 lattice floating off
+  // both piece faces — live blue, dead outline-only, hovered pulsing.
   if (edit) {
     const pose = piecePose(edit.piece, edit.y)
-    const dims = cellDims(edit.piece)
     return (
-      <group
-        position={[edit.x, pose.y, edit.z]}
-        rotation={[edit.piece === 'roof' ? pose.tilt : 0, edit.yaw, 0, 'YXZ']}
-        userData={{ __boots: true }}
-      >
-        {EDIT_CELL_BITS.map((bit) => {
-          const center = cellCenter(edit.piece, bit % CELLS, Math.floor(bit / CELLS))
-          const hovered = edit.hover === bit
-          const alive = (edit.mask & (1 << bit)) !== 0
-          return (
-            <mesh key={bit} position={center}>
-              <boxGeometry args={[dims[0] * 1.03, dims[1] * 1.03, dims[2] * 1.03]} />
-              <meshBasicMaterial
-                color={hovered ? '#ffd34d' : alive ? '#59a7ff' : '#ff5a4d'}
-                depthWrite={false}
-                opacity={hovered ? 0.55 : alive ? 0.18 : 0.3}
-                transparent
-              />
-            </mesh>
-          )
-        })}
-      </group>
+      <EditOverlay
+        piece={edit.piece}
+        mask={edit.mask}
+        hover={edit.hover}
+        x={edit.x}
+        y={pose.y}
+        z={edit.z}
+        yaw={edit.yaw}
+        tilt={pose.tilt}
+      />
     )
   }
 
   if (!ghost) return null
+  // Roof ghost IS the shape preset's bilinear patch (base-y position, no
+  // plank tilt — the placed-mesh convention for cornered roofs). Uniform
+  // 1.03 scale mirrors the box ghost's coplanar z-fight inflation.
+  if (ghost.piece === 'roof') {
+    return (
+      <group ref={ghostRef} userData={{ __boots: true }}>
+        <mesh
+          geometry={cornerRoofGeometry(ghost.corners ?? SLOPE_CORNERS)}
+          position={[ghost.x, ghost.y, ghost.z]}
+          rotation={[0, ghost.yaw, 0]}
+          scale={1.03}
+        >
+          <meshBasicMaterial
+            color={ghost.valid ? '#59a7ff' : '#ff5a4d'}
+            depthWrite={false}
+            opacity={0.38}
+            transparent
+          />
+        </mesh>
+      </group>
+    )
+  }
   const pose = piecePose(ghost.piece, ghost.y)
   // Inflated 1.03 like the edit overlay above: a ghost hovering over an
   // already-placed piece would otherwise sit exactly coplanar with its
@@ -1387,7 +1446,7 @@ export function Builder() {
     <group ref={ghostRef} userData={{ __boots: true }}>
       <mesh
         position={[ghost.x, pose.y, ghost.z]}
-        rotation={[ghost.piece === 'roof' ? pose.tilt : 0, ghost.yaw, 0, 'YXZ']}
+        rotation={[pose.tilt, ghost.yaw, 0, 'YXZ']}
       >
         <boxGeometry args={[ghostDims[0] * 1.03, ghostDims[1] * 1.03, ghostDims[2] * 1.03]} />
         <meshBasicMaterial

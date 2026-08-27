@@ -49,7 +49,7 @@ describe('slotPose', () => {
     expect(pose.position).toEqual([1.5, 2 * STOREY, 1.5])
   })
 
-  test('roof yaw follows the quarter', () => {
+  test('R-slot yaw follows the quarter', () => {
     for (const q of [0, 1, 2, 3]) {
       expect(slotPose({ kind: 'R', i: 0, k: 0, s: 0 }, q).yaw).toBeCloseTo((q * Math.PI) / 2)
     }
@@ -105,13 +105,69 @@ describe('resolveTargetSlot — defaults', () => {
     expect(under.slotId).toBe('F:0,0,1')
   })
 
-  test('roof targets the facing cell with ascent from the player side', () => {
+  test('stairs target the facing cell with ascent from the player side', () => {
     const result = resolveTargetSlot(
-      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'roof', rotState: 0 },
+      { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'stairs', rotState: 0 },
       OPEN,
     )
     expect(result.slotId).toBe('R:1,0,0')
     expect(result.pose.yaw).toBeCloseTo(Math.PI / 2) // quarter 1 = ascend +X
+  })
+
+  test('stairs ascend AWAY on all four cardinals (the ±Z quarter fix)', () => {
+    // slotPose yaw q·π/2 carries the plank's high edge (local +Z) onto
+    // (sin yaw, cos yaw) — so the quarter must aim the high side ALONG the
+    // facing cardinal. The pre-split mapping had ±Z swapped: Z-facing ramps
+    // rose back at the player.
+    const cases: Array<[number, number]> = [
+      [0, Math.PI], // facing −Z → high side −Z → quarter 2
+      [Math.PI, 0], // facing +Z → high side +Z → quarter 0
+      [-Math.PI / 2, Math.PI / 2], // facing +X → quarter 1
+      [Math.PI / 2, (3 * Math.PI) / 2], // facing −X → quarter 3
+    ]
+    for (const [yaw, wantYaw] of cases) {
+      const result = resolveTargetSlot(
+        { position: [1.5, 0, 1.5], yaw, pitch: 0, piece: 'stairs', rotState: 0 },
+        OPEN,
+      )
+      const d = yawCardinal(yaw)
+      expect(result.slotId).toBe(`R:${d[0]},${d[1]},0`)
+      expect(Math.sin(result.pose.yaw)).toBeCloseTo(Math.sin(wantYaw))
+      expect(Math.cos(result.pose.yaw)).toBeCloseTo(Math.cos(wantYaw))
+      // High-edge direction (sin, cos) equals the facing cardinal.
+      expect(Math.round(Math.sin(result.pose.yaw))).toBeCloseTo(d[0])
+      expect(Math.round(Math.cos(result.pose.yaw))).toBeCloseTo(d[1])
+    }
+  })
+
+  test('roof shares R slots; R presses never change its facing-aimed yaw', () => {
+    for (const rotState of [0, 1, 2, 3]) {
+      const result = resolveTargetSlot(
+        { position: [1.5, 0, 1.5], yaw: -Math.PI / 2, pitch: 0, piece: 'roof', rotState },
+        OPEN,
+      )
+      expect(result.slotId).toBe('R:1,0,0')
+      expect(result.pose.yaw).toBeCloseTo(Math.PI / 2) // aimed by facing alone
+    }
+  })
+
+  test('ceiling flow, pure: feet at 0 aiming up resolves an F slot at s=1', () => {
+    // Steep pitch: the ray's first horizontal crossing stays in the own
+    // cell → its top face. Shallow (just past the band): the crossing walks
+    // into the neighbor — still an F slot one storey up, never s=0.
+    const steep = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: Math.PI, pitch: 1.2, piece: 'floor', rotState: 0 },
+      OPEN,
+    )
+    expect(steep.slotId).toBe('F:0,0,1')
+    expect(steep.pose.position[1]).toBeCloseTo(STOREY)
+    const shallow = resolveTargetSlot(
+      { position: [1.5, 0, 1.5], yaw: Math.PI, pitch: 0.65, piece: 'floor', rotState: 0 },
+      OPEN,
+    )
+    const slot = parseSlotId(shallow.slotId)!
+    expect(slot.kind).toBe('F')
+    expect(slot.s).toBe(1)
   })
 })
 

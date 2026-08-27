@@ -2,6 +2,8 @@
 
 import { useState } from 'react'
 import { useBoots } from './store'
+import { applyItems, discardItems } from './game/item-keep'
+import { useItems } from './game/item-place'
 import { discardPlaced, keepPlaced } from './game/keep'
 import { applyPaint, discardPaint, usePaintKeep } from './game/paint-keep'
 import { deleteDestroyed, discardDemolition, useDemolition } from './game/save-demolition'
@@ -18,6 +20,7 @@ export default function BootsPanel() {
   const placed = useBoots((s) => s.placed)
   const destroyed = useDemolition((s) => s.destroyed)
   const painted = usePaintKeep((s) => s.painted)
+  const placedItems = useItems((s) => s.items)
   const [lastKept, setLastKept] = useState<string | null>(null)
 
   const wallCount = placed.filter((p) => p.piece === 'wall').length
@@ -48,7 +51,11 @@ export default function BootsPanel() {
         ⏵ Jump in
       </button>
 
-      {pendingDecision && (placed.length > 0 || destroyed.length > 0 || painted.length > 0) && (
+      {pendingDecision &&
+        (placed.length > 0 ||
+          destroyed.length > 0 ||
+          painted.length > 0 ||
+          placedItems.length > 0) && (
         <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
           <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
             Nothing was saved while you played — shooting, breaking, all of it stays in the game.
@@ -75,6 +82,13 @@ export default function BootsPanel() {
               {painted.length > 1 ? ' their' : ' its'} dominant coat (undoable).
             </p>
           )}
+          {placedItems.length > 0 && (
+            <p className="text-xs leading-relaxed">
+              You placed <span className="font-semibold">{placedItems.length}</span> catalog item
+              {placedItems.length > 1 ? 's' : ''} — saving adds {placedItems.length > 1 ? 'them' : 'it'} as
+              real furniture (undoable).
+            </p>
+          )}
           <div className="flex gap-2">
             <button
               className="flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs hover:bg-sidebar-accent/80"
@@ -95,11 +109,16 @@ export default function BootsPanel() {
                 // Paint applies AFTER the demolition delete so nodes removed
                 // just above are skipped instead of patched.
                 const repainted = applyPaint()
+                const itemsResult = applyItems()
                 setLastKept(
                   `Kept ${walls} wall${walls === 1 ? '' : 's'}${extras ? ` + ${extras}` : ''}${
                     removed > 0 ? ` · deleted ${removed} leveled element${removed === 1 ? '' : 's'}` : ''
                   }${repainted > 0 ? ` · repainted ${repainted}` : ''}${
-                    result.skipped > 0 ? ` — ${result.skipped} piece(s) had no node type yet` : ''
+                    itemsResult.kept > 0 ? ` · placed ${itemsResult.kept} item(s)` : ''
+                  }${
+                    result.skipped + itemsResult.skipped > 0
+                      ? ` — ${result.skipped + itemsResult.skipped} piece(s) had no node type yet`
+                      : ''
                   }`,
                 )
               }}
@@ -113,6 +132,7 @@ export default function BootsPanel() {
                 discardPlaced()
                 discardDemolition()
                 discardPaint()
+                discardItems()
                 setLastKept('Discarded — your building is exactly as it was')
               }}
               type="button"
@@ -138,12 +158,13 @@ export default function BootsPanel() {
         <p>Mouse shoot · E gear up at the table</p>
         <p>Peaceful until you grab a gun — then a five-second countdown, and the machines come in waves.</p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer · 7 paint</p>
-        <p>RMB aim (pistol/rifle) · Q cycle piece · R cycles paint color · Esc exit</p>
+        <p>RMB aim (pistol/rifle) · Q or Z/X/C/V pick piece · R cycles paint color · Esc exit</p>
         <p>
           Pieces lock to the grid — look up to build the ceiling above you, R rotates (walls flip
-          sides, roofs turn), run up your ramps while holding click to chain them, Z undo, G
-          grenade.
+          sides, stairs turn, roofs cycle shapes), run up your stairs while holding click to chain
+          them, U undo, G grenade.
         </p>
+        <p>I opens the item catalog — place couches and appliances in your fort.</p>
         <p>
           F edits a placed piece — 3×3 cells on walls and floors (pocket the middle for a window),
           corner heights on roofs (raise or drop corners for slopes, valleys and flat caps).

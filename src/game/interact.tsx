@@ -8,7 +8,7 @@ import { Box3, Matrix4, type Object3D, Quaternion, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
-import { minigunTablePosition, tablePosition } from './guntable'
+import { buildTablePosition, minigunTablePosition, tablePosition } from './guntable'
 import { playerRig } from './player'
 import { getSession } from './session'
 import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world'
@@ -551,7 +551,7 @@ const _aimDir = new Vector3()
 
 export function Interact({ world }: { world: GameWorld }) {
   const statesRef = useRef<Map<string, OperableState> | null>(null)
-  const tablesRef = useRef<Array<{ position: Vector3; weapon: 'rifle' | 'minigun' }>>([])
+  const tablesRef = useRef<Array<{ position: Vector3; weapon: 'rifle' | 'minigun' | 'builder' }>>([])
   const lastPrompt = useRef<string | null>(null)
 
   useEffect(() => {
@@ -561,6 +561,7 @@ export function Interact({ world }: { world: GameWorld }) {
     // (the rear minigun table was missing pre-refactor — the double-fire bug:
     // E both grabbed the big one AND toggled a door behind the wall).
     tablesRef.current = [
+      { position: buildTablePosition(world), weapon: 'builder' },
       { position: tablePosition(world), weapon: 'rifle' },
       { position: minigunTablePosition(world), weapon: 'minigun' },
     ]

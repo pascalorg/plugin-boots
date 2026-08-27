@@ -25,6 +25,7 @@ import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, resetGlass } from './glass'
 import { Grenades } from './grenade'
 import { GunTable } from './guntable'
+import { GameItems } from './item-place'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
 import { Player, playerDebug, playerRig } from './player'
@@ -531,6 +532,7 @@ function ActiveGame() {
       <GunTable world={world} />
       <Doors world={world} />
       <PlacedPieces world={world} />
+      <GameItems world={world} />
       <Builder />
       <Enemies world={world} />
       <Nature world={world} />

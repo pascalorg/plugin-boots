@@ -8,6 +8,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { builderDebug } from './builder'
 import { throwGrenade } from './grenade'
+import { itemGhostActive } from './item-place'
 import { MOVE } from './movement'
 import { cyclePaintColor, SprayerModel } from './paint'
 import { playerRig } from './player'
@@ -224,7 +225,9 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         // grenade rises in the hand, whips forward, and lets go.
         if (grenadeAnimT.current === null) grenadeAnimT.current = 0
       } else if (action === 'WheelUp' || action === 'WheelDown') {
-        const list: ToolId[] = [...state.owned, 'builder', 'paint']
+        // Dedupe: 'builder' can be IN owned (build-table pickup) — a repeat
+        // entry would trap the wheel on it (indexOf finds the first copy).
+        const list: ToolId[] = [...new Set<ToolId>([...state.owned, 'builder', 'paint'])]
         const at = list.indexOf(state.weapon)
         const next = list[(at + (action === 'WheelDown' ? 1 : list.length - 1)) % list.length]!
         switchWeapon(next)
@@ -235,7 +238,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         const editFlag = (builderDebug as { isEditing?: boolean | (() => boolean) }).isEditing
         const editing = typeof editFlag === 'function' ? editFlag() : editFlag === true
         if (!editing) {
-          const order = ['wall', 'floor', 'roof'] as const
+          const order = ['wall', 'floor', 'stairs', 'roof'] as const
           state.setBuildPiece(order[(order.indexOf(state.buildPiece) + 1) % order.length]!)
         }
       }
@@ -347,7 +350,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
     // The sprayer's trigger loop lives in PaintTool (paint.tsx) — it reads
     // the non-consuming `firing` state, so the input queue stays ours alone.
-    if (current !== 'builder' && current !== 'paint' && !staggered) {
+    if (current !== 'builder' && current !== 'paint' && !staggered && !itemGhostActive()) {
       const def = WEAPONS[current]
       if (def.id === 'hammer') {
         // Two-phase strike: the click only STARTS the wind-up — the hit

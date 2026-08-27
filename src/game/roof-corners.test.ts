@@ -6,7 +6,9 @@ import {
   CORNER_RISE,
   cornerRoofGeometry,
   nearestCorner,
+  presetCorners,
   raycastRoofCorner,
+  ROOF_PRESETS,
   type RoofCorners,
   rotateQuarter,
   SLOPE_CORNERS,
@@ -44,6 +46,36 @@ describe('corner ring math', () => {
     expect(bilinearHeight(c, 1, 1)).toBe(1)
     expect(bilinearHeight(c, 0, 1)).toBe(0)
     expect(bilinearHeight(c, 0.5, 0.5)).toBeCloseTo(0.5)
+  })
+})
+
+describe('ROOF_PRESETS: the ghost R-cycle', () => {
+  test('cycle order reads slope → corner-tip → valley → flat cap', () => {
+    expect(ROOF_PRESETS.length).toBe(4)
+    expect(ROOF_PRESETS[0]).toEqual(SLOPE_CORNERS)
+    expect(ROOF_PRESETS.map((c) => classifyRoofShape(c).kind)).toEqual([
+      'slope',
+      'corner',
+      'valley',
+      'flat',
+    ])
+    // The flat cap is the HIGH flat (a ridge-level terrace, not a floor).
+    expect(classifyRoofShape(ROOF_PRESETS[3]!)).toEqual({ kind: 'flat', high: true })
+    // Every canonical pattern is quarter 0: the ghost yaw (facing) alone
+    // aims the high side — no hidden extra rotation.
+    for (const preset of ROOF_PRESETS.slice(0, 3)) {
+      const shape = classifyRoofShape(preset)
+      expect(shape.kind === 'flat' ? 0 : (shape as { quarter: number }).quarter).toBe(0)
+    }
+  })
+
+  test('presetCorners wraps mod 4 and returns fresh arrays', () => {
+    expect(presetCorners(0)).toEqual(ROOF_PRESETS[0]!)
+    expect(presetCorners(5)).toEqual(ROOF_PRESETS[1]!)
+    expect(presetCorners(-1)).toEqual(ROOF_PRESETS[3]!)
+    const a = presetCorners(2)
+    expect(a).not.toBe(ROOF_PRESETS[2]) // placements own their pattern
+    expect(a).toEqual(ROOF_PRESETS[2]!)
   })
 })
 
@@ -153,7 +185,7 @@ describe('store contract (pyramid grammar)', () => {
     // The folded-ramp contract: the transformed piece inherits the slot's
     // structural role (slotId retained — the p5r2/r3 QA'd behavior), and
     // the corner heights don't survive a piece-type rebuild.
-    useBoots.getState().transformPlaced(stored.id, 'roof', Math.PI / 2)
+    useBoots.getState().transformPlaced(stored.id, 'stairs', Math.PI / 2)
     const transformed = useBoots.getState().placed.find((p) => p.id === stored.id)!
     expect(transformed.corners).toBeUndefined()
     expect(transformed.slotId).toBe('R:0,0,0')

@@ -31,6 +31,11 @@ const GAME_KEYS = new Set([
   'KeyF',
   'KeyG',
   'KeyZ',
+  'KeyX',
+  'KeyC',
+  'KeyV',
+  'KeyU',
+  'KeyI',
   'Digit1',
   'Digit2',
   'Digit3',
@@ -56,6 +61,13 @@ export class GameInput {
    * denied or already released — this fires instead. */
   onEscape: (() => void) | null = null
 
+  /** Item-catalog latch (inventory.tsx): while set, every keydown routes to
+   * onMenuKey instead of the game state and pointer/wheel events pass
+   * through to the DOM menu untouched (no preventDefault, no relock). The
+   * menu clears held keys/buttons when it opens, so nothing sticks. */
+  menuOpen = false
+  onMenuKey: ((code: string) => void) | null = null
+
   private canvas: HTMLCanvasElement | null = null
   private detachFns: Array<() => void> = []
   private relockOnClick = false
@@ -80,6 +92,12 @@ export class GameInput {
         this.onEscape?.()
         return
       }
+      if (this.menuOpen) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        this.onMenuKey?.(e.code)
+        return
+      }
       if (!GAME_KEYS.has(e.code)) return
       e.preventDefault()
       e.stopImmediatePropagation()
@@ -89,6 +107,11 @@ export class GameInput {
       }
     })
     on('keyup', (e) => {
+      if (this.menuOpen) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        return
+      }
       if (!GAME_KEYS.has(e.code)) return
       e.preventDefault()
       e.stopImmediatePropagation()
@@ -111,6 +134,7 @@ export class GameInput {
       syncButtons(e.buttons)
     })
     on('pointerdown', (e) => {
+      if (this.menuOpen) return
       e.preventDefault()
       e.stopImmediatePropagation()
       if (!this.pointerLocked) {
@@ -120,6 +144,7 @@ export class GameInput {
       syncButtons(e.buttons)
     })
     on('pointerup', (e) => {
+      if (this.menuOpen) return
       e.preventDefault()
       e.stopImmediatePropagation()
       syncButtons(e.buttons)
@@ -130,6 +155,7 @@ export class GameInput {
     // ADS click ("multiple clicks per shot" bug, 2026-08-25).
     for (const type of ['mousedown', 'mouseup'] as const) {
       on(type, (e) => {
+        if (this.menuOpen) return
         e.preventDefault()
         e.stopImmediatePropagation()
         if (this.pointerLocked) syncButtons(e.buttons)
@@ -137,11 +163,13 @@ export class GameInput {
     }
     for (const type of ['click', 'dblclick', 'contextmenu'] as const) {
       on(type, (e) => {
+        if (this.menuOpen) return
         e.preventDefault()
         e.stopImmediatePropagation()
       })
     }
     on('wheel', (e) => {
+      if (this.menuOpen) return
       e.preventDefault()
       e.stopImmediatePropagation()
       this.state.actions.push(e.deltaY > 0 ? 'WheelDown' : 'WheelUp')
@@ -180,6 +208,8 @@ export class GameInput {
 
   detach(): void {
     this.relockOnClick = false
+    this.menuOpen = false
+    this.onMenuKey = null
     for (const fn of this.detachFns) fn()
     this.detachFns = []
     this.state.keys.clear()

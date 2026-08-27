@@ -45,12 +45,13 @@ const register = (kind: string, schema: unknown, defaults?: () => Record<string,
 }
 
 const seed = (
-  piece: 'wall' | 'floor' | 'roof',
+  piece: 'wall' | 'floor' | 'stairs' | 'roof',
   position: [number, number, number],
   yaw = 0,
   mask = FULL_MASK,
   slotId?: string,
-) => useBoots.getState().addPlaced({ piece, position, yaw, mask, slotId })
+  corners?: [number, number, number, number],
+) => useBoots.getState().addPlaced({ piece, position, yaw, mask, slotId, corners })
 
 beforeEach(() => {
   useBoots.getState().resolvePlaced()
@@ -63,7 +64,7 @@ describe('keepPlaced with an EMPTY registry (host never registered kinds)', () =
     nodeRegistry._reset()
     seed('wall', [1.5, 0, 0])
     seed('floor', [1.5, 0, 1.5], 0, FULL_MASK, 'F:0,0,0')
-    seed('roof', [4.5, 0, 1.5])
+    seed('stairs', [4.5, 0, 1.5])
     const result = keepPlaced()
     expect(result).toEqual({ kept: 0, skipped: 3, windows: 0, doors: 0, roofs: 0, floors: 0 })
     expect(useBoots.getState().placed).toEqual([])
@@ -144,8 +145,8 @@ describe('keepPlaced against the REAL host schemas', () => {
     expect(walls.some((w) => w.id === win!.parentId)).toBe(true)
   })
 
-  test('roof mapping unchanged: shed roof-segment at the piece pose', () => {
-    seed('roof', [1.5, 0, 1.5], Math.PI / 2, FULL_MASK, 'R:0,0,0')
+  test('stairs mapping = the old roof plank: shed roof-segment at the piece pose', () => {
+    seed('stairs', [1.5, 0, 1.5], Math.PI / 2, FULL_MASK, 'R:0,0,0')
     const result = keepPlaced()
     expect(result.kept).toBe(1)
     expect(result.roofs).toBe(1)
@@ -154,11 +155,35 @@ describe('keepPlaced against the REAL host schemas', () => {
     expect(roof!.rotation).toBeCloseTo(Math.PI / 2, 9)
   })
 
+  test('roof flat cap → slab terrace at ridge elevation (exact)', () => {
+    seed('roof', [1.5, 2.8, 1.5], 0, FULL_MASK, 'R:0,0,1', [1, 1, 1, 1])
+    const result = keepPlaced()
+    expect(result.kept).toBe(1)
+    expect(result.roofs).toBe(1)
+    expect(result.skipped).toBe(0)
+    const [slab] = nodesOf('slab')
+    expect(slab).toBeDefined()
+    expect(slab!.elevation).toBeCloseTo(2.8 + 2.8) // base + CORNER_RISE
+  })
+
+  test('roof slope preset keeps an exact shed; corner-tip approximates (skipped++)', () => {
+    seed('roof', [1.5, 0, 1.5], Math.PI / 2, FULL_MASK, 'R:0,0,0', [0, 0, 1, 1])
+    seed('roof', [4.5, 0, 1.5], 0, FULL_MASK, 'R:1,0,0', [0, 0, 1, 0])
+    const result = keepPlaced()
+    expect(result.kept).toBe(2)
+    expect(result.roofs).toBe(2)
+    expect(result.skipped).toBe(1) // the corner-tip counted as approximated
+    const sheds = nodesOf('roof-segment')
+    expect(sheds.length).toBe(2)
+    const exact = sheds.find((s) => Math.abs((s.rotation as number) - Math.PI / 2) < 1e-9)
+    expect(exact).toBeDefined() // slope quarter 0 → piece yaw untouched
+  })
+
   test('mixed batch counts: legacy no-slotId pieces flow like any other', () => {
     seed('wall', [1.5, 0, 0]) // legacy: no slotId
     seed('floor', [1.5, 0, 1.5], 0, FULL_MASK, 'F:0,0,0')
     seed('floor', [4.5, 0, 1.5], 0, 0) // dead → skipped
-    seed('roof', [1.5, 0, 4.5], 0, FULL_MASK, 'R:0,1,0')
+    seed('stairs', [1.5, 0, 4.5], 0, FULL_MASK, 'R:0,1,0')
     const result = keepPlaced()
     expect(result).toEqual({ kept: 3, skipped: 1, windows: 0, doors: 0, roofs: 1, floors: 1 })
   })
@@ -188,11 +213,11 @@ describe('keepPlaced when the HOST defaults() throws (p5r1 gate g: 8/8 roofs ski
     })
   })
 
-  test('placed roof at a v2 R slot (nonzero i/k, rotQuarter 1) keeps as a real roof-segment', () => {
+  test('placed stairs at a v2 R slot (nonzero i/k, rotQuarter 1) keep as a real roof-segment', () => {
     const slot = parseSlotId('R:2,3,0')
     expect(slot).not.toBeNull()
     const pose = slotPose(slot!, 1) // rotQuarter 1 → ascends toward +X
-    seed('roof', pose.position, pose.yaw, FULL_MASK, 'R:2,3,0')
+    seed('stairs', pose.position, pose.yaw, FULL_MASK, 'R:2,3,0')
     const result = keepPlaced()
     expect(result.kept).toBe(1)
     expect(result.roofs).toBe(1)
@@ -210,10 +235,10 @@ describe('keepPlaced when the HOST defaults() throws (p5r1 gate g: 8/8 roofs ski
     expect((roof!.id as string).startsWith('rseg_')).toBe(true) // schema-generated id
   })
 
-  test('storey s=1 roof: baseY = 1·2.8 lands in the node position, skipped stays 0', () => {
+  test('storey s=1 stairs: baseY = 1·2.8 lands in the node position, skipped stays 0', () => {
     const slot = parseSlotId('R:1,1,1')
     const pose = slotPose(slot!, 3) // rotQuarter 3 → ascends toward −X
-    seed('roof', pose.position, pose.yaw, FULL_MASK, 'R:1,1,1')
+    seed('stairs', pose.position, pose.yaw, FULL_MASK, 'R:1,1,1')
     const result = keepPlaced()
     expect(result.kept).toBe(1)
     expect(result.roofs).toBe(1)

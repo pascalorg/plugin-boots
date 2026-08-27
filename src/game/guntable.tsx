@@ -14,13 +14,15 @@ import { HammerModel, MinigunModel, PistolModel, RifleModel } from './weapon-mod
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
- * The gun tables: the small-arms table a few steps ahead of the player, and
- * the heavy table a bit farther BEHIND the spawn — turn around to find the
- * big rotary gun. Walk up, press E, gear up. Each table is a real collider
- * so it blocks movement and eats bullets like any other prop — the RENDERED
- * meshes double as the colliders, so when a table voxelizes the destruction
- * manager hides the very top + legs the player sees and the voxel replica
- * takes over ("everything should be able to break apart").
+ * The gun tables: the small BUILD table dead ahead of the player (nearest —
+ * E there equips ONLY the builder tool, no alert, no waves), the small-arms
+ * table a few steps ahead of the player, and the heavy table a bit farther
+ * BEHIND the spawn — turn around to find the big rotary gun. Walk up, press
+ * E, gear up. Each table is a real collider so it blocks movement and eats
+ * bullets like any other prop — the RENDERED meshes double as the colliders,
+ * so when a table voxelizes the destruction manager hides the very top +
+ * legs the player sees and the voxel replica takes over ("everything should
+ * be able to break apart").
  *
  * Set dressing (phase 4):
  * - First table: a pair of work boots beside the guns, and the SIREN BEACON
@@ -42,10 +44,12 @@ const ExternalWarhammer = externalModels.WarhammerModel
 const BootsPair: ComponentType = externalModels.BootsPairModel ?? FallbackBootsPair
 const SirenModel: ComponentType = externalModels.SirenBeaconModel ?? FallbackSirenBeacon
 
-const TABLE_SIZE: [number, number, number] = [1.7, 0.06, 0.8]
+export const TABLE_SIZE: [number, number, number] = [1.7, 0.06, 0.8]
+/** The build table is deliberately small — a side stand, not an armory. */
+export const BUILD_TABLE_SIZE: [number, number, number] = [1.0, 0.06, 0.55]
 const TABLE_HEIGHT = 0.82
 const TABLE_TOP = TABLE_HEIGHT + 0.03
-const GRAB_RANGE = 2.4
+export const GRAB_RANGE = 2.4
 
 export function tablePosition(world: GameWorld): Vector3 {
   const fwdX = -Math.sin(world.spawnYaw)
@@ -54,6 +58,19 @@ export function tablePosition(world: GameWorld): Vector3 {
     world.spawn.x + fwdX * 2.6 - fwdZ * 0.9,
     0,
     world.spawn.z + fwdZ * 2.6 + fwdX * 0.9,
+  )
+}
+
+/** The build table: nearest of the three, almost dead ahead — side-stepped
+ * OPPOSITE the gear table so the two footprints keep clear air between
+ * them, and inside GRAB_RANGE so the prompt is up the moment you spawn. */
+export function buildTablePosition(world: GameWorld): Vector3 {
+  const fwdX = -Math.sin(world.spawnYaw)
+  const fwdZ = -Math.cos(world.spawnYaw)
+  return new Vector3(
+    world.spawn.x + fwdX * 2.3 + fwdZ * 0.55,
+    0,
+    world.spawn.z + fwdZ * 2.3 - fwdX * 0.55,
   )
 }
 
@@ -71,11 +88,47 @@ export function minigunTablePosition(world: GameWorld): Vector3 {
 export function GunTable({ world }: { world: GameWorld }) {
   const frontPos = useMemo(() => tablePosition(world), [world])
   const rearPos = useMemo(() => minigunTablePosition(world), [world])
+  const buildPos = useMemo(() => buildTablePosition(world), [world])
   const geared = useBoots((s) => s.owned.includes('rifle'))
   const hasMinigun = useBoots((s) => s.owned.includes('minigun'))
+  const hasBuilder = useBoots((s) => s.owned.includes('builder'))
 
   return (
     <>
+      {/* BUILD table: the peaceful entry. Grants ONLY the builder tool —
+       * the wave director keys off pistol/rifle/minigun ownership, so no
+       * countdown, no siren, no bots until the gear table is touched. */}
+      <WeaponTable
+        world={world}
+        position={buildPos}
+        yaw={world.spawnYaw}
+        nodeId="__boots-table-3"
+        size={BUILD_TABLE_SIZE}
+        taken={hasBuilder}
+        prompt="Press E — start building"
+        promptOwner="guntable3"
+        onPickup={() => {
+          const s = useBoots.getState()
+          s.giveWeapon('builder')
+          s.setWeapon('builder')
+        }}
+        fixtures={
+          <TableSign
+            position={[0, TABLE_TOP, -0.19]}
+            rotation={[0, 0, 0]}
+            scale={0.7}
+            text={hasBuilder ? 'BUILD AWAY' : 'START BUILDING'}
+          />
+        }
+      >
+        {/* tiny construction hammer on display — flat like the small arms
+         * (haft along the tabletop, head raked up a touch). */}
+        <group position={[0.08, TABLE_TOP + 0.035, 0.08]} rotation={[0, 0.5, 0]}>
+          <group rotation={[-Math.PI / 2 + 0.06, Math.PI / 2, 0]} scale={0.9}>
+            <HammerModel />
+          </group>
+        </group>
+      </WeaponTable>
       <WeaponTable
         world={world}
         position={frontPos}
@@ -271,10 +324,13 @@ function TableSign({
   position,
   rotation,
   text,
+  scale = 1,
 }: {
   position: [number, number, number]
   rotation: [number, number, number]
   text: string
+  /** Uniform shrink for the small build table — the position stays put. */
+  scale?: number
 }) {
   const texture = useMemo(() => {
     if (typeof document === 'undefined') return null
@@ -295,7 +351,7 @@ function TableSign({
     return new CanvasTexture(canvas)
   }, [text])
   return (
-    <group position={position} rotation={rotation}>
+    <group position={position} rotation={rotation} scale={scale}>
       {[-0.42, 0.42].map((x) => (
         <mesh key={x} position={[x, 0.09, 0]}>
           <cylinderGeometry args={[0.008, 0.008, 0.18]} />
@@ -372,6 +428,7 @@ function WeaponTable({
   position,
   yaw,
   nodeId,
+  size = TABLE_SIZE,
   taken,
   prompt,
   promptOwner,
@@ -384,6 +441,8 @@ function WeaponTable({
   yaw: number
   /** Destruction key — each table is its own voxelizable target. */
   nodeId: string
+  /** Footprint (w, top thickness, d) — legs inset from the corners. */
+  size?: [number, number, number]
   /** True once this table's gear is owned: displays gone, prompt off. */
   taken: boolean
   prompt: string
@@ -461,15 +520,15 @@ function WeaponTable({
           solidRefs.current[0] = mesh
         }}
       >
-        <boxGeometry args={TABLE_SIZE} />
+        <boxGeometry args={size} />
         <meshStandardMaterial color="#6e5137" roughness={0.8} />
       </mesh>
-      {/* legs */}
+      {/* legs — inset from the top's corners, whatever the footprint */}
       {[
-        [-0.75, -0.32],
-        [0.75, -0.32],
-        [-0.75, 0.32],
-        [0.75, 0.32],
+        [-(size[0] / 2 - 0.1), -(size[2] / 2 - 0.08)],
+        [size[0] / 2 - 0.1, -(size[2] / 2 - 0.08)],
+        [-(size[0] / 2 - 0.1), size[2] / 2 - 0.08],
+        [size[0] / 2 - 0.1, size[2] / 2 - 0.08],
       ].map(([x, z], i) => (
         <mesh
           key={i}

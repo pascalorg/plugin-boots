@@ -251,7 +251,7 @@ export class Hud {
     )
     el(
       `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em;white-space:nowrap`,
-      'Esc exit · G grenade · R rotate · F edit · Z undo',
+      'Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog',
     )
 
     container.appendChild(root)
