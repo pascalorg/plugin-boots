@@ -1,3 +1,4 @@
+import { type AnyNodeId, useScene } from '@pascal-app/core'
 import { Box3, Color, Matrix4, type Mesh, type Object3D, Quaternion, Vector3 } from 'three'
 import { create } from 'zustand'
 import { useBoots } from '../store'
@@ -1006,6 +1007,49 @@ function targetBaseColor(meshes: Mesh[]): Color {
 }
 
 /**
+ * A node's explicitly saved coat — the color the paint bridge (or an editor
+ * custom paint) wrote into the scene, resolved the way the host renders
+ * walls: `node.slots[interior|exterior]` scene-material ref FIRST, then the
+ * legacy inline `material`. Only 'custom' coats qualify — preset/texture
+ * finishes keep the mesh-sample fallback, which reads their real render
+ * tone. Pure and exported for tests.
+ */
+export function savedCoatHex(
+  node: {
+    slots?: Record<string, string>
+    material?: { preset?: string; properties?: { color?: string } }
+  },
+  materials?: Record<string, { material?: { preset?: string; properties?: { color?: string } } }>,
+): string | null {
+  for (const side of ['interior', 'exterior']) {
+    const ref = node.slots?.[side]
+    if (typeof ref !== 'string' || !ref.startsWith('scene:')) continue
+    const coat = materials?.[ref.slice('scene:'.length)]?.material
+    if (coat?.preset === 'custom' && typeof coat.properties?.color === 'string') {
+      return coat.properties.color
+    }
+  }
+  const legacy = node.material
+  if (legacy?.preset === 'custom' && typeof legacy.properties?.color === 'string') {
+    return legacy.properties.color
+  }
+  return null
+}
+
+/** Wall lane: the scene node's saved coat beats the mesh sample — the first
+ * mesh material can be a cap/default-face tone, so a freshly saved coat
+ * would otherwise re-enter as the old greige skin. Read-only store access. */
+function nodeCoatColor(nodeId: string): Color | null {
+  const state = useScene.getState() as ReturnType<typeof useScene.getState> & {
+    materials?: Record<string, { material?: { preset?: string; properties?: { color?: string } } }>
+  }
+  const node = state.nodes[nodeId as AnyNodeId] as Parameters<typeof savedCoatHex>[0] | undefined
+  if (!node) return null
+  const hex = savedCoatHex(node, state.materials)
+  return hex ? new Color(hex) : null
+}
+
+/**
  * Hide a node's host meshes (session ledger — the editor gets them back
  * untouched) and hand its colliders over to the voxel replica. A wall's
  * render mesh is the scene-graph PARENT of its hosted door/window/item
@@ -1336,7 +1380,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
     roof,
     item,
     grid,
-    baseColor: targetBaseColor(meshes),
+    baseColor: (wall ? nodeCoatColor(nodeId) : null) ?? targetBaseColor(meshes),
     segments,
     studs: segments,
     sheets: sheetInfo?.sheets ?? [],

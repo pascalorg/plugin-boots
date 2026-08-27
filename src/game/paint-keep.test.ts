@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test'
-import { dominantPaint } from './paint-keep'
+import { useScene } from '@pascal-app/core'
+import {
+  applyPaint,
+  buildPaintPatches,
+  dominantPaint,
+  mintSceneMaterialId,
+  type PaintedNode,
+  usePaintKeep,
+} from './paint-keep'
 
 /** cell → palette index, from [cell, color] pairs. */
 const coats = (pairs: [number, number][]) => new Map<number, number>(pairs)
@@ -67,5 +75,126 @@ describe('dominantPaint (the save-the-paint aggregator)', () => {
     cells.set(0, 4)
     cells.set(1, 4)
     expect(dominantPaint(cells)).toBe(4)
+  })
+})
+
+/** Painted-node record with the fields the planner reads. */
+const coat = (nodeId: string, color: string, colorName = 'NAVY'): PaintedNode => ({
+  nodeId,
+  color,
+  colorName,
+  cells: 1,
+})
+
+describe('buildPaintPatches (the save planner)', () => {
+  test('legacy-only node: inline material patch, nothing minted', () => {
+    const nodes = {
+      wall_a: { material: { preset: 'plaster', properties: { color: '#ffffff', roughness: 0.7 } } },
+    }
+    const { updates, minted } = buildPaintPatches(nodes, [coat('wall_a', '#3b4a63')])
+    expect(minted).toEqual([])
+    expect(updates).toEqual([
+      {
+        id: 'wall_a',
+        data: {
+          material: {
+            preset: 'custom',
+            // Existing fields survive — only the color moves.
+            properties: { color: '#3b4a63', roughness: 0.7 },
+          },
+        },
+      },
+    ])
+  })
+
+  test('slot-modelled wall: interior/exterior refs re-point at ONE minted coat', () => {
+    // The host renders `node.slots[side]` first — the legacy patch alone
+    // would save "repainted" with no visible change (QA round-1 fix 1).
+    const nodes = {
+      wall_a: { slots: { interior: 'scene:mat_old', exterior: 'library:brick' } },
+      wall_b: { slots: { interior: 'library:plaster', skirtingInterior: 'library:oak' } },
+    }
+    const { updates, minted } = buildPaintPatches(
+      nodes,
+      [coat('wall_a', '#3b4a63'), coat('wall_b', '#3b4a63')],
+      () => 'mat_test0000000000',
+    )
+    expect(minted).toEqual([
+      {
+        id: 'mat_test0000000000',
+        name: 'NAVY',
+        material: { preset: 'custom', properties: { color: '#3b4a63' } },
+      },
+    ])
+    expect(updates[0]!.data.slots).toEqual({
+      interior: 'scene:mat_test0000000000',
+      exterior: 'scene:mat_test0000000000',
+    })
+    // Non-surface slots (trims) stay untouched; only the painted sides move.
+    expect(updates[1]!.data.slots).toEqual({
+      interior: 'scene:mat_test0000000000',
+      skirtingInterior: 'library:oak',
+    })
+  })
+
+  test('distinct coats mint distinct materials; missing nodes are skipped', () => {
+    let n = 0
+    const nodes = {
+      wall_a: { slots: { interior: 'scene:x' } },
+      wall_b: { slots: { exterior: 'scene:y' } },
+    }
+    const { updates, minted } = buildPaintPatches(
+      nodes,
+      [coat('wall_a', '#3b4a63'), coat('wall_b', '#44464a', 'CHARCOAL'), coat('wall_gone', '#3b4a63')],
+      () => `mat_${n++}`,
+    )
+    expect(updates.map((u) => u.id)).toEqual(['wall_a', 'wall_b'])
+    expect(minted.map((m) => m.name)).toEqual(['NAVY', 'CHARCOAL'])
+  })
+
+  test('slot-less node never mints — the legacy inline patch is enough', () => {
+    const { minted, updates } = buildPaintPatches({ wall_a: {} }, [coat('wall_a', '#9cab8b')])
+    expect(minted).toEqual([])
+    expect(updates[0]!.data.slots).toBeUndefined()
+  })
+})
+
+describe('mintSceneMaterialId', () => {
+  test('host scene-material id shape: mat_<16 lowercase alphanumerics>', () => {
+    expect(mintSceneMaterialId()).toMatch(/^mat_[0-9a-z]{16}$/)
+    expect(mintSceneMaterialId()).not.toBe(mintSceneMaterialId())
+  })
+})
+
+describe('applyPaint against the REAL core store (minting path)', () => {
+  test('one set lands minted materials + slot refs + legacy patch, then clears', () => {
+    useScene.setState({
+      nodes: {
+        wall_p: {
+          id: 'wall_p',
+          type: 'wall',
+          slots: { interior: 'scene:mat_before' },
+          material: { preset: 'plaster', properties: { color: '#ffffff' } },
+        },
+      },
+    } as never)
+    usePaintKeep
+      .getState()
+      .setPainted([{ nodeId: 'wall_p', color: '#3b4a63', colorName: 'NAVY', cells: 9 }])
+
+    expect(applyPaint()).toBe(1)
+
+    const state = useScene.getState() as ReturnType<typeof useScene.getState> & {
+      materials?: Record<string, { material: { properties: { color: string } } }>
+    }
+    const wall = state.nodes['wall_p' as keyof typeof state.nodes] as unknown as {
+      slots: Record<string, string>
+      material: { preset: string; properties: { color: string } }
+    }
+    const ref = wall.slots.interior!
+    expect(ref).toMatch(/^scene:mat_[0-9a-z]{16}$/)
+    expect(state.materials?.[ref.slice('scene:'.length)]?.material.properties.color).toBe('#3b4a63')
+    expect(wall.material).toEqual({ preset: 'custom', properties: { color: '#3b4a63' } })
+    expect(usePaintKeep.getState().painted).toEqual([])
   })
 })

@@ -8,6 +8,7 @@ import {
   prevoxelizeTick,
   raycastSegments,
   resetDestruction,
+  savedCoatHex,
   useDestruction,
 } from './destruction'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -416,5 +417,38 @@ describe('skeleton snap (cladding gone → bare frame falls)', () => {
     // After the 1.5 s span (+ buffer): the whole skeleton is down.
     await new Promise((resolve) => setTimeout(resolve, 1800))
     expect(wall.segments.every((s) => s.broken)).toBe(true)
+  })
+})
+
+describe('savedCoatHex (host-order coat resolution for voxel skins)', () => {
+  const navyScene = {
+    mat_navy0000000000: { material: { preset: 'custom', properties: { color: '#3b4a63' } } },
+  }
+
+  test('slot scene-material ref wins over the legacy inline field', () => {
+    const node = {
+      slots: { interior: 'scene:mat_navy0000000000' },
+      material: { preset: 'custom', properties: { color: '#ffffff' } },
+    }
+    expect(savedCoatHex(node, navyScene)).toBe('#3b4a63')
+  })
+
+  test('legacy custom coat resolves when no slot ref applies', () => {
+    const node = { material: { preset: 'custom', properties: { color: '#44464a' } } }
+    expect(savedCoatHex(node)).toBe('#44464a')
+    // library: refs never flatten to a tint — the mesh sample stays right.
+    expect(savedCoatHex({ ...node, slots: { interior: 'library:brick' } })).toBe('#44464a')
+  })
+
+  test('preset/texture finishes keep the mesh-sample fallback (null)', () => {
+    expect(savedCoatHex({})).toBeNull()
+    expect(savedCoatHex({ material: { preset: 'brick', properties: { color: '#ffffff' } } })).toBeNull()
+    // A slot ref to a NON-custom scene material also declines.
+    expect(
+      savedCoatHex(
+        { slots: { exterior: 'scene:mat_tex' } },
+        { mat_tex: { material: { preset: 'brick', properties: { color: '#ffffff' } } } },
+      ),
+    ).toBeNull()
   })
 })

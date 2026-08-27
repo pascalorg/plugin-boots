@@ -143,6 +143,14 @@ export function selectSplatCells(
   return cells
 }
 
+/**
+ * Dev-only handle (published as `globalThis.__bootsPaint` while the tool
+ * runs — the `__bootsBuilder` pattern): headless E2E can't engage pointer
+ * lock, so `holdFire` stands in for the held LMB (it is OR-ed with the real
+ * input each frame).
+ */
+export const paintDebug: { holdFire: boolean } = { holdFire: false }
+
 // ── Spray resolution (raycast scratch — module temps, no per-shot allocs) ──
 
 const _origin = new Vector3()
@@ -374,7 +382,9 @@ export function PaintTool({ world }: { world: GameWorld }) {
 
   useEffect(() => {
     resetPaint()
+    ;(globalThis as Record<string, unknown>).__bootsPaint = paintDebug
     return () => {
+      paintDebug.holdFire = false
       spray.current?.stop()
       spray.current = null
       spraying.current = false
@@ -404,7 +414,8 @@ export function PaintTool({ world }: { world: GameWorld }) {
     }
 
     // Held trigger: soft hiss while spraying, splats at PAINT_RATE.
-    const wants = active && session.input.state.firing && !state.staggered
+    const wants =
+      active && (session.input.state.firing || paintDebug.holdFire) && !state.staggered
     if (wants !== spraying.current) {
       spraying.current = wants
       if (wants) {
