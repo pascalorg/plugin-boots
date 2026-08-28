@@ -2173,6 +2173,16 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
   // SESSION START — an item never morphs into voxels on its first hit, it
   // just starts losing chunks. This also deletes the first-item-wake spike
   // (62–68 ms live finding): there is no item wake left to pay for.
+  //
+  // VOXEL-FIRST ROOFS + SLABS (owner call 2026-08-28 round 2: "the roof
+  // looked like editor, and 1st bullet it changed into voxels" — NO
+  // morphing anywhere): roof and slab/ceiling/floor kinds voxelize AWAKE
+  // too, wearing their per-cell texture patterns from frame one. The same
+  // prevoxelize budget spreads the cost (the entry veil covers gear-up);
+  // Esc-restore is untouched — the hide rides the same session ledger.
+  // Only doors/windows and the block/column/stair family still prebuild
+  // dormant: their hosts keep live behaviors (Doors renderer, stair walk
+  // feel) that should not hand over until first damage.
   for (const collider of world.colliders) {
     const nodeId = collider.nodeId
     if (
@@ -2194,8 +2204,11 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
       continue
     }
     if (now() >= deadline) return false
-    const awakeItem = ITEM_FAMILY_KINDS.has(collider.nodeType)
-    if (!ensureVoxelTarget(world, nodeId, awakeItem ? undefined : { dormant: true })) {
+    const awake =
+      ITEM_FAMILY_KINDS.has(collider.nodeType) ||
+      ROOF_KINDS.has(collider.nodeType) ||
+      SLAB_KINDS.has(collider.nodeType)
+    if (!ensureVoxelTarget(world, nodeId, awake ? undefined : { dormant: true })) {
       prevoxelizeSkip.add(nodeId)
     }
   }

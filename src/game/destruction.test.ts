@@ -121,8 +121,9 @@ describe('prevoxelizeTick', () => {
     // ITEM-FAMILY nodes (voxel-first, owner 2026-08-28): the crate's host
     // GLB hides at session start and its silhouette replica renders from
     // frame one, so an item never morphs into voxels on its first hit —
-    // it just starts losing chunks. Non-item explodables (doors, slabs,
-    // roofs…) still prebuild DORMANT (the grenade-lag economics).
+    // it just starts losing chunks. Roofs and slabs joined them (round 2,
+    // "no morphing anywhere"); only doors/windows and the block/column/
+    // stair family still prebuild DORMANT (live host behaviors).
     expect(targets.get('wall-1')?.dormant).toBeFalsy()
     expect(targets.get('crate-1')?.dormant).toBeFalsy()
     expect(targets.get('crate-1')?.item).toBe(true)
@@ -166,6 +167,32 @@ describe('prevoxelizeTick', () => {
     expect(dormantTargetCount()).toBe(0)
     // …and once the census is zero the per-frame scan idles out O(1).
     expect(wakeAheadTick(world, center, 3.2)).toBe(false)
+  })
+
+  test('roofs and slabs voxelize AWAKE too: replicas from frame one, no morphing (owner round 2)', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('slab-1', 'slab', [3, 0.2, 3], [0, 3, 5]))
+    world.colliders.push(boxCollider('ceil-1', 'ceiling', [3, 0.1, 3], [0, 2.6, -5]))
+    world.colliders.push(boxCollider('roof-1', 'roof', [4, 0.3, 4], [0, 5.6, 0]))
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
+    expect(done).toBe(true)
+    const targets = useDestruction.getState().targets
+    for (const nodeId of ['slab-1', 'ceil-1', 'roof-1']) {
+      const target = targets.get(nodeId)!
+      expect(target).toBeDefined()
+      expect(target.dormant).toBeFalsy()
+      expect(target.grid.aliveCount).toBeGreaterThan(0)
+    }
+    expect(dormantTargetCount()).toBe(0)
+    // The hosts handed over at session start: colliders disabled so the
+    // voxel grids own collision from frame one. (The mesh hide itself
+    // rides hideForGame's session ledger — a live-session concern; it
+    // no-ops headless, and Esc-restore is session.ts's tested contract.)
+    for (const nodeId of ['slab-1', 'ceil-1', 'roof-1']) {
+      const collider = world.colliders.find((c) => c.nodeId === nodeId)!
+      expect(Boolean(collider.disabled)).toBe(true)
+    }
   })
 
   test('placed items (__boots-item-*) never prebuild and never wedge completeness', () => {
