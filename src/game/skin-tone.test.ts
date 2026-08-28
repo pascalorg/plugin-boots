@@ -358,6 +358,30 @@ function stripedMap(w = 8, h = 8, uuid?: string): SurfaceMaterialLike['map'] {
   return map as unknown as SurfaceMaterialLike['map']
 }
 
+/** Dark-shingle map whose 1-texel border ring is TRANSPARENT WHITE — the
+ * thumbnail-margin shape that used to dress a roof's eave/rake EDGE cells
+ * in white while the field read the true dark tone. */
+function borderedMap(w = 8, h = 8): SurfaceMaterialLike['map'] {
+  const data = new Uint8Array(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) {
+        data[o] = 255
+        data[o + 1] = 255
+        data[o + 2] = 255
+        data[o + 3] = 0 // transparent white margin
+      } else {
+        data[o] = 96
+        data[o + 1] = 64
+        data[o + 2] = 48
+        data[o + 3] = 255 // opaque dark shingle
+      }
+    }
+  }
+  return { image: { data, width: w, height: h } } as unknown as SurfaceMaterialLike['map']
+}
+
 describe('per-cell texture patterns', () => {
   test('mapPatternGrid resamples the image; cellToneAt reads the stripes', () => {
     const grid = mapPatternGrid(stripedMap())!
@@ -368,6 +392,37 @@ describe('per-cell texture patterns', () => {
     expect(left.b).toBeLessThan(0.1)
     expect(right.b).toBeGreaterThan(0.9)
     expect(right.r).toBeLessThan(0.1)
+  })
+
+  test('bordered ToneGrid: edge-cell tone == interior family, never the white margin', () => {
+    // Roof-edge whites (owner round 5): cellPatternTone tiles v=0 straight
+    // onto the eave row, so a transparent/white image margin must backfill
+    // from the nearest OPAQUE texel instead of masquerading as pattern.
+    const grid = mapPatternGrid(borderedMap())!
+    const roof: SkinToneSource = {
+      kind: 'roof',
+      baseColor: new Color('#5a524a'),
+      toneGrid: grid,
+      grid: {
+        // Cell 0: eave row (iy = 0 → v = 0, the margin row). Cell 1: an
+        // interior row of the same column. Both outer skin (iz = 0).
+        coords: new Int16Array([1, 0, 0, 1, 1, 0]),
+        cellX: 0.2,
+        cellY: 0.2,
+        cellZ: 0.2,
+      },
+    }
+    const eave = cellPatternTone(new Color(), roof, 0)!
+    const interior = cellPatternTone(new Color(), roof, 1)!
+    // The margin texel inherited the interior tone — bit-equal here since
+    // the opaque field is uniform.
+    expectSame(eave, interior)
+    expect(isUntexturedWhite(eave)).toBe(false)
+    expect(eave.r).toBeLessThan(0.5)
+    // The primed cell (tone + jitter) stays in the dark family too.
+    const primed = primedCellColor(new Color(), roof, 0)
+    expect(isUntexturedWhite(primed)).toBe(false)
+    expect(primed.r).toBeLessThan(0.5)
   })
 
   test('cellToneAt tiles: u wraps in both directions', () => {

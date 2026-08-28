@@ -23,7 +23,7 @@ import { Doors, doorsDebug } from './doors'
 import { clearDust, dustDebug, DustSystem, setDustFloorProbe } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
-import { GlassCracks, resetGlass } from './glass'
+import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
 import { GunTable } from './guntable'
 import { GameItems } from './item-place'
@@ -513,6 +513,9 @@ function ActiveGame() {
     const landingProbe = (x: number, y: number, z: number) => probeLandingY(world, x, y, z)
     setDebrisGroundProbe(landingProbe)
     setDustFloorProbe(landingProbe)
+    // Glass plate shards land on their own storey's floor too — probed once
+    // per pane FACE at shatter time (glass.tsx), never per shard/frame.
+    setGlassFloorProbe(landingProbe)
 
     // Dev/E2E handle — lets headless tests aim and fire deterministically.
     ;(globalThis as Record<string, unknown>).__boots = {
@@ -604,6 +607,9 @@ function ActiveGame() {
       // (debris.tsx debrisDump; floors-for-things QA reads settle heights
       // straight off this instead of traversing instance matrices).
       debris: () => debrisDump(),
+      // Glass plate-shard census (owner round 5: panes shatter into flat
+      // plates, never cubes) — live count / mean vy / sliver thickness.
+      glassShards: () => glassShardCensus(),
       // Unbreakable-face tripwire (owner round 2026-08-25, feedback B):
       // visible bones-overlay meshes that would actually render right now —
       // MUST be 0 during a session; non-zero means a hide was undone or a
@@ -656,6 +662,7 @@ function ActiveGame() {
       delete (globalThis as Record<string, unknown>).__boots
       setDebrisGroundProbe(null)
       setDustFloorProbe(null)
+      setGlassFloorProbe(null)
       resetDestruction()
       resetGlass()
       clearDebris()

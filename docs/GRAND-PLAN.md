@@ -147,6 +147,34 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   flare that owns its window), WAVE CLEARED banner, dual-rotor drone
   hum with squared distance falloff, metal items spark + ping on carve
   (metalness>0.5 at voxelize). 797 tests / 22.3k assertions green.
+- Owner fix round 5 (2026-08-28, fleet 3 lanes + manager stitch):
+  BOOM MOMENT — the detonation-frame hitch on big houses was the
+  synchronous ring-1 carve inside explodeAt (4 full-depth nodes, roof
+  nodes fanning to every sibling plane while costing 1): boom frame now
+  carves only EXPLOSION_CORE_NODES=2 nearest nodes (instant hole at the
+  blast point), the rest ride the 16 ms staggered steps; roof groups
+  weigh their plane count against the per-step budget. 52-target /
+  20.1k-voxel QA house: boom-carve-sync 7.0→5.4/0.2 ms, worst blast
+  frame 16.6→≤15.3 ms, identical voxels removed. removedQueue upload
+  budgeting NOT taken (measured trivial; would multiply full-buffer
+  uploads on three r185 — WebGPU-path candidate only) · ROOF-EDGE
+  WHITES — the roof #residual member was re-tracing rim faces (eave
+  fascia, rake caps, ridge caps, soffits) already voxelized inside the
+  kept planes' slab volumes, tinted near-white by
+  dominantResidualMaterial: fillResidual now drops faces fully inside a
+  kept plane's slab band (polygon dilated 0.15 m); gable ends keep ≥1
+  deep vertex and stay residual. Host-shell replay: residual 91→39 tris,
+  all 52 rim faces excluded. skin-tone hardening: alpha<128 texels are
+  holes, backfilled from the nearest opaque texel (no white-margin
+  bleed onto eave rows) · GLASS PLATES — routing was already correct
+  (panes → world.glass, window voxel target dormant); the cubes were
+  shatterPane's 26 spawnDebris cubes. Replaced with a self-contained
+  96-cap instanced plate-shard pool (one draw call, 8 mm sliver, 0.06-
+  0.22 m faces, oriented in the pane plane, full gravity + tumble +
+  one dead bounce, area-scaled 10-34 count, per-pane-face floor probe,
+  resetGlass clears it); crack-decal two-stage kept. New perf sections:
+  boom-carve-sync/bots/sfx/dust, skin-drain, skin-reprime. 897 tests /
+  23.9k assertions green.
 
 ## In flight
 

@@ -394,8 +394,10 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   const boom = (
     destruct as { damageExplosion?: (w: GameWorld, c: Vector3, r: number) => number }
   ).damageExplosion
+  const carveT0 = performance.now()
   if (typeof boom === 'function') boom(world, center, BLAST_RADIUS)
   else fallbackCarve(world, center)
+  perfSection('boom-carve-sync', performance.now() - carveT0)
 
   // Glass inside the blast shatters (shatterPane is idempotent) — but each
   // pane pays 26 shards + a store bump, so only a couple break on the boom
@@ -437,6 +439,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
 
   // Bots: damage + fling (positions shoved — the pathing push-out resolves
   // any wall the fling lands them against next frame).
+  const botsT0 = performance.now()
   for (const bot of bots) {
     if (bot.state !== 'alive') continue
     const d = bot.position.distanceTo(center)
@@ -475,7 +478,11 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
     )
   }
 
+  perfSection('boom-bots', performance.now() - botsT0)
+
+  const sfxT0 = performance.now()
   sfx.explosion()
+  perfSection('boom-sfx', performance.now() - sfxT0)
 
   // Ground scar — craters.tsx owns the green-vs-road/building call and the
   // 16-slot ring buffer; a blast on pavement or indoors is a no-op here.
@@ -485,6 +492,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
 
   // Dust storm — a handful of plumes (each auto-spawns haze) ringed by
   // puffs, plus one wide lingering haze. All feature-checked (contract).
+  const dustT0 = performance.now()
   if (typeof spawnDust === 'function') {
     for (let i = 0; i < 4; i++) {
       _dustPoint.set(
@@ -507,6 +515,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   for (let i = 0; i < 8; i++) {
     spawnDebris(center.x, center.y + 0.3, center.z, 0.05 + Math.random() * 0.05, SCRAP, 4, 1.6)
   }
+  perfSection('boom-dust', performance.now() - dustT0)
   perfSection('boom-explode', performance.now() - explodeT0)
 }
 

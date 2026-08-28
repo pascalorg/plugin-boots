@@ -45,6 +45,15 @@ const MIN_PLANE_AREA = 0.4
 const DEFAULT_SHELL_T = 0.08
 const MIN_SHELL_T = 0.02
 const MAX_SHELL_T = 0.5
+/** Normal-band slack around a kept plane's slab when classifying RIM faces:
+ * end-caps sit exactly ON the outer/inner surfaces, but rake bargeboards
+ * and ridge caps stand ~0.06-0.08 m PROUD of the shingle surface on host
+ * shells (measured live) — a hair under one plane-grid cell, so the plane's
+ * border cells still cover them. Metres. */
+const SLAB_EPS = 0.1
+/** In-plane dilation of the plane polygon for the rim test — gutter/trim
+ * boards may stand slightly proud of the footprint edge. Metres. */
+const RIM_PAD = 0.15
 
 type NormalCluster = {
   /** Area-weighted normal sum (unnormalized while accumulating). */
@@ -155,6 +164,29 @@ export type RoofPlane = RoofPlaneBasis & {
   thickness: number
 }
 
+/** One kept plane's SLAB volume in world terms — the rim-face test's input
+ * (unit normal + plane frame, the normal band, and the plane-space polygon
+ * in the same re-based frame the RoofPlane carries). Internal. */
+type Slab = {
+  nx: number
+  ny: number
+  nz: number
+  ax: number
+  ay: number
+  az: number
+  ux: number
+  uy: number
+  uz: number
+  /** Inner/outer surface offsets along the normal (absolute projections). */
+  nInner: number
+  nOuter: number
+  /** Frame re-base offsets (across from eave center, upSlope from eave). */
+  midA: number
+  minU: number
+  /** Plane-space footprint triangles, packed [a,u]×3 (the plane's own). */
+  poly: readonly number[]
+}
+
 /**
  * Enumerate the sloped planes of a roof node's collected meshes as
  * world-space RoofPlane records (RoofPlaneBasis + thickness — the
@@ -165,11 +197,15 @@ export type RoofPlane = RoofPlaneBasis & {
  * `residual` (optional out-array) receives the shell faces the returned
  * planes do NOT cover, as packed world-space triangles (ax,ay,az,…cz — 9
  * floats per face): faces the pitch gate excludes (near-VERTICAL gable-end
- * triangles, fascia caps, flat soffits) plus sloped faces no kept cluster
- * claimed (MIN_PLANE_AREA slivers). Down-facing tris opposing a kept plane
- * lie on that plane's inner surface — inside its slab — so they never count
- * as residual. The destruction residual lane voxelizes this set so gable
- * ends stop VANISHING when the merged host mesh hides on first hit.
+ * triangles) plus sloped faces no kept cluster claimed (MIN_PLANE_AREA
+ * slivers). Down-facing tris opposing a kept plane lie on that plane's
+ * inner surface — inside its slab — so they never count as residual, and
+ * neither does ANY face wholly inside a kept plane's slab volume (fascia,
+ * rake caps, overhang soffits — see triInSlab: the plane grid's border
+ * cells already trace the rim, and a duplicate trim-toned shell there was
+ * the owner-reported WHITE-CUBES-ON-ROOF-EDGES defect). The destruction
+ * residual lane voxelizes this set so gable ends stop VANISHING when the
+ * merged host mesh hides on first hit.
  */
 export function enumerateRoofPlanes(meshes: readonly Mesh[], residual?: number[]): RoofPlane[] {
   const up: Tri[] = []
@@ -178,7 +214,7 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[], residual?: number[]
   collectSlopedTris(meshes, up, down, rest)
   if (up.length === 0) {
     // No planes → nothing is covered; every collected face is residual.
-    if (residual && rest) fillResidual(residual, rest, up, down, [])
+    if (residual && rest) fillResidual(residual, rest, up, down, [], [])
     return []
   }
 
@@ -225,6 +261,8 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[], residual?: number[]
   /** Unit normals of the KEPT planes, packed x,y,z — residual matching
    * runs the exact complement of the polyTris assignment test below. */
   const keptNormals: number[] = []
+  /** The kept planes' slab volumes — the residual RIM-face exclusion. */
+  const slabs: Slab[] = []
   for (const cluster of upClusters) {
     const len = Math.sqrt(
       cluster.nx * cluster.nx + cluster.ny * cluster.ny + cluster.nz * cluster.nz,
@@ -306,9 +344,108 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[], residual?: number[]
       polyTris,
     })
     keptNormals.push(nx, ny, nz)
+    slabs.push({
+      nx,
+      ny,
+      nz,
+      ax: across[0],
+      ay: across[1],
+      az: across[2],
+      ux: upSlope[0],
+      uy: upSlope[1],
+      uz: upSlope[2],
+      nInner,
+      nOuter,
+      midA,
+      minU,
+      poly: polyTris,
+    })
   }
-  if (residual && rest) fillResidual(residual, rest, up, down, keptNormals)
+  if (residual && rest) fillResidual(residual, rest, up, down, keptNormals, slabs)
   return planes
+}
+
+/** Squared distance from plane-space point (a, u) to segment (x1,y1)-(x2,y2). */
+function distSqToSegment(
+  a: number,
+  u: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+): number {
+  const dx = x2 - x1
+  const dy = y2 - y1
+  const lenSq = dx * dx + dy * dy
+  let t = lenSq > 0 ? ((a - x1) * dx + (u - y1) * dy) / lenSq : 0
+  if (t < 0) t = 0
+  else if (t > 1) t = 1
+  const px = x1 + dx * t - a
+  const py = y1 + dy * t - u
+  return px * px + py * py
+}
+
+/** True when plane-space point (a, u) lies inside (either winding) or
+ * within `pad` of any footprint triangle (packed [a,u]×3 per tri). */
+function pointNearPoly(a: number, u: number, poly: readonly number[], pad: number): boolean {
+  const padSq = pad * pad
+  for (let k = 0; k + 5 < poly.length; k += 6) {
+    const x1 = poly[k]!
+    const y1 = poly[k + 1]!
+    const x2 = poly[k + 2]!
+    const y2 = poly[k + 3]!
+    const x3 = poly[k + 4]!
+    const y3 = poly[k + 5]!
+    const c1 = (x2 - x1) * (u - y1) - (y2 - y1) * (a - x1)
+    const c2 = (x3 - x2) * (u - y2) - (y3 - y2) * (a - x2)
+    const c3 = (x1 - x3) * (u - y3) - (y1 - y3) * (a - x3)
+    if ((c1 >= 0 && c2 >= 0 && c3 >= 0) || (c1 <= 0 && c2 <= 0 && c3 <= 0)) return true
+    if (
+      distSqToSegment(a, u, x1, y1, x2, y2) <= padSq ||
+      distSqToSegment(a, u, x2, y2, x3, y3) <= padSq ||
+      distSqToSegment(a, u, x3, y3, x1, y1) <= padSq
+    )
+      return true
+  }
+  return false
+}
+
+/**
+ * True when EVERY vertex of the triangle lies inside one kept plane's slab
+ * volume: normal offset within [nInner − SLAB_EPS, nOuter + SLAB_EPS] and
+ * plane-space (a, u) inside the plane's own footprint polygon dilated by
+ * RIM_PAD. Such faces are the assembly's END-CAPS — eave fascia, rake
+ * caps, overhang soffits: the roof's RIM. The plane's pinned grid already
+ * voxelizes that exact volume (its border cells trace these very faces),
+ * so tracing them AGAIN as residual paints a second, trim-toned cube shell
+ * OVER the plane's shingle-family border cells — the owner-reported WHITE
+ * CUBES along the eaves/rakes of an otherwise dark roof. Gable-end
+ * triangles always keep at least one vertex well below the inner surface
+ * (they close the attic, not the slab), so they stay residual and keep
+ * their siding/trim tone — the vanishing-gable-end fix is untouched.
+ */
+function triInSlab(tri: Tri, slabs: readonly Slab[]): boolean {
+  for (const s of slabs) {
+    let inside = true
+    for (let k = 0; k < 9; k += 3) {
+      const x = tri.v[k]!
+      const y = tri.v[k + 1]!
+      const z = tri.v[k + 2]!
+      const w = x * s.nx + y * s.ny + z * s.nz
+      if (w < s.nInner - SLAB_EPS || w > s.nOuter + SLAB_EPS) {
+        inside = false
+        break
+      }
+      const a = x * s.ax + y * s.ay + z * s.az - s.midA
+      const u = x * s.ux + y * s.uy + z * s.uz - s.minU
+      if (!pointNearPoly(a, u, s.poly, RIM_PAD)) {
+        inside = false
+        break
+      }
+    }
+    if (inside) return true
+  }
+  return false
 }
 
 /**
@@ -317,7 +454,9 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[], residual?: number[]
  * CLUSTER_DOT cone (the same test that assigns polyTris — exact
  * complement), and down tris whose OPPOSITE misses every kept plane (an
  * opposing underside sits on its plane's inner surface, inside the slab
- * the plane target already voxelizes).
+ * the plane target already voxelizes). Faces that lie INSIDE a kept
+ * plane's slab volume (triInSlab — the eave/rake/soffit rim end-caps) are
+ * excluded from all three lanes for the same already-voxelized reason.
  */
 function fillResidual(
   out: number[],
@@ -325,6 +464,7 @@ function fillResidual(
   up: readonly Tri[],
   down: readonly Tri[],
   keptNormals: readonly number[],
+  slabs: readonly Slab[],
 ): void {
   const covered = (nx: number, ny: number, nz: number): boolean => {
     for (let k = 0; k < keptNormals.length; k += 3) {
@@ -333,9 +473,10 @@ function fillResidual(
     }
     return false
   }
-  for (const tri of rest) out.push(...tri.v)
-  for (const tri of up) if (!covered(tri.nx, tri.ny, tri.nz)) out.push(...tri.v)
-  for (const tri of down) if (!covered(-tri.nx, -tri.ny, -tri.nz)) out.push(...tri.v)
+  for (const tri of rest) if (!triInSlab(tri, slabs)) out.push(...tri.v)
+  for (const tri of up) if (!covered(tri.nx, tri.ny, tri.nz) && !triInSlab(tri, slabs)) out.push(...tri.v)
+  for (const tri of down)
+    if (!covered(-tri.nx, -tri.ny, -tri.nz) && !triInSlab(tri, slabs)) out.push(...tri.v)
 }
 
 /**

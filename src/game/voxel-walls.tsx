@@ -463,17 +463,21 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
     if (!syncDormantWallFrame(group, wall, primeEntry.current)) return
     if (revision.current !== wall.revision) {
       revision.current = wall.revision
+      const drainT0 = performance.now()
       const queue = wall.removedQueue
       for (let i = 0; i < queue.length; i++) mesh.setMatrixAt(queue[i]!, ZERO)
       queue.length = 0
       mesh.instanceMatrix.needsUpdate = true
+      perfSection('skin-drain', performance.now() - drainT0)
     }
     // Async skin tone landed (roof shingle GPU readback — destruction.ts
     // bumps skinRevision after retinting baseColor): re-prime the whole
     // layer once. Idles at one number compare per target per frame.
     if (skinRevision.current !== (wall.skinRevision ?? 0)) {
       skinRevision.current = wall.skinRevision ?? 0
+      const reprimeT0 = performance.now()
       primeSkin(mesh, wall)
+      perfSection('skin-reprime', performance.now() - reprimeT0)
     }
   })
 

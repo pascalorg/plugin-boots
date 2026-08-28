@@ -149,11 +149,54 @@ export function patternGridCacheSize(): number {
 
 const _gridTexel = new Color()
 
+/** Alpha below this marks a texel as a HOLE (thumbnail margins, webp
+ * transparency) — its color bytes are garbage (white or premultiplied
+ * black), never a shingle/brick tone. */
+const OPAQUE_ALPHA = 128
+
+/** Backfill hole texels with their nearest OPAQUE neighbor's tone
+ * (expanding Chebyshev rings, first hit wins — always an ORIGINAL opaque
+ * texel, never a previously-backfilled hole). cellPatternTone tiles v=0
+ * straight onto a roof's eave-row cells, so a transparent/white image
+ * margin sampled as-is would dress every EDGE cell in a lie while the
+ * field reads true. Voxelize-time only (grid build), size² ≤ 32². */
+function backfillHoleTexels(rgb: Float32Array, size: number, holes: number[]): void {
+  const hole = new Uint8Array(size * size)
+  for (const h of holes) hole[h] = 1
+  for (const h of holes) {
+    const hx = h % size
+    const hy = (h - hx) / size
+    let done = false
+    for (let r = 1; r < size && !done; r++) {
+      for (let dy = -r; dy <= r && !done; dy++) {
+        const y = hy + dy
+        if (y < 0 || y >= size) continue
+        // Ring cells only: full row at the top/bottom edges, ends otherwise.
+        const stepX = Math.abs(dy) === r ? 1 : 2 * r
+        for (let dx = -r; dx <= r; dx += stepX) {
+          const x = hx + dx
+          if (x < 0 || x >= size) continue
+          const o = y * size + x
+          if (hole[o]) continue
+          rgb[h * 3] = rgb[o * 3]!
+          rgb[h * 3 + 1] = rgb[o * 3 + 1]!
+          rgb[h * 3 + 2] = rgb[o * 3 + 2]!
+          done = true
+          break
+        }
+      }
+    }
+  }
+}
+
 /** Pure: resample RGBA pixels into a ToneGrid (nearest texel, sRGB decode
- * when the source bytes are sRGB — GPU readbacks are already linear). */
+ * when the source bytes are sRGB — GPU readbacks are already linear).
+ * Near-transparent texels backfill from their nearest opaque neighbor
+ * (backfillHoleTexels) so image margins never masquerade as pattern. */
 function toneGridFromPixels(pixels: MapPixels): ToneGrid {
   const size = TONE_GRID_SIZE
   const rgb = new Float32Array(size * size * 3)
+  const holes: number[] = []
   const { data, width, height, srgb } = pixels
   for (let gy = 0; gy < size; gy++) {
     const sy = Math.min(height - 1, Math.floor(((gy + 0.5) / size) * height))
@@ -161,6 +204,7 @@ function toneGridFromPixels(pixels: MapPixels): ToneGrid {
       const sx = Math.min(width - 1, Math.floor(((gx + 0.5) / size) * width))
       const s = (sy * width + sx) * 4
       const o = (gy * size + gx) * 3
+      if ((data[s + 3] ?? 255) < OPAQUE_ALPHA) holes.push(gy * size + gx)
       if (srgb) {
         _gridTexel.setRGB(data[s]! / 255, data[s + 1]! / 255, data[s + 2]! / 255, 'srgb')
         rgb[o] = _gridTexel.r
@@ -173,6 +217,8 @@ function toneGridFromPixels(pixels: MapPixels): ToneGrid {
       }
     }
   }
+  // A fully-transparent image has no truth to copy — keep the raw read.
+  if (holes.length > 0 && holes.length < size * size) backfillHoleTexels(rgb, size, holes)
   return { size, rgb }
 }
 

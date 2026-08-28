@@ -1403,3 +1403,79 @@ strictness — verify no E2E scene depended on it); cross-color respray
 overwrites the color index while strength keeps accumulating
 (spec-literal; cross-fade is a possible follow-up); decal-lane drips
 out of scope this round.
+
+## Owner fix round 5 — boom hitch / roof-edge whites / glass plates (2026-08-28, fleet 3 lanes, manager stitch)
+
+Three lanes on one tree, all landed; manager integrated. 897 tests /
+23,912 assertions green; tsc clean; real exit codes. Owner-reported
+triple from wave-4 play on his REAL house: (a) hitch AT detonation,
+(b) white voxel cubes on roof edges over a dark shingle field,
+(c) glass breaking into cubes.
+
+BOOM MOMENT (destruction.ts, grenade.tsx, voxel-walls.tsx): profiled on
+a new 3×3-room QA house (52 targets, ~20,100 voxels — qa-boom-scale.mjs,
+headed, 120 Hz). Suspects acquitted by measurement: skin-drain 0.1-0.5 ms,
+boom-glass 0.8, boom-dust 0.1, boom-sfx 0.1, boom-bots 0.2, boom-crater
+0.1, settle-drain ~0.3 ms/call. Convict: the synchronous ring-1 first
+step inside explodeAt — 4 full-depth node carves in the detonation frame,
+and a roof node fans its carve to EVERY sibling plane while counting as 1
+against the 4-node budget. Fix: EXPLOSION_CORE_NODES=2 (boom frame carves
+the 2 nearest nodes for the instant hole; the rest rides the existing
+16 ms staggered steps under the flash/dust) + collectExplosionNodes
+returns a plane-count weight so a heavy roof node can't squeeze into a
+nearly-spent step (only a step's first node may overshoot). Numbers:
+boom-carve-sync 7.0/2.4 → 5.4/0.2 ms, boom-explode 8.1/2.6 → 6.7/0.6 ms,
+worst blast frame 16.6/12.7 → 15.3/11.6/10.9 ms; 5482 voxels removed
+before AND after (identical blast). Zero ≥50 ms spikes, zero invariant
+violations. removedQueue→instanceMatrix upload budgeting deliberately
+NOT added: CPU trivial, no render-submit spikes, and spreading it means
+extra full-buffer uploads without updateRanges on three r185 — logged as
+a WebGPU-path candidate only.
+
+ROOF-EDGE WHITES (roof-planes.ts, skin-tone.ts): NOT the ToneGrid — live
+instrumented probe (qa-roofedge-probe.mjs) showed plane cells uniformly
+dark including eave/rake rows, while the #residual member carried 836
+cells, 332 of them INSIDE the kept planes' slab volumes at the polygon
+border, mean color exactly #ebe7df (dominantResidualMaterial picks the
+near-white trim/deck slot on host roofs). fillResidual had only excluded
+down-facing tris directly opposing a plane, so eave fascia / rake
+bargeboards / ridge caps / overhang soffits were re-traced as a white
+cube shell over the dark plane grids. Fix: triInSlab + pointNearPoly —
+any face whose 3 vertices sit within one kept plane's slab band
+(normal range [nInner−0.1, nOuter+0.1], polygon dilated 0.15 m) is
+dropped from residual; gable ends keep ≥1 vertex far below the inner
+surface and survive with their own trim tone (vanishing-gable-end fix
+intact). Offline replay of the dumped host shell: residual 91 → 39 tris,
+all 52 rim faces excluded. Hardening: toneGridFromPixels treats
+alpha<128 texels as holes and backfills from the nearest opaque texel,
+so a thumbnail's transparent margin can never tile white onto edge cells.
+
+GLASS PLATES (glass.tsx, game-root.tsx wiring): routing exonerated —
+pane material matches isGlassLikeMesh, all rifle shots returned 'glass',
+the window voxel target stayed dormant 84/84 alive; the cubes were
+shatterPane's own 26 uniform spawnDebris cubes. Replaced with a
+self-contained instanced plate-shard pool: cap 96 thin plates, one draw
+call (boxGeometry + transparent standard material #bcd8e2 opacity 0.55,
+depthWrite off; no instanceColor), zero per-frame allocations. Shards
+are real glass: 8 mm sliver axis (spec 6-10 mm), 0.06-0.22 m face edges,
+oriented IN the pane plane at spawn, launched off both faces, full
+gravity + fast tumble, one dead bounce, settle, shrink-out; count scales
+with pane area (10-34 clamp). Floor probed once PER PANE FACE at shatter
+(upstairs panes drop onto their own storey) — also removes the old
+26-per-pane debris apex probes. resetGlass clears the pool (post-Esc
+waves spawn nothing). Two-stage crack decals preserved. Headed: all 34
+shards fall, land, drain to 0 at ~120 fps; debris ring gains ZERO pieces.
+
+Manager integration: cross-file wiring was already in-tree from the
+lanes (game-root.tsx glassShardCensus/setGlassFloorProbe + __boots
+.glassShards(); grenade.tsx boom-carve-sync/bots/sfx/dust sections;
+voxel-walls.tsx skin-drain/skin-reprime sections). world.ts glass fence
+and voxel-walls upload budget were REQUESTED as leads but both lanes'
+measurements refuted the need — not applied. QA scripts saved in
+private-editor: qa-boom-scale.mjs, qa-roofedge-probe.mjs,
+qa-glass-lane.mjs, qa-glass-plates.mjs, qa-glass-headed.mjs.
+
+QA leads for next round: owner-scene acceptance on his real house
+(eave/rake ring reads shingle-dark; detonation frame stays clean at his
+target density); first host-item wake spike still open from fix round 3;
+removedQueue upload budgeting if/when a WebGPU path lands.

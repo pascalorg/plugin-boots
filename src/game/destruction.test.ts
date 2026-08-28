@@ -18,6 +18,7 @@ import {
   dormantTargetCount,
   dropTarget,
   ensureVoxelTarget,
+  EXPLOSION_CORE_NODES,
   isMetalItemMaterial,
   ITEM_CHUNK_CAP,
   ITEM_CHUNK_PER_CELLS,
@@ -557,6 +558,55 @@ describe('damageExplosion (grenade detonation carve)', () => {
     const targets = useDestruction.getState().targets
     expect(targets.has('wall-2')).toBe(false)
     expect(targets.has('crate-1')).toBe(false)
+  })
+
+  test('the boom frame carves at most EXPLOSION_CORE_NODES nodes; the rest ride the stagger', async () => {
+    // Four walls clustered inside the core ring (radius * 0.5 = 1.6 m) of a
+    // dead-center blast — the scale scenario: lots of material AT the point.
+    const cluster = (id: string, center: [number, number, number]) =>
+      boxCollider(id, 'wall', [1.6, 2.7, 0.12], center)
+    const wallEntry = (c: ColliderEntry, z: number) => ({
+      node: { id: c.nodeId, start: [-0.8, z] as [number, number], end: [0.8, z] as [number, number], height: 2.7, thickness: 0.12 },
+      root: c.root,
+      meshes: [c.mesh],
+    })
+    const a = cluster('cw-1', [0, 1.35, -0.6])
+    const b = cluster('cw-2', [0, 1.35, 0.6])
+    const c = cluster('cw-3', [0, 1.35, -1.2])
+    const d = cluster('cw-4', [0, 1.35, 1.2])
+    const colliders = [a, b, c, d]
+    const buildingAabb = new Box3()
+    for (const e of colliders) buildingAabb.union(e.worldBox)
+    const world: GameWorld = {
+      colliders,
+      walls: new Map([
+        ['cw-1', wallEntry(a, -0.6)],
+        ['cw-2', wallEntry(b, 0.6)],
+        ['cw-3', wallEntry(c, -1.2)],
+        ['cw-4', wallEntry(d, 1.2)],
+      ]),
+      glass: [],
+      doors: [],
+      overlayRoots: [],
+      buildingAabb,
+      spawn: new Vector3(6, 0, 6),
+      spawnYaw: 0,
+      levelId: null,
+    }
+    const removedNow = damageExplosion(world, new Vector3(0, 1.2, 0), 3.2)
+    // Instant feedback: SOMETHING carved this very frame…
+    expect(removedNow).toBeGreaterThan(0)
+    // …but the detonation frame itself touched at most the core budget.
+    const targets = useDestruction.getState().targets
+    let carvedNow = 0
+    for (const t of targets.values()) if (t.grid.aliveCount < t.grid.count) carvedNow++
+    expect(carvedNow).toBeGreaterThan(0)
+    expect(carvedNow).toBeLessThanOrEqual(EXPLOSION_CORE_NODES)
+    // The staggered steps finish the cluster within a few frames.
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    let carvedLater = 0
+    for (const t of targets.values()) if (t.grid.aliveCount < t.grid.count) carvedLater++
+    expect(carvedLater).toBe(4)
   })
 })
 

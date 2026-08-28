@@ -308,6 +308,64 @@ describe('enumerateRoofPlanes', () => {
     enumerateRoofPlanes([gableShellMesh()], none)
     expect(none.length).toBe(0)
   })
+
+  test('rim end-caps (eave fascia, rake caps) inside a plane slab never count as residual', () => {
+    // The owner-reported WHITE CUBES ON ROOF EDGES: the shell's own slab
+    // end-caps — vertical fascia at the eave, rake caps along the slope —
+    // lie INSIDE the kept planes' slab volumes, which the plane grids
+    // already voxelize (their border cells trace these very faces). Traced
+    // AGAIN as residual they painted a duplicate trim-toned cube shell
+    // over the shingle-family border cells. Pin: with caps appended the
+    // residual set stays EXACTLY the two gable-end triangles.
+    const out: number[] = []
+    const mesh = gableShellMesh(true)
+    const positions = Array.from(mesh.geometry.getAttribute('position')!.array as Float32Array)
+    out.push(...positions)
+    for (const yaw of [GABLE.yaw, GABLE.yaw + Math.PI]) {
+      const f = roofPlaneFrame(yaw, GABLE.pitch)
+      const A = new Vector3(...f.across)
+      const N = new Vector3(...f.normal)
+      const U = new Vector3(...f.upSlope)
+      const eave = GABLE.ridge.clone().addScaledVector(U, -GABLE.slopeLength)
+      const half = A.clone().multiplyScalar(GABLE.eaveLength / 2)
+      const inN = N.clone().multiplyScalar(-GABLE.t)
+      const p0 = eave.clone().sub(half)
+      const p1 = eave.clone().add(half)
+      // Eave fascia: the slab's down-slope end cap (outer edge → inner).
+      pushQuad(out, p0, p1, p1.clone().add(inN), p0.clone().add(inN), U.clone().negate())
+      // Rake caps: the slab's side end caps along both slope edges.
+      for (const sign of [1, -1] as const) {
+        const off = A.clone().multiplyScalar((sign * GABLE.eaveLength) / 2)
+        const e = eave.clone().add(off)
+        const r = GABLE.ridge.clone().add(off)
+        pushQuad(out, e, r, r.clone().add(inN), e.clone().add(inN), A.clone().multiplyScalar(sign))
+      }
+    }
+    const geometry = new BufferGeometry()
+    geometry.setAttribute('position', new BufferAttribute(Float32Array.from(out), 3))
+    const capped = new Mesh(geometry)
+    capped.updateMatrixWorld(true)
+    const residual: number[] = []
+    const planes = enumerateRoofPlanes([capped], residual)
+    expect(planes.length).toBe(2)
+    // Only the two gable-end triangles survive — every cap face vanished.
+    expect(residual.length).toBe(18)
+    const A = new Vector3(...roofPlaneFrame(GABLE.yaw, GABLE.pitch).across)
+    for (let k = 0; k < residual.length; k += 9) {
+      const u = new Vector3(
+        residual[k + 3]! - residual[k]!,
+        residual[k + 4]! - residual[k + 1]!,
+        residual[k + 5]! - residual[k + 2]!,
+      )
+      const w = new Vector3(
+        residual[k + 6]! - residual[k]!,
+        residual[k + 7]! - residual[k + 1]!,
+        residual[k + 8]! - residual[k + 2]!,
+      )
+      const n = new Vector3().crossVectors(u, w).normalize()
+      expect(Math.abs(n.dot(A))).toBeCloseTo(1, 6)
+    }
+  })
 })
 
 describe('roof target lane (per-plane pitched grids, Phase C2)', () => {

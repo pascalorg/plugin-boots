@@ -3472,8 +3472,19 @@ const EXPLOSION_NIBBLES = 5
 const EXPLOSION_SEGMENT_CAP = 48
 /** Nodes carved per staggered blast step (~one display frame apart). The
  * blast's frame cost — carve CPU, wakes, and the render submit behind
- * them — scales with nodes touched per frame, so this bounds it. */
+ * them — scales with nodes touched per frame, so this bounds it. Roof
+ * GROUPS count their plane fan-out against this budget (weight = plane
+ * count): one "node" that carves 4-6 plane grids is 4-6 steps' worth. */
 export const EXPLOSION_NODES_PER_STEP = 4
+/** Nodes carved SYNCHRONOUSLY inside the detonation frame itself (the
+ * boom-moment budget, QA 2026-08-28 scale round): explodeAt's frame also
+ * pays glass, dust storm, crater, sfx and the render submit, and the
+ * profiled boom frame was ~half sync carve (7 ms of a 16.6 ms worst at a
+ * 51-target house — and it grows with material density at the blast
+ * point). Two nearest nodes still put the hole AT the blast point this
+ * very frame; the rest of the core lands one display frame later, inside
+ * the flash + dust storm, which reads identical. */
+export const EXPLOSION_CORE_NODES = 2
 /** Gap between staggered blast steps — one display frame. */
 const EXPLOSION_STEP_MS = 16
 /** Bumped on resetDestruction — staggered blast steps from a torn-down
@@ -3569,21 +3580,25 @@ export function wakeAheadTick(world: GameWorld, center: Vector3, radius: number)
 
 /** Explodable nodes whose bounds sit within `ring`, nearest first — the
  * order the staggered carve walks so the blast reads as one expanding
- * shockwave (per-BLAST allocations only, never per frame). */
+ * shockwave (per-BLAST allocations only, never per frame). `w` is the
+ * node's step-budget weight: a roof node fans its carve out to every
+ * sibling plane grid (damageTarget's group dispatch), so it weighs its
+ * plane count — a hip roof can't ride a 4-node step as if it were one. */
 function collectExplosionNodes(
   world: GameWorld,
   center: Vector3,
   ring: number,
-): { id: string; d: number }[] {
+): { id: string; d: number; w: number }[] {
   const seen = new Set<string>()
-  const out: { id: string; d: number }[] = []
+  const out: { id: string; d: number; w: number }[] = []
   for (const collider of world.colliders) {
     if (seen.has(collider.nodeId)) continue
     if (!EXPLODABLE.has(collider.nodeType)) continue
     const d = collider.worldBox.distanceToPoint(center)
     if (d > ring) continue
     seen.add(collider.nodeId)
-    out.push({ id: collider.nodeId, d })
+    const group = roofGroups.get(collider.nodeId) ?? roofGroups.get(roofMemberOf.get(collider.nodeId) ?? '')
+    out.push({ id: collider.nodeId, d, w: group ? Math.max(1, group.length) : 1 })
   }
   out.sort((a, b) => a.d - b.d)
   return out
@@ -3638,17 +3653,17 @@ export function damageExplosion(
     { ring: radius, notBefore: blastT0 + 70, withNibbles: true, tag: 'boom-ring3' },
   ]
   let ringIndex = -1 // step() advances to ring 0 on its first pass
-  let nodes: { id: string; d: number }[] = []
+  let nodes: { id: string; d: number; w: number }[] = []
   let cursor = 0
   let coreTotal = 0
   const epoch = blastEpoch
-  const step = (): void => {
+  const step = (budget: number): void => {
     // Session ended mid-blast (Save/Discard tears the store down) — drop
     // the tail instead of carving into the next session's targets.
     if (epoch !== blastEpoch) return
     const stepT0 = performance.now()
     let carved = 0
-    while (carved < EXPLOSION_NODES_PER_STEP) {
+    while (carved < budget) {
       if (cursor >= nodes.length) {
         // Ring exhausted — segments snap after the last ring, then done.
         if (ringIndex >= rings.length - 1) {
@@ -3662,7 +3677,7 @@ export function damageExplosion(
         const wait = next.notBefore - now()
         if (wait > 0) {
           if (ringIndex >= 0) perfSection(rings[ringIndex]!.tag, performance.now() - stepT0)
-          setTimeout(step, wait)
+          setTimeout(() => step(EXPLOSION_NODES_PER_STEP), wait)
           return
         }
         ringIndex++
@@ -3671,18 +3686,24 @@ export function damageExplosion(
         continue
       }
       const ring = rings[ringIndex]!
-      const removed = carveExplosionNode(world, nodes[cursor]!.id, frozen, ring.ring, ring.withNibbles)
+      const node = nodes[cursor]!
+      // A heavy node (roof group) never squeezes into a nearly-spent step —
+      // it opens the NEXT one instead. Only a step's FIRST node may exceed
+      // the budget (something must always carve, or the blast stalls).
+      if (carved > 0 && carved + node.w > budget) break
+      const removed = carveExplosionNode(world, node.id, frozen, ring.ring, ring.withNibbles)
       cursor++
       if (ringIndex === 0) coreTotal += removed
-      carved++
+      carved += node.w
     }
     perfSection(rings[ringIndex]!.tag, performance.now() - stepT0)
-    setTimeout(step, EXPLOSION_STEP_MS)
+    setTimeout(() => step(EXPLOSION_NODES_PER_STEP), EXPLOSION_STEP_MS)
   }
-  // The first pass runs synchronously: it advances into ring 0 and carves
-  // the nearest core nodes THIS frame — instant feedback at the blast
-  // point; everything else rides the staggered steps behind it.
-  step()
+  // The first pass runs synchronously with the SMALL boom-moment budget: it
+  // advances into ring 0 and carves the nearest core node(s) THIS frame —
+  // instant feedback at the blast point; everything else rides the
+  // staggered steps behind it, starting one display frame later.
+  step(EXPLOSION_CORE_NODES)
   return coreTotal
 }
 
