@@ -1,13 +1,15 @@
 'use client'
 
 import { useFrame, useThree } from '@react-three/fiber'
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
+  BoxGeometry,
   Color,
   DynamicDrawUsage,
   type Group,
   type InstancedMesh,
   Matrix4,
+  MeshStandardMaterial,
   Quaternion,
   Vector3,
 } from 'three'
@@ -170,6 +172,17 @@ const BOARD_DAMAGED = new Color('#d8d1c2')
 const WOOD_BASE = new Color('#b08d57')
 const WOOD_DAMAGED = new Color('#8f6f45')
 
+// Shared render resources — every layer of every replica is configuration-
+// identical per layer type (all per-instance variation rides instanceMatrix
+// + instanceColor; paint gates ride mesh.userData), so one geometry and one
+// material per layer serve the whole house instead of 3N fresh objects.
+// Passed via `args`, so R3F never auto-disposes them on unmount; they live
+// for the module (the dust-texture idiom).
+const VOXEL_GEOMETRY = new BoxGeometry()
+const SKIN_MATERIAL = new MeshStandardMaterial({ roughness: 0.92 })
+const BOARD_MATERIAL = new MeshStandardMaterial({ roughness: 0.95 })
+const WOOD_MATERIAL = new MeshStandardMaterial({ roughness: 0.85 })
+
 function isGone(m: SandwichMember): boolean {
   return m.broken === true || m.torn === true
 }
@@ -249,7 +262,7 @@ function MemberLayer({
   jitter,
   inset,
   pinch,
-  roughness,
+  material,
 }: {
   members: SandwichMember[]
   base: Color
@@ -257,7 +270,7 @@ function MemberLayer({
   jitter: number
   inset: number
   pinch: boolean
-  roughness: number
+  material: MeshStandardMaterial
 }) {
   const meshRef = useRef<InstancedMesh>(null!)
   const checksum = useRef(Number.NaN)
@@ -279,6 +292,11 @@ function MemberLayer({
   useFrame(() => {
     const mesh = meshRef.current
     if (!mesh) return
+    // Dormant replica (parent group hidden — the wake IS the visibility
+    // flip, done by the parent's earlier-registered useFrame in this same
+    // frame): members BY CONTRACT can't change while dormant (damage paths
+    // always wake first), so skip the O(members) checksum entirely.
+    if (mesh.parent && mesh.parent.visible === false) return
     // Chips (hp loss without break) never bump revision, so poll the cheap
     // checksum every frame and re-upload the whole small layer on change.
     const h = layerChecksum(members)
@@ -287,12 +305,7 @@ function MemberLayer({
     uploadLayer(mesh, members, base, damaged, jitter, inset, pinch, maxHp.current)
   })
 
-  return (
-    <instancedMesh args={[undefined, undefined, members.length]} ref={meshRef}>
-      <boxGeometry />
-      <meshStandardMaterial roughness={roughness} />
-    </instancedMesh>
-  )
+  return <instancedMesh args={[VOXEL_GEOMETRY, material, members.length]} ref={meshRef} />
 }
 
 /** Bottom-skin tone for slab sandwiches — the ceiling face reads as
@@ -388,7 +401,12 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
  * craters) ever reveals it. */
 const WARM_DRAW_DROP = 600
 
-function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
+/** memo: a destruction-store bump re-renders VoxelWalls (membership may
+ * have changed) but every EXISTING wall object is stable — all its updates
+ * are mutations drained in useFrame (dormant flag, revision, skinRevision),
+ * so a shallow prop compare keeps wake/glass/crumble bumps from
+ * re-reconciling N unchanged wall subtrees in the hot blast window. */
+const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
   const groupRef = useRef<Group>(null!)
   const revision = useRef(-1)
@@ -492,19 +510,16 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
 
   return (
     <group ref={groupRef} userData={{ __boots: true }} visible={!wall.dormant}>
-      <instancedMesh args={[undefined, undefined, wall.grid.count]} ref={meshRef}>
-        <boxGeometry />
-        <meshStandardMaterial roughness={0.92} />
-      </instancedMesh>
+      <instancedMesh args={[VOXEL_GEOMETRY, SKIN_MATERIAL, wall.grid.count]} ref={meshRef} />
       {boards && boards.length > 0 && (
         <MemberLayer
           base={BOARD_BASE}
           damaged={BOARD_DAMAGED}
           inset={0.99}
           jitter={0.05}
+          material={BOARD_MATERIAL}
           members={boards}
           pinch={false}
-          roughness={0.95}
         />
       )}
       {segments.length > 0 && (
@@ -513,14 +528,14 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
           damaged={WOOD_DAMAGED}
           inset={0.99}
           jitter={0.1}
+          material={WOOD_MATERIAL}
           members={segments}
           pinch={true}
-          roughness={0.85}
         />
       )}
     </group>
   )
-}
+})
 
 export function VoxelWalls() {
   const version = useDestruction((s) => s.version)

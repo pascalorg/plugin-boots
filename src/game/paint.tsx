@@ -202,6 +202,8 @@ export const paintDebug: { holdFire: boolean } = { holdFire: false }
 const _origin = new Vector3()
 const _direction = new Vector3()
 const _ray = new Ray()
+const _worldRay = new Ray()
+const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _point = new Vector3()
 
@@ -221,9 +223,18 @@ export function sprayPaint(world: GameWorld): boolean {
   let nodeId: string | null = null
   let solidType: string | null = null
   let needsVoxelize = false
+  // Broadphase before the BVH (the shooting.ts idiom): a ray-vs-AABB test
+  // costs nanoseconds, culls almost every collider per spray tick, and —
+  // critically — keeps the lazy `.bvh` getter from BUILDING BVHs for
+  // distant untouched colliders inside the tick. An AABB entry point
+  // farther than the current winner can never beat it (entry ≤ true hit).
+  _worldRay.origin.copy(_origin)
+  _worldRay.direction.copy(_direction)
   for (const collider of world.colliders) {
     // walkOnly planks are capsule-only — the spray lands on their voxels.
     if (collider.disabled || collider.walkOnly) continue
+    const entry = _worldRay.intersectBox(collider.worldBox, _boxHit)
+    if (entry === null || entry.distanceTo(_origin) > bestDist) continue
     _inverse.copy(collider.inverse)
     _ray.origin.copy(_origin).applyMatrix4(_inverse)
     _ray.direction.copy(_direction).transformDirection(_inverse)
@@ -320,10 +331,17 @@ function matchesTarget(mesh: InstancedMesh, target: VoxelTarget): boolean {
   )
 }
 
+/** Full-scene resolveMesh traversals left this drain — a cache miss walks
+ * the WHOLE host scene, so at most one node pays that per frame (the rest
+ * retry next drain; splats are 9 Hz, a one-frame tint delay is invisible). */
+let traverseBudget = 0
+
 function resolveMesh(scene: Object3D, nodeId: string, target: VoxelTarget): InstancedMesh | null {
   const cached = meshCache.get(nodeId)
   if (cached && cached.parent && matchesTarget(cached, target)) return cached
   meshCache.delete(nodeId)
+  if (traverseBudget <= 0) return null
+  traverseBudget--
   let found: InstancedMesh | null = null
   scene.traverse((object) => {
     if (found) return
@@ -344,10 +362,20 @@ function resolveMesh(scene: Object3D, nodeId: string, target: VoxelTarget): Inst
  */
 export function drainPaintTints(scene: Object3D): void {
   if (paintedByNode.size === 0) return
+  traverseBudget = 1
   const targets = useDestruction.getState().targets
   for (const [nodeId, cells] of paintedByNode) {
     const target = targets.get(nodeId)
     if (!target) continue
+    // FULLY-dead grid (island crumble / collapse): there is nothing left to
+    // tint AND matchesTarget can never fingerprint it (no alive probe), so
+    // resolving would full-scene-traverse every drain forever. Skip it —
+    // the LEDGER stays (capturePaint's "every painted cell died" full-ledger
+    // vote still counts the node on Save); only the mesh ref drops.
+    if (target.grid.aliveCount === 0) {
+      meshCache.delete(nodeId)
+      continue
+    }
     const serial = nodeSerials.get(nodeId) ?? 0
     const mesh = resolveMesh(scene, nodeId, target)
     if (!mesh) continue

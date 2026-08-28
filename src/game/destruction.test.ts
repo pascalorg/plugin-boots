@@ -5,12 +5,14 @@ import {
   damageExplosion,
   damageSegment,
   damageTarget,
+  dormantTargetCount,
   ensureVoxelTarget,
   prevoxelizeTick,
   raycastSegments,
   resetDestruction,
   savedCoatHex,
   useDestruction,
+  wakeAheadTick,
 } from './destruction'
 import { settleTasksPending } from './structure'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -114,6 +116,23 @@ describe('prevoxelizeTick', () => {
     for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
     expect(done).toBe(true)
     expect(prevoxelizeTick(world, 8)).toBe(true) // idempotent once done
+  })
+
+  test('dormant census tracks prebuilds; wake-ahead idles out at zero', () => {
+    const world = makeWorld()
+    expect(dormantTargetCount()).toBe(0)
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
+    expect(done).toBe(true)
+    // Walls wake instantly; the crate is this layout's one dormant prebuild.
+    expect(dormantTargetCount()).toBe(1)
+    // A cooking stick near the crate wakes it through wakeAheadTick…
+    const center = new Vector3(10, 1.35, 0)
+    expect(wakeAheadTick(world, center, 3.2)).toBe(true)
+    expect(useDestruction.getState().targets.get('crate-1')?.dormant).toBeFalsy()
+    expect(dormantTargetCount()).toBe(0)
+    // …and once the census is zero the per-frame scan idles out O(1).
+    expect(wakeAheadTick(world, center, 3.2)).toBe(false)
   })
 
   test('placed items (__boots-item-*) never prebuild and never wedge completeness', () => {

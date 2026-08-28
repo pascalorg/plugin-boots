@@ -418,19 +418,21 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   }
   perfSection('boom-glass', performance.now() - glassT0)
   if (deferredPanes) {
+    // Self-rescheduling batches of GLASS_MID every 40 ms — the tail used to
+    // be ONE unbounded flush at 80 ms, so a glass-heavy blast (sunroom /
+    // curtain wall) paid every remaining pane's 26 shards + store bump in a
+    // single macrotask. Same total shatters, bounded per flush; only one
+    // timeout is ever pending, so a long frame coalesces at most one batch.
     const wave = deferredPanes
-    setTimeout(() => {
+    let cursor = 0
+    const step = () => {
       glassT0 = performance.now()
-      for (let i = 0; i < wave.length && i < GLASS_MID; i++) shatterPane(wave[i]!)
+      const end = Math.min(cursor + GLASS_MID, wave.length)
+      for (; cursor < end; cursor++) shatterPane(wave[cursor]!)
       perfSection('boom-glass', performance.now() - glassT0)
-    }, 40)
-    if (wave.length > GLASS_MID) {
-      setTimeout(() => {
-        glassT0 = performance.now()
-        for (let i = GLASS_MID; i < wave.length; i++) shatterPane(wave[i]!)
-        perfSection('boom-glass', performance.now() - glassT0)
-      }, 80)
+      if (cursor < wave.length) setTimeout(step, 40)
     }
+    setTimeout(step, 40)
   }
 
   // Bots: damage + fling (positions shoved — the pathing push-out resolves

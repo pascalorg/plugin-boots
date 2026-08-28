@@ -609,8 +609,10 @@ async function gpuAverageMapColor(map: Texture): Promise<Color | null> {
   }
 }
 
-/** map → resolved average tone (before the base-color multiply). */
-const toneCache = new Map<Texture, Color>()
+/** map → resolved average tone (before the base-color multiply). WeakMap:
+ * a strong Map would pin every session's shingle Textures (and their CPU
+ * image data) for the module lifetime across project jump-ins. */
+const toneCache = new WeakMap<Texture, Color>()
 
 /**
  * Resolve the roof surface tone including compressed textures: the

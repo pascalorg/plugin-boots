@@ -1485,7 +1485,10 @@ function buildRoofPlaneTargets(
   // that hide to wakeTarget (group-wide: one map entry per roof node).
   if (dormant) {
     dormantRoofHide.set(nodeId, meshes)
-    for (const target of built) target.dormant = true
+    for (const target of built) {
+      target.dormant = true
+      dormantCount++
+    }
   } else {
     hideHostNode(world, nodeId, meshes)
   }
@@ -1800,6 +1803,7 @@ export function ensureVoxelTarget(
   // defer the hide to wakeTarget — the host keeps rendering AND colliding.
   if (opts?.dormant) {
     target.dormant = true
+    dormantCount++
     target.hostMeshes = meshes
     target.hostRoot = wall?.root
   } else {
@@ -1820,6 +1824,17 @@ export const ensureVoxelWall = ensureVoxelTarget
 /** Deferred hideHostNode meshes for DORMANT roof groups (keyed by the real
  * roof node id — one hide for the whole plane family). */
 const dormantRoofHide = new Map<string, Mesh[]>()
+
+/** Live dormant-prebuild census — wakeAheadTick's O(1) idle-out. Every
+ * `dormant = true` write increments, every wake/drop of a dormant target
+ * decrements, resetDestruction zeroes. Once a session's dormants are all
+ * awake, cooking sticks stop paying the full collider scan per frame. */
+let dormantCount = 0
+
+/** Tests + QA introspection. */
+export function dormantTargetCount(): number {
+  return dormantCount
+}
 
 /** The session's world, stamped by every voxelize — wakeTarget's fallback
  * for callers without a world in hand (structure crumbles). */
@@ -1845,7 +1860,10 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
     const state = useDestruction.getState()
     for (const id of roofGroups.get(groupId) ?? []) {
       const member = state.targets.get(id)
-      if (member) member.dormant = false
+      if (member?.dormant) {
+        member.dormant = false
+        dormantCount--
+      }
     }
     state.bump()
     perfSection('wake', performance.now() - wakeT0)
@@ -1853,6 +1871,7 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   }
   target.walkOnly = hideHostNode(world, target.nodeId, target.hostMeshes ?? [], target.hostRoot)
   target.dormant = false
+  dormantCount--
   target.hostMeshes = undefined
   target.hostRoot = undefined
   useDestruction.getState().bump()
@@ -3213,6 +3232,9 @@ function explosionRing(
  * Returns true when it woke something (callers budget one per frame).
  */
 export function wakeAheadTick(world: GameWorld, center: Vector3, radius: number): boolean {
+  // Everything is awake (any mid/late session): don't pay the collider scan
+  // per cooking stick per frame just to find nothing.
+  if (dormantCount === 0) return false
   const targets = useDestruction.getState().targets
   let best: VoxelTarget | null = null
   let bestD = Number.POSITIVE_INFINITY
@@ -3576,6 +3598,7 @@ export function dropTarget(nodeId: string): void {
   cancelSettleTask(islandKey(nodeId))
   cancelSettleTask(framingKey(nodeId))
   const state = useDestruction.getState()
+  if (state.targets.get(nodeId)?.dormant) dormantCount--
   if (state.targets.delete(nodeId)) {
     state.bump()
     dropStructureTarget(nodeId)
@@ -3591,6 +3614,7 @@ export function resetDestruction(): void {
   sessionWorld = null
   blastEpoch++
   dormantRoofHide.clear()
+  dormantCount = 0
   if (sceneSupportTimer !== null) {
     clearTimeout(sceneSupportTimer)
     sceneSupportTimer = null
