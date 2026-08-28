@@ -459,8 +459,28 @@ export function dronePathBlocked(
   const len = Math.hypot(dx, dy, dz)
   if (len > 1e-6) {
     const inv = 1 / len
+    // Axis broadphase: a box wholly outside the segment's per-axis extents
+    // can't intersect it (the slab test would fail on that axis anyway) —
+    // a few compares cull almost every collider of a big scene before the
+    // full slab walk. Exact reject: answers are identical.
+    const minX = dx < 0 ? x + dx : x
+    const maxX = dx < 0 ? x : x + dx
+    const minY = dy < 0 ? y + dy : y
+    const maxY = dy < 0 ? y : y + dy
+    const minZ = dz < 0 ? z + dz : z
+    const maxZ = dz < 0 ? z : z + dz
     for (const collider of colliders) {
-      if (segmentHitsBox(collider.worldBox, x, y, z, dx * inv, dy * inv, dz * inv, len)) {
+      const box = collider.worldBox
+      if (
+        box.max.x < minX ||
+        box.min.x > maxX ||
+        box.max.z < minZ ||
+        box.min.z > maxZ ||
+        box.max.y < minY ||
+        box.min.y > maxY
+      )
+        continue
+      if (segmentHitsBox(box, x, y, z, dx * inv, dy * inv, dz * inv, len)) {
         return true
       }
     }
@@ -483,8 +503,14 @@ export function droneDescentBlocked(
   drop: number,
 ): boolean {
   const reach = drop + DRONE_DESCENT_CLEARANCE
+  const floor = y - reach
   for (const collider of colliders) {
-    if (segmentHitsBox(collider.worldBox, x, y, z, 0, -1, 0, reach)) return true
+    const box = collider.worldBox
+    // Straight-down sweep: the XZ point + Y band reject is exact — only
+    // boxes actually under the rotors reach the slab test.
+    if (x < box.min.x || x > box.max.x || z < box.min.z || z > box.max.z) continue
+    if (box.max.y < floor || box.min.y > y) continue
+    if (segmentHitsBox(box, x, y, z, 0, -1, 0, reach)) return true
   }
   return false
 }

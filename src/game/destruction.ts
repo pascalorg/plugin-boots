@@ -25,7 +25,7 @@ import {
   resolveRoofSkinTone,
   roofSurfaceColor,
 } from './roof-planes'
-import { hideForGameKeepingRoots } from './session'
+import { hideForGameKeepingRoots, maskForGame } from './session'
 import {
   cancelSettleTask,
   dropStructureTarget,
@@ -1347,13 +1347,26 @@ function hideHostNode(
   nodeId: string,
   meshes: readonly Mesh[],
   wallRoot?: Object3D,
+  maskOnly?: boolean,
 ): boolean {
   const keepRoots = new Set(world.solidRoots ?? [])
   if (wallRoot) keepRoots.delete(wallRoot)
   for (const collider of world.colliders) {
     if (collider.nodeId === nodeId) keepRoots.delete(collider.root)
   }
-  for (const mesh of meshes) hideForGameKeepingRoots(mesh, keepRoots)
+  // ITEM-family nodes hide via the layers mask, not the `visible` flip:
+  // the first item wake used to stall the render submit ~60 ms with zero
+  // renderer-count change — host-side systems reacting to `visible = false`
+  // on the GLB item meshes. Masks don't cascade and nothing host-side
+  // watches layers, so the wake goes back to being cheap. collectWorld's
+  // mesh sweep gathered EVERY solid leaf mesh of the node (fenced at other
+  // nodes' roots), so masking each one hides exactly what the flip hid;
+  // restore rides the session teardown list.
+  if (maskOnly) {
+    for (const mesh of meshes) maskForGame(mesh)
+  } else {
+    for (const mesh of meshes) hideForGameKeepingRoots(mesh, keepRoots)
+  }
   let walkOnly = false
   for (const collider of world.colliders) {
     if (collider.nodeId !== nodeId) continue
@@ -1881,7 +1894,7 @@ export function ensureVoxelTarget(
     target.hostMeshes = meshes
     target.hostRoot = wall?.root
   } else {
-    target.walkOnly = hideHostNode(world, nodeId, meshes, wall?.root)
+    target.walkOnly = hideHostNode(world, nodeId, meshes, wall?.root, item)
   }
 
   state.targets.set(nodeId, target)
@@ -1948,7 +1961,13 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
     perfSection('wake', performance.now() - wakeT0)
     return
   }
-  target.walkOnly = hideHostNode(world, target.nodeId, target.hostMeshes ?? [], target.hostRoot)
+  target.walkOnly = hideHostNode(
+    world,
+    target.nodeId,
+    target.hostMeshes ?? [],
+    target.hostRoot,
+    target.item,
+  )
   target.dormant = false
   dormantCount--
   target.hostMeshes = undefined

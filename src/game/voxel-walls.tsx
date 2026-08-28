@@ -73,8 +73,12 @@ import { primedCellColor } from './skin-tone'
 // frame — the material/geometry combo is identical to the awake walls
 // rendering from session start, so the GPU pipeline is warm too.
 
-/** One pending dormant prime. `primed` doubles as the unmount tombstone. */
-export type DormantPrimeEntry = { primed: boolean; prime: () => void }
+/** One pending dormant prime. `primed` doubles as the unmount tombstone.
+ * `prime` may return `true` to signal it armed a WARM DRAW (a GPU upload of
+ * the replica's instance buffers lands next frame) — the drain stops there
+ * so at most ONE replica uploads per frame instead of the whole budget's
+ * worth stacking on the same entry frame. */
+export type DormantPrimeEntry = { primed: boolean; prime: () => boolean | void }
 
 /** Dormant replica primes executed per frame (VoxelWalls' drain). */
 export const DORMANT_PRIME_PER_FRAME = 2
@@ -96,15 +100,21 @@ export function primeDormantNow(entry: DormantPrimeEntry): void {
 }
 
 /** Run up to `budget` queued primes; returns how many actually primed.
- * Tombstoned/woken entries drop for free (never counted against budget). */
+ * Tombstoned/woken entries drop for free (never counted against budget).
+ * A prime that ARMS A WARM DRAW (returns true) ends the drain early: its
+ * GPU buffer upload lands next frame, and serializing the uploads keeps
+ * two replicas' first uploads from stacking on one session-entry frame —
+ * the queue only exists during gear-up, so the extra frames are absorbed
+ * there. */
 export function drainDormantPrimes(budget = DORMANT_PRIME_PER_FRAME): number {
   let primed = 0
   while (primeQueue.length > 0 && primed < budget) {
     const entry = primeQueue.shift()!
     if (entry.primed) continue
     entry.primed = true
-    entry.prime()
+    const armedWarmDraw = entry.prime() === true
     primed++
+    if (armedWarmDraw) break
   }
   return primed
 }
@@ -413,8 +423,12 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
             // would restore + re-hide before anything ever drew.
             warmDraw.current = 2
             perfSection('warm-draw-armed', 0)
+            // Tell the drain an upload is in flight — it stops for this
+            // frame so warm draws serialize (one first-upload per frame).
+            return true
           }
         }
+        return false
       },
     }
     primeEntry.current = entry

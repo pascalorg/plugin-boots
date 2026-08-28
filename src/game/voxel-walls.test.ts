@@ -71,6 +71,26 @@ describe('dormant prime queue — budgeted drain', () => {
     for (const entry of live) expect(entry.calls).toBe(1)
   })
 
+  test('a prime that arms a warm draw ends the drain for the frame', () => {
+    // Warm-draw serialization: the armed prime's GPU upload lands next
+    // frame, so the drain stops there — one first-upload per frame instead
+    // of the whole budget's worth stacking on a single entry frame.
+    const uploader = spyEntry()
+    uploader.prime = () => {
+      uploader.calls++
+      return true // armed a warm draw
+    }
+    const waiting = spyEntry()
+    queueDormantPrime(uploader)
+    queueDormantPrime(waiting)
+
+    expect(drainDormantPrimes(2)).toBe(1) // budget 2, but the upload gates
+    expect(uploader.calls).toBe(1)
+    expect(waiting.calls).toBe(0)
+    expect(drainDormantPrimes(2)).toBe(1) // next frame drains the rest
+    expect(waiting.calls).toBe(1)
+  })
+
   test('primeDormantNow (the wake path) is idempotent against the queue', () => {
     const entry = spyEntry()
     queueDormantPrime(entry)

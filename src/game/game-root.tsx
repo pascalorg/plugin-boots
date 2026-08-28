@@ -428,8 +428,13 @@ function ActiveGame() {
   // restores visibility (React commits new render → old cleanup → new
   // effects), so the render-time snapshot above can come up empty — the
   // "building vanished" QA burn. Effects run after the restore: re-collect
-  // once if the snapshot missed every wall.
+  // once if the snapshot missed every wall. DEV-ONLY: the race is a Fast
+  // Refresh remount artifact (players never remount mid-session), and in
+  // production a wall-less lot has `walls.size === 0` as its NORMAL state —
+  // without the gate every jump-in there paid a duplicate full-scene
+  // collectWorld walk.
   useEffect(() => {
+    if (process.env.NODE_ENV === 'production') return
     if (world.walls.size > 0) return
     const fresh = collectWorld()
     if (fresh.walls.size > 0) setWorld(fresh)

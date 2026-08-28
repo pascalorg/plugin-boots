@@ -481,6 +481,14 @@ const _dripPos = new Vector3()
 const _dripScale = new Vector3()
 const _dripMatrix = new Matrix4()
 const _dripTint = new Color()
+/** Wet-coat tint per palette entry — the palette color pushed a touch
+ * darker + richer, precomputed once (module lifetime, like the drip
+ * texture). stepDrips used to re-parse the hex STRING per growing drip per
+ * frame (`Color.set(string)` runs setStyle's regex — a per-frame
+ * allocation) for a value that is constant per palette slot. */
+const DRIP_TINTS: readonly Color[] = PAINT_PALETTE.map((p) =>
+  new Color(p.hex).offsetHSL(0, 0.05, -0.06),
+)
 
 /** Advance growing drips: ease-out length growth, top edge anchored so the
  * run translates DOWN as it grows; fully grown runs freeze (persist until
@@ -499,9 +507,8 @@ function stepDrips(mesh: InstancedMesh, dt: number): void {
     _dripScale.set(DRIP_WIDTH, len, 1)
     _dripMatrix.compose(_dripPos, _dripQuat, _dripScale)
     mesh.setMatrixAt(i, _dripMatrix)
-    // Wet coat: the palette color pushed a touch darker + richer.
-    _dripTint.set(PAINT_PALETTE[s.color]!.hex).offsetHSL(0, 0.05, -0.06)
-    mesh.setColorAt(i, _dripTint)
+    // Wet coat: the precomputed darker+richer palette tint (DRIP_TINTS).
+    mesh.setColorAt(i, DRIP_TINTS[s.color]!)
     if (k >= 1) {
       s.done = true
       dripsGrowing--
@@ -1066,6 +1073,10 @@ const meshCache = new Map<string, InstancedMesh>()
 type PaintedUserData = {
   __bootsPaintSerial?: number
   __bootsPaintTarget?: VoxelTarget
+  /** Cached fingerprint probe cell (matchesTarget). Any ALIVE cell works —
+   * the cache only saves the first-alive scan, which is O(grid.count) on a
+   * heavily-carved grid and used to run per painted node per frame. */
+  __bootsPaintProbe?: number
 }
 
 /**
@@ -1078,14 +1089,24 @@ type PaintedUserData = {
 function matchesTarget(mesh: InstancedMesh, target: VoxelTarget): boolean {
   const grid = target.grid
   if (mesh.count !== grid.count) return false
-  let probe = -1
-  for (let i = 0; i < grid.count; i++) {
-    if (grid.alive[i]) {
-      probe = i
-      break
+  // First-alive probe, cached on the mesh: the linear scan re-ran per
+  // painted node per FRAME (cache hits revalidate through here), and a big
+  // carved grid can have thousands of dead cells before the first live one.
+  // Any alive cell fingerprints equally well, so reuse the last probe until
+  // that cell dies (or the userData gates reset with a re-prime).
+  const ud = mesh.userData as PaintedUserData
+  let probe = ud.__bootsPaintProbe ?? -1
+  if (probe < 0 || probe >= grid.count || !grid.alive[probe]) {
+    probe = -1
+    for (let i = 0; i < grid.count; i++) {
+      if (grid.alive[i]) {
+        probe = i
+        break
+      }
     }
+    if (probe === -1) return false
+    ud.__bootsPaintProbe = probe
   }
-  if (probe === -1) return false
   mesh.getMatrixAt(probe, _probeMatrix)
   const e = _probeMatrix.elements
   return (

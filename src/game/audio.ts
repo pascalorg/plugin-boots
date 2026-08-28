@@ -801,11 +801,19 @@ export const sfx = {
       wobbleDepth.disconnect()
       swellDepth.disconnect()
     }
+    // Change gate: enemies.tsx calls setIntensity every frame (including a
+    // constant 0 with no drones alive) and each call used to write THREE
+    // automation-timeline events — ~360/s for the whole session. The
+    // setTargetAtTime curves converge on their own, so an unchanged target
+    // needs no new events; idle cost drops to one compare.
+    let lastN = -1
     return {
       setIntensity: (v: number) => {
         // Legacy input scale (target level ≤ DRONE_LEVEL_MAX) — normalize,
         // then SQUARE: strong distance falloff, near drones still read.
         const n = Math.min(1, Math.max(0, v / DRONE_LEVEL_MAX))
+        if (Math.abs(n - lastN) < 1e-4) return
+        lastN = n
         const t = c.currentTime
         gain.gain.setTargetAtTime(0.075 * n * n, t, 0.12)
         // Rotors lean up slightly as the pack closes — menace, not siren.

@@ -216,6 +216,28 @@ export class Hud {
       'position:absolute;inset:0;pointer-events:none;z-index:2147483646;user-select:none;font-family:system-ui'
     this.root = root
 
+    // Entry veil — a plain black div that fades out over the first second
+    // of the session. Session entry front-loads real one-off work (dormant
+    // replica primes + their serialized first GPU uploads, BVH warms,
+    // Prevoxelize ticks); the veil masks those gear-up frames instead of
+    // showing them as a stutter. Pure DOM, outside the scene graph, first
+    // child on purpose: every HUD element paints ON TOP of it, so prompts
+    // stay readable while the world fades in. Removes itself when done.
+    const veil = document.createElement('div')
+    veil.style.cssText =
+      'position:absolute;inset:0;background:#000;opacity:1;transition:opacity 1.2s ease 0.15s'
+    root.appendChild(veil)
+    if (typeof requestAnimationFrame === 'function') {
+      // Double-rAF: the opacity:1 frame must COMMIT before the transition
+      // target lands, or the browser skips straight to transparent.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          veil.style.opacity = '0'
+        })
+      })
+    } else veil.style.opacity = '0'
+    window.setTimeout(() => veil.remove(), 1700)
+
     const el = (css: string, text = ''): HTMLDivElement => {
       const div = document.createElement('div')
       div.style.cssText = css
