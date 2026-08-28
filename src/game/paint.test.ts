@@ -1,14 +1,28 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  COAT_ADD,
+  DRIP_MAX_PER_TICK,
+  DRIP_P,
+  DRIP_STRENGTH_GATE,
   PAINT_PALETTE,
+  paintColorOf,
   paintLabelInk,
   paintLabelTexture,
   paintPrompt,
+  paintStrengthOf,
+  paintValue,
+  RIM_SPECKLE_ADD,
+  RIM_SPECKLE_P,
   selectSplatCells,
+  shouldDrip,
+  speckleHash,
   SPLAT_FAR_DIST,
   SPLAT_FAR_RADIUS,
   SPLAT_NEAR_DIST,
   SPLAT_NEAR_RADIUS,
+  SPLAT_RIM_OUTER,
+  splatCoat,
+  splatFalloff,
   splatRadiusAt,
   WRITING_DISTANCE,
 } from './paint'
@@ -94,6 +108,153 @@ describe('selectSplatCells (the paint splat)', () => {
 
   test('a miss paints nothing', () => {
     expect(selectSplatCells(row(4, 0.15), 9, 9, 9, splatRadiusAt(3))).toEqual([])
+  })
+})
+
+describe('packed ledger values ((color << 8) | strength)', () => {
+  test('round trip across the palette and the strength range', () => {
+    for (let color = 0; color < PAINT_PALETTE.length; color++) {
+      for (const s of [0, 0.25, 0.5, 1]) {
+        const value = paintValue(color, s)
+        expect(paintColorOf(value)).toBe(color)
+        expect(paintStrengthOf(value)).toBeCloseTo(s, 2)
+      }
+    }
+  })
+
+  test('strength clamps to the byte — accumulation can never overflow color bits', () => {
+    expect(paintValue(3, 1.7)).toBe((3 << 8) | 255)
+    expect(paintValue(3, -0.4)).toBe(3 << 8)
+    expect(paintColorOf(paintValue(6, 99))).toBe(6)
+  })
+})
+
+describe('splatFalloff (the feathered edge)', () => {
+  test('anchors: full at the center, zero at the rim, half mid-way', () => {
+    expect(splatFalloff(0)).toBe(1)
+    expect(splatFalloff(-1)).toBe(1)
+    expect(splatFalloff(1)).toBe(0)
+    expect(splatFalloff(2)).toBe(0)
+    expect(splatFalloff(0.5)).toBeCloseTo(0.5, 10)
+  })
+
+  test('monotonic non-increasing across the splat', () => {
+    let prev = splatFalloff(0)
+    for (let t = 0.05; t <= 1.2; t += 0.05) {
+      const w = splatFalloff(t)
+      expect(w).toBeLessThanOrEqual(prev)
+      prev = w
+    }
+  })
+})
+
+describe('speckleHash (the rim overspray lottery)', () => {
+  test('deterministic per (cell, serial), in [0, 1)', () => {
+    for (let cell = 0; cell < 64; cell++) {
+      for (const serial of [0, 1, 7, 1000]) {
+        const h = speckleHash(cell, serial)
+        expect(h).toBe(speckleHash(cell, serial))
+        expect(h).toBeGreaterThanOrEqual(0)
+        expect(h).toBeLessThan(1)
+      }
+    }
+  })
+
+  test('a new serial redraws the pattern (successive ticks speckle differently)', () => {
+    let moved = 0
+    for (let cell = 0; cell < 64; cell++) {
+      if ((speckleHash(cell, 1) < RIM_SPECKLE_P) !== (speckleHash(cell, 2) < RIM_SPECKLE_P)) {
+        moved++
+      }
+    }
+    expect(moved).toBeGreaterThan(0)
+  })
+
+  test('lottery rate lands near RIM_SPECKLE_P over many draws', () => {
+    let hits = 0
+    const draws = 4000
+    for (let i = 0; i < draws; i++) if (speckleHash(i, 3) < RIM_SPECKLE_P) hits++
+    expect(hits / draws).toBeGreaterThan(RIM_SPECKLE_P * 0.6)
+    expect(hits / draws).toBeLessThan(RIM_SPECKLE_P * 1.4)
+  })
+})
+
+describe('splatCoat (accumulating feathered splat)', () => {
+  test('adds peak at the hit point and feather toward the rim', () => {
+    const grid = row(9, 0.15)
+    const radius = 0.5
+    const coats = splatCoat(grid, 0.6, 0, 0, radius, 1)
+    const byCell = new Map(coats.map((c) => [c.cell, c.add]))
+    // Cell 4 sits exactly at the hit point: the full COAT_ADD.
+    expect(byCell.get(4)).toBeCloseTo(COAT_ADD, 10)
+    // Feather: strictly less as distance grows, matching the pure curve
+    // (precision 6 — grid centers are Float32, the curve math is Float64).
+    expect(byCell.get(3)!).toBeCloseTo(COAT_ADD * splatFalloff(0.15 / radius), 6)
+    expect(byCell.get(3)!).toBeLessThan(byCell.get(4)!)
+    expect(byCell.get(2)!).toBeLessThan(byCell.get(3)!)
+    expect(byCell.get(2)!).toBeCloseTo(byCell.get(6)!, 6)
+  })
+
+  test('rim annulus cells take only the faint speckle add, by the lottery', () => {
+    const grid = row(200, 0.01)
+    const radius = 0.5
+    const serial = 7 // draws 3 annulus winners — pinned by the hash
+    const coats = splatCoat(grid, 0, 0, 0, radius, serial)
+    const coated = new Set(coats.map((c) => c.cell))
+    let speckles = 0
+    for (const { cell, add } of coats) {
+      const d = cell * 0.01
+      expect(d).toBeLessThanOrEqual(radius * SPLAT_RIM_OUTER + 1e-9)
+      if (d > radius) {
+        // Annulus: the flat fleck strength, only for lottery winners.
+        expect(add).toBe(RIM_SPECKLE_ADD)
+        speckles++
+      }
+    }
+    // Membership matches the deterministic lottery exactly, both ways.
+    for (let cell = 51; cell <= 62; cell++) {
+      expect(coated.has(cell)).toBe(speckleHash(cell, serial) < RIM_SPECKLE_P)
+    }
+    expect(speckles).toBeGreaterThan(0)
+    // Same serial, same splat — fully deterministic.
+    expect(splatCoat(grid, 0, 0, 0, radius, serial)).toEqual(coats)
+  })
+
+  test('dead cells never coat; beyond 1.25 r nothing lands', () => {
+    const grid = row(5, 0.15, [2])
+    const coats = splatCoat(grid, 0.3, 0, 0, 0.2, 1)
+    expect(coats.some((c) => c.cell === 2)).toBe(false)
+    expect(splatCoat(row(4, 0.15), 9, 9, 9, 0.5, 1)).toEqual([])
+  })
+
+  test('repeated ticks accumulate to saturation (the ledger math)', () => {
+    // Simulate sprayPaint's accumulation on one center cell.
+    let strength = 0
+    let ticks = 0
+    while (strength < 1 && ticks < 10) {
+      strength = Math.min(1, strength + COAT_ADD)
+      ticks++
+    }
+    expect(ticks).toBe(Math.ceil(1 / COAT_ADD))
+    expect(paintStrengthOf(paintValue(2, strength))).toBe(1)
+  })
+})
+
+describe('shouldDrip (over-coat runs, P4)', () => {
+  test('only saturated wall cells under the per-tick cap can drip', () => {
+    expect(shouldDrip('wall', 0.9, 0, 0.1)).toBe(true)
+    // Not a near-vertical surface.
+    expect(shouldDrip('slab', 0.9, 0, 0.1)).toBe(false)
+    expect(shouldDrip('roof', 0.9, 0, 0.1)).toBe(false)
+    // First coats never drip — the cell must already sit past the gate.
+    expect(shouldDrip('wall', DRIP_STRENGTH_GATE, 0, 0.1)).toBe(false)
+    expect(shouldDrip('wall', 0, 0, 0.1)).toBe(false)
+    // Per-tick cap.
+    expect(shouldDrip('wall', 0.9, DRIP_MAX_PER_TICK, 0.1)).toBe(false)
+    expect(shouldDrip('wall', 0.9, DRIP_MAX_PER_TICK - 1, 0.1)).toBe(true)
+    // The lottery.
+    expect(shouldDrip('wall', 0.9, 0, DRIP_P)).toBe(false)
+    expect(shouldDrip('wall', 0.9, 0, DRIP_P - 1e-9)).toBe(true)
   })
 })
 

@@ -11,7 +11,9 @@ import {
   notifySceneSupportChanged,
   onCollapse,
   onPieceRemoved,
+  PIECE_DEAD_ALIVE_FRACTION,
   pieceAt,
+  pieceReplicaDead,
   registerPlacement,
   resetPieceSlots,
   setSceneSupportProbe,
@@ -252,6 +254,27 @@ describe('died-slot lockout (turbo)', () => {
     registerPlacement('Wz:0,0,0', 2)
     expect(diedAt('Wz:0,0,0')).toBe(0)
     expect(isDeathLocked('Wz:0,0,0')).toBe(false)
+  })
+})
+
+describe('piece-as-unit death (SUPPORT-STRICT)', () => {
+  test('a piece dies below the 15% alive fraction — one corner voxel holds nothing up', () => {
+    expect(PIECE_DEAD_ALIVE_FRACTION).toBeCloseTo(0.15)
+    expect(pieceReplicaDead(0, 100)).toBe(true) // the old rule, still dead
+    expect(pieceReplicaDead(1, 100)).toBe(true) // the lone-corner-voxel case
+    expect(pieceReplicaDead(14, 100)).toBe(true) // just under the fraction
+    expect(pieceReplicaDead(15, 100)).toBe(false) // at the fraction → alive
+    expect(pieceReplicaDead(100, 100)).toBe(false)
+  })
+
+  test('degenerate zero-cell grids are dead by definition', () => {
+    expect(pieceReplicaDead(0, 0)).toBe(true)
+  })
+
+  test('threshold sits far below the walk-only demotion (planks demote first)', () => {
+    // walkOnly retires at 12% DAMAGE (88% alive) — a plank always becomes
+    // solid-holed voxels long before the piece itself bursts at <15% alive.
+    expect(PIECE_DEAD_ALIVE_FRACTION).toBeLessThan(1 - 0.12)
   })
 })
 

@@ -282,6 +282,29 @@ export function flushCollapse(): void {
   }
 }
 
+// --- Piece-as-unit death (SUPPORT-STRICT, phase 9) ----------------------------
+
+/** A placed piece's voxel replica is structurally DEAD once fewer than this
+ * fraction of its cells survive. The old rule (dead only at aliveCount 0)
+ * let ONE surviving corner voxel hold a whole column of pieces up — the
+ * genre reads pieces as units: shot past ~85%, the piece bursts and its
+ * dependents cascade. 15% chosen over a contact-band scan because
+ * aliveCount/count already sit on every grid (zero extra state, no
+ * per-voxel loop on the hot carve path) and the fraction reads the same
+ * for every piece shape/mask. Stays comfortably above the walk-only plank
+ * demotion (12% DAMAGE ≡ 88% alive), so planks always demote long before
+ * they die. */
+export const PIECE_DEAD_ALIVE_FRACTION = 0.15
+
+/** True when a piece replica with `aliveCount` live cells of `count` total
+ * should be treated as REMOVED — destruction.settleSupportAfterRemoval
+ * gates the full undo cleanup (store removal → collider splice + dropTarget
+ * → onPieceRemoved cascade) on this instead of aliveCount === 0. Pure;
+ * degenerate zero-cell grids are dead by definition. */
+export function pieceReplicaDead(aliveCount: number, count: number): boolean {
+  return aliveCount <= 0 || aliveCount < count * PIECE_DEAD_ALIVE_FRACTION
+}
+
 // --- Died-slot lockout (turbo) ----------------------------------------------
 
 /** Timestamp (ms, performance.now clock) of the last piece death in this

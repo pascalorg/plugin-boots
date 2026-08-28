@@ -17,7 +17,7 @@ import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { blastDebrisActive, queueDebris } from './grenade'
 import { perfEvent, perfSection } from './perf-monitor'
-import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
+import { notifySceneSupportChanged, onPieceRemoved, pieceReplicaDead, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
 import {
   enumerateRoofPlanes,
@@ -314,6 +314,10 @@ export type VoxelTarget = {
    * shape-preserving cells, carve dust voiced 'concrete'-lite (the
    * porcelain read — see damageTarget). */
   item?: boolean
+  /** True when the item's dominant sub-mesh material reads metallic
+   * (metalness > 0.5 at voxelize time) — shooting.ts swaps the carve
+   * chip/puff for spark streaks + sfx.metalPing(). */
+  metal?: boolean
   /** Per-voxel RGB (3 floats per index, working color space) — sampled at
    * VOXELIZE time from the item's own sub-mesh materials (silhouette lane
    * only; see sampleItemCellColors). voxel-walls.tsx prefers it over
@@ -1503,6 +1507,8 @@ function buildRoofPlaneTargets(
   }
   roofGroups.set(nodeId, ids)
   state.bump()
+  // Paint decal lane: the plane family is live under the scene node id.
+  if (!dormant) targetLiveListener?.(nodeId)
   // Async skin tone (QA phase-6 round 3: post-vox roofs rendered WHITE —
   // host shingle materials are white-base + compressed KTX2 map, so the
   // synchronous sample above can't see the real tone). resolveRoofSkinTone
@@ -1599,6 +1605,15 @@ function buildRoofResidualTarget(
     removedQueue: [],
     revision: 0,
   }
+}
+
+/** Paint decal lane (phase 9): fired once whenever a node's replica goes
+ * LIVE (fresh awake voxelize, roof-plane decomposition, or a dormant wake
+ * — the host hides in all three). paint.tsx registers its decal → cell-
+ * ledger conversion here; null clears (PaintTool unmount). */
+let targetLiveListener: ((nodeId: string) => void) | null = null
+export function setTargetLiveListener(cb: ((nodeId: string) => void) | null): void {
+  targetLiveListener = cb
 }
 
 /**
@@ -1773,6 +1788,10 @@ export function ensureVoxelTarget(
   // target's flat baseColor becomes the palette average so dust/fallbacks
   // stay in family.
   const itemPalette = item ? sampleItemCellColors(grid, meshes) : null
+  // Metal read (phase 9 juice lane): dominant sub-mesh metalness > 0.5 at
+  // voxelize time — carves throw sparks instead of chips (shooting.ts).
+  const metal =
+    item && meshes.some((m) => ((dominantMeshMaterial(m) as { metalness?: number } | null)?.metalness ?? 0) > 0.5)
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -1785,6 +1804,7 @@ export function ensureVoxelTarget(
     kind,
     roof,
     item,
+    metal,
     grid,
     baseColor:
       itemPalette?.average ?? (wall ? nodeCoatColor(nodeId) : null) ?? targetBaseColor(meshes),
@@ -1815,6 +1835,9 @@ export function ensureVoxelTarget(
   // Cross-target support (Phase B3): record the target's world AABB so
   // carving it can wake the walls resting on it (structure.ts).
   registerStructureTarget(target, kind)
+  // Paint decal lane: awake voxelize = the replica is live NOW; dormant
+  // prebuilds fire from wakeTarget instead (the host is still showing).
+  if (!opts?.dormant) targetLiveListener?.(nodeId)
   return target
 }
 
@@ -1866,6 +1889,8 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
       }
     }
     state.bump()
+    // Paint decal lane: the whole plane family just went live.
+    targetLiveListener?.(groupId)
     perfSection('wake', performance.now() - wakeT0)
     return
   }
@@ -1875,6 +1900,8 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   target.hostMeshes = undefined
   target.hostRoot = undefined
   useDestruction.getState().bump()
+  // Paint decal lane: dormant wake — the host just hid, replica is live.
+  targetLiveListener?.(target.nodeId)
   perfSection('wake', performance.now() - wakeT0)
 }
 
@@ -2566,7 +2593,10 @@ let sceneSupportTimer: ReturnType<typeof setTimeout> | null = null
 
 function settleSupportAfterRemoval(target: VoxelTarget): void {
   if (target.nodeId.startsWith(PLACED_PIECE_PREFIX)) {
-    if (target.grid.aliveCount > 0) return
+    // Piece-as-unit death (phase 9 support lane): a placed piece dies as a
+    // WHOLE once its replica drops under the alive-fraction floor — long
+    // before the last voxel goes, and well below the walk-only demotion.
+    if (!pieceReplicaDead(target.grid.aliveCount, target.grid.count)) return
     const pieceId = Number(target.nodeId.slice(PLACED_PIECE_PREFIX.length))
     if (!Number.isFinite(pieceId)) return
     // Store removal first (undo-ordering contract): unmounting the mesh

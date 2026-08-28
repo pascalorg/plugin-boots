@@ -88,6 +88,12 @@ export type Bot = {
  * enemies.tsx. y is feet, like the player capsule. */
 export const GROUND_BOT_CAPSULE = { radius: 0.35, height: 1.2 }
 
+/** Drone capsule for the same wall rule (DRONE WALL RULE in enemies.tsx) —
+ * sized to the rotor frame. A drone's position is its BODY CENTER (no feet),
+ * so enemies.tsx offsets by half the height into the feet-based collide*
+ * calls and back. */
+export const DRONE_CAPSULE = { radius: 0.3, height: 0.5 }
+
 export const BOT_STATS: Record<
   BotKind,
   { health: number; speed: number; damage: number; reach: number; bodyY: number; radius: number }
@@ -389,6 +395,133 @@ export function settleGroundBot(world: GameWorld, bot: Bot, dt: number): void {
     const rate = bot.position.y - bot.groundY > FALL_GAP ? BOT_FALL_RATE : BOT_SETTLE_RATE
     bot.position.y = Math.max(bot.groundY, bot.position.y - rate * dt)
   }
+}
+
+// --- DRONE STEERING PROBES + MELEE LOS: pure math (see enemies.tsx) ---------
+// The capsule pass is TRUTH for drone placement; these probes are steering —
+// they decide when a drone climbs, when it may settle, and when a melee swing
+// is walled off. Pure over collider worldBoxes so they unit-test with plain
+// Box3 stubs (no meshes/BVHs needed).
+
+/** The slice of a collider the probes read. Disabled entries (voxelized
+ * walls/pieces) stay INCLUDED on purpose — the box outlives the hidden mesh,
+ * so drones climb over breached buildings instead of threading holes meant
+ * for ground bots (the capsule pass, which honors liveness, is still truth). */
+export type ProbeBox = { worldBox: Box3 }
+
+/** Wall-top skim: extra probe this far under the path's far end (m) so a
+ * wall whose top sits just below the flight line still reads solid. */
+const PATH_PROBE_UNDER = 0.6
+/** Descent corridor: how far below the rotors the settle probe looks (m). */
+export const DRONE_DESCENT_PROBE = 1.2
+/** Rotor clearance kept over anything solid in the corridor (m). */
+export const DRONE_DESCENT_CLEARANCE = 0.4
+
+const _probePoint = new Vector3()
+
+/** Point-vs-collider worldBox — the skim-probe primitive. */
+export function pointInColliderBoxes(
+  colliders: readonly ProbeBox[],
+  x: number,
+  y: number,
+  z: number,
+): boolean {
+  _probePoint.set(x, y, z)
+  for (const collider of colliders) {
+    if (collider.worldBox.containsPoint(_probePoint)) return true
+  }
+  return false
+}
+
+/**
+ * Path-aware forward probe: an exact sweep along the intended DISPLACEMENT
+ * (dx, dy, dz — vertical included, so a descent toward the player reads the
+ * floor it would cut through; a segment test never straddles a thin slab
+ * the way point samples can), plus one point just under the far end so wall
+ * tops keep reading solid while skimming. Blocked → the drone climbs.
+ */
+export function dronePathBlocked(
+  colliders: readonly ProbeBox[],
+  x: number,
+  y: number,
+  z: number,
+  dx: number,
+  dy: number,
+  dz: number,
+): boolean {
+  const len = Math.hypot(dx, dy, dz)
+  if (len > 1e-6) {
+    const inv = 1 / len
+    for (const collider of colliders) {
+      if (segmentHitsBox(collider.worldBox, x, y, z, dx * inv, dy * inv, dz * inv, len)) {
+        return true
+      }
+    }
+  }
+  return pointInColliderBoxes(colliders, x + dx, y + dy - PATH_PROBE_UNDER, z + dz)
+}
+
+/**
+ * Descent corridor: before a drone gives altitude back (settling banked
+ * climb, or following the player down a storey) the band under the rotors
+ * is swept down to `drop` + clearance. Blocked → hold altitude: an elevated
+ * floor/roof/wall under the drone is COVER, exactly like ground walls stop
+ * ground bots.
+ */
+export function droneDescentBlocked(
+  colliders: readonly ProbeBox[],
+  x: number,
+  y: number,
+  z: number,
+  drop: number,
+): boolean {
+  const reach = drop + DRONE_DESCENT_CLEARANCE
+  for (const collider of colliders) {
+    if (segmentHitsBox(collider.worldBox, x, y, z, 0, -1, 0, reach)) return true
+  }
+  return false
+}
+
+/**
+ * Segment-vs-AABB slab test — melee LOS vs non-voxelized solids (closed
+ * doors, props, pristine walls). Exact where the old single midpoint probe
+ * could miss a thin door leaf sitting near either end of the swing: bots
+ * never damage through a closed door. Allocation-free; attack-frames only.
+ */
+export function segmentHitsBox(
+  box: Box3,
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  maxDist: number,
+): boolean {
+  let tMin = 0
+  let tMax = maxDist
+  for (let axis = 0; axis < 3; axis++) {
+    const o = axis === 0 ? ox : axis === 1 ? oy : oz
+    const d = axis === 0 ? dx : axis === 1 ? dy : dz
+    const min = axis === 0 ? box.min.x : axis === 1 ? box.min.y : box.min.z
+    const max = axis === 0 ? box.max.x : axis === 1 ? box.max.y : box.max.z
+    if (Math.abs(d) < 1e-9) {
+      if (o < min || o > max) return false
+      continue
+    }
+    const inv = 1 / d
+    let t1 = (min - o) * inv
+    let t2 = (max - o) * inv
+    if (t1 > t2) {
+      const swap = t1
+      t1 = t2
+      t2 = swap
+    }
+    if (t1 > tMin) tMin = t1
+    if (t2 < tMax) tMax = t2
+    if (tMin > tMax) return false
+  }
+  return true
 }
 
 export type BotRayHit = { bot: Bot; distance: number; point: Vector3 }

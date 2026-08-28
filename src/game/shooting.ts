@@ -8,11 +8,14 @@ import {
   isTearLaneNode,
   raycastStuds,
   raycastVoxelTargets,
+  useDestruction,
 } from './destruction'
 import { spawnDust } from './dust'
 import { bots, damageBot, raycastBots } from './enemies-state'
 import { hitGlass, raycastGlass } from './glass'
+import type { HitmarkerKind } from './hud'
 import { playerRig } from './player'
+import { getSession } from './session'
 import type { WeaponDef } from './weapons'
 import type { GameWorld } from './world'
 
@@ -70,6 +73,23 @@ import type { GameWorld } from './world'
  * Hits only need { distance, point }; the damage callback receives the
  * exact object its paired raycast returned, so extra fields flow through.
  * Until registration, trees resolve as plain solid colliders (sparks).
+ *
+ * ── Hit feedback (phase 9 juice) ───────────────────────────────────────
+ * This file owns confirmed-hit HUD feedback — it alone knows the true
+ * outcome: hud.hitmarker('carve') on any voxel/segment damage that landed,
+ * 'hit' + sfx.hitmarker on a bot hit, 'kill' + sfx.killConfirm when the
+ * round dropped the bot (state left 'alive' inside this shot). Headless /
+ * out-of-session, getSession() is null and feedback is a silent no-op.
+ * NOTE for integration: viewmodel.tsx's legacy outcome==='bot' hitmarker
+ * calls double-voice against this and should be removed (manager diff).
+ *
+ * ── Metal spark lane (phase 9 juice) ───────────────────────────────────
+ * Item targets flagged `metal` (destruction.ts samples the dominant
+ * sub-mesh material's metalness > 0.5 at VOXELIZE time — feature-detected
+ * here through a cast until the flag lands) trade the porcelain chip/puff
+ * for 3–5 bright yellow-white spark streaks (debris idiom: tiny cubes,
+ * high speed, short ttl, gravity) + sfx.metalPing. Walls, tile-read items
+ * and glass keep their existing reads untouched.
  */
 
 export type FireOutcome = 'bot' | 'wall' | 'glass' | 'tree' | 'solid' | 'none'
@@ -172,6 +192,48 @@ const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _point = new Vector3()
 const SPARK = new Color('#c9c2b4')
+/** Hot metal-impact spark tone — bright yellow-white (debris jitters it). */
+const SPARK_HOT = new Color('#ffe9a0')
+
+/**
+ * Spark-lane material gate, pure (pinned by shooting.test.ts): a target
+ * sparks metal only when its voxelize-time `metal` flag is exactly true.
+ * The flag is OPTIONAL — destruction.ts samples dominant material.metalness
+ * > 0.5 on item targets; until that lands (or on any pre-flag target) every
+ * shape of missing/false answers false and the porcelain read stays.
+ */
+export function isMetalTarget(target: { metal?: boolean } | null | undefined): boolean {
+  return target?.metal === true
+}
+
+/** Confirmed-hit HUD feedback — see the header block. Null-session safe. */
+function hitFeedback(kind: HitmarkerKind): void {
+  getSession()?.hud.hitmarker(kind)
+}
+
+const _sparkDir = { x: 0, y: 0, z: 0 }
+
+/** 3–5 bright spark streaks off a metal hit: tiny hot debris cubes thrown
+ * back along the shot with an upward kick — spawnDebris adds the spray and
+ * gravity; the short ttl keeps them streaks, not litter. */
+function metalSparks(point: Vector3, direction: Vector3): void {
+  _sparkDir.x = -direction.x * 0.8
+  _sparkDir.y = 0.55
+  _sparkDir.z = -direction.z * 0.8
+  const n = 3 + Math.floor(Math.random() * 3)
+  for (let i = 0; i < n; i++) {
+    spawnDebris(
+      point.x,
+      point.y,
+      point.z,
+      0.016 + Math.random() * 0.014,
+      SPARK_HOT,
+      3.2,
+      0.3,
+      _sparkDir,
+    )
+  }
+}
 
 export function aimDirection(target: Vector3, spread: number): Vector3 {
   target.set(0, 0, -1)
@@ -296,10 +358,20 @@ function carve(
   }
   if (wall) {
     sfx.drywallCrunch(Math.min(1, removed / 10))
+  } else if (
+    isMetalTarget(
+      useDestruction.getState().targets.get(nodeId) as { metal?: boolean } | undefined,
+    )
+  ) {
+    // Metal-flagged item (fridge, faucet, range hood…): bright spark
+    // streaks + a metallic ring instead of the porcelain chip/puff read.
+    metalSparks(point, direction)
+    sfx.metalPing()
   } else {
     chip(point, Math.min(0.5, 0.2 + removed / 60))
     heavyPuff(point, direction, removed)
   }
+  hitFeedback('carve')
   return removed
 }
 
@@ -419,10 +491,15 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
 
   if (winner === 'bot' && botHit) {
     damageBot(botHit.bot, weapon.damage)
+    // The round dropped it iff the state left 'alive' inside this shot.
+    const killed = botHit.bot.state !== 'alive'
     // Metal chassis: sparks only, no dust.
     for (let i = 0; i < 2; i++) {
       spawnDebris(botHit.point.x, botHit.point.y, botHit.point.z, 0.03, SPARK, 1.6, 0.5)
     }
+    if (killed) sfx.killConfirm()
+    else sfx.hitmarker()
+    hitFeedback(killed ? 'kill' : 'hit')
     return 'bot'
   }
   if (winner === 'glass' && glassHit) {
@@ -445,6 +522,7 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
       ? d3.damageSegment(world, segmentHit.nodeId, memberId, dmg, segmentHit.point)
       : damageStud(world, segmentHit.nodeId, memberId, dmg, segmentHit.point)
     if (!applied) sfx.voxelCrunch(0.25)
+    else hitFeedback('carve')
     // Material contract (phase 4): framing is WOOD — no dust at all, the
     // splinters come from damageSegment's own debris (dust.tsx returns
     // early on kind 'wood'; skipping the call keeps that intent local).

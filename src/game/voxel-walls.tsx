@@ -16,6 +16,7 @@ import {
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
 import { type RoofToneRenderer, setRoofTextureRenderer } from './roof-planes'
+import { primedCellColor } from './skin-tone'
 
 /**
  * Renders every voxelized target as the phase-3 WALL SANDWICH, one
@@ -140,7 +141,6 @@ const _pos = new Vector3()
 const _scale = new Vector3()
 const _quat = new Quaternion()
 const _color = new Color()
-const _cellTone = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 const UP = new Vector3(0, 1, 0)
 const Z_AXIS = new Vector3(0, 0, 1)
@@ -308,16 +308,6 @@ function MemberLayer({
   return <instancedMesh args={[VOXEL_GEOMETRY, material, members.length]} ref={meshRef} />
 }
 
-/** Bottom-skin tone for slab sandwiches — the ceiling face reads as
- * drywall, slightly lighter/greyer than the floor sheathing above it. */
-const _ceilingTone = new Color()
-/** Roof-plane tones (kind 'roof', Phase C2): every ~3rd up-slope row of
- * the outer skin darkens a touch (shingle course striping), and the inner
- * skin — the underside a player sees from inside the attic — lightens
- * toward bare deck. */
-const _courseTone = new Color()
-const _underTone = new Color()
-
 /** Prime (or re-prime) the skin layer's matrices + colors from the grid.
  * Runs on mount and again whenever `skinRevision` bumps (async roof tone).
  * Clears the mesh's paint gates afterwards so drainPaintTints re-applies
@@ -341,19 +331,6 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
     _quat.set(-grid.q.x, -grid.q.y, -grid.q.z, grid.q.w)
   } else if (grid.yaw === 0) _quat.identity()
   else _quat.setFromAxisAngle(UP, -grid.yaw)
-  // Slab sandwiches wear TWO tones: the top skin keeps the host's floor
-  // tone (baseColor) while the bottom skin — the ceiling face a player
-  // looks up at — renders as slightly lighter, desaturated drywall.
-  const isSlab = wall.kind === 'slab'
-  if (isSlab) _ceilingTone.copy(wall.baseColor).offsetHSL(0, -0.06, 0.14)
-  // Roof planes wear the shingle read: outer skin (min-z layer) in the
-  // roof surface tone with course striping, inner skin as pale deck.
-  const isRoof = wall.kind === 'roof'
-  if (isRoof) {
-    _courseTone.copy(wall.baseColor).offsetHSL(0, 0, -0.055)
-    _underTone.copy(wall.baseColor).offsetHSL(0, -0.08, 0.16)
-  }
-  const cellColors = wall.cellColors
   for (let i = 0; i < grid.count; i++) {
     if (grid.alive[i]) {
       _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
@@ -362,30 +339,9 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
     } else {
       mesh.setMatrixAt(i, ZERO)
     }
-    // Per-voxel shade jitter — the "block" read. Two independent hashes:
-    // a value spread plus a whisper of saturation drift so runs of voxels
-    // never band into flat stripes. Roof outer skins push the value
-    // spread harder — per-shingle tonal scatter.
-    const j1 = ((i * 2654435761) % 97) / 97
-    const j2 = ((i * 1597334677) % 89) / 89
-    let base = wall.baseColor
-    let jitter = 0.1
-    if (cellColors) {
-      // Item palette (destruction.ts sampleItemCellColors): each voxel
-      // wears its sub-mesh region tone; keep the gentle wall jitter below.
-      base = _cellTone.setRGB(cellColors[i * 3]!, cellColors[i * 3 + 1]!, cellColors[i * 3 + 2]!)
-    } else if (isSlab && grid.coords[i * 3 + 1] === 0) base = _ceilingTone
-    else if (isRoof) {
-      if (grid.coords[i * 3 + 2] !== 0) base = _underTone
-      else {
-        // Outer skin: every ~3rd in-plane row (grid Y = up the slope)
-        // darkens slightly — the shingle course striping.
-        base = grid.coords[i * 3 + 1]! % 3 === 2 ? _courseTone : wall.baseColor
-        jitter = 0.16
-      }
-    }
-    _color.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * jitter)
-    mesh.setColorAt(i, _color)
+    // Shared per-cell prime tone (skin-tone.ts) — paint.tsx feathers coats
+    // up from exactly this color, so the two must never drift.
+    mesh.setColorAt(i, primedCellColor(_color, wall, i))
   }
   mesh.instanceMatrix.needsUpdate = true
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true

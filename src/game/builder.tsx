@@ -799,37 +799,75 @@ const IDENTITY_ANCHOR: GridAnchor = { x: 0, z: 0, yaw: 0 }
 
 /** Collider nodeId prefix for placed pieces (PlacedPieceMesh entries). */
 const PIECE_NODE_PREFIX = '__boots-piece-'
-/** Contact margin around a slot's volume for the scene-support test. */
+/** Collider nodeId prefix for placed ITEMS (item-place.tsx entries) —
+ * "props never anchor": dropped furniture must never prop a build. */
+const ITEM_NODE_PREFIX = '__boots-item-'
+/** Contact tolerance around a slot's volume for the scene-support test —
+ * a NARROW-PHASE margin: the OBB the collider BVH is tested against grows
+ * by this, it is never a plain world-AABB inflation (SUPPORT-STRICT: an
+ * inflated AABB is exactly the over-grant that propped floating walls off
+ * a host roof's bounding box). */
 const PROBE_MARGIN = 0.35
+/** ANCHOR ALLOWLIST — the structural host kinds that can prop placed
+ * pieces ("props never anchor", the fort-builder genre rule: a bookshelf
+ * must not hold a sky bridge up). Doors/windows count as structure — they
+ * fill structural openings and read as part of their wall. Item-family
+ * kinds, fences, generic blocks and the rest of SOLID_KINDS are collision
+ * geometry only. */
+const SUPPORT_NODE_TYPES: ReadonlySet<string> = new Set([
+  'wall',
+  'slab',
+  'roof',
+  'roof-segment',
+  'floor',
+  'ceiling',
+  'stair',
+  'stair-segment',
+  'column',
+  'door',
+  'window',
+])
+/** Broad-phase world AABB of the (margin-expanded) slot volume. */
 const _probeBox = new Box3()
+/** Narrow-phase slot volume + PROBE_MARGIN, axis-aligned in the GRID frame
+ * (a world-space OBB under a non-identity anchor). */
+const _slotObb = new Box3()
+/** Grid→world rigid transform of the session anchor (rotY(yaw)·T). */
+const _gridToWorld = new Matrix4()
+/** _slotObb's frame → one collider's mesh-local frame (BVH space). */
+const _obbToLocal = new Matrix4()
 
-/** AABB of the piece volume a slot holds (walls are planes, floors faces,
- * R slots — stairs/roofs — the whole cell) — the box scene geometry must
- * touch to prop it. Under a non-identity GRID ANCHOR the slot volume is an
- * OBB in world space; v1 takes the world AABB of the rotated grid box.
- * Conservative in the SAFE direction: AABB ⊇ OBB, so a slot really touching
- * scene geometry can never read unsupported — the cost is extra support
- * leniency (a 45°-worst-case wall plane reads ~1 m deep instead of 0),
- * which is the same class of slop PROBE_MARGIN (0.35) already grants by
- * design, just wider. Identity keeps the legacy exact box. */
+/** The piece volume a slot holds (walls are planes, floors faces, R slots
+ * — stairs/roofs — the whole cell), expanded by the PROBE_MARGIN contact
+ * tolerance. Writes TWO scratch boxes: `_slotObb` gets the grid-frame box
+ * (the narrow-phase OBB — under the anchor it is oriented in world space),
+ * `box` gets its exact world AABB (the broad-phase pre-filter; identity
+ * anchors copy bit-exact, otherwise the four XZ corners rotate out and
+ * wrap — Y never transforms). */
 function setSlotBox(slot: Slot, box: Box3): void {
-  const x0 = slot.i * CELL
-  const z0 = slot.k * CELL
-  const y0 = storeyBase(slot.s)
+  const gx0 = slot.i * CELL
+  const gz0 = slot.k * CELL
+  const gy0 = storeyBase(slot.s)
   // Grid-frame extents (Wx/Wz are zero-thickness planes, F a face) — the
   // vertical extent follows the slot's LOCAL storey span (ladder-aware).
-  const x1 = slot.kind === 'Wx' ? x0 : x0 + CELL
-  const z1 = slot.kind === 'Wz' ? z0 : z0 + CELL
-  const y1 = slot.kind === 'F' ? y0 : y0 + storeySpan(slot.s)
+  const gx1 = slot.kind === 'Wx' ? gx0 : gx0 + CELL
+  const gz1 = slot.kind === 'Wz' ? gz0 : gz0 + CELL
+  const gy1 = slot.kind === 'F' ? gy0 : gy0 + storeySpan(slot.s)
+  _slotObb.min.set(gx0 - PROBE_MARGIN, gy0 - PROBE_MARGIN, gz0 - PROBE_MARGIN)
+  _slotObb.max.set(gx1 + PROBE_MARGIN, gy1 + PROBE_MARGIN, gz1 + PROBE_MARGIN)
   const anchor = getGridAnchor()
   if (anchor.x === 0 && anchor.z === 0 && anchor.yaw === 0) {
-    box.min.set(x0, y0, z0)
-    box.max.set(x1, y1, z1)
+    box.copy(_slotObb)
   } else {
-    // Rotate the four grid XZ corners grid→world (the slotPose OUT math)
-    // and wrap them; Y never transforms.
+    // Rotate the expanded box's four grid XZ corners grid→world (the
+    // slotPose OUT math) and wrap them; Y never transforms. This is the
+    // exact AABB of the margin-expanded OBB — no AABB-of-OBB inflation.
     const c = Math.cos(anchor.yaw)
     const s = Math.sin(anchor.yaw)
+    const x0 = _slotObb.min.x
+    const z0 = _slotObb.min.z
+    const x1 = _slotObb.max.x
+    const z1 = _slotObb.max.z
     const wx00 = anchor.x + x0 * c + z0 * s
     const wz00 = anchor.z - x0 * s + z0 * c
     const wx01 = anchor.x + x0 * c + z1 * s
@@ -838,45 +876,71 @@ function setSlotBox(slot: Slot, box: Box3): void {
     const wz10 = anchor.z - x1 * s + z0 * c
     const wx11 = anchor.x + x1 * c + z1 * s
     const wz11 = anchor.z - x1 * s + z1 * c
-    box.min.set(Math.min(wx00, wx01, wx10, wx11), y0, Math.min(wz00, wz01, wz10, wz11))
-    box.max.set(Math.max(wx00, wx01, wx10, wx11), y1, Math.max(wz00, wz01, wz10, wz11))
+    box.min.set(Math.min(wx00, wx01, wx10, wx11), _slotObb.min.y, Math.min(wz00, wz01, wz10, wz11))
+    box.max.set(Math.max(wx00, wx01, wx10, wx11), _slotObb.max.y, Math.max(wz00, wz01, wz10, wz11))
   }
-  box.expandByScalar(PROBE_MARGIN)
 }
 
 /**
  * Scene-support probe for piece-slots.setSceneSupportProbe: true while LIVE
- * scene geometry touches the slot's volume. Placed-piece colliders are
- * skipped (they support each other through the graph — counting them here
- * would prop every orphan). Disabled colliders defer to their voxel
- * replica's liveness: at least one alive voxel inside the box (REVIEW risk
- * note — a demolished scene wall must drop its dependents). Answers are
- * cached per slot by piece-slots; destruction hooks invalidate via
- * notifySceneSupportChanged.
+ * STRUCTURAL scene geometry actually touches the slot's volume
+ * (SUPPORT-STRICT, phase 9):
+ * - ANCHOR ALLOWLIST first: placed-piece colliders are skipped (they
+ *   support each other through the graph — counting them here would prop
+ *   every orphan), placed items and every non-structural nodeType are
+ *   skipped too ("props never anchor").
+ * - BROAD PHASE: entry.worldBox vs the slot volume's world AABB — a cheap
+ *   pre-filter only, it GRANTS nothing.
+ * - NARROW PHASE: entry.bvh.intersectsBox against the margin-expanded slot
+ *   OBB taken into mesh-local space (grid frame → anchor → entry.inverse),
+ *   so a host roof's huge AABB no longer props the airspace beside it.
+ * - Disabled colliders defer to their voxel replica's liveness: at least
+ *   one ALIVE voxel center inside the slot OBB (point-in-OBB via the
+ *   world→grid seam — a demolished scene wall must drop its dependents).
+ * Exported for tests. Answers are cached per slot by piece-slots;
+ * destruction hooks invalidate via notifySceneSupportChanged.
  */
-function makeSceneSupportProbe(world: GameWorld): SceneSupportProbe {
+export function makeSceneSupportProbe(world: GameWorld): SceneSupportProbe {
   return (id) => {
     const slot = parseSlotId(id)
     if (!slot) return false
     setSlotBox(slot, _probeBox)
+    const anchor = getGridAnchor()
+    const ac = Math.cos(anchor.yaw)
+    const as = Math.sin(anchor.yaw)
+    let matrixStale = true
     for (const entry of world.colliders) {
       if (entry.nodeId.startsWith(PIECE_NODE_PREFIX)) continue
+      if (entry.nodeId.startsWith(ITEM_NODE_PREFIX)) continue
+      if (!SUPPORT_NODE_TYPES.has(entry.nodeType)) continue
       if (!entry.worldBox.intersectsBox(_probeBox)) continue
-      if (!entry.disabled) return true
+      if (!entry.disabled) {
+        // NARROW PHASE: real triangle contact with the slot OBB. The OBB is
+        // axis-aligned in the GRID frame, so its frame→BVH transform is
+        // entry.inverse ∘ (anchor grid→world). rotY(yaw) matches the OUT
+        // seam: grid +X → world (cos yaw, 0, −sin yaw).
+        if (matrixStale) {
+          _gridToWorld.makeRotationY(anchor.yaw).setPosition(anchor.x, 0, anchor.z)
+          matrixStale = false
+        }
+        _obbToLocal.multiplyMatrices(entry.inverse, _gridToWorld)
+        if (entry.bvh.intersectsBox(_slotObb, _obbToLocal)) return true
+        continue
+      }
       const target = useDestruction.getState().targets.get(entry.nodeId)
       if (!target) continue
       const { centers, alive, count } = target.grid
       for (let v = 0; v < count; v++) {
         if (alive[v] === 0) continue
         const c = v * 3
-        if (
-          centers[c]! >= _probeBox.min.x &&
-          centers[c]! <= _probeBox.max.x &&
-          centers[c + 1]! >= _probeBox.min.y &&
-          centers[c + 1]! <= _probeBox.max.y &&
-          centers[c + 2]! >= _probeBox.min.z &&
-          centers[c + 2]! <= _probeBox.max.z
-        ) {
+        const wy = centers[c + 1]!
+        if (wy < _slotObb.min.y || wy > _slotObb.max.y) continue
+        // Voxel center world→grid (the IN seam), then point-in-OBB.
+        const dx = centers[c]! - anchor.x
+        const dz = centers[c + 2]! - anchor.z
+        const gx = dx * ac - dz * as
+        const gz = dx * as + dz * ac
+        if (gx >= _slotObb.min.x && gx <= _slotObb.max.x && gz >= _slotObb.min.z && gz <= _slotObb.max.z) {
           return true
         }
       }

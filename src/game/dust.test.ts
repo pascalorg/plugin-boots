@@ -127,6 +127,14 @@ describe('spawnDust material kinds', () => {
     expect(dustCounts().haze).toBe(0)
   })
 
+  test('paint mist spawns 2-3 fine puffs and never a haze (phase 9)', () => {
+    spawnDust(P, 1, { kind: 'paint', tint: { r: 0.23, g: 0.29, b: 0.39 } })
+    const n = dustCounts().puffs
+    expect(n).toBeGreaterThanOrEqual(2)
+    expect(n).toBeLessThanOrEqual(3)
+    expect(dustCounts().haze).toBe(0)
+  })
+
   test('legacy 5-arg scalar form accepts a material kind', () => {
     spawnDust(1, 2, 3, 1, 'concrete')
     const n = dustCounts().puffs

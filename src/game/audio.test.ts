@@ -68,6 +68,21 @@ describe('char-feel one-shots (silent no-ops headless)', () => {
   })
 })
 
+describe('phase-9 juice voices (headless contracts)', () => {
+  test('killConfirm and metalPing are silent no-ops without WebAudio', () => {
+    expect(() => {
+      sfx.killConfirm()
+      sfx.metalPing()
+      sfx.killConfirm()
+      sfx.metalPing()
+    }).not.toThrow()
+  })
+
+  test('droneBuzz keeps its null-without-WebAudio contract (callers null-check)', () => {
+    expect(sfx.droneBuzz()).toBeNull()
+  })
+})
+
 describe('session-start warmers (silent no-ops headless)', () => {
   test('prime() is idempotent and safe without WebAudio', () => {
     expect(() => {

@@ -38,6 +38,9 @@ import { createProbeMemo } from './probe-memo'
  *                    puffs (also the CMU/generic-voxel voice)
  *       'wood'     — NO dust at all (returns early — wood reads as
  *                    splinters from debris alone)
+ *       'paint'    — aerosol mist (the sprayer, phase 9): fine short-lived
+ *                    puffs wearing opts.tint PURE (no pulverized-gray
+ *                    blend — mist is pigment, not debris)
  *     opts.normal/direction aim a ~35° cone around
  *     normal*0.8 + direction*0.2; with neither, the old 360° ring is used.
  *     Legacy scalar form spawnDust(x, y, z, intensity, kind?) is still
@@ -60,8 +63,9 @@ const PRESSURE = 0.7
 
 export type DustKind = 'chip' | 'puff' | 'plume'
 
-/** Material tags (phase 4) — what destruction/collapse emit per removal. */
-export type DustMaterial = 'drywall' | 'concrete' | 'wood'
+/** Material tags (phase 4; 'paint' = the sprayer's aerosol mist, phase 9) —
+ * what destruction/collapse/paint emit per removal or spray tick. */
+export type DustMaterial = 'drywall' | 'concrete' | 'wood' | 'paint'
 
 /** Drywall at/above this intensity upgrades from puff to plume (+haze). */
 const DRYWALL_HEAVY = 0.7
@@ -292,9 +296,10 @@ export function spawnDust(
   // gypsum behavior (plume + auto haze once the tear is heavy); concrete
   // stays a puff but goes half-size, shorter-lived and grayer below.
   const concrete = rawKind === 'concrete'
+  const paint = rawKind === 'paint'
   let kind: DustKind
   if (rawKind === 'drywall') kind = k >= DRYWALL_HEAVY ? 'plume' : 'puff'
-  else if (rawKind === 'concrete') kind = 'puff'
+  else if (rawKind === 'concrete' || rawKind === 'paint') kind = 'puff'
   else kind = rawKind
 
   // Ejection axis: cone around normal*0.8 + direction*0.2 (either alone
@@ -353,13 +358,26 @@ export function spawnDust(
       s.ttl = 0.4 + Math.random() * 0.25
       s.alpha = 0.36 + k * 0.1
       s.drag = 4.2
+    } else if (paint) {
+      // Aerosol mist: fine, quick, braking hard — droplets, not dust.
+      s.size *= 0.35
+      s.ttl = 0.22 + Math.random() * 0.14
+      s.alpha = 0.3 + k * 0.12
+      s.drag = 5.2
     }
     // Item carves pass a sampled palette tint — blended toward the concrete
-    // gray so the cloud reads as pulverized material, not confetti.
+    // gray so the cloud reads as pulverized material, not confetti. Paint
+    // mist wears the tint PURE: pigment, not debris.
     const tint = opts?.tint
-    s.cr = tint ? tint.r * 0.65 + CONC_R * 0.35 : concrete ? CONC_R : DUST_R
-    s.cg = tint ? tint.g * 0.65 + CONC_G * 0.35 : concrete ? CONC_G : DUST_G
-    s.cb = tint ? tint.b * 0.65 + CONC_B * 0.35 : concrete ? CONC_B : DUST_B
+    if (tint && paint) {
+      s.cr = tint.r
+      s.cg = tint.g
+      s.cb = tint.b
+    } else {
+      s.cr = tint ? tint.r * 0.65 + CONC_R * 0.35 : concrete ? CONC_R : DUST_R
+      s.cg = tint ? tint.g * 0.65 + CONC_G * 0.35 : concrete ? CONC_G : DUST_G
+      s.cb = tint ? tint.b * 0.65 + CONC_B * 0.35 : concrete ? CONC_B : DUST_B
+    }
     if (hasAxis) {
       coneDirection(_vel, _axis, CONE_SPREAD, Math.random(), Math.random())
       s.vx = _vel.x * speed

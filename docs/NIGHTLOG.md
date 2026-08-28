@@ -1322,3 +1322,84 @@ meshes get visibility-hidden.
 Ceiling regress: clean, no spikes. Discard identity + censuses
 byte-identical; zero INVARIANT VIOLATION; zero deduped console errors.
 731 tests / 20,757 assertions green; tsc clean; real exit codes.
+
+## Phase 9 — spray / support / drones / juice (2026-08-28 night, fleet 5 lanes, manager stitch)
+
+Five lanes on one tree; four landed, the breakage lane died with zero
+output (nothing to salvage — destruction.ts untouched by it; the manager
+applied every cross-file diff there instead). 797 tests / 22,305
+assertions green; tsc clean; real exit codes.
+
+SPRAY (paint.tsx, dust.tsx, skin-tone.ts NEW, paint-keep.ts,
+viewmodel.tsx): P1 mist — tinted cone off the can nozzle each tick,
+bounce-back cone at the hit, air puff on a miss (paint DustMaterial
+variant: puff shape, x0.35 size, PURE tint, short ttl; reuses the dust
+pool, zero allocations). P2 accumulation — the paint ledger packs
+(color<<8)|strength per cell; splatFalloff smoothstep feather + COAT_ADD
+0.45 + deterministic rim speckle per (cell, serial); drain lerps the
+TRUE primed base tone → coat by strength. The per-cell prime color math
+moved to skin-tone.ts (primedCellColor) and voxel-walls.tsx now calls
+the shared helper — bit-identity pinned by skin-tone.test.ts, so paint
+and prime can never drift. P3 feel — wrist-flick shake + can rattle on
+R-cycle and draw-in (sfx.paintRattle: 3-5 metallic ticks), nozzle-press
+lean while spraying. P4 drips — 48-quad InstancedMesh pool, walls only,
+prev strength > 0.75, p 0.25, cap 2/tick, one cached streak texture.
+P5 pristine decals — painting NO LONGER voxelizes: pristine hosts get
+DecalGeometry splats (plain BufferGeometry + shared standard material,
+polygonOffset -4, depthWrite off; 256 global / 64 per node, 1 texture +
+<=7 materials, >5k-tri guard falls back to the voxel path); the new
+destruction.setTargetLiveListener hook converts a node's decals into
+full-falloff ledger coats the moment its replica goes live (awake
+voxelize, roof-plane decomposition, dormant wake); paint-keep merges
+live-decal votes area-weighted so decal-only nodes Keep correctly.
+
+SUPPORT STRICT (builder.tsx, piece-slots.ts): the scene-support probe's
+AABB test is now broad-phase ONLY — the grant is a real BVH-vs-OBB
+narrow phase in the grid frame (PROBE_MARGIN expands the slot box as
+contact tolerance, never the world AABB); anchor allowlist = structural
+node types only (wall/slab/roof/floor/stair/column/door/window family —
+items, blocks, fences, props never prop a build); piece-as-unit death:
+a placed piece's replica dies whole at <15% alive fraction
+(pieceReplicaDead, wired into settleSupportAfterRemoval) — planks
+demote to walk-only at 12% damage long before they burst. Pin tests:
+a huge host-roof AABB over empty air no longer grants; a killed host
+wall drops its propped stack through the debounced sweep.
+
+DRONES REAL (enemies.tsx, enemies-state.ts): drones collide for real —
+one drone capsule pass per frame through collideCapsule +
+collideVoxelTargets AFTER the altitude lerp and horizontal step (no
+more phasing through elevated floors/roofs/pieces); path-aware
+avoidance sweeps the actual displacement segment (vertical intent
+included) + a wall-top skim probe; descent holds while the corridor
+below is blocked; reach is 3D (a drone parked high over the roof is
+not "in range"); meleeBlocked gates ALL bot kinds and swings sweep an
+exact segment-vs-AABB test — no more damage through a closed door leaf.
+
+JUICE (hud.ts, audio.ts, shooting.ts + wiring): once-per-session
+micro-hints above the keybar (builder keys, paint "hold close to
+write", RMB-to-aim, catalog after 20 s — suppressed if the catalog
+opens first); hitmarker kinds — carve pulse (0.45 opacity, 80 ms) vs
+kill flare (warm, 160 ms, OWNS its window so a burst can't stomp the
+killing blow) + sfx.killConfirm; viewmodel's legacy double-voiced
+hitmarker removed (shooting.ts owns feedback now); WAVE CLEARED center
+banner on the alive>0 → 0 edge (death/reset silent); droneBuzz rebuilt
+as a low dual-rotor beat-frequency hum with squared distance falloff
+(one shared voice by construction); metal items (dominant sub-mesh
+metalness > 0.5 at voxelize) throw 3-5 spark streaks + sfx.metalPing
+on carve instead of drywall chips.
+
+Manager wiring applied (was cross-lane): sfx.paintRattle in audio.ts ·
+voxel-walls primedCellColor adoption · destruction.ts
+setTargetLiveListener + 4 call sites, pieceReplicaDead in
+settleSupportAfterRemoval, VoxelTarget.metal at voxelize ·
+enemies.tsx wave-cleared edge · inventory.tsx hintSeen('catalog') ·
+viewmodel.tsx double-feedback removal.
+
+QA leads for next round: headless spray-a-slab pass under the perf
+monitor (PaintDecals re-renders its slot map at up to 9 Hz while
+actively spraying a pristine node — bounded but unmeasured); host
+block/chimney/dormer nodes no longer anchor builds (intended
+strictness — verify no E2E scene depended on it); cross-color respray
+overwrites the color index while strength keeps accumulating
+(spec-literal; cross-fade is a possible follow-up); decal-lane drips
+out of scope this round.

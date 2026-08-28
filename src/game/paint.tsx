@@ -1,23 +1,30 @@
 'use client'
 
 import { useFrame, useThree } from '@react-three/fiber'
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import {
+  type BufferGeometry,
   CanvasTexture,
   Color,
+  DynamicDrawUsage,
   type InstancedMesh,
   Matrix4,
   type Mesh,
-  type MeshStandardMaterial,
-  type Object3D,
+  MeshStandardMaterial,
+  Object3D,
+  Quaternion,
   Ray,
   Vector3,
 } from 'three'
+import { DecalGeometry } from 'three/examples/jsm/geometries/DecalGeometry.js'
 import { useBoots } from '../store'
 import { sfx, type SprayHandle } from './audio'
+import * as destructionModule from './destruction'
 import { ensureVoxelTarget, raycastVoxelTargets, useDestruction, type VoxelTarget } from './destruction'
+import { spawnDust } from './dust'
 import { itemGhostActive } from './item-place'
 import { playerRig } from './player'
+import { primedCellColor } from './skin-tone'
 import { getSession } from './session'
 import { aimDirection } from './shooting'
 import type { GameWorld } from './world'
@@ -51,8 +58,9 @@ import type { GameWorld } from './world'
  *
  * ── Persistence ─────────────────────────────────────────────────────────
  * NOTHING here writes the scene store (standing rule). Splats accumulate
- * in a module ledger (nodeId → cell → palette index) that paint-keep.ts
- * aggregates into per-node dominant colors on exit; the explicit sidebar
+ * in a module ledger (nodeId → cell → packed (color << 8) | strength) that
+ * paint-keep.ts aggregates into per-node dominant colors on exit (votes
+ * weighted by strength); the explicit sidebar
  * Save button is the only path that patches real nodes. The ledger resets
  * on PaintTool mount — the same session lifetime destruction state has.
  */
@@ -141,10 +149,26 @@ export function paintPrompt(writing: boolean, colorName: string): string {
 }
 
 // ── The splat ledger (read by paint-keep on exit) ─────────────────────────
+//
+// FEATHERED ACCUMULATION (phase 9): ledger values pack (colorIndex << 8) |
+// strengthByte. Every splat ADDS smoothstep-falloff weight — the center of
+// a pass saturates in ~2 ticks, the feathered edge takes repeated coats —
+// so held spray builds up like real aerosol instead of stamping hard-edged
+// discs. The drain lerps each cell from its PRIMED base tone (skin-tone.ts)
+// by strength; paint-keep votes (value >> 8) weighted by the strength byte.
 
-/** nodeId → voxel cell index → palette index. Later coats overwrite. */
+/** Pack a coat: palette index + strength 0..1 → (color << 8) | byte. */
+export const paintValue = (color: number, strength: number): number =>
+  (color << 8) | Math.max(0, Math.min(255, Math.round(strength * 255)))
+/** Palette index half of a packed ledger value. */
+export const paintColorOf = (value: number): number => value >> 8
+/** Strength half of a packed ledger value, back in 0..1. */
+export const paintStrengthOf = (value: number): number => (value & 0xff) / 255
+
+/** nodeId → voxel cell index → packed (color << 8) | strength coat. */
 const paintedByNode = new Map<string, Map<number, number>>()
-/** Per-node write serial — the renderer-drain's change gate. */
+/** Per-node write serial — the renderer-drain's change gate (also the
+ * deterministic seed for the rim speckle hash). */
 const nodeSerials = new Map<string, number>()
 
 export const getPaintedByNode = (): ReadonlyMap<string, ReadonlyMap<number, number>> =>
@@ -164,6 +188,70 @@ let lastHitDistance: number | null = null
 /** Distance (m) of the most recent spray tick's surface hit; null while
  * spraying at nothing. PaintTool reads it for the writing-mode prompt. */
 export const lastSprayHitDistance = (): number | null => lastHitDistance
+
+// ── Feathered coat math (pure — exported for tests) ───────────────────────
+
+/** Rim speckle band: overspray flecks land between 1.0 r and this × r. */
+export const SPLAT_RIM_OUTER = 1.25
+/** Strength a splat's CENTER adds per tick — saturates in ~2–3 coats. */
+export const COAT_ADD = 0.45
+/** Fraction of annulus cells that catch an overspray fleck. */
+export const RIM_SPECKLE_P = 0.18
+/** Strength one rim fleck adds — faint, builds only under repeated passes. */
+export const RIM_SPECKLE_ADD = 0.16
+
+/** Smoothstep falloff across the splat: 1 at the center (t = 0), 0 at the
+ * rim (t = d / radius = 1). Pure — the feathered-edge curve. */
+export function splatFalloff(t: number): number {
+  if (t <= 0) return 1
+  if (t >= 1) return 0
+  const u = 1 - t
+  return u * u * (3 - 2 * u)
+}
+
+/** Deterministic per-(cell, serial) hash in [0, 1) — the rim speckle
+ * lottery. Same (cell, serial) always draws the same number, so a splat's
+ * overspray pattern is reproducible (tests pin it). */
+export function speckleHash(cell: number, serial: number): number {
+  let h = (Math.imul(cell + 1, 2654435761) ^ Math.imul(serial + 1, 1597334677)) >>> 0
+  h = Math.imul(h ^ (h >>> 13), 1 | h) >>> 0
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296
+}
+
+/**
+ * One splat's strength contributions: every ALIVE cell inside `radius`
+ * gains COAT_ADD × smoothstep falloff (full at the hit point, feathering
+ * to zero at the rim); cells in the 1.0–1.25 r annulus catch faint
+ * overspray flecks by the deterministic (cell, serial) lottery. Pure —
+ * sprayPaint accumulates the adds into the packed ledger.
+ */
+export function splatCoat(
+  grid: { count: number; alive: ArrayLike<number>; centers: ArrayLike<number> },
+  x: number,
+  y: number,
+  z: number,
+  radius: number,
+  serial: number,
+): { cell: number; add: number }[] {
+  const r2 = radius * radius
+  const outer2 = r2 * SPLAT_RIM_OUTER * SPLAT_RIM_OUTER
+  const out: { cell: number; add: number }[] = []
+  for (let i = 0; i < grid.count; i++) {
+    if (!grid.alive[i]) continue
+    const dx = (grid.centers[i * 3] ?? 0) - x
+    const dy = (grid.centers[i * 3 + 1] ?? 0) - y
+    const dz = (grid.centers[i * 3 + 2] ?? 0) - z
+    const d2 = dx * dx + dy * dy + dz * dz
+    if (d2 > outer2) continue
+    if (d2 <= r2) {
+      const add = COAT_ADD * splatFalloff(Math.sqrt(d2) / radius)
+      if (add > 0) out.push({ cell: i, add })
+    } else if (speckleHash(i, serial) < RIM_SPECKLE_P) {
+      out.push({ cell: i, add: RIM_SPECKLE_ADD })
+    }
+  }
+  return out
+}
 
 /**
  * Pure splat-cell selection: every ALIVE cell whose world center sits
@@ -197,6 +285,580 @@ export function selectSplatCells(
  */
 export const paintDebug: { holdFire: boolean } = { holdFire: false }
 
+// ── Aerosol mist (dust.tsx kind 'paint' — tinted cone off the nozzle) ─────
+
+/** Nozzle offset from the eye, matching the viewmodel carry pose (the can
+ * rides low-right with the spout converging on the crosshair). */
+export const NOZZLE_FORWARD = 0.35
+export const NOZZLE_RIGHT = 0.28
+export const NOZZLE_DOWN = 0.28
+
+const _up = new Vector3(0, 1, 0)
+const _nozzleRight = new Vector3()
+const _nozzle = new Vector3()
+const _mistAt = new Vector3()
+const _mistDir = new Vector3()
+const _bounce = new Vector3()
+const _tintScratch = new Color()
+/** Reused DustOpts — zero allocations per spray tick (module temps). */
+const _mistTint = { r: 0, g: 0, b: 0 }
+const _mistOpts = { kind: 'paint', direction: _mistDir, tint: _mistTint } as const
+const _bounceOpts = { kind: 'paint', normal: _bounce, tint: _mistTint } as const
+
+/** Refresh the shared mist tint from the live coat (working color space). */
+function refreshMistTint(): void {
+  _tintScratch.set(currentPaintColor().hex)
+  _mistTint.r = _tintScratch.r
+  _mistTint.g = _tintScratch.g
+  _mistTint.b = _tintScratch.b
+}
+
+/** World nozzle position: eye + aim·forward + right·0.28 + down·0.28 —
+ * where the can's spout sits in the carry pose. Writes the module temp. */
+function nozzleAt(origin: Vector3, aim: Vector3): Vector3 {
+  _nozzleRight.crossVectors(aim, _up)
+  if (_nozzleRight.lengthSq() < 1e-6) _nozzleRight.set(1, 0, 0)
+  else _nozzleRight.normalize()
+  return _nozzle
+    .copy(origin)
+    .addScaledVector(aim, NOZZLE_FORWARD)
+    .addScaledVector(_nozzleRight, NOZZLE_RIGHT)
+    .addScaledVector(_up, -NOZZLE_DOWN)
+}
+
+// ── Drips (P4 — heavy coats on walls shed runs) ───────────────────────────
+
+/** Drip pool size — one InstancedMesh of wall-plane streak quads. */
+export const DRIP_CAP = 48
+/** A cell must already carry this much strength for a re-coat to run. */
+export const DRIP_STRENGTH_GATE = 0.75
+/** Chance a qualifying cell sheds a drip. */
+export const DRIP_P = 0.25
+/** Hard cap on drips born per spray tick. */
+export const DRIP_MAX_PER_TICK = 2
+/** Seconds a fresh drip takes to run down to full length. */
+const DRIP_GROW_TIME = 1.1
+/** Streak quad width (m) and final run length range (m). */
+const DRIP_WIDTH = 0.05
+const DRIP_LEN_MIN = 0.18
+const DRIP_LEN_MAX = 0.38
+
+/**
+ * Pure spawn decision — exported for tests. Only near-vertical surfaces
+ * (the wall sandwich) drip; the cell must ALREADY be saturated past the
+ * gate (drips come from over-coating, not the first pass); at most
+ * DRIP_MAX_PER_TICK per tick; then the DRIP_P lottery.
+ */
+export function shouldDrip(
+  kind: string,
+  prevStrength: number,
+  spawnedThisTick: number,
+  rand: number,
+): boolean {
+  return (
+    kind === 'wall' &&
+    prevStrength > DRIP_STRENGTH_GATE &&
+    spawnedThisTick < DRIP_MAX_PER_TICK &&
+    rand < DRIP_P
+  )
+}
+
+type DripSlot = {
+  alive: boolean
+  /** Top anchor — the run grows DOWN from here. */
+  x: number
+  y: number
+  z: number
+  /** Wall-plane yaw: the quad's +Z faces back along the spray. */
+  yaw: number
+  color: number
+  age: number
+  /** Final run length (m). */
+  len: number
+  /** Fully grown — the matrix is final, the step loop skips it. */
+  done: boolean
+}
+
+const dripSlots: DripSlot[] = Array.from({ length: DRIP_CAP }, () => ({
+  alive: false,
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  color: 0,
+  age: 0,
+  len: 0.2,
+  done: false,
+}))
+let dripCursor = 0
+/** Slots still growing — the step loop idles at a number check. */
+let dripsGrowing = 0
+
+/** Live/growing counts — QA + tests introspection. */
+export function dripCensus(): { live: number; growing: number } {
+  let live = 0
+  for (const s of dripSlots) if (s.alive) live++
+  return { live, growing: dripsGrowing }
+}
+
+export function resetDrips(): void {
+  for (const s of dripSlots) {
+    s.alive = false
+    s.done = false
+  }
+  dripCursor = 0
+  dripsGrowing = 0
+}
+
+/** Claim the next ring slot (the debris-ring idiom — the 49th drip reuses
+ * the first; runs persist until reused). */
+function spawnDrip(x: number, y: number, z: number, yaw: number, color: number): void {
+  const s = dripSlots[dripCursor]!
+  dripCursor = (dripCursor + 1) % DRIP_CAP
+  if (!s.alive || s.done) dripsGrowing++
+  s.alive = true
+  s.done = false
+  s.x = x
+  s.y = y
+  s.z = z
+  s.yaw = yaw
+  s.color = color
+  s.age = 0
+  s.len = DRIP_LEN_MIN + Math.random() * (DRIP_LEN_MAX - DRIP_LEN_MIN)
+}
+
+/** One cached white streak texture — tinted per instance, built once for
+ * the module lifetime (the dust-texture idiom). */
+let dripTexture: CanvasTexture | null = null
+function getDripTexture(): CanvasTexture | null {
+  if (dripTexture) return dripTexture
+  if (typeof document === 'undefined') return null
+  const canvas = document.createElement('canvas')
+  canvas.width = 32
+  canvas.height = 128
+  const g = canvas.getContext('2d')
+  if (!g) return null
+  // A tapering run with a fat bead at the bottom — white so the instance
+  // color carries the coat.
+  const run = g.createLinearGradient(0, 0, 0, 128)
+  run.addColorStop(0, 'rgba(255,255,255,0.55)')
+  run.addColorStop(0.15, 'rgba(255,255,255,0.85)')
+  run.addColorStop(0.8, 'rgba(255,255,255,0.9)')
+  run.addColorStop(1, 'rgba(255,255,255,0)')
+  g.fillStyle = run
+  g.beginPath()
+  g.moveTo(13, 0)
+  g.lineTo(19, 0)
+  g.lineTo(18, 96)
+  g.lineTo(14, 96)
+  g.closePath()
+  g.fill()
+  const bead = g.createRadialGradient(16, 100, 0, 16, 100, 9)
+  bead.addColorStop(0, 'rgba(255,255,255,0.95)')
+  bead.addColorStop(0.7, 'rgba(255,255,255,0.8)')
+  bead.addColorStop(1, 'rgba(255,255,255,0)')
+  g.fillStyle = bead
+  g.beginPath()
+  g.arc(16, 100, 9, 0, Math.PI * 2)
+  g.fill()
+  dripTexture = new CanvasTexture(canvas)
+  return dripTexture
+}
+
+const DRIP_ZERO = new Matrix4().makeScale(0, 0, 0)
+const DRIP_UP = new Vector3(0, 1, 0)
+const _dripQuat = new Quaternion()
+const _dripPos = new Vector3()
+const _dripScale = new Vector3()
+const _dripMatrix = new Matrix4()
+const _dripTint = new Color()
+
+/** Advance growing drips: ease-out length growth, top edge anchored so the
+ * run translates DOWN as it grows; fully grown runs freeze (persist until
+ * their slot is reused). Zero allocations; idles at a number check. */
+function stepDrips(mesh: InstancedMesh, dt: number): void {
+  if (dripsGrowing === 0) return
+  for (let i = 0; i < DRIP_CAP; i++) {
+    const s = dripSlots[i]!
+    if (!s.alive || s.done) continue
+    s.age += dt
+    const k = Math.min(1, s.age / DRIP_GROW_TIME)
+    const grow = k * (2 - k) // ease-out: the run slows as it dries
+    const len = Math.max(0.02, s.len * grow)
+    _dripQuat.setFromAxisAngle(DRIP_UP, s.yaw)
+    _dripPos.set(s.x, s.y - len / 2, s.z)
+    _dripScale.set(DRIP_WIDTH, len, 1)
+    _dripMatrix.compose(_dripPos, _dripQuat, _dripScale)
+    mesh.setMatrixAt(i, _dripMatrix)
+    // Wet coat: the palette color pushed a touch darker + richer.
+    _dripTint.set(PAINT_PALETTE[s.color]!.hex).offsetHSL(0, 0.05, -0.06)
+    mesh.setColorAt(i, _dripTint)
+    if (k >= 1) {
+      s.done = true
+      dripsGrowing--
+    }
+  }
+  mesh.instanceMatrix.needsUpdate = true
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+}
+
+/**
+ * The drip pool renderer — mounted by PaintTool. One InstancedMesh of
+ * DRIP_CAP streak quads over one cached CanvasTexture; instanceColor is
+ * primed before the first draw (the debris idiom — a WebGPU pipeline
+ * compiled without it would ignore every later setColorAt).
+ */
+function DripsLayer() {
+  const meshRef = useRef<InstancedMesh>(null!)
+  const texture = getDripTexture()
+  useLayoutEffect(() => {
+    const mesh = meshRef.current
+    if (!mesh) return
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage)
+    mesh.frustumCulled = false
+    _dripTint.set('#ffffff')
+    for (let i = 0; i < DRIP_CAP; i++) {
+      mesh.setMatrixAt(i, DRIP_ZERO)
+      mesh.setColorAt(i, _dripTint)
+    }
+    mesh.instanceMatrix.needsUpdate = true
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    resetDrips()
+    return resetDrips
+  }, [])
+  useFrame((_, rawDt) => {
+    const mesh = meshRef.current
+    if (mesh) stepDrips(mesh, Math.min(rawDt, 1 / 30))
+  })
+  if (!texture) return null
+  return (
+    <instancedMesh args={[undefined, undefined, DRIP_CAP]} ref={meshRef} userData={{ __boots: true }}>
+      <planeGeometry />
+      <meshBasicMaterial
+        depthWrite={false}
+        map={texture}
+        polygonOffset
+        polygonOffsetFactor={-2}
+        polygonOffsetUnits={-2}
+        toneMapped={false}
+        transparent
+      />
+    </instancedMesh>
+  )
+}
+
+// ── Decals (P5 — pristine hosts wear splats, painting no longer voxelizes) ─
+//
+// A spray tick that lands on a PRISTINE host surface (a dormant prebuild or
+// a never-voxelized node) projects a DecalGeometry splat onto the host mesh
+// instead of voxelizing it: plain BufferGeometry + shared standard material
+// (polygonOffset −4, depthWrite false — the craters read), one cached splat
+// alpha texture + ≤ PAINT_PALETTE.length cached materials. Slots live in a
+// crater-style ring (cap DECAL_CAP, per-node DECAL_NODE_CAP, geometry
+// disposed on reuse/reset). Heavy meshes (> DECAL_MAX_TRIS) and failed
+// projections fall back to the classic voxelize path. When the node later
+// voxelizes for real (damage), destruction's target-live hook converts the
+// node's decals into the cell ledger and frees the slots; paint-keep votes
+// live decals area-weighted next to the cell ledger.
+
+export const DECAL_CAP = 256
+export const DECAL_NODE_CAP = 64
+/** Hosts above this triangle count skip the decal clip (fallback = voxels). */
+export const DECAL_MAX_TRIS = 5000
+
+/** Pure guard — exported for tests. */
+export function decalEligibleTris(triangles: number): boolean {
+  return triangles <= DECAL_MAX_TRIS
+}
+
+type DecalSlot = {
+  alive: boolean
+  /** Bumped on every (re)use — the React key, so a reused slot remounts. */
+  gen: number
+  nodeId: string
+  /** Built eagerly at spawn (world-space vertices); disposed on reuse. */
+  geometry: BufferGeometry | null
+  color: number
+  /** Splat center + radius — the ledger conversion + area votes. */
+  x: number
+  y: number
+  z: number
+  radius: number
+}
+
+const decalSlots: DecalSlot[] = Array.from({ length: DECAL_CAP }, () => ({
+  alive: false,
+  gen: 0,
+  nodeId: '',
+  geometry: null,
+  color: 0,
+  x: 0,
+  y: 0,
+  z: 0,
+  radius: 0.1,
+}))
+let decalCursor = 0
+/** nodeId → slot indices in spawn order (per-node cap + conversion). */
+const nodeDecals = new Map<string, number[]>()
+let decalVersion = 0
+const decalListeners = new Set<() => void>()
+
+function emitDecals(): void {
+  decalVersion++
+  for (const listener of decalListeners) listener()
+}
+const subscribeDecals = (listener: () => void): (() => void) => {
+  decalListeners.add(listener)
+  return () => decalListeners.delete(listener)
+}
+const getDecalVersion = (): number => decalVersion
+
+/** Live decal counts (QA/tests) — total and for one node. */
+export function decalCensus(nodeId?: string): number {
+  if (nodeId !== undefined) return nodeDecals.get(nodeId)?.length ?? 0
+  let n = 0
+  for (const s of decalSlots) if (s.alive) n++
+  return n
+}
+
+function releaseSlot(index: number): void {
+  const s = decalSlots[index]!
+  if (!s.alive) return
+  s.alive = false
+  s.geometry?.dispose()
+  s.geometry = null
+  const list = nodeDecals.get(s.nodeId)
+  if (list) {
+    const at = list.indexOf(index)
+    if (at >= 0) list.splice(at, 1)
+    if (list.length === 0) nodeDecals.delete(s.nodeId)
+  }
+}
+
+export function resetPaintDecals(): void {
+  for (let i = 0; i < DECAL_CAP; i++) releaseSlot(i)
+  nodeDecals.clear()
+  decalCursor = 0
+  emitDecals()
+}
+
+/** Area-weighted live-decal votes per node: colorIndex → painted m².
+ * paint-keep merges these next to the strength-weighted cell votes. */
+export function getDecalVotesByNode(): Map<string, Map<number, number>> {
+  const out = new Map<string, Map<number, number>>()
+  for (const s of decalSlots) {
+    if (!s.alive) continue
+    let votes = out.get(s.nodeId)
+    if (!votes) {
+      votes = new Map()
+      out.set(s.nodeId, votes)
+    }
+    const area = Math.PI * s.radius * s.radius
+    votes.set(s.color, (votes.get(s.color) ?? 0) + area)
+  }
+  return out
+}
+
+/** One cached soft-splat alpha texture — white, tinted by the material. */
+let decalTexture: CanvasTexture | null = null
+function getDecalTexture(): CanvasTexture | null {
+  if (decalTexture) return decalTexture
+  if (typeof document === 'undefined') return null
+  const canvas = document.createElement('canvas')
+  canvas.width = 128
+  canvas.height = 128
+  const g = canvas.getContext('2d')
+  if (!g) return null
+  // Dense core feathering out, with a few overspray blobs off the rim.
+  const core = g.createRadialGradient(64, 64, 0, 64, 64, 58)
+  core.addColorStop(0, 'rgba(255,255,255,0.96)')
+  core.addColorStop(0.62, 'rgba(255,255,255,0.9)')
+  core.addColorStop(0.85, 'rgba(255,255,255,0.4)')
+  core.addColorStop(1, 'rgba(255,255,255,0)')
+  g.fillStyle = core
+  g.fillRect(0, 0, 128, 128)
+  for (let i = 0; i < 9; i++) {
+    const angle = (i / 9) * Math.PI * 2 + (i % 3) * 0.41
+    const dist = 44 + (i % 4) * 5
+    const bx = 64 + Math.cos(angle) * dist
+    const by = 64 + Math.sin(angle) * dist
+    const r = 4 + (i % 3) * 3
+    const blob = g.createRadialGradient(bx, by, 0, bx, by, r)
+    blob.addColorStop(0, 'rgba(255,255,255,0.55)')
+    blob.addColorStop(1, 'rgba(255,255,255,0)')
+    g.fillStyle = blob
+    g.beginPath()
+    g.arc(bx, by, r, 0, Math.PI * 2)
+    g.fill()
+  }
+  decalTexture = new CanvasTexture(canvas)
+  return decalTexture
+}
+
+/** Palette-index → shared decal material (≤ PAINT_PALETTE.length, module
+ * lifetime — the label-texture idiom; R3F never disposes prop materials). */
+const decalMaterials = new Map<number, MeshStandardMaterial>()
+export function decalMaterialFor(color: number): MeshStandardMaterial | null {
+  const swatch = PAINT_PALETTE[color]
+  if (!swatch) return null
+  const cached = decalMaterials.get(color)
+  if (cached) return cached
+  const material = new MeshStandardMaterial({
+    color: swatch.hex,
+    depthWrite: false,
+    map: getDecalTexture(),
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
+    roughness: 0.55,
+    transparent: true,
+  })
+  decalMaterials.set(color, material)
+  return material
+}
+
+const _decalHelper = new Object3D()
+const _decalLook = new Vector3()
+const _decalSize = new Vector3()
+
+/**
+ * Project one splat onto a pristine host mesh and claim a ring slot.
+ * Returns false when the mesh is too heavy or the clip produced nothing —
+ * sprayPaint then falls back to the voxelize path. Per-node overflow reuses
+ * the NODE's oldest decal (a wall being over-sprayed churns its own splats,
+ * never the rest of the scene's).
+ */
+export function spawnPaintDecal(
+  mesh: Mesh,
+  nodeId: string,
+  point: Vector3,
+  normal: Vector3,
+  radius: number,
+  color: number = colorIndex,
+): boolean {
+  const geometryHost = mesh.geometry
+  if (!geometryHost) return false
+  const position = geometryHost.getAttribute('position')
+  if (!position) return false
+  const triangles = (geometryHost.index ? geometryHost.index.count : position.count) / 3
+  if (!decalEligibleTris(triangles)) return false
+  // Projector frame: look back along the surface normal, random roll so
+  // repeated splats never stamp identical.
+  _decalHelper.position.copy(point)
+  _decalLook.copy(point).add(normal)
+  _decalHelper.lookAt(_decalLook)
+  _decalHelper.rotation.z = Math.random() * Math.PI * 2
+  const d = radius * 2
+  _decalSize.set(d, d, Math.max(0.12, d * 0.5))
+  const geometry = new DecalGeometry(mesh, point, _decalHelper.rotation, _decalSize)
+  if (!geometry.getAttribute('position') || geometry.getAttribute('position').count === 0) {
+    geometry.dispose()
+    return false
+  }
+  // Slot claim: the node at its cap recycles ITS oldest; otherwise the
+  // global ring advances (evicting whatever lived there).
+  let list = nodeDecals.get(nodeId)
+  let index: number
+  if (list && list.length >= DECAL_NODE_CAP) {
+    index = list[0]!
+    releaseSlot(index)
+  } else {
+    index = decalCursor
+    decalCursor = (decalCursor + 1) % DECAL_CAP
+    releaseSlot(index)
+  }
+  list = nodeDecals.get(nodeId)
+  if (!list) {
+    list = []
+    nodeDecals.set(nodeId, list)
+  }
+  list.push(index)
+  const s = decalSlots[index]!
+  s.alive = true
+  s.gen++
+  s.nodeId = nodeId
+  s.geometry = geometry
+  s.color = color
+  s.x = point.x
+  s.y = point.y
+  s.z = point.z
+  s.radius = radius
+  emitDecals()
+  return true
+}
+
+/**
+ * The target-live hook body (destruction calls it whenever a node's replica
+ * goes live — fresh voxelize or dormant wake): every decal on the node
+ * converts into the CELL ledger as a full falloff coat (splatCoat's adds
+ * normalized back out of COAT_ADD), then the slots free — from that frame
+ * on the voxel drain owns the paint. Roof nodes decompose into `id#pN`
+ * member targets; each live member takes the cells inside its own grid.
+ */
+export function convertDecalsForNode(nodeId: string): void {
+  const indices = nodeDecals.get(nodeId)
+  if (!indices || indices.length === 0) return
+  const targets = useDestruction.getState().targets
+  const prefix = `${nodeId}#`
+  for (const target of targets.values()) {
+    if (target.dormant) continue
+    if (target.nodeId !== nodeId && !target.nodeId.startsWith(prefix)) continue
+    const ledgerId = target.nodeId
+    let painted = paintedByNode.get(ledgerId)
+    const serial = nodeSerials.get(ledgerId) ?? 0
+    let wrote = false
+    for (const index of indices) {
+      const s = decalSlots[index]!
+      if (!s.alive) continue
+      const coats = splatCoat(target.grid, s.x, s.y, s.z, s.radius, serial)
+      if (coats.length === 0) continue
+      if (!painted) {
+        painted = new Map()
+        paintedByNode.set(ledgerId, painted)
+      }
+      for (const { cell, add } of coats) {
+        const strength = Math.min(1, add / COAT_ADD)
+        const prev = painted.get(cell)
+        const before = prev === undefined ? 0 : paintStrengthOf(prev)
+        painted.set(cell, paintValue(s.color, Math.min(1, before + strength)))
+      }
+      wrote = true
+    }
+    if (wrote) nodeSerials.set(ledgerId, serial + 1)
+  }
+  // Free the node's slots whether or not a live grid caught them — the
+  // host surface they were clipped against is hidden now.
+  for (const index of [...indices]) releaseSlot(index)
+  emitDecals()
+}
+
+/** Feature-detected registration — destruction.ts gains
+ * setTargetLiveListener via the manager diff; until then decals simply
+ * persist unconverted (they still render over the replica). */
+function targetLiveRegistrar(): ((cb: ((nodeId: string) => void) | null) => void) | undefined {
+  return (destructionModule as { setTargetLiveListener?: (cb: ((nodeId: string) => void) | null) => void })
+    .setTargetLiveListener
+}
+
+/** The session's splats — mounted by PaintTool, crater-style keyed slots. */
+function PaintDecals() {
+  useSyncExternalStore(subscribeDecals, getDecalVersion, getDecalVersion)
+  return (
+    <group userData={{ __boots: true }}>
+      {decalSlots.map((slot, i) => {
+        if (!slot.alive || !slot.geometry) return null
+        const material = decalMaterialFor(slot.color)
+        if (!material) return null
+        return (
+          // Geometry lifetime is the ring's (disposed on reuse/reset), the
+          // materials are module-cached — R3F must dispose neither.
+          <mesh dispose={null} geometry={slot.geometry} key={`${i}:${slot.gen}`} material={material} />
+        )
+      })}
+    </group>
+  )
+}
+
 // ── Spray resolution (raycast scratch — module temps, no per-shot allocs) ──
 
 const _origin = new Vector3()
@@ -206,6 +868,7 @@ const _worldRay = new Ray()
 const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _point = new Vector3()
+const _decalNormal = new Vector3()
 
 /**
  * One trigger tick: resolve the crosshair ray (voxel skins beat solid
@@ -223,6 +886,7 @@ export function sprayPaint(world: GameWorld): boolean {
   let nodeId: string | null = null
   let solidType: string | null = null
   let needsVoxelize = false
+  let decalMesh: Mesh | null = null
   // Broadphase before the BVH (the shooting.ts idiom): a ray-vs-AABB test
   // costs nanoseconds, culls almost every collider per spray tick, and —
   // critically — keeps the lazy `.bvh` getter from BUILDING BVHs for
@@ -247,6 +911,11 @@ export function sprayPaint(world: GameWorld): boolean {
       nodeId = collider.nodeId
       solidType = collider.nodeType
       needsVoxelize = true
+      decalMesh = collider.mesh
+      // Decal projector axis: the true face normal when the BVH hands one
+      // back, the reversed aim otherwise.
+      if (hit.face) _decalNormal.copy(hit.face.normal).transformDirection(collider.mesh.matrixWorld)
+      else _decalNormal.copy(_direction).negate()
       _point.copy(world_)
     }
   }
@@ -259,14 +928,32 @@ export function sprayPaint(world: GameWorld): boolean {
     _point.copy(voxelHit.point)
     bestDist = voxelHit.distance
   }
+  // Mist (P1): a tinted cone puffs off the nozzle every tick; on a surface
+  // hit the spray bounces back off the wall at the hit point, a clean miss
+  // hangs a puff in the air downrange instead.
+  refreshMistTint()
+  _mistDir.copy(_direction)
+  spawnDust(nozzleAt(_origin, _direction), 0.4, _mistOpts)
   if (!nodeId) {
+    _mistAt.copy(_nozzle).addScaledVector(_direction, 1.1)
+    spawnDust(_mistAt, 0.28, _mistOpts)
     lastHitDistance = null
     return false
   }
+  _bounce.copy(_direction).negate()
+  spawnDust(_point, 0.55, _bounceOpts)
   lastHitDistance = bestDist
   let ensured: VoxelTarget | null = null
   if (needsVoxelize) {
     if (!solidType || !PAINTABLE.has(solidType)) return false
+    // P5: a PRISTINE host wears a DecalGeometry splat — painting no longer
+    // voxelizes it. The node keeps its host meshes and colliders until
+    // real damage arrives; destruction's target-live hook then converts
+    // these splats into the cell ledger and frees the slots.
+    if (decalMesh && spawnPaintDecal(decalMesh, nodeId, _point, _decalNormal, splatRadiusAt(bestDist))) {
+      return true
+    }
+    // Fallback (heavy mesh / degenerate clip): the classic voxelize lane.
     ensured = ensureVoxelTarget(world, nodeId)
     if (!ensured) return false // degenerate grid
   }
@@ -278,21 +965,51 @@ export function sprayPaint(world: GameWorld): boolean {
   const target = useDestruction.getState().targets.get(nodeId) ?? ensured
   if (!target) return false
 
-  const cells = selectSplatCells(target.grid, _point.x, _point.y, _point.z, splatRadiusAt(bestDist))
-  if (cells.length === 0) return false
+  const serial = nodeSerials.get(nodeId) ?? 0
+  const coats = splatCoat(target.grid, _point.x, _point.y, _point.z, splatRadiusAt(bestDist), serial)
+  if (coats.length === 0) return false
   let painted = paintedByNode.get(nodeId)
   if (!painted) {
     painted = new Map()
     paintedByNode.set(nodeId, painted)
   }
-  for (const cell of cells) painted.set(cell, colorIndex)
-  nodeSerials.set(nodeId, (nodeSerials.get(nodeId) ?? 0) + 1)
+  // Drip frame (P4): the streak quad faces back along the spray, pushed
+  // just off the voxel face; over-coated wall cells shed runs below.
+  let nx = -_direction.x
+  let nz = -_direction.z
+  const nl = Math.hypot(nx, nz)
+  if (nl > 1e-4) {
+    nx /= nl
+    nz /= nl
+  } else {
+    nx = 0
+    nz = 1
+  }
+  const dripYaw = Math.atan2(nx, nz)
+  let drips = 0
+  for (const { cell, add } of coats) {
+    const prev = painted.get(cell)
+    const before = prev === undefined ? 0 : paintStrengthOf(prev)
+    if (shouldDrip(target.kind, before, drips, Math.random())) {
+      drips++
+      spawnDrip(
+        target.grid.centers[cell * 3]! + nx * 0.06,
+        target.grid.centers[cell * 3 + 1]! - target.grid.cellY * 0.5,
+        target.grid.centers[cell * 3 + 2]! + nz * 0.06,
+        dripYaw,
+        colorIndex,
+      )
+    }
+    painted.set(cell, paintValue(colorIndex, Math.min(1, before + add)))
+  }
+  nodeSerials.set(nodeId, serial + 1)
   return true
 }
 
 // ── Tint drain (renderer side — writes ONLY instanceColor) ────────────────
 
 const _tint = new Color()
+const _base = new Color()
 const _probeMatrix = new Matrix4()
 /** nodeId → resolved skin mesh (revalidated by fingerprint every drain). */
 const meshCache = new Map<string, InstancedMesh>()
@@ -381,13 +1098,17 @@ export function drainPaintTints(scene: Object3D): void {
     if (!mesh) continue
     const gates = mesh.userData as PaintedUserData
     if (gates.__bootsPaintSerial === serial && gates.__bootsPaintTarget === target) continue
-    for (const [cell, color] of cells) {
+    for (const [cell, value] of cells) {
       if (!target.grid.alive[cell]) continue
       // Same hash the priming jitter uses, gentler spread — painted runs
       // keep the per-voxel "block" read instead of banding flat.
       const j = ((cell * 2654435761) % 97) / 97
-      _tint.set(PAINT_PALETTE[color]!.hex).offsetHSL(0, 0, (j - 0.5) * 0.06)
-      mesh.setColorAt(cell, _tint)
+      _tint.set(PAINT_PALETTE[paintColorOf(value)]!.hex).offsetHSL(0, 0, (j - 0.5) * 0.06)
+      // Feathered accumulation: the coat lerps up from the cell's PRIMED
+      // base tone by strength — thin edges show the wall through, full
+      // coats cover it (skin-tone.ts is the shared prime-color math).
+      primedCellColor(_base, target, cell)
+      mesh.setColorAt(cell, _base.lerp(_tint, paintStrengthOf(value)))
     }
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
     gates.__bootsPaintSerial = serial
@@ -541,14 +1262,21 @@ export function PaintTool({ world }: { world: GameWorld }) {
 
   useEffect(() => {
     resetPaint()
+    resetPaintDecals()
     ;(globalThis as Record<string, unknown>).__bootsPaint = paintDebug
+    // Decal → ledger conversion the frame a node's replica goes live
+    // (feature-detected until destruction.ts ships the hook).
+    const register = targetLiveRegistrar()
+    register?.(convertDecalsForNode)
     return () => {
+      register?.(null)
       paintDebug.holdFire = false
       spray.current?.stop()
       spray.current = null
       spraying.current = false
-      // Never hold host meshes across sessions.
+      // Never hold host meshes (or their clipped decals) across sessions.
       meshCache.clear()
+      resetPaintDecals()
     }
   }, [])
 
@@ -606,5 +1334,12 @@ export function PaintTool({ world }: { world: GameWorld }) {
 
     drainPaintTints(scene)
   })
-  return null
+  // The drip + decal pools ride the tool's lifetime — reused slots persist,
+  // exit resets the rings with the ledger.
+  return (
+    <>
+      <DripsLayer />
+      <PaintDecals />
+    </>
+  )
 }

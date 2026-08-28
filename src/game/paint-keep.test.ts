@@ -9,8 +9,11 @@ import {
   usePaintKeep,
 } from './paint-keep'
 
-/** cell → palette index, from [cell, color] pairs. */
-const coats = (pairs: [number, number][]) => new Map<number, number>(pairs)
+/** cell → packed (color << 8) | strength coat, from [cell, color,
+ * strengthByte?] triples (full-strength 255 by default — the classic
+ * "one color per cell" ledger read). */
+const coats = (pairs: [number, number, number?][]) =>
+  new Map<number, number>(pairs.map(([cell, color, s]) => [cell, (color << 8) | (s ?? 255)]))
 
 describe('dominantPaint (the save-the-paint aggregator)', () => {
   test('per-cell majority wins', () => {
@@ -24,6 +27,36 @@ describe('dominantPaint (the save-the-paint aggregator)', () => {
         ]),
       ),
     ).toBe(2)
+  })
+
+  test('votes are strength-weighted — a heavy coat beats wide overspray', () => {
+    // Two saturated sage cells (2 × 255) outweigh five faint navy
+    // speckles (5 × 40): the deliberate coat wins the save.
+    expect(
+      dominantPaint(
+        coats([
+          [0, 2, 255],
+          [1, 2, 255],
+          [2, 4, 40],
+          [3, 4, 40],
+          [4, 4, 40],
+          [5, 4, 40],
+          [6, 4, 40],
+        ]),
+      ),
+    ).toBe(2)
+  })
+
+  test('zero-strength cells never vote', () => {
+    expect(dominantPaint(coats([[0, 3, 0]]))).toBeNull()
+    expect(
+      dominantPaint(
+        coats([
+          [0, 3, 0],
+          [1, 5, 1],
+        ]),
+      ),
+    ).toBe(5)
   })
 
   test('dead cells do not vote — dominance can flip', () => {
@@ -66,14 +99,14 @@ describe('dominantPaint (the save-the-paint aggregator)', () => {
   })
 
   test('later coats already overwrote earlier ones — the map is the truth', () => {
-    // paint.tsx's ledger stores ONE color per cell; a re-coated cell votes
-    // only for its final color.
+    // paint.tsx's ledger stores ONE packed coat per cell; a re-coated cell
+    // votes only for its final color.
     const cells = coats([
       [0, 0],
       [1, 0],
     ])
-    cells.set(0, 4)
-    cells.set(1, 4)
+    cells.set(0, (4 << 8) | 255)
+    cells.set(1, (4 << 8) | 255)
     expect(dominantPaint(cells)).toBe(4)
   })
 })

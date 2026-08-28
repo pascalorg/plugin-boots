@@ -123,6 +123,30 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   slow-submit renderer.info forensics, named wake tags,
   dormantPrimeQueueSize/settleTasksPending on `__boots`. 731 tests /
   20.8k assertions green.
+- Phase 9 (2026-08-28 night, fleet 5 lanes — spray/support/drones/juice
+  landed, breakage lane died with zero output; manager wired + stitched):
+  SPRAY FEEL — nozzle mist cone + bounce-back puffs (paint DustMaterial
+  variant, pure tint), feathered ACCUMULATING splats (packed
+  (color<<8)|strength ledger, smoothstep falloff + rim speckle, coats
+  lerp from the true primed cell tone via new skin-tone.ts —
+  voxel-walls now shares the same helper, bit-identity test-pinned),
+  48-slot drip pool on heavy wall coats, DecalGeometry splats on
+  PRISTINE hosts (painting no longer voxelizes; decals convert to
+  ledger coats on the destruction target-live hook, paint-keep votes
+  merge them area-weighted), can-shake wrist flick + rattle SFX +
+  nozzle-press lean · SUPPORT STRICT — scene-support probe grew a BVH
+  narrow phase (grid-frame slot OBB, margin as contact tolerance;
+  AABB overlap alone never grants), structural-nodeType anchor
+  allowlist (props/items never prop a build), piece-as-unit death at
+  <15% alive fraction (dead planks cascade long after walk-only
+  demotion) · DRONES REAL — drone-sized capsule collision through the
+  ground-bot pipeline (no phasing through floors/roofs/pieces),
+  displacement-swept path probes + descent-corridor hold, 3D reach,
+  meleeBlocked for all bot kinds + exact door-leaf swing sweep · JUICE —
+  once-per-session micro-hints, hitmarker kinds (carve pulse / kill
+  flare that owns its window), WAVE CLEARED banner, dual-rotor drone
+  hum with squared distance falloff, metal items spark + ping on carve
+  (metalness>0.5 at voxelize). 797 tests / 22.3k assertions green.
 
 ## In flight
 

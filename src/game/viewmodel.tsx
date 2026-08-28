@@ -10,7 +10,7 @@ import { builderDebug } from './builder'
 import { throwGrenade } from './grenade'
 import { itemGhostActive } from './item-place'
 import { MOVE } from './movement'
-import { cyclePaintColor, SprayerModel } from './paint'
+import { cyclePaintColor, paintDebug, SprayerModel } from './paint'
 import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -125,6 +125,17 @@ function playHammerSmash(): void {
   ;(sfx as unknown as { hammerSmash?: () => void }).hammerSmash?.()
 }
 
+/** audio.ts gains sfx.paintRattle() (spray lane, manager wiring) — the
+ * ball-bearing can rattle on R and on draw-in; guarded until it ships. */
+function playPaintRattle(): void {
+  ;(sfx as unknown as { paintRattle?: () => void }).paintRattle?.()
+}
+
+/** Sprayer juice tuning: the R/draw-in can shake decays over ~0.5 s; the
+ * press-the-nozzle lean eases in/out at ~14/s while spraying. */
+const PAINT_SHAKE_DECAY = 2
+const PAINT_PRESS_RATE = 14
+
 /** audio.ts gains sfx.minigun() this round (audio agent) — feature-detect so
  * the trigger works either way; shots fall back to rifle cracks until then. */
 type MinigunSfxHandle = { setSpin: (v: number) => void; shot: () => void; stop: () => void }
@@ -182,6 +193,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const hammerPhase = useRef<HammerPhase>('idle')
   const hammerT = useRef(0)
 
+  // Sprayer juice: 1→0 can-shake envelope (R cycle / draw-in) and the 0..1
+  // press-the-nozzle lean while spraying.
+  const paintShakeT = useRef(0)
+  const paintPressT = useRef(0)
+
   // Kill the whine if the session unmounts mid-spin, and hand the player
   // their legs back (speedScale contract: writers restore exactly 1).
   useEffect(
@@ -218,8 +234,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       else if (action === 'KeyR' && (state.weapon as ToolId) === 'paint') {
         // R is the builder's ROTATE (held state) everywhere else — with the
         // sprayer up the tap cycles the palette instead; PaintTool's
-        // change-gated HUD line picks the new color up next frame.
+        // change-gated HUD line picks the new color up next frame. The can
+        // gets a wrist-flick shake + ball-bearing rattle with the cycle.
         cyclePaintColor()
+        paintShakeT.current = 1
+        playPaintRattle()
       } else if (action === 'KeyG') {
         // G is the grenade EVERYWHERE (group contract). The throw itself
         // fires at the RELEASE keyframe of the wind-up below — the stick
@@ -317,6 +336,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     if (current !== prevWeapon.current) {
       prevWeapon.current = current
       drawT.current = 0
+      // Drawing the sprayer shakes the can awake — same rattle as R.
+      if (current === 'paint') {
+        paintShakeT.current = 1
+        playPaintRattle()
+      }
     }
     drawT.current = Math.min(1, drawT.current + dt / DRAW_TIME)
 
@@ -404,11 +428,9 @@ export function Viewmodel({ world }: { world: GameWorld }) {
               else sfx.rifleShot() // fallback until audio.ts ships sfx.minigun()
             } else sfx.rifleShot()
           }
-          const outcome = fire(world, def)
-          if (outcome === 'bot') {
-            session.hud.hitmarker()
-            sfx.hitmarker()
-          }
+          // Hit feedback lives in shooting.ts now (hitmarker kinds + kill
+          // confirm) — firing here again would voice it twice.
+          fire(world, def)
         }
       }
     }
@@ -432,13 +454,9 @@ export function Viewmodel({ world }: { world: GameWorld }) {
           // IMPACT — the moment the head lands. Route through the shared
           // smash path: fire() with the hammer def (smashRadius mirrored
           // into hole/tear radii until shooting routes it explicitly).
-          const outcome = fire(world, WEAPONS.hammer)
+          fire(world, WEAPONS.hammer)
           rigFeel.shake?.(1.0)
           playHammerSmash()
-          if (outcome === 'bot') {
-            session.hud.hitmarker()
-            sfx.hitmarker()
-          }
         } else if (hammerPhase.current === 'recover' && hammerT.current >= HAMMER_RECOVER) {
           hammerPhase.current = 'idle'
         }
@@ -503,6 +521,24 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const rumX = rumble > 0 ? Math.sin(breathT.current * 71) * 0.0035 * rumble : 0
     const rumY = rumble > 0 ? Math.sin(breathT.current * 57 + 1.3) * 0.003 * rumble : 0
 
+    // Sprayer juice (the rumble idiom, slower and wider): the R/draw-in
+    // shake is a decaying wrist-flick oscillation — the ball bearing
+    // knocking around the can — and holding the trigger leans the can in
+    // as the thumb presses the nozzle. Both exactly zero at rest.
+    paintShakeT.current = Math.max(0, paintShakeT.current - dt * PAINT_SHAKE_DECAY)
+    const canShake = current === 'paint' ? paintShakeT.current : 0
+    const shakeX = canShake > 0 ? Math.sin(breathT.current * 26) * 0.02 * canShake : 0
+    const shakeY = canShake > 0 ? Math.sin(breathT.current * 33 + 0.9) * 0.012 * canShake : 0
+    const shakeRoll = canShake > 0 ? Math.sin(breathT.current * 22 + 0.4) * 0.14 * canShake : 0
+    const sprayHeld =
+      current === 'paint' &&
+      (firing || paintDebug.holdFire) &&
+      !staggered &&
+      !itemGhostActive()
+    paintPressT.current +=
+      ((sprayHeld ? 1 : 0) - paintPressT.current) * Math.min(1, dt * PAINT_PRESS_RATE)
+    const press = current === 'paint' ? paintPressT.current : 0
+
     // ADS pose blend: lerp the carry pose toward the centered aim pose and
     // steady the procedural motion (bob/breath/look-lag) toward ADS_STEADY
     // at full aim — planted sights, not a bouncing scope.
@@ -547,14 +583,14 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     if (p) {
       const sag = droop.current
       p.position.set(
-        baseX + (bobX + breatheX + lagYaw.current * 0.35) * steady + rumX,
-        baseY + (bobY + breatheY + lagPitch.current * 0.3) * steady - dip - draw * 0.24 - swing * 0.1 - sag * 0.06 + rumY + hamY,
-        baseZ + recoil * 0.07 + hamZ,
+        baseX + (bobX + breatheX + lagYaw.current * 0.35) * steady + rumX + shakeX,
+        baseY + (bobY + breatheY + lagPitch.current * 0.3) * steady - dip - draw * 0.24 - swing * 0.1 - sag * 0.06 + rumY + hamY + shakeY - press * 0.015,
+        baseZ + recoil * 0.07 + hamZ - press * 0.02,
       )
       p.rotation.set(
-        baseRX + hamPitch - draw * 0.55 - dip * 1.4 - swing * 1.7 + recoil * 0.14 + lagPitch.current * steady - sag * 0.12,
+        baseRX + hamPitch - draw * 0.55 - dip * 1.4 - swing * 1.7 + recoil * 0.14 + lagPitch.current * steady - sag * 0.12 - press * 0.1,
         baseRY + lagYaw.current * steady + swing * 0.5,
-        baseRZ + bobRoll * steady + swing * 0.3 + sag * 0.07,
+        baseRZ + bobRoll * steady + swing * 0.3 + sag * 0.07 + shakeRoll,
       )
     }
   })

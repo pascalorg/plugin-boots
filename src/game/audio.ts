@@ -20,8 +20,17 @@
  *   beatPulse() here on mount so the visual pulse lands on the sound.
  *
  * Loop voices (stop() always idempotent):
- * - sfx.droneBuzz() — { setIntensity(0..1), stop } fixed-pitch hover buzz.
- *   Returns null without WebAudio.
+ * - sfx.droneBuzz() — { setIntensity, stop } the shared drone-pack voice
+ *   (redesigned 2026-08-28, owner: "super annoying"): a LOW dual-rotor hum
+ *   — two detuned sawtooths under a 260Hz lowpass whose ~2.6Hz beating plus
+ *   a gentle 11Hz blade-pass AM make the wobble — duty-cycled by a slow
+ *   ~0.17Hz swell so it breathes instead of droning. setIntensity keeps the
+ *   legacy input scale (a target level ≤ DRONE_LEVEL_MAX, enemies.tsx feeds
+ *   (1 − d/22) × 0.09) but the voice SQUARES the normalized value — strong
+ *   distance falloff: a drone at half the audible range plays at a quarter
+ *   level. ONE voice serves the whole pack (enemies.tsx drives it off the
+ *   nearest drone), so concurrency is capped by construction. Returns null
+ *   without WebAudio.
  * - sfx.machineSpinup() — { setProgress(0..1), stop } gear-up countdown
  *   voice: distant machinery waking up. progress sweeps pitch 50→180Hz,
  *   lowpass 350→2200Hz, AM 18→40Hz and level 0→~0.09 (capped so it stays
@@ -53,6 +62,10 @@
  * Phase-4 one-shots: hammerSmash() — the warhammer's deep thunder crack
  * (60–90Hz thump stack + masonry snap + long dust tail, loud but limited);
  * grenadeBeep() — short 900Hz arming blip for the fuse/HUD pip.
+ *
+ * Phase-9 juice one-shots: killConfirm() — the bot-kill tick, one low
+ * triangle blip, softer than hitmarker(); metalPing() — metallic impact
+ * ring for metal-flagged item hits (shooting.ts's spark lane).
  *
  * Phase-6 char-feel: charSnap(depth) — depth = prior snaps on the SAME
  * tree; each successive snap sits ~9% lower with a deeper, longer thunk
@@ -95,6 +108,12 @@ export function setHeartbeatPulseListener(cb: ((delayMs: number) => void) | null
 /** Muffle sweep endpoints — fully open vs. concussed. */
 const MUFFLE_OPEN_HZ = 19000
 const MUFFLE_CLOSED_HZ = 700
+
+/** Drone-pack voice tuning — see droneBuzz() in the header. The level max
+ * is the legacy caller scale: enemies.tsx passes (1 − d/22) × 0.09. */
+const DRONE_LEVEL_MAX = 0.09
+const DRONE_ROTOR_HZ = 74
+const DRONE_DETUNE = 1.036
 
 let ctx: AudioContext | null = null
 let master: DynamicsCompressorNode | null = null
@@ -702,6 +721,23 @@ export const sfx = {
     thump(1100, 0.03, 0.14, 0, 'triangle')
   },
 
+  /** Kill-confirm tick — softer and lower than hitmarker: one triangle
+   * blip at low gain (the "that one dropped" cue under the marker flare). */
+  killConfirm(): void {
+    thump(560, 0.06, 0.12, 0, 'triangle')
+  },
+
+  /** Metallic impact ping — a bullet on sheet metal: two high-Q inharmonic
+   * ring partials (noise-through-filter rings at Q≥14, the glass idiom)
+   * over a small dull body knock. Round-robin detuned so a burst into a
+   * fridge doesn't ring identical. */
+  metalPing(): void {
+    const v = rr()
+    burst({ duration: 0.14, gain: 0.32, freq: 3300 * v, q: 14 })
+    burst({ duration: 0.1, gain: 0.15, freq: 5170 * v, q: 16 }, 0.004)
+    thump(210 * v, 0.05, 0.18)
+  },
+
   botHit(): void {
     burst({ duration: 0.05, gain: 0.3, freq: 2200, q: 2.5 })
     thump(200, 0.05, 0.2)
@@ -715,29 +751,75 @@ export const sfx = {
   droneBuzz(): { stop: () => void; setIntensity: (v: number) => void } | null {
     const c = ensureContext()
     if (!c || !master) return null
-    const osc = c.createOscillator()
-    osc.type = 'sawtooth'
-    osc.frequency.value = 160
-    const lfo = c.createOscillator()
-    lfo.frequency.value = 33
-    const lfoGain = c.createGain()
-    lfoGain.gain.value = 22
-    lfo.connect(lfoGain)
-    lfoGain.connect(osc.frequency)
+    // Two detuned low rotors — their ~2.6Hz beat is the hum's slow churn.
+    const oscA = c.createOscillator()
+    oscA.type = 'sawtooth'
+    oscA.frequency.value = DRONE_ROTOR_HZ
+    const oscB = c.createOscillator()
+    oscB.type = 'sawtooth'
+    oscB.frequency.value = DRONE_ROTOR_HZ * DRONE_DETUNE
+    // Lowpass strips the sawtooth edge — a hum, not the old piercing whine.
+    const filter = c.createBiquadFilter()
+    filter.type = 'lowpass'
+    filter.frequency.value = 260
+    filter.Q.value = 0.8
+    // Gentle blade-pass amplitude wobble.
+    const am = c.createGain()
+    am.gain.value = 0.86
+    const wobble = c.createOscillator()
+    wobble.type = 'sine'
+    wobble.frequency.value = 11
+    const wobbleDepth = c.createGain()
+    wobbleDepth.gain.value = 0.12
+    wobble.connect(wobbleDepth)
+    wobbleDepth.connect(am.gain)
+    // Duty cycle: a slow swell so the threat cue breathes — subtle rises
+    // and dips instead of a constant tone.
+    const duty = c.createGain()
+    duty.gain.value = 0.72
+    const swell = c.createOscillator()
+    swell.type = 'sine'
+    swell.frequency.value = 0.17
+    const swellDepth = c.createGain()
+    swellDepth.gain.value = 0.28
+    swell.connect(swellDepth)
+    swellDepth.connect(duty.gain)
     const gain = c.createGain()
     gain.gain.value = 0.0
-    osc.connect(gain)
+    oscA.connect(filter)
+    oscB.connect(filter)
+    filter.connect(am)
+    am.connect(duty)
+    duty.connect(gain)
     gain.connect(master)
-    osc.start()
-    lfo.start()
+    oscA.start()
+    oscB.start()
+    wobble.start()
+    swell.start()
+    oscA.onended = () => {
+      gain.disconnect()
+      wobbleDepth.disconnect()
+      swellDepth.disconnect()
+    }
     return {
       setIntensity: (v: number) => {
-        gain.gain.setTargetAtTime(Math.min(0.09, v), c.currentTime, 0.08)
+        // Legacy input scale (target level ≤ DRONE_LEVEL_MAX) — normalize,
+        // then SQUARE: strong distance falloff, near drones still read.
+        const n = Math.min(1, Math.max(0, v / DRONE_LEVEL_MAX))
+        const t = c.currentTime
+        gain.gain.setTargetAtTime(0.075 * n * n, t, 0.12)
+        // Rotors lean up slightly as the pack closes — menace, not siren.
+        const f = DRONE_ROTOR_HZ + 14 * n
+        oscA.frequency.setTargetAtTime(f, t, 0.25)
+        oscB.frequency.setTargetAtTime(f * DRONE_DETUNE, t, 0.25)
       },
       stop: () => {
         gain.gain.setTargetAtTime(0.0001, c.currentTime, 0.05)
-        osc.stop(c.currentTime + 0.3)
-        lfo.stop(c.currentTime + 0.3)
+        const end = c.currentTime + 0.3
+        oscA.stop(end)
+        oscB.stop(end)
+        wobble.stop(end)
+        swell.stop(end)
       },
     }
   },
@@ -1079,6 +1161,23 @@ export const sfx = {
         lfo = null
         gain = null
       },
+    }
+  },
+
+  /**
+   * Ball-bearing can rattle — the sprayer shaken awake (R cycle / draw-in;
+   * viewmodel.tsx already calls sfx.paintRattle?.() feature-detected).
+   * 3–5 short metallic ticks: hot bandpass ping + tiny square knock per
+   * tick, 45–90 ms apart, round-robin detuned. Quiet — peak ~0.22.
+   */
+  paintRattle(): void {
+    const v = rr()
+    const ticks = 3 + Math.floor(Math.random() * 3)
+    let at = 0
+    for (let i = 0; i < ticks; i++) {
+      burst({ duration: 0.02, gain: 0.22, freq: (2600 + Math.random() * 1400) * v, q: 4 }, at)
+      thump(430 * v, 0.03, 0.1, at + 0.004, 'square')
+      at += 0.045 + Math.random() * 0.045
     }
   },
 

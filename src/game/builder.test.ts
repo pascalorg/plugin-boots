@@ -12,6 +12,7 @@ import {
   drainCladQueue,
   HALF_WALL_MASK,
   isOccupied,
+  makeSceneSupportProbe,
   maskBit,
   PIECE_DIMS,
   PIECE_KEYS,
@@ -33,13 +34,22 @@ import {
   wallExitTransform,
 } from './builder'
 import {
+  collapseWholeTarget,
   damageTarget,
   dropTarget,
   ensureVoxelTarget,
   resetDestruction,
   useDestruction,
 } from './destruction'
-import { resolveTargetSlot, STOREY, type TargetInput, parseSlotId } from './grid'
+import {
+  gridToWorld,
+  parseSlotId,
+  resetGridAnchor,
+  resolveTargetSlot,
+  setGridAnchor,
+  STOREY,
+  type TargetInput,
+} from './grid'
 import {
   DIED_SLOT_LOCKOUT_MS,
   diedAt,
@@ -47,6 +57,7 @@ import {
   isDeathLocked,
   isOccupied as slotIsOccupied,
   isSupported as slotIsSupported,
+  notifySceneSupportChanged,
   onCollapse,
   onPieceRemoved,
   registerPlacement,
@@ -900,6 +911,196 @@ describe('destruction ↔ slot registry (the third door pieces leave through)', 
     flushCollapse()
     // …then the orphan cascades out of the registry AND the store.
     expect(slotIsOccupied('F:2,2,1')).toBe(false)
+    expect(useBoots.getState().placed.length).toBe(0)
+    off()
+  })
+})
+
+// --- Scene-support probe: SUPPORT-STRICT (phase 9) ---------------------------
+// The old probe granted support on world-AABB overlap alone, so a host
+// roof's huge bounding box propped the airspace beside it (floating walls)
+// and cascades under-fired for the same reason. The strict probe keeps the
+// AABB as a broad-phase pre-filter only and requires REAL BVH contact with
+// the margin-expanded slot OBB; only structural nodeTypes may anchor.
+
+/** One host collider registered the way world.ts does it. `worldBoxOverride`
+ * models the AABB ⊃ geometry over-grant (a pitched roof's box). */
+function hostEntry(
+  nodeId: string,
+  nodeType: string,
+  dims: [number, number, number],
+  x: number,
+  y: number,
+  z: number,
+  rotY = 0,
+  worldBoxOverride?: Box3,
+): ColliderEntry {
+  const mesh = new Mesh(new BoxGeometry(...dims))
+  mesh.position.set(x, y, z)
+  mesh.rotation.y = rotY
+  mesh.updateMatrixWorld(true)
+  mesh.geometry.computeBoundingBox()
+  return {
+    mesh,
+    bvh: bvhFor(mesh),
+    inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+    worldBox:
+      worldBoxOverride ?? mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+    root: mesh,
+    nodeId,
+    nodeType,
+  }
+}
+
+function hostWorld(...colliders: ColliderEntry[]): GameWorld {
+  const aabb = new Box3()
+  for (const entry of colliders) aabb.union(entry.worldBox)
+  return {
+    colliders,
+    walls: new Map(),
+    glass: [],
+    doors: [],
+    overlayRoots: [],
+    buildingAabb: aabb,
+    spawn: new Vector3(0, 0, 6),
+    spawnYaw: 0,
+    levelId: null,
+  }
+}
+
+/** A 3 m host wall spanning cell (0,0)'s Wz:0,0,0 plane, y 0..2.8 — its top
+ * sits exactly at storey 1's base, inside the probe's contact tolerance. */
+const hostWall = (nodeId: string, nodeType = 'wall') =>
+  hostEntry(nodeId, nodeType, [3, 2.8, 0.2], 1.5, 1.4, 0)
+
+describe('scene-support probe: AABB overlap alone never grants (PIN)', () => {
+  afterEach(() => {
+    resetPieceSlots()
+    resetDestruction()
+    resetGridAnchor()
+    useBoots.setState({ placed: [] })
+  })
+
+  test('a host-roof AABB over empty airspace refuses placement AND cascades a 3-stack', () => {
+    // The over-grant model: a small far-away roof mesh whose worldBox is
+    // huge (a pitched roof's AABB covers the airspace beside its slopes).
+    // Real geometry never touches the Wz:0,0,* column.
+    const roof = hostEntry(
+      'host-roof-1',
+      'roof',
+      [1, 0.2, 1],
+      10,
+      3,
+      10,
+      0,
+      new Box3(new Vector3(-5, 0, -5), new Vector3(15, 9, 15)),
+    )
+    const world = hostWorld(roof)
+    setSceneSupportProbe(makeSceneSupportProbe(world))
+
+    // PLACEMENT: the empty sky slot inside the roof's AABB reads
+    // unsupported — the old probe said true here (floating walls).
+    expect(slotIsSupported('Wz:0,0,1')).toBe(false)
+    expect(slotIsSupported('Wz:0,0,2')).toBe(false)
+
+    // CASCADE: a grounded 3-stack in the same column. Killing the bottom
+    // must drop BOTH uppers — the old probe propped them off the AABB.
+    const falls: number[] = []
+    const off = onCollapse((pieceId) => falls.push(pieceId))
+    registerPlacement('Wz:0,0,0', 1)
+    registerPlacement('Wz:0,0,1', 2)
+    registerPlacement('Wz:0,0,2', 3)
+    onPieceRemoved('Wz:0,0,0')
+    flushCollapse()
+    expect(falls).toEqual([2, 3])
+    expect(slotIsOccupied('Wz:0,0,1')).toBe(false)
+    expect(slotIsOccupied('Wz:0,0,2')).toBe(false)
+    off()
+  })
+
+  test('real contact within the margin props; the storey above and the next cell do not', () => {
+    const world = hostWorld(hostWall('host-wall-1'))
+    const probe = makeSceneSupportProbe(world)
+    expect(probe('Wz:0,0,1')).toBe(true) // rests on the wall's top edge
+    expect(probe('F:0,0,1')).toBe(true) // ceiling face on the same top edge
+    expect(probe('Wz:0,0,2')).toBe(false) // one storey higher — no contact
+    expect(probe('Wz:0,2,1')).toBe(false) // two cells away in z
+    expect(probe('not-a-slot')).toBe(false)
+  })
+
+  test('props never anchor: items, item placements and non-structural kinds are skipped', () => {
+    // Identical geometry under the slot — only the structural kind grants.
+    expect(makeSceneSupportProbe(hostWorld(hostWall('host-col', 'column')))('Wz:0,0,1')).toBe(true)
+    expect(makeSceneSupportProbe(hostWorld(hostWall('host-item', 'item')))('Wz:0,0,1')).toBe(false)
+    expect(makeSceneSupportProbe(hostWorld(hostWall('host-blk', 'block')))('Wz:0,0,1')).toBe(false)
+    expect(makeSceneSupportProbe(hostWorld(hostWall('host-fnc', 'fence')))('Wz:0,0,1')).toBe(false)
+    // A placed-item collider is skipped even if its nodeType were structural.
+    expect(
+      makeSceneSupportProbe(hostWorld(hostWall('__boots-item-7', 'wall')))('Wz:0,0,1'),
+    ).toBe(false)
+    // Placed pieces keep supporting each other through the GRAPH only.
+    expect(
+      makeSceneSupportProbe(hostWorld(hostWall('__boots-piece-9', 'wall')))('Wz:0,0,1'),
+    ).toBe(false)
+  })
+
+  test('under a grid anchor the slot probes as a true OBB (no AABB inflation)', () => {
+    setGridAnchor({ x: 10, z: 5, yaw: Math.PI / 4 })
+    // Host wall aligned WITH the anchored grid: grid center (1.5, 0), tall
+    // enough that its top meets storey 1 — supports the anchored slot.
+    const on = gridToWorld(1.5, 0)
+    const aligned = hostWorld(
+      hostEntry('host-wall-a', 'wall', [3, 2.8, 0.2], on.x, 1.4, on.z, Math.PI / 4),
+    )
+    expect(makeSceneSupportProbe(aligned)('Wz:0,0,1')).toBe(true)
+    // The same wall shifted 1.2 m along grid +Z (past the 0.35 tolerance):
+    // its world AABB still brushes the slot's, but the OBB has no contact.
+    const shifted = gridToWorld(1.5, 1.2)
+    const beside = hostWorld(
+      hostEntry('host-wall-b', 'wall', [3, 2.8, 0.2], shifted.x, 1.4, shifted.z, Math.PI / 4),
+    )
+    expect(makeSceneSupportProbe(beside)('Wz:0,0,1')).toBe(false)
+  })
+
+  test('a stack propped by a HOST wall falls when collapseWholeTarget kills it (PIN)', async () => {
+    const world = hostWorld(hostWall('host-wall-c'))
+    setSceneSupportProbe(makeSceneSupportProbe(world))
+    const store = useBoots.getState()
+    const lower = store.addPlaced({
+      piece: 'wall',
+      position: [1.5, STOREY, 0],
+      yaw: 0,
+      slotId: 'Wz:0,0,1',
+    })
+    const upper = store.addPlaced({
+      piece: 'wall',
+      position: [1.5, STOREY * 2, 0],
+      yaw: 0,
+      slotId: 'Wz:0,0,2',
+    })
+    registerPlacement('Wz:0,0,1', lower.id)
+    registerPlacement('Wz:0,0,2', upper.id)
+    expect(slotIsSupported('Wz:0,0,1')).toBe(true)
+    expect(slotIsSupported('Wz:0,0,2')).toBe(true)
+    const off = onCollapse((pieceId) => {
+      useBoots.getState().removePlaced(pieceId)
+    })
+
+    // Voxelize the host wall (entry disables — the probe now reads voxel
+    // liveness through the same OBB) — still standing, nothing falls.
+    expect(ensureVoxelTarget(world, 'host-wall-c')).not.toBeNull()
+    expect(world.colliders[0]!.disabled).toBe(true)
+    notifySceneSupportChanged()
+    flushCollapse()
+    expect(slotIsOccupied('Wz:0,0,1')).toBe(true)
+
+    // The support cascade crumbles the WHOLE host wall → the debounced
+    // scene sweep lands → both propped pieces cascade out.
+    expect(collapseWholeTarget('host-wall-c')).toBeGreaterThan(0)
+    await new Promise((resolve) => setTimeout(resolve, 220))
+    flushCollapse()
+    expect(slotIsOccupied('Wz:0,0,1')).toBe(false)
+    expect(slotIsOccupied('Wz:0,0,2')).toBe(false)
     expect(useBoots.getState().placed.length).toBe(0)
     off()
   })

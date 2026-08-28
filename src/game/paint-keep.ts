@@ -1,7 +1,7 @@
 import { type AnyNode, type AnyNodeId, useScene } from '@pascal-app/core'
 import { create } from 'zustand'
 import { useDestruction } from './destruction'
-import { getPaintedByNode, PAINT_PALETTE } from './paint'
+import { getDecalVotesByNode, getPaintedByNode, PAINT_PALETTE } from './paint'
 
 /**
  * Save-the-paint — the sprayer's half of the persistence contract
@@ -12,12 +12,13 @@ import { getPaintedByNode, PAINT_PALETTE } from './paint'
  * undoable batch (legacy `material` inline, plus re-pointed slot refs for
  * slot-modelled walls) — and only ever from the explicit button.
  *
- * Dominance is per-cell majority: the palette color covering the most of
- * a node's still-alive painted cells wins (a wall 70% sage / 30% navy
- * saves sage — a node has ONE material color, so the splatter art itself
- * stays game-only). Cells shot out after painting don't vote; if every
- * painted cell died the full ledger votes instead — the player's explicit
- * act still counts even if the surface later took fire.
+ * Dominance is strength-weighted per-cell majority: the palette color
+ * carrying the most accumulated coat strength across a node's still-alive
+ * painted cells wins (a wall 70% sage / 30% navy saves sage — a node has
+ * ONE material color, so the splatter art itself stays game-only). Cells
+ * shot out after painting don't vote; if every painted cell died the full
+ * ledger votes instead — the player's explicit act still counts even if
+ * the surface later took fire.
  */
 
 export type PaintedNode = {
@@ -42,20 +43,41 @@ export const usePaintKeep = create<PaintKeepState>((set) => ({
 }))
 
 /**
- * Pure dominant-color aggregation — exported for tests. Cells failing
- * `isAlive` don't vote; the most-voted palette index wins and ties break
- * to the LOWER index (stable across map iteration order). Null when
- * nothing voted.
+ * Pure dominant-color aggregation — exported for tests. Ledger values are
+ * paint.tsx's packed (colorIndex << 8) | strengthByte coats: each alive
+ * cell votes its color WEIGHTED by strength, so a wall half-covered in a
+ * heavy sage coat beats a wide faint navy overspray. Cells failing
+ * `isAlive` (or at zero strength) don't vote; the most-weighted palette
+ * index wins and ties break to the LOWER index (stable across map
+ * iteration order). Null when nothing voted.
  */
 export function dominantPaint(
   cells: ReadonlyMap<number, number>,
   isAlive: (cell: number) => boolean = () => true,
 ): number | null {
+  return winningPaint(paintVotes(cells, isAlive))
+}
+
+/** Strength-weighted vote tally over a packed ledger — the dominantPaint
+ * half that decal area votes can merge into. Exported for tests. */
+export function paintVotes(
+  cells: ReadonlyMap<number, number>,
+  isAlive: (cell: number) => boolean = () => true,
+): Map<number, number> {
   const votes = new Map<number, number>()
-  for (const [cell, color] of cells) {
+  for (const [cell, value] of cells) {
     if (!isAlive(cell)) continue
-    votes.set(color, (votes.get(color) ?? 0) + 1)
+    const strength = value & 0xff
+    if (strength === 0) continue
+    const color = value >> 8
+    votes.set(color, (votes.get(color) ?? 0) + strength)
   }
+  return votes
+}
+
+/** The winner of a vote tally — most weight, ties to the LOWER palette
+ * index (stable across map iteration order). Null when nothing voted. */
+export function winningPaint(votes: ReadonlyMap<number, number>): number | null {
   let best: number | null = null
   let bestVotes = 0
   for (const [color, count] of votes) {
@@ -67,25 +89,53 @@ export function dominantPaint(
   return best
 }
 
+/** Decal m² → cell-vote units: one 0.15 m wall cell at FULL strength casts
+ * 255 — an equal-area decal splat must weigh the same at the ballot. */
+export const DECAL_VOTE_PER_M2 = 255 / (0.15 * 0.15)
+
 /**
  * Snapshot the session's painted nodes. Called from exitGame BEFORE the
  * destruction state resets with the game tree (the alive filter needs the
- * live grids). Game-only targets (tables, builder pieces — '__boots' ids)
- * never qualify: they are not scene nodes. Returns the captured count for
- * the pendingDecision gate.
+ * live grids). Voxel-cell coats vote strength-weighted; LIVE DECALS
+ * (pristine hosts the sprayer splatted without voxelizing, P5) vote
+ * area-weighted next to them through DECAL_VOTE_PER_M2. Game-only targets
+ * (tables, builder pieces — '__boots' ids) never qualify: they are not
+ * scene nodes. Returns the captured count for the pendingDecision gate.
  */
 export function capturePaint(): number {
   const painted: PaintedNode[] = []
   const targets = useDestruction.getState().targets
-  for (const [nodeId, cells] of getPaintedByNode()) {
+  const ledger = getPaintedByNode()
+  const decals = getDecalVotesByNode()
+  const nodeIds = new Set<string>([...ledger.keys(), ...decals.keys()])
+  for (const nodeId of nodeIds) {
     if (nodeId.startsWith('__boots')) continue
-    if (cells.size === 0) continue
+    const cells = ledger.get(nodeId)
     const target = targets.get(nodeId)
     const alive = target ? (cell: number) => target.grid.alive[cell] === 1 : undefined
-    const index = (alive ? dominantPaint(cells, alive) : null) ?? dominantPaint(cells)
+    let votes =
+      cells !== undefined && cells.size > 0 ? paintVotes(cells, alive) : new Map<number, number>()
+    // Every painted cell died: the full ledger votes instead — the
+    // player's explicit act still counts even after the surface took fire.
+    if (votes.size === 0 && cells !== undefined && cells.size > 0) votes = paintVotes(cells)
+    const areaVotes = decals.get(nodeId)
+    let decalCellEquivalents = 0
+    if (areaVotes) {
+      for (const [color, area] of areaVotes) {
+        const weight = area * DECAL_VOTE_PER_M2
+        votes.set(color, (votes.get(color) ?? 0) + weight)
+        decalCellEquivalents += weight / 255
+      }
+    }
+    const index = winningPaint(votes)
     if (index === null) continue
     const swatch = PAINT_PALETTE[index]!
-    painted.push({ nodeId, color: swatch.hex, colorName: swatch.name, cells: cells.size })
+    painted.push({
+      nodeId,
+      color: swatch.hex,
+      colorName: swatch.name,
+      cells: (cells?.size ?? 0) + Math.round(decalCellEquivalents),
+    })
   }
   usePaintKeep.getState().setPainted(painted)
   return painted.length

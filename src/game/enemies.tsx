@@ -21,8 +21,13 @@ import {
   DOOR_SCAN_RANGE,
   doorIsClosed,
   doorScanDue,
+  DRONE_CAPSULE,
+  DRONE_DESCENT_PROBE,
+  droneDescentBlocked,
+  dronePathBlocked,
   GROUND_BOT_CAPSULE,
   pickDoorCandidate,
+  segmentHitsBox,
   resetBots,
   setDoorApproach,
   settleGroundBot,
@@ -60,19 +65,30 @@ import type { GameWorld } from './world'
  *   Missions abort after DOOR_MISSION_TTL; a door the player opened
  *   mid-fumble is left alone (doorIsClosed re-check). Drones ignore all of
  *   this — they climb. Pure clocks + candidate pick live in enemies-state.
- * - MELEE LOS: an attack only lands if raycastVoxelTargets + a collider-box
- *   midpoint probe show clear air to the player — no punching through a
- *   sheet of drywall; a blocked attack triggers wall-follow instead.
+ * - MELEE LOS (ALL bots, drones included): an attack only lands if
+ *   raycastVoxelTargets + an exact segment-vs-collider-box sweep show clear
+ *   air to the player — no punching through a sheet of drywall, a closed
+ *   door leaf, or an elevated wall under a drone; a blocked attack triggers
+ *   wall-follow (ground bots) or a retry pause (drones).
  * - GROUND SETTLE (bots on floors): droids/dogs settle toward the live
  *   landing plane under their feet (enemies-state.settleGroundBot →
  *   destruction.probeLandingY, cached ~0.2 s per bot, never per frame) —
  *   they stand on slabs/upper floors, and a carved hole underfoot drops
  *   them to the storey below. No stair pathing yet.
- * - DRONES: no capsule. A forward point probe (~1.2 m ahead, at rotor height
- *   and just below) vs every collider worldBox — voxelized walls keep their
- *   box, so drones climb over buildings rather than thread breaches — feeds
- *   `bot.climb`: they rise while blocked, settle slowly when clear, and
- *   barely advance horizontally mid-climb.
+ * - DRONE WALL RULE: drones get the SAME truth as ground bots — one
+ *   drone-sized capsule pass per frame (DRONE_CAPSULE around the body
+ *   center) through collideCapsule + collideVoxelTargets, run AFTER the
+ *   altitude lerp and the horizontal step, so neither axis can phase
+ *   through walls, roofs or placed pieces. Steering stays probe-based
+ *   (enemies-state pure math, vs collider worldBoxes — voxelized walls
+ *   keep their box, so drones climb over buildings rather than thread
+ *   breaches): a path-aware probe samples the intended DISPLACEMENT
+ *   (~1.2 m ahead, vertical intent included, plus a wall-top skim point)
+ *   and feeds `bot.climb` — rise while blocked, barely advance mid-climb —
+ *   and before any altitude comes back the DESCENT CORRIDOR under the
+ *   rotors is probed: blocked → hold, so an elevated floor or roof is
+ *   cover you can hide under, exactly like ground walls. Drone reach is
+ *   3D — a drone parked high over your roof is NOT in range.
  *
  * Pacing (see enemies-state.ts for the state shape + tickWaveDirector):
  * - Peaceful until the industrial breaker switch is thrown (guntable.tsx →
@@ -117,7 +133,7 @@ const MELEE_BLOCKED_RETRY = 0.4
 const _toPlayer = new Vector3()
 const _center = new Vector3()
 const _botVel = new Vector3()
-const _probe = new Vector3()
+const _droneFeet = new Vector3()
 const _chest = new Vector3()
 const _meleeDir = new Vector3()
 const _doorCenter = new Vector3()
@@ -142,34 +158,37 @@ function spawnWave(world: GameWorld): void {
   }
 }
 
-/** Drone forward probe: point-vs-collider worldBox. Disabled entries
- * (voxelized walls) stay INCLUDED on purpose — the box outlives the hidden
- * mesh, so drones climb over breached buildings instead of threading holes
- * meant for ground bots. */
-function pointInColliderBox(world: GameWorld, x: number, y: number, z: number): boolean {
-  _probe.set(x, y, z)
-  for (const collider of world.colliders) {
-    if (collider.worldBox.containsPoint(_probe)) return true
-  }
-  return false
-}
-
 /** True when a solid sits between the bot's chest and the player's head —
- * melee never lands through drywall. Voxel grids get a real ray (their thin
- * skins would slip between point samples); non-voxelized solids (closed
- * doors, props) a midpoint box probe. Attack-frames only, never per-frame. */
-function meleeBlocked(world: GameWorld, bot: Bot): boolean {
+ * melee never lands through drywall, a closed door, or an elevated wall.
+ * Voxel grids get a real ray (their thin skins would slip between point
+ * samples); non-voxelized solids (closed doors, props, pristine walls) an
+ * exact segment-vs-worldBox sweep (enemies-state.segmentHitsBox — a single
+ * midpoint probe used to miss a door leaf near either end of the swing).
+ * Gates ALL bot kinds, drones included. Attack-frames only, never per-frame. */
+export function meleeBlocked(world: GameWorld, bot: Bot): boolean {
   _chest.set(bot.position.x, bot.position.y + BOT_STATS[bot.kind].bodyY, bot.position.z)
   _meleeDir.copy(playerRig.position).sub(_chest)
   const len = _meleeDir.length()
   if (len < 1e-4) return false
   _meleeDir.divideScalar(len)
   if (raycastVoxelTargets(_chest, _meleeDir, len)) return true
-  _probe.copy(_chest).addScaledVector(_meleeDir, len * 0.5)
   for (const collider of world.colliders) {
     // walkOnly planks are capsule-only — their voxel grid answered above.
     if (collider.disabled || collider.walkOnly) continue
-    if (collider.worldBox.containsPoint(_probe)) return true
+    if (
+      segmentHitsBox(
+        collider.worldBox,
+        _chest.x,
+        _chest.y,
+        _chest.z,
+        _meleeDir.x,
+        _meleeDir.y,
+        _meleeDir.z,
+        len,
+      )
+    ) {
+      return true
+    }
   }
   return false
 }
@@ -190,6 +209,8 @@ export function Enemies({ world }: { world: GameWorld }) {
   const waveText = useRef<string | null>(null)
   const staggerWas = useRef(false)
   const heart = useRef<HeartbeatHandle | null>(null)
+  /** Alive count last frame — the alive>0 → 0 edge fires the banner. */
+  const aliveWas = useRef(0)
 
   useEffect(() => {
     resetBots()
@@ -312,32 +333,67 @@ export function Enemies({ world }: { world: GameWorld }) {
       const dirX = dist > 0.001 ? _toPlayer.x / dist : 0
       const dirZ = dist > 0.001 ? _toPlayer.z / dist : 1
 
+      // Drone reach is 3D (ground bots stay XZ): a drone parked high over
+      // the roof you're under is NOT in range — it has to actually get to you.
+      const reachDist =
+        bot.kind === 'drone' ? Math.hypot(dist, playerRig.position.y - bot.position.y) : dist
+
       // Drone altitude: hover over the player's head, plus whatever climb
-      // the forward probe has banked to clear walls/roofs under the path.
+      // the path probe has banked to clear walls/roofs under the path.
       let droneBlocked = false
       if (bot.kind === 'drone') {
         if (!frozen) {
-          if (!staggered && dist > stats.reach) {
-            // Probe ~1.2 m ahead at rotor height AND just below, so wall
-            // tops read solid while skimming — climb while blocked, settle
-            // slowly when clear.
-            const ax = bot.position.x + dirX * DRONE_PROBE
-            const az = bot.position.z + dirZ * DRONE_PROBE
-            droneBlocked =
-              pointInColliderBox(world, ax, bot.position.y, az) ||
-              pointInColliderBox(world, ax, bot.position.y - 0.6, az)
-          }
-          bot.climb = droneBlocked
-            ? Math.min(DRONE_CLIMB_MAX, bot.climb + DRONE_CLIMB_RATE * dt)
-            : Math.max(0, bot.climb - DRONE_SETTLE_RATE * dt)
           // Mercy: drones climb an extra meter and hold while you're staggered.
-          const targetY =
+          const hoverY =
             playerRig.position.y +
             0.9 +
-            bot.climb +
             (staggered ? 1 : 0) +
             Math.sin(bot.phase * 0.7 + bot.seed) * 0.5
-          bot.position.y += (targetY - bot.position.y) * Math.min(1, dt * 2.2)
+          if (!staggered && reachDist > stats.reach) {
+            // Path-aware probe (enemies-state.dronePathBlocked): an exact
+            // sweep along the intended displacement ~1.2 m ahead — vertical
+            // intent included, so a dive toward the player reads the roof
+            // it would cut through — plus a wall-top skim point just under
+            // the far end. Climb while blocked, settle slowly when clear.
+            let wantDy = hoverY + bot.climb - bot.position.y
+            if (wantDy > DRONE_PROBE) wantDy = DRONE_PROBE
+            else if (wantDy < -DRONE_PROBE) wantDy = -DRONE_PROBE
+            droneBlocked = dronePathBlocked(
+              world.colliders,
+              bot.position.x,
+              bot.position.y,
+              bot.position.z,
+              dirX * DRONE_PROBE,
+              wantDy,
+              dirZ * DRONE_PROBE,
+            )
+          }
+          let descentHeld = false
+          if (droneBlocked) {
+            bot.climb = Math.min(DRONE_CLIMB_MAX, bot.climb + DRONE_CLIMB_RATE * dt)
+          } else {
+            // DESCENT CORRIDOR: before giving altitude back (settling banked
+            // climb, or following the player down a storey), probe the band
+            // under the rotors — blocked → hold, the piece below is cover.
+            const wantY = hoverY + Math.max(0, bot.climb - DRONE_SETTLE_RATE * dt)
+            const drop = bot.position.y - wantY
+            descentHeld =
+              drop > 0 &&
+              droneDescentBlocked(
+                world.colliders,
+                bot.position.x,
+                bot.position.y,
+                bot.position.z,
+                Math.min(drop, DRONE_DESCENT_PROBE),
+              )
+            if (!descentHeld) bot.climb = Math.max(0, bot.climb - DRONE_SETTLE_RATE * dt)
+          }
+          const targetY = hoverY + bot.climb
+          // A held descent freezes the lerp too — never sink toward a
+          // blocked corridor (the capsule pass below is the backstop).
+          if (!descentHeld || targetY > bot.position.y) {
+            bot.position.y += (targetY - bot.position.y) * Math.min(1, dt * 2.2)
+          }
         }
         nearestDrone = Math.min(nearestDrone, bot.position.distanceTo(playerRig.position))
       }
@@ -395,7 +451,7 @@ export function Enemies({ world }: { world: GameWorld }) {
         bot.followT -= dt
         moveX = -dirZ * stats.speed * bot.followSign
         moveZ = dirX * stats.speed * bot.followSign
-      } else if (dist > stats.reach) {
+      } else if (reachDist > stats.reach) {
         let sx = dirX
         let sz = dirZ
         // Dogs weave as they close in.
@@ -412,12 +468,15 @@ export function Enemies({ world }: { world: GameWorld }) {
         moveX = sx * stats.speed * advance
         moveZ = sz * stats.speed * advance
       } else if (bot.attackCooldown <= 0) {
-        if (grounded && meleeBlocked(world, bot)) {
-          // In reach but a wall is between us (thin walls beat the reach
-          // radius): don't punch drywall — pause, then wall-follow to a way in.
+        if (meleeBlocked(world, bot)) {
+          // In reach but a solid is between us (thin walls/door leaves beat
+          // the reach radius): don't punch drywall — pause, then ground bots
+          // wall-follow to a way in; drones just re-probe (walls are cover).
           bot.attackCooldown = MELEE_BLOCKED_RETRY
-          bot.followT = FOLLOW_TIME
-          bot.followSign = bot.seed % 2 < 1 ? 1 : -1
+          if (grounded) {
+            bot.followT = FOLLOW_TIME
+            bot.followSign = bot.seed % 2 < 1 ? 1 : -1
+          }
         } else {
           bot.attackCooldown = 1.1
           // bot→player XZ direction; damagePlayer normalizes and handles
@@ -429,6 +488,27 @@ export function Enemies({ world }: { world: GameWorld }) {
       if (!grounded) {
         bot.position.x += moveX * dt
         bot.position.z += moveZ * dt
+        if (!frozen) {
+          // DRONE WALL RULE: the same truth as ground bots — one capsule
+          // pass vs host colliders + live voxels, run AFTER the altitude
+          // lerp and the horizontal step so neither axis can phase through
+          // walls, roofs or placed pieces (the probes above are steering;
+          // the capsule is truth). Position is the body center; collide*
+          // wants feet, so offset by half the capsule height and back.
+          _botVel.set(moveX, 0, moveZ)
+          _droneFeet.set(
+            bot.position.x,
+            bot.position.y - DRONE_CAPSULE.height / 2,
+            bot.position.z,
+          )
+          collideCapsule(_droneFeet, _botVel, world.colliders, DRONE_CAPSULE)
+          collideVoxelTargets(_droneFeet, _botVel, DRONE_CAPSULE.radius, DRONE_CAPSULE.height)
+          bot.position.set(
+            _droneFeet.x,
+            _droneFeet.y + DRONE_CAPSULE.height / 2,
+            _droneFeet.z,
+          )
+        }
       } else if (!frozen) {
         const prevX = bot.position.x
         const prevZ = bot.position.z
@@ -489,6 +569,14 @@ export function Enemies({ world }: { world: GameWorld }) {
         }
       }
     }
+
+    // Wave-cleared banner (phase 9 juice lane): fire on the alive>0 → 0
+    // edge only while a wave is actually running — death/reset stay silent.
+    let alive = 0
+    for (const b of bots) if (b.state === 'alive') alive++
+    if (aliveWas.current > 0 && alive === 0 && waveState.alerted && waveState.wave > 0)
+      session.hud.waveCleared?.()
+    aliveWas.current = alive
 
     buzz.current?.setIntensity(nearestDrone === Infinity ? 0 : Math.max(0, 1 - nearestDrone / 22) * 0.09)
 

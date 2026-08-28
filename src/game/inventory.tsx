@@ -166,6 +166,8 @@ export function openItemMenu(
   input.state.actions.length = 0
   input.menuOpen = true
   input.onMenuKey = handleMenuKey
+  // The catalog is open — the "I — place furniture" micro-hint is moot.
+  session.hud.hintSeen?.('catalog')
 
   const root = document.createElement('div')
   root.id = 'boots-item-menu'

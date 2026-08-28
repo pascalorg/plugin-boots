@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { resetDestruction, useDestruction } from './destruction'
 import { playerRig } from './player'
-import { fire } from './shooting'
+import { fire, isMetalTarget } from './shooting'
 import { WEAPONS, type WeaponDef } from './weapons'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -125,6 +125,35 @@ describe('tear routing: tearRadius rules walls, holeRadius rules volumes', () =>
     const explicit = removedByOneShot({ ...GUN, tearRadius: GUN.holeRadius }, 'wall-1', 0)
     const fallback = removedByOneShot(GUN, 'wall-1', 0)
     expect(fallback).toBe(explicit)
+  })
+})
+
+/**
+ * Metal spark gate (phase 9 juice): only an explicit voxelize-time
+ * `metal: true` flag routes a carve to the spark lane — every shape of
+ * missing/false keeps the porcelain chip/puff read (targets predating the
+ * destruction.ts sampling included). Pure, so it's pinned exhaustively.
+ */
+describe('metal spark gate', () => {
+  test('only metal: true sparks metal', () => {
+    expect(isMetalTarget(undefined)).toBe(false)
+    expect(isMetalTarget(null)).toBe(false)
+    expect(isMetalTarget({})).toBe(false)
+    expect(isMetalTarget({ metal: false })).toBe(false)
+    expect(isMetalTarget({ metal: undefined })).toBe(false)
+    expect(isMetalTarget({ metal: true })).toBe(true)
+  })
+
+  test('a metal-flagged target changes cosmetics only — carves still land', () => {
+    resetDestruction()
+    const world = makeWorld()
+    aimFrom(10, 1.35, 5)
+    expect(fire(world, GUN)).toBe('wall') // first blood voxelizes the crate
+    const target = useDestruction.getState().targets.get('crate-1')!
+    ;(target as { metal?: boolean }).metal = true
+    const before = target.grid.count - target.grid.aliveCount
+    expect(fire(world, GUN)).toBe('wall') // spark lane, headless-silent
+    expect(target.grid.count - target.grid.aliveCount).toBeGreaterThan(before)
   })
 })
 

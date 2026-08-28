@@ -54,6 +54,25 @@ import type { TargetResult } from './grid'
  * - Keybind bar: automatic. Follows store.weapon — while the BUILDER is
  *   held it lists the piece hotkeys (builderKeybarText: Z/X/C/V/Q, with
  *   layout-map caps on non-QWERTY), otherwise KEYBAR_DEFAULT.
+ * - hint(id, text) — contextual micro-hints (owner: "it needs to be
+ *   discreet"): a tiny low-contrast line just above the keybar, fade-in
+ *   300ms, gone after ~4s, each id shown ONCE per session (per Hud
+ *   instance — session.ts builds a fresh Hud every Jump-in). Weapon-moment
+ *   hints fire from the store subscription itself (first builder equip,
+ *   first gun, first paint equip); the catalog hint fires from a 20s
+ *   mount timer unless hintSeen('catalog') suppressed it (openItemMenu
+ *   marks it — the player already found the catalog). Overlapping hints
+ *   queue; nothing is permanent chrome. Returns whether the hint fired
+ *   (the once-gate is what hud.test.ts pins).
+ * - hitmarker(kind?) — confirmed-hit feedback, driven by shooting.ts:
+ *   'hit' (default) the classic 4-tick pulse (~90ms), 'carve' a subtler
+ *   low-opacity pulse (~80ms) for wall/item carves, 'kill' a warm-tinted
+ *   slightly-longer flare for bot kills. A kill flare holds against
+ *   trailing 'hit'/'carve' writes for its window, so the killing blow's
+ *   read never gets stomped by the next round of a burst.
+ * - waveCleared() — one-shot "WAVE CLEARED" center banner (fade in, hold
+ *   ~1.8s, fade out). Driven by enemies.tsx when the last live bot of a
+ *   wave dies; feature-detected there, so integration order can't crash.
  */
 
 const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
@@ -111,6 +130,19 @@ export function builderKeybarText(
   return `${pieces} · R rotate/shape · F edit · U undo · Esc exit`
 }
 
+/** Hitmarker flavors — see hitmarker() in the header. */
+export type HitmarkerKind = 'hit' | 'kill' | 'carve'
+
+/** How long a kill flare owns the marker against trailing hit writes. */
+const KILL_HOLD_MS = 160
+
+/** Micro-hint pacing: fade-in 300ms, hold ~4s, fade-out, small gap. */
+const HINT_HOLD_MS = 4000
+const HINT_GAP_MS = 700
+
+/** The catalog nudge moment — ~20s into a session that never opened it. */
+const CATALOG_HINT_DELAY_MS = 20000
+
 const WEAPON_LABEL: Record<string, string> = {
   knife: 'KNIFE',
   pistol: 'PISTOL',
@@ -129,6 +161,21 @@ export class Hud {
   private editHintEl: HTMLDivElement | null = null
   private ghostStatusEl: HTMLDivElement | null = null
   private hitmarkerEl: HTMLDivElement | null = null
+  private hitArms: HTMLDivElement[] = []
+  /** Last arm color written (change gate — recolors are per-kind flips). */
+  private hitColor = ''
+  /** Until this Date.now() a kill flare owns the marker (see header). */
+  private killHoldUntil = 0
+  private hintEl: HTMLDivElement | null = null
+  /** Once-per-session gate: hint ids already fired (or hintSeen-marked). */
+  private readonly hintsShown = new Set<string>()
+  private hintQueue: string[] = []
+  private hintActive = false
+  private hintTimer: ReturnType<typeof setTimeout> | null = null
+  private hintGapTimer: ReturnType<typeof setTimeout> | null = null
+  private catalogTimer: ReturnType<typeof setTimeout> | null = null
+  private waveClearEl: HTMLDivElement | null = null
+  private waveClearTimer: ReturnType<typeof setTimeout> | null = null
   private edgeEls: HTMLDivElement[] | null = null
   private lowHpEl: HTMLDivElement | null = null
   private staggerEl: HTMLDivElement | null = null
@@ -209,7 +256,9 @@ export class Hud {
       const arm = document.createElement('div')
       arm.style.cssText = `position:absolute;left:-1px;top:-14px;width:2px;height:8px;background:#fff;transform:rotate(${rot}deg);transform-origin:1px 14px`
       this.hitmarkerEl.appendChild(arm)
+      this.hitArms.push(arm)
     }
+    this.hitColor = '#fff'
 
     // Stagger overlay — heavy red pulse + 'shake it off' while store.staggered.
     // Created BEFORE the edge-glow strips on purpose: siblings paint in DOM
@@ -302,6 +351,22 @@ export class Hud {
       `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em;white-space:nowrap`,
       KEYBAR_DEFAULT,
     )
+    // Contextual micro-hint — one small low-contrast line just above the
+    // keybar (its top edge sits near 59px). No box, no border: text only.
+    this.hintEl = el(
+      `position:absolute;left:50%;bottom:66px;transform:translateX(-50%);color:rgba(255,255,255,0.6);font:${FONT};font-size:11px;letter-spacing:0.08em;text-shadow:0 1px 3px rgba(0,0,0,0.7);white-space:nowrap;opacity:0;transition:opacity 0.3s`,
+    )
+    // WAVE CLEARED banner — center card, opacity-only (waveCleared()).
+    this.waveClearEl = el(
+      `position:absolute;left:50%;top:34%;transform:translateX(-50%);color:rgba(255,255,255,0.92);font:${FONT};font-size:16px;letter-spacing:0.34em;text-shadow:0 1px 4px rgba(0,0,0,0.9);white-space:nowrap;opacity:0;transition:opacity 0.25s`,
+      'WAVE CLEARED',
+    )
+    // Catalog nudge: ~20s in, IF the player never opened it (openItemMenu
+    // marks the id via hintSeen, which makes this timer's hint() a no-op).
+    this.catalogTimer = setTimeout(() => {
+      this.catalogTimer = null
+      this.hint('catalog', 'I — place furniture')
+    }, CATALOG_HINT_DELAY_MS)
 
     // The piece hotkeys match PHYSICAL key positions (e.code), so non-QWERTY
     // layouts print different caps on those keys (AZERTY: KeyZ is W, KeyQ is
@@ -347,6 +412,13 @@ export class Hud {
       }
       if (this.healthEl) this.healthEl.textContent = `♥ ${Math.max(0, Math.round(s.health))}`
       this.health = s.health
+
+      // Weapon-moment micro-hints — the once-gate inside hint() makes these
+      // per-render calls free after the first fire of each id.
+      if (s.weapon === 'builder') this.hint('builder-keys', 'Z wall · X floor · C stairs · V roof')
+      else if (s.weapon === 'paint') this.hint('paint-close', 'hold close to write')
+      else if (s.weapon === 'pistol' || s.weapon === 'rifle' || s.weapon === 'minigun')
+        this.hint('gun-aim', 'RMB to aim')
 
       // Low-HP vignette DEPTH: 0 above 45hp, ramping to 1 at 10hp. (Pulse
       // RATE is heartbeatBpm(health) — shared with the audible heartbeat.)
@@ -532,13 +604,108 @@ export class Hud {
     this.ghostStatusEl.style.opacity = '0'
   }
 
-  hitmarker(): void {
-    if (!this.hitmarkerEl) return
-    this.hitmarkerEl.style.opacity = '1'
+  /**
+   * Confirmed-hit crosshair pulse. 'hit' = the classic full 4-tick flash,
+   * 'carve' = a subtler low-opacity pulse for wall/item carves, 'kill' = a
+   * warm flare that holds slightly longer AND owns the marker for
+   * KILL_HOLD_MS — a burst's next 'hit'/'carve' can't stomp the killing
+   * blow's read. Zero-arg calls keep the legacy 'hit' behavior.
+   */
+  hitmarker(kind: HitmarkerKind = 'hit'): void {
+    const el = this.hitmarkerEl
+    if (!el) return
+    const now = Date.now()
+    if (kind !== 'kill' && now < this.killHoldUntil) return
+    let color = '#fff'
+    let opacity = '1'
+    let hold = 90
+    if (kind === 'kill') {
+      color = 'rgba(255,120,90,0.95)'
+      opacity = '0.9'
+      hold = KILL_HOLD_MS
+      this.killHoldUntil = now + KILL_HOLD_MS
+    } else if (kind === 'carve') {
+      opacity = '0.45'
+      hold = 80
+    }
+    if (color !== this.hitColor) {
+      this.hitColor = color
+      for (const arm of this.hitArms) arm.style.background = color
+    }
+    el.style.opacity = opacity
     if (this.hitTimer) clearTimeout(this.hitTimer)
     this.hitTimer = setTimeout(() => {
       if (this.hitmarkerEl) this.hitmarkerEl.style.opacity = '0'
-    }, 90)
+    }, hold)
+  }
+
+  /**
+   * Contextual micro-hint, once per session per id (see header). Returns
+   * whether this call fired the hint — false when the id already showed
+   * (or was hintSeen-suppressed). The once-gate runs before any DOM work,
+   * so the gate itself is testable headless; unmounted, a fresh id is
+   * consumed silently (the moment passed without a screen to show it on).
+   */
+  hint(id: string, text: string): boolean {
+    if (this.hintsShown.has(id)) return false
+    this.hintsShown.add(id)
+    if (!this.hintEl) return true
+    this.hintQueue.push(text)
+    if (!this.hintActive) this.showNextHint()
+    return true
+  }
+
+  /**
+   * Mark a hint id as already-known WITHOUT showing it — e.g. openItemMenu
+   * calls hintSeen('catalog') so the 20s nudge never fires for a player
+   * who already found the catalog.
+   */
+  hintSeen(id: string): void {
+    this.hintsShown.add(id)
+  }
+
+  /** Dequeue-and-show loop for hint(): fade in 300ms, hold ~4s, fade out,
+   * small gap, next. Self-terminates when the queue drains. */
+  private showNextHint = (): void => {
+    this.hintGapTimer = null
+    const el = this.hintEl
+    if (!el) return
+    const text = this.hintQueue.shift()
+    if (text === undefined) {
+      this.hintActive = false
+      return
+    }
+    this.hintActive = true
+    el.textContent = text
+    el.style.transition = 'opacity 0.3s'
+    el.style.opacity = '1'
+    this.hintTimer = setTimeout(() => {
+      this.hintTimer = null
+      if (!this.hintEl) return
+      this.hintEl.style.transition = 'opacity 0.6s'
+      this.hintEl.style.opacity = '0'
+      this.hintGapTimer = setTimeout(this.showNextHint, HINT_GAP_MS)
+    }, HINT_HOLD_MS)
+  }
+
+  /**
+   * One-shot WAVE CLEARED banner: fade in fast, hold ~1.8s, fade out slow.
+   * Caller: enemies.tsx, on the frame the last live bot of a wave dies
+   * (feature-detected — `session.hud.waveCleared?.()`). Re-entrant safe:
+   * a second call mid-fade just restarts the hold.
+   */
+  waveCleared(): void {
+    const el = this.waveClearEl
+    if (!el) return
+    el.style.transition = 'opacity 0.25s'
+    el.style.opacity = '1'
+    if (this.waveClearTimer) clearTimeout(this.waveClearTimer)
+    this.waveClearTimer = setTimeout(() => {
+      this.waveClearTimer = null
+      if (!this.waveClearEl) return
+      this.waveClearEl.style.transition = 'opacity 0.9s'
+      this.waveClearEl.style.opacity = '0'
+    }, 1800)
   }
 
   /**
@@ -587,6 +754,18 @@ export class Hud {
     if (this.beatTimer) clearTimeout(this.beatTimer)
     if (this.relaxTimer) clearTimeout(this.relaxTimer)
     this.hitTimer = this.flashTimer = this.beatTimer = this.relaxTimer = null
+    if (this.hintTimer) clearTimeout(this.hintTimer)
+    if (this.hintGapTimer) clearTimeout(this.hintGapTimer)
+    if (this.catalogTimer) clearTimeout(this.catalogTimer)
+    if (this.waveClearTimer) clearTimeout(this.waveClearTimer)
+    this.hintTimer = this.hintGapTimer = this.catalogTimer = this.waveClearTimer = null
+    this.hintQueue.length = 0
+    this.hintActive = false
+    this.hintEl = null
+    this.waveClearEl = null
+    this.hitArms.length = 0
+    this.hitColor = ''
+    this.killHoldUntil = 0
     this.root?.remove()
     this.root = null
     this.editHintEl = null
