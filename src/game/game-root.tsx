@@ -27,6 +27,7 @@ import { GlassCracks, resetGlass } from './glass'
 import { Grenades } from './grenade'
 import { GunTable } from './guntable'
 import { GameItems } from './item-place'
+import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
@@ -170,6 +171,62 @@ function Prevoxelize({ world }: { world: GameWorld }) {
     if (done.current) return
     if (frame.current++ === 0) return
     done.current = prevoxelizeTick(world, 4)
+  })
+  return null
+}
+
+/**
+ * Feeds the HUD's entry veil with REAL progress (loading.ts weights) —
+ * the owner's "terrible lag when launching" fix: the veil holds until the
+ * session's actual gear-up pipeline is done instead of a fixed 1.2 s.
+ * Per frame while session.loading (a boolean check once revealed):
+ *
+ *  - wall fraction: walls with a destruction target / world.walls.size —
+ *    prevoxelizeTick only reports a done BOOLEAN, so the counter is read
+ *    off useDestruction's targets map directly (O(walls) Map lookups).
+ *  - prevoxelize done: the zero-budget prevoxelizeTick probe (same idiom
+ *    as warmup.tsx — budget 0 means "check, never work").
+ *  - prime drain: dormantPrimeQueueSize() against the highest size seen
+ *    (the queue GROWS while prevoxelize enqueues — loading.ts caps the
+ *    open-queue fraction and advanceProgress keeps the signal monotonic).
+ *  - warm frames: counted only after the primes drained — they absorb the
+ *    serialized warm-draw GPU uploads (voxel-walls serializes one replica
+ *    upload per frame) plus the first steady renders.
+ *
+ * The 4 s cap lives in advanceProgress (elapsed wall clock) AND as a
+ * hud-side timer (a wedged frame loop can't hold the veil). Feature-
+ * detected hud call, plain reads only — never writes any store.
+ */
+function LoadingDriver({ world }: { world: GameWorld }) {
+  const start = useRef(0)
+  const peak = useRef(0)
+  const warm = useRef(0)
+  const progress = useRef(0)
+  useFrame(() => {
+    const session = getSession()
+    if (!session?.loading) return
+    if (start.current === 0) start.current = performance.now()
+    const targets = useDestruction.getState().targets
+    let voxelized = 0
+    for (const nodeId of world.walls.keys()) {
+      if (targets.has(nodeId)) voxelized++
+    }
+    const remaining = dormantPrimeQueueSize()
+    if (remaining > peak.current) peak.current = remaining
+    const prevoxelizeDone = prevoxelizeTick(world, 0)
+    if (prevoxelizeDone && remaining === 0) warm.current++
+    const sample: LoadingSample = {
+      snapshotDone: true, // collectWorld ran synchronously before this mount
+      wallsTotal: world.walls.size,
+      wallsVoxelized: voxelized,
+      prevoxelizeDone,
+      primeQueuePeak: peak.current,
+      primeQueueRemaining: remaining,
+      warmFrames: warm.current,
+      elapsedMs: performance.now() - start.current,
+    }
+    progress.current = advanceProgress(progress.current, sample)
+    session.hud.loadingProgress?.(progress.current, pendingLabel(sample))
   })
   return null
 }
@@ -621,6 +678,7 @@ function ActiveGame() {
       <Enemies world={world} />
       <Nature world={world} />
       <PipelineWarmup world={world} />
+      <LoadingDriver world={world} />
       <ResurrectionSweep />
       <TreesDestruct world={world} />
       <PerfMonitor />

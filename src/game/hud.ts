@@ -1,6 +1,7 @@
 import { useBoots } from '../store'
 import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
 import type { TargetResult } from './grid'
+import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
 
 /**
  * DOM HUD, mounted INSIDE the fullscreen element (the canvas' parent) so it
@@ -73,6 +74,16 @@ import type { TargetResult } from './grid'
  * - waveCleared() — one-shot "WAVE CLEARED" center banner (fade in, hold
  *   ~1.8s, fade out). Driven by enemies.tsx when the last live bot of a
  *   wave dies; feature-detected there, so integration order can't crash.
+ * - loadingProgress(p, pending?) — the entry veil's REAL progress feed
+ *   (game-root's LoadingDriver, weights in loading.ts). The veil mounts
+ *   opaque with a thin bottom bar + one quip line and holds until p ≥ 1
+ *   (or the LOADING_CAP_MS backstop), then fades 300ms and removes
+ *   itself; a cap reveal console.infos the last `pending` label. Bar DOM
+ *   writes are width%-only on ONE element, change-gated on whole percents
+ *   and rate-limited to 10 Hz (loading.ts shouldWriteBar). `onReveal`
+ *   fires exactly once at reveal — session.ts uses it to drop the
+ *   loading input gate. unmount() tears the veil down with the session,
+ *   so Esc during loading exits cleanly.
  */
 
 const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
@@ -143,6 +154,13 @@ const HINT_GAP_MS = 700
 /** The catalog nudge moment — ~20s into a session that never opened it. */
 const CATALOG_HINT_DELAY_MS = 20000
 
+/** Veil fade once progress completes (ms) — quick, the work is done. */
+const VEIL_FADE_MS = 300
+
+/** Loading quips — one line, rotating at most once (game tone, no lore
+ * dump): the second lands when progress crosses the halfway mark. */
+const LOADING_QUIPS = ['lacing up your boots…', 'hanging the drywall…'] as const
+
 const WEAPON_LABEL: Record<string, string> = {
   knife: 'KNIFE',
   pistol: 'PISTOL',
@@ -208,6 +226,24 @@ export class Hud {
   private pipF = -1
   /** Last setAds() value written (change gate; -1 = never). */
   private lastAds = -1
+  /** Entry veil (loading) — see loadingProgress() in the header. */
+  private veilEl: HTMLDivElement | null = null
+  private veilBarEl: HTMLDivElement | null = null
+  private veilQuipEl: HTMLDivElement | null = null
+  private veilRevealed = false
+  private veilCapTimer: ReturnType<typeof setTimeout> | null = null
+  private veilRemoveTimer: ReturnType<typeof setTimeout> | null = null
+  /** Last bar write (10 Hz + whole-percent change gate; loading.ts). */
+  private veilBarWriteAt = 0
+  private veilBarPct = -1
+  /** Quip index currently shown (change gate). */
+  private veilQuip = -1
+  /** Last pending label from the driver — non-empty at reveal = a cap. */
+  private veilPending = ''
+  /** Fires exactly once when the veil reveals (progress or cap) — session.ts
+   * drops its loading input gate here. Cleared on unmount, never called by
+   * teardown (an Esc mid-load exits without a reveal). */
+  onReveal: (() => void) | null = null
 
   mount(container: HTMLElement): void {
     const root = document.createElement('div')
@@ -216,27 +252,52 @@ export class Hud {
       'position:absolute;inset:0;pointer-events:none;z-index:2147483646;user-select:none;font-family:system-ui'
     this.root = root
 
-    // Entry veil — a plain black div that fades out over the first second
-    // of the session. Session entry front-loads real one-off work (dormant
-    // replica primes + their serialized first GPU uploads, BVH warms,
-    // Prevoxelize ticks); the veil masks those gear-up frames instead of
-    // showing them as a stutter. Pure DOM, outside the scene graph, first
-    // child on purpose: every HUD element paints ON TOP of it, so prompts
-    // stay readable while the world fades in. Removes itself when done.
+    // Entry veil — a black cover that holds until the session's REAL entry
+    // work is done. Session entry front-loads one-off work (prevoxelize
+    // ticks, dormant replica primes + their serialized first GPU uploads,
+    // BVH warms); the old fixed 1.2s fade revealed mid-churn — this one is
+    // progress-driven: game-root's LoadingDriver feeds loadingProgress()
+    // (stage weights in loading.ts) and the veil fades VEIL_FADE_MS once
+    // progress hits 1, with a LOADING_CAP_MS wall-clock backstop so a
+    // wedged stage (or a dead frame loop) never traps the player. Pure
+    // DOM, outside the scene graph, first child on purpose: every HUD
+    // element paints ON TOP of it, so prompts stay readable through the
+    // fade. Carries its own minimal chrome — small title, one quip line,
+    // a thin bottom bar (ONE element, width%-only writes, ≤ 10 Hz).
     const veil = document.createElement('div')
-    veil.style.cssText =
-      'position:absolute;inset:0;background:#000;opacity:1;transition:opacity 1.2s ease 0.15s'
+    veil.dataset.bootsVeil = '1' // QA hook: presence = still loading
+    veil.style.cssText = 'position:absolute;inset:0;background:#000;opacity:1'
+    const veilTitle = document.createElement('div')
+    veilTitle.textContent = 'BOOTS'
+    veilTitle.style.cssText = `position:absolute;left:50%;bottom:118px;transform:translateX(-50%);color:rgba(255,255,255,0.85);font:${FONT};font-size:14px;letter-spacing:0.42em;text-indent:0.42em`
+    veil.appendChild(veilTitle)
+    this.veilQuipEl = document.createElement('div')
+    this.veilQuipEl.textContent = LOADING_QUIPS[0]
+    this.veilQuip = 0
+    this.veilQuipEl.style.cssText = `position:absolute;left:50%;bottom:88px;transform:translateX(-50%);color:rgba(255,255,255,0.45);font:${FONT};font-size:11px;letter-spacing:0.14em;white-space:nowrap`
+    veil.appendChild(this.veilQuipEl)
+    const veilTrack = document.createElement('div')
+    veilTrack.style.cssText =
+      'position:absolute;left:50%;bottom:72px;transform:translateX(-50%);width:min(320px,42%);height:2px;border-radius:2px;background:rgba(255,255,255,0.14);overflow:hidden'
+    this.veilBarEl = document.createElement('div')
+    this.veilBarEl.dataset.bootsVeilBar = '1' // QA hook: width% = progress
+    this.veilBarEl.style.cssText =
+      'height:100%;width:0%;border-radius:2px;background:rgba(255,255,255,0.85);transition:width 0.25s linear'
+    veilTrack.appendChild(this.veilBarEl)
+    veil.appendChild(veilTrack)
     root.appendChild(veil)
-    if (typeof requestAnimationFrame === 'function') {
-      // Double-rAF: the opacity:1 frame must COMMIT before the transition
-      // target lands, or the browser skips straight to transparent.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          veil.style.opacity = '0'
-        })
-      })
-    } else veil.style.opacity = '0'
-    window.setTimeout(() => veil.remove(), 1700)
+    this.veilEl = veil
+    this.veilRevealed = false
+    this.veilBarWriteAt = 0
+    this.veilBarPct = -1
+    this.veilPending = ''
+    // Wall-clock backstop: even a wedged R3F loop (the driver never runs)
+    // reveals at the cap — never trap the player behind the veil.
+    this.veilCapTimer = setTimeout(() => {
+      this.veilCapTimer = null
+      if (!this.veilPending) this.veilPending = 'no progress reported (frame loop stalled?)'
+      this.revealVeil()
+    }, LOADING_CAP_MS)
 
     const el = (css: string, text = ''): HTMLDivElement => {
       const div = document.createElement('div')
@@ -503,6 +564,60 @@ export class Hud {
     if (!this.root || this.lowHp <= 0) return
     if (this.beatTimer) clearTimeout(this.beatTimer)
     this.beatTimer = setTimeout(this.beat, delayMs)
+  }
+
+  /**
+   * Entry-veil progress feed (see header). `p` is the driver's monotonic
+   * capped progress (loading.ts advanceProgress); `pending` is the compact
+   * still-pending label — non-empty at reveal time means the cap fired, and
+   * gets console.info'd so a slow scene leaves a trace. Safe per frame:
+   * DOM writes are change-gated on whole percents and ≤ 10 Hz.
+   */
+  loadingProgress(p: number, pending = ''): void {
+    if (!this.veilEl || this.veilRevealed) return
+    this.veilPending = pending
+    const now = Date.now()
+    if (shouldWriteBar(this.veilBarWriteAt, this.veilBarPct, now, p)) {
+      this.veilBarWriteAt = now
+      this.veilBarPct = barPercent(p)
+      if (this.veilBarEl) this.veilBarEl.style.width = `${this.veilBarPct}%`
+      const quip = p >= 0.5 ? 1 : 0
+      if (quip !== this.veilQuip && this.veilQuipEl) {
+        this.veilQuip = quip
+        this.veilQuipEl.textContent = LOADING_QUIPS[quip] ?? ''
+      }
+    }
+    if (p >= 1) this.revealVeil()
+  }
+
+  /** Fade the veil out (VEIL_FADE_MS) and remove it; idempotent. Fires
+   * onReveal exactly once — a cap reveal logs what was still pending. */
+  private revealVeil(): void {
+    const veil = this.veilEl
+    if (!veil || this.veilRevealed) return
+    this.veilRevealed = true
+    if (this.veilCapTimer) {
+      clearTimeout(this.veilCapTimer)
+      this.veilCapTimer = null
+    }
+    if (this.veilPending) {
+      console.info(
+        `[boots] loading veil capped at ${LOADING_CAP_MS / 1000}s — still pending: ${this.veilPending}`,
+      )
+    }
+    if (this.veilBarEl) this.veilBarEl.style.width = '100%'
+    veil.style.transition = `opacity ${VEIL_FADE_MS / 1000}s ease`
+    veil.style.opacity = '0'
+    this.veilRemoveTimer = setTimeout(() => {
+      this.veilRemoveTimer = null
+      veil.remove()
+      this.veilEl = null
+      this.veilBarEl = null
+      this.veilQuipEl = null
+    }, VEIL_FADE_MS + 100)
+    const onReveal = this.onReveal
+    this.onReveal = null
+    onReveal?.()
   }
 
   /**
@@ -785,6 +900,21 @@ export class Hud {
     this.hintActive = false
     this.hintEl = null
     this.waveClearEl = null
+    // Veil teardown — Esc during loading exits cleanly: the veil rides the
+    // root removal below; onReveal is deliberately NOT fired (the session
+    // is over, there is nothing to un-gate).
+    if (this.veilCapTimer) clearTimeout(this.veilCapTimer)
+    if (this.veilRemoveTimer) clearTimeout(this.veilRemoveTimer)
+    this.veilCapTimer = this.veilRemoveTimer = null
+    this.veilEl = null
+    this.veilBarEl = null
+    this.veilQuipEl = null
+    this.veilRevealed = false
+    this.veilBarWriteAt = 0
+    this.veilBarPct = -1
+    this.veilQuip = -1
+    this.veilPending = ''
+    this.onReveal = null
     this.hitArms.length = 0
     this.hitColor = ''
     this.killHoldUntil = 0

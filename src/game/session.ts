@@ -35,6 +35,9 @@ export type GameSession = {
   /** Host objects the game hid (damaged walls, shattered panes). */
   hiddenObjects: Array<{ object: Object3D; visible: boolean }>
   teardown: Array<() => void>
+  /** True while the entry loading veil is up — the input gate below
+   * suppresses look/fire until hud's onReveal drops it. */
+  loading: boolean
 }
 
 let current: GameSession | null = null
@@ -234,8 +237,43 @@ export function enterGame(): boolean {
     savedCamera: null,
     hiddenObjects: [],
     teardown: teardownList,
+    loading: true,
   }
   current = session
+
+  // ── Entry loading gate (look/fire only) ────────────────────────────────
+  // While the veil is up (session.loading), suppress firing and look
+  // WITHOUT touching input.ts or player.tsx: every consumer reads
+  // `input.state.firing/altFiring` per frame (viewmodel, builder, paint,
+  // item-place) and look flows through `input.consumeLook()` (player.tsx
+  // only), so wrapping both HERE — where the input is constructed — gates
+  // all of them at once. The state proxy answers `false` for the two fire
+  // bits while loading and forwards everything else (handlers keep writing
+  // the real state through it); consumeLook drains-and-discards deltas so
+  // pre-reveal mouse flailing never snaps the camera at reveal. WASD is
+  // deliberately NOT gated (harmless under an opaque veil) and the
+  // pointer-lock request keeps its original timing: deferring it to the
+  // reveal would fire it outside the click's transient activation and
+  // browsers would reject it (the exact WrongDocumentError class of bug
+  // the fullscreen sequencing above already fights) — the veil hides the
+  // early lock anyway. hud.onReveal (below) drops the gate exactly when
+  // the veil fades; an Esc mid-load never fires it, and the discarded
+  // session's gate dies with the session.
+  const realInputState = input.state
+  input.state = new Proxy(realInputState, {
+    get(target, prop, receiver) {
+      if (session.loading && (prop === 'firing' || prop === 'altFiring')) return false
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+  const rawConsumeLook = input.consumeLook.bind(input)
+  input.consumeLook = () => {
+    const look = rawConsumeLook()
+    return session.loading ? { dx: 0, dy: 0 } : look
+  }
+  hud.onReveal = () => {
+    if (current === session) session.loading = false
+  }
 
   sfx.resume()
   // Sequence the lock AFTER the fullscreen transition settles: firing both

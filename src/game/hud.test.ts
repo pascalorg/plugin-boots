@@ -76,3 +76,30 @@ describe('micro-hints fire once per session', () => {
     expect(next.hint('gun-aim', 'RMB to aim')).toBe(true)
   })
 })
+
+/**
+ * Entry veil, headless surface: the progress feed and the reveal callback
+ * must be safe without a DOM (loadingProgress is feature-detected and the
+ * driver can outlive a torn-down HUD by a frame). Everything visual lives
+ * behind mount(); these pin the no-DOM contract only.
+ */
+describe('entry loading veil (headless contract)', () => {
+  test('loadingProgress before mount is a safe no-op (no reveal fired)', () => {
+    const hud = new Hud()
+    let revealed = 0
+    hud.onReveal = () => revealed++
+    expect(() => hud.loadingProgress(0.5)).not.toThrow()
+    expect(() => hud.loadingProgress(1, 'warm frames (3/20)')).not.toThrow()
+    // No veil element exists — progress 1 must not fire the reveal gate.
+    expect(revealed).toBe(0)
+  })
+
+  test('unmount clears onReveal without calling it (Esc mid-load exits clean)', () => {
+    const hud = new Hud()
+    let revealed = 0
+    hud.onReveal = () => revealed++
+    hud.unmount()
+    expect(revealed).toBe(0)
+    expect(hud.onReveal).toBeNull()
+  })
+})
