@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { resetDestruction, useDestruction } from './destruction'
 import { playerRig } from './player'
-import { fire, isMetalTarget } from './shooting'
+import { fire, isMetalHit, isMetalTarget } from './shooting'
 import { WEAPONS, type WeaponDef } from './weapons'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -142,6 +142,21 @@ describe('metal spark gate', () => {
     expect(isMetalTarget({ metal: false })).toBe(false)
     expect(isMetalTarget({ metal: undefined })).toBe(false)
     expect(isMetalTarget({ metal: true })).toBe(true)
+  })
+
+  test('per-cell mask localizes sparks; mask-less metal sparks everywhere', () => {
+    const grid = {
+      count: 2,
+      centers: new Float32Array([0, 0, 0, 10, 0, 0]),
+    }
+    const masked = { metal: true, cellMetal: new Uint8Array([1, 0]), grid }
+    expect(isMetalHit(masked, { x: 0.1, y: 0, z: 0 })).toBe(true) // near the metal cell
+    expect(isMetalHit(masked, { x: 9.9, y: 0, z: 0 })).toBe(false) // near the wood cell
+    // No mask (legacy / host-resolved metalness read): the flag alone decides.
+    expect(isMetalHit({ metal: true, grid }, { x: 9.9, y: 0, z: 0 })).toBe(true)
+    // The coarse gate still rules everything out when the flag is off.
+    expect(isMetalHit({ metal: false, cellMetal: new Uint8Array([1, 1]), grid }, { x: 0, y: 0, z: 0 })).toBe(false)
+    expect(isMetalHit(null, { x: 0, y: 0, z: 0 })).toBe(false)
   })
 
   test('a metal-flagged target changes cosmetics only — carves still land', () => {

@@ -84,9 +84,11 @@ import type { GameWorld } from './world'
  * calls double-voice against this and should be removed (manager diff).
  *
  * ── Metal spark lane (phase 9 juice) ───────────────────────────────────
- * Item targets flagged `metal` (destruction.ts samples the dominant
- * sub-mesh material's metalness > 0.5 at VOXELIZE time — feature-detected
- * here through a cast until the flag lands) trade the porcelain chip/puff
+ * Item targets flagged `metal` (destruction.ts reads each sub-mesh's
+ * dominant material at VOXELIZE time: metalness > 0.5 OR a 'metal-*'
+ * pascal_material library tag — catalog GLBs bake metallicFactor 0 — and
+ * masks the metal CELLS; isMetalHit gates on the cell nearest the impact,
+ * so mixed items spark on their metal parts only) trade the porcelain
  * for 3–5 bright yellow-white spark streaks (debris idiom: tiny cubes,
  * high speed, short ttl, gravity) + sfx.metalPing. Walls, tile-read items
  * and glass keep their existing reads untouched.
@@ -198,12 +200,52 @@ const SPARK_HOT = new Color('#ffe9a0')
 /**
  * Spark-lane material gate, pure (pinned by shooting.test.ts): a target
  * sparks metal only when its voxelize-time `metal` flag is exactly true.
- * The flag is OPTIONAL — destruction.ts samples dominant material.metalness
- * > 0.5 on item targets; until that lands (or on any pre-flag target) every
- * shape of missing/false answers false and the porcelain read stays.
+ * The flag is OPTIONAL — destruction.ts flags item targets whose dominant
+ * sub-mesh materials read metal (isMetalItemMaterial); on any pre-flag
+ * target every shape of missing/false answers false and porcelain stays.
  */
 export function isMetalTarget(target: { metal?: boolean } | null | undefined): boolean {
   return target?.metal === true
+}
+
+/** Target slice the per-cell spark gate reads (matches VoxelTarget). */
+type MetalHitTarget = {
+  metal?: boolean
+  cellMetal?: Uint8Array
+  grid?: { count: number; centers: Float32Array }
+}
+
+/**
+ * Per-cell spark gate, pure (QA P9R1 fix 2): metal items are mostly MIXED
+ * — a couch with a chrome handle must spark on the handle only, the
+ * barbell on bar AND plates per their own regions. When the target carries
+ * the voxelize-time `cellMetal` mask, the grid cell nearest the impact
+ * decides (carved cells keep their centers — the just-removed cell still
+ * answers); a metal-flagged target without a mask sparks everywhere
+ * (legacy read). Allocation-free O(grid.count ≤ ~2600) per carve hit.
+ */
+export function isMetalHit(
+  target: MetalHitTarget | null | undefined,
+  point: { x: number; y: number; z: number },
+): boolean {
+  if (!isMetalTarget(target)) return false
+  const mask = target?.cellMetal
+  const grid = target?.grid
+  if (!mask || !grid || grid.count === 0) return true
+  const centers = grid.centers
+  let bestIndex = -1
+  let bestD2 = Infinity
+  for (let i = 0; i < grid.count; i++) {
+    const dx = centers[i * 3]! - point.x
+    const dy = centers[i * 3 + 1]! - point.y
+    const dz = centers[i * 3 + 2]! - point.z
+    const d2 = dx * dx + dy * dy + dz * dz
+    if (d2 < bestD2) {
+      bestD2 = d2
+      bestIndex = i
+    }
+  }
+  return bestIndex >= 0 && mask[bestIndex] === 1
 }
 
 /** Confirmed-hit HUD feedback — see the header block. Null-session safe. */
@@ -359,12 +401,10 @@ function carve(
   if (wall) {
     sfx.drywallCrunch(Math.min(1, removed / 10))
   } else if (
-    isMetalTarget(
-      useDestruction.getState().targets.get(nodeId) as { metal?: boolean } | undefined,
-    )
+    isMetalHit(useDestruction.getState().targets.get(nodeId) as MetalHitTarget | undefined, point)
   ) {
-    // Metal-flagged item (fridge, faucet, range hood…): bright spark
-    // streaks + a metallic ring instead of the porcelain chip/puff read.
+    // Metal part hit (barbell bar, chrome fixture, brass handle…): bright
+    // spark streaks + a metallic ring instead of the porcelain chip/puff.
     metalSparks(point, direction)
     sfx.metalPing()
   } else {

@@ -314,10 +314,18 @@ export type VoxelTarget = {
    * shape-preserving cells, carve dust voiced 'concrete'-lite (the
    * porcelain read — see damageTarget). */
   item?: boolean
-  /** True when the item's dominant sub-mesh material reads metallic
-   * (metalness > 0.5 at voxelize time) — shooting.ts swaps the carve
-   * chip/puff for spark streaks + sfx.metalPing(). */
+  /** True when ANY sub-mesh's dominant material reads metallic at
+   * voxelize time (metalness > 0.5 OR a 'metal-*' pascal_material library
+   * tag — catalog GLBs bake metallicFactor 0; see isMetalItemMaterial) —
+   * shooting.ts swaps the carve chip/puff for spark streaks +
+   * sfx.metalPing(), refined per cell through `cellMetal`. */
   metal?: boolean
+  /** Per-voxel metal bit (1 = the cell's region reads metal) — same
+   * region attribution as cellColors, allocated only when the item MIXES
+   * materials with at least one metal region (a couch sparks on its chrome
+   * handle, puffs on the leather). shooting.ts's isMetalHit reads the cell
+   * nearest the impact. Never touched per frame. */
+  cellMetal?: Uint8Array
   /** Per-voxel RGB (3 floats per index, working color space) — sampled at
    * VOXELIZE time from the item's own sub-mesh materials (silhouette lane
    * only; see sampleItemCellColors). voxel-walls.tsx prefers it over
@@ -834,7 +842,12 @@ function buildItemGrid(sources: VoxelSource[], bounds: Box3): VoxelGridData {
 // target.cellColors per instance; debris tint reads it via cellTint.
 
 /** Minimal material slice the palette sampler reads (Mesh['material']). */
-type ItemMaterialLike = { color?: Color; map?: { image?: unknown } | null }
+type ItemMaterialLike = {
+  color?: Color
+  map?: { image?: unknown } | null
+  metalness?: number
+  userData?: { pascal_material?: unknown }
+}
 
 /**
  * Average tone of a material's texture map through a tiny 2D canvas —
@@ -899,6 +912,25 @@ function dominantMeshMaterial(mesh: Mesh): ItemMaterialLike | null {
   return (material[bestIndex] ?? material[0]) as unknown as ItemMaterialLike
 }
 
+/** Pascal material-library refs whose ids sit in the 'metal' category —
+ * catalog GLBs tag every sub-material with `extras.pascal_material`
+ * (→ material.userData through the loader), e.g. 'library:metal-chrome'.
+ * The library category is the naming convention: every metal id is
+ * 'metal-*'. */
+const METAL_LIBRARY_REF = /^(?:library:)?metal-/
+
+/** Metal read for ONE material (QA P9R1 fix 2): `metalness > 0.5` catches
+ * host-resolved library materials (metal-chrome resolves at 0.6), but
+ * catalog GLBs often BAKE metallicFactor 0 (the barbell's chrome bar ships
+ * metalness 0) — there the `pascal_material` library tag is the ground
+ * truth. Exported for tests. */
+export function isMetalItemMaterial(material: ItemMaterialLike | null): boolean {
+  if (!material) return false
+  if ((material.metalness ?? 0) > 0.5) return true
+  const tag = material.userData?.pascal_material
+  return typeof tag === 'string' && METAL_LIBRARY_REF.test(tag)
+}
+
 /** One sub-mesh's resolved tone: base color × map average when the map is
  * drawable (host GLB materials often carry the look in the MAP over a
  * white base — reading `color` alone yields white), else the base color,
@@ -927,29 +959,46 @@ const _regionSize = new Vector3()
  * detail shells beat enclosing bodies, and surface cells whose centers sit
  * a hair proud of a thin shell still resolve to it. Also returns the
  * cell-weighted average tone (the target's baseColor → dust/fallback
- * debris inherit the palette). Voxelize-time only — O(cells × sub-meshes),
+ * debris inherit the palette) and — when any region reads metal
+ * (isMetalItemMaterial) — a per-cell metal mask riding the same
+ * attribution. Voxelize-time only — O(cells × sub-meshes),
  * ≤ ~2600 × a handful. Null when the node exposes no solid meshes.
  */
 function sampleItemCellColors(
   grid: VoxelGridData,
   meshes: readonly Mesh[],
-): { colors: Float32Array; average: Color } | null {
+): { colors: Float32Array; average: Color; cellMetal?: Uint8Array } | null {
   if (meshes.length === 0 || grid.count === 0) return null
-  const regions: Array<{ box: Box3; score: number; r: number; g: number; b: number }> = []
+  const regions: Array<{
+    box: Box3
+    score: number
+    r: number
+    g: number
+    b: number
+    metal: boolean
+  }> = []
+  let anyMetal = false
   for (const mesh of meshes) {
     if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
     const box = mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld)
     box.getSize(_regionSize)
     const tone = itemRegionColor(mesh)
+    // Metal rides the SAME region attribution as the palette (QA P9R1 fix
+    // 2): most metal items are MIXED — a couch's chrome handle or the
+    // barbell's bar must spark without turning the whole item metallic.
+    const metal = isMetalItemMaterial(dominantMeshMaterial(mesh))
+    anyMetal ||= metal
     regions.push({
       box,
       score: _regionSize.x * _regionSize.y * _regionSize.z * REGION_VOLUME_WEIGHT,
       r: tone.r,
       g: tone.g,
       b: tone.b,
+      metal,
     })
   }
   const colors = new Float32Array(grid.count * 3)
+  const cellMetal = anyMetal ? new Uint8Array(grid.count) : undefined
   let sumR = 0
   let sumG = 0
   let sumB = 0
@@ -973,6 +1022,7 @@ function sampleItemCellColors(
     colors[i * 3] = best.r
     colors[i * 3 + 1] = best.g
     colors[i * 3 + 2] = best.b
+    if (cellMetal && best.metal) cellMetal[i] = 1
     sumR += best.r
     sumG += best.g
     sumB += best.b
@@ -980,6 +1030,7 @@ function sampleItemCellColors(
   return {
     colors,
     average: new Color(sumR / grid.count, sumG / grid.count, sumB / grid.count),
+    cellMetal,
   }
 }
 
@@ -1788,10 +1839,12 @@ export function ensureVoxelTarget(
   // target's flat baseColor becomes the palette average so dust/fallbacks
   // stay in family.
   const itemPalette = item ? sampleItemCellColors(grid, meshes) : null
-  // Metal read (phase 9 juice lane): dominant sub-mesh metalness > 0.5 at
-  // voxelize time — carves throw sparks instead of chips (shooting.ts).
-  const metal =
-    item && meshes.some((m) => ((dominantMeshMaterial(m) as { metalness?: number } | null)?.metalness ?? 0) > 0.5)
+  // Metal read (phase 9 juice lane): ANY sub-mesh whose dominant material
+  // reads metal (metalness OR pascal_material library tag — see
+  // isMetalItemMaterial) flags the target, and the palette sampler's
+  // per-cell mask localizes the sparks to the metal parts (shooting.ts's
+  // isMetalHit — a couch sparks on its chrome handle only).
+  const metal = item && itemPalette?.cellMetal !== undefined
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -1805,6 +1858,7 @@ export function ensureVoxelTarget(
     roof,
     item,
     metal,
+    cellMetal: itemPalette?.cellMetal,
     grid,
     baseColor:
       itemPalette?.average ?? (wall ? nodeCoatColor(nodeId) : null) ?? targetBaseColor(meshes),

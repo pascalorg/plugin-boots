@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import { Box3, BoxGeometry, type Material, Matrix4, Mesh, MeshStandardMaterial, Vector3 } from 'three'
 import {
   collapseWholeTarget,
   damageExplosion,
@@ -7,6 +7,7 @@ import {
   damageTarget,
   dormantTargetCount,
   ensureVoxelTarget,
+  isMetalItemMaterial,
   prevoxelizeTick,
   raycastSegments,
   resetDestruction,
@@ -505,5 +506,78 @@ describe('savedCoatHex (host-order coat resolution for voxel skins)', () => {
         { mat_tex: { material: { preset: 'brick', properties: { color: '#ffffff' } } } },
       ),
     ).toBeNull()
+  })
+})
+
+describe('isMetalItemMaterial (metal spark flag — QA P9R1 fix 2)', () => {
+  test('metalness > 0.5 reads metal; 0 / missing does not', () => {
+    expect(isMetalItemMaterial({ metalness: 1 })).toBe(true)
+    expect(isMetalItemMaterial({ metalness: 0.6 })).toBe(true)
+    expect(isMetalItemMaterial({ metalness: 0.5 })).toBe(false)
+    expect(isMetalItemMaterial({ metalness: 0 })).toBe(false)
+    expect(isMetalItemMaterial({})).toBe(false)
+    expect(isMetalItemMaterial(null)).toBe(false)
+  })
+
+  test("a 'metal-*' pascal_material library tag reads metal even at baked metalness 0", () => {
+    // The barbell's chrome bar ships metallicFactor 0 in the GLB but tags
+    // extras.pascal_material 'library:metal-chrome' — the tag is truth.
+    expect(isMetalItemMaterial({ metalness: 0, userData: { pascal_material: 'library:metal-chrome' } })).toBe(true)
+    expect(isMetalItemMaterial({ userData: { pascal_material: 'metal-steel' } })).toBe(true)
+    // Non-metal library tags (and non-string junk) stay porcelain.
+    expect(isMetalItemMaterial({ userData: { pascal_material: 'library:preset-nearblack' } })).toBe(false)
+    expect(isMetalItemMaterial({ userData: { pascal_material: 'library:wood-finewood27' } })).toBe(false)
+    expect(isMetalItemMaterial({ userData: { pascal_material: 42 } })).toBe(false)
+    // 'metal-*' must be the id START — a substring never matches.
+    expect(isMetalItemMaterial({ userData: { pascal_material: 'library:sheet-metal-look' } })).toBe(false)
+  })
+
+  test('item target flags metal from a tagged sub-mesh; untagged stays false', () => {
+    const world = makeWorld()
+    const crate = world.colliders.find((c) => c.nodeId === 'crate-1')!
+    ;(crate.mesh.material as Material).userData = { pascal_material: 'library:metal-chrome' }
+    expect(ensureVoxelTarget(world, 'crate-1')?.metal).toBe(true)
+    resetDestruction()
+    ;(crate.mesh.material as Material).userData = {}
+    expect(ensureVoxelTarget(world, 'crate-1')?.metal).toBe(false)
+  })
+
+  test('mixed item: the per-cell mask marks only the metal sub-mesh region', () => {
+    const world = makeWorld()
+    const wood = boxCollider('mixed-1', 'item', [1, 0.3, 1], [20, 1, 0])
+    const chrome = boxCollider('mixed-1', 'item', [1, 0.3, 1], [22, 1, 0])
+    ;(chrome.mesh.material as Material).userData = { pascal_material: 'library:metal-chrome' }
+    world.colliders.push(wood, chrome)
+    const target = ensureVoxelTarget(world, 'mixed-1')!
+    expect(target.metal).toBe(true)
+    const mask = target.cellMetal!
+    expect(mask).toBeDefined()
+    let metalCells = 0
+    let woodCells = 0
+    for (let i = 0; i < target.grid.count; i++) {
+      const x = target.grid.centers[i * 3]!
+      if (mask[i] === 1) {
+        metalCells++
+        expect(x).toBeGreaterThan(21) // chrome box territory
+      } else {
+        woodCells++
+        expect(x).toBeLessThan(21) // wood box territory
+      }
+    }
+    expect(metalCells).toBeGreaterThan(0)
+    expect(woodCells).toBeGreaterThan(0)
+  })
+
+  test('multi-material mesh: the DOMINANT group decides (wood table with a metal screw stays wood)', () => {
+    const world = makeWorld()
+    const crate = world.colliders.find((c) => c.nodeId === 'crate-1')!
+    const wood = new MeshStandardMaterial({ metalness: 0 })
+    const chrome = new MeshStandardMaterial({ metalness: 1 })
+    crate.mesh.material = [wood, chrome]
+    const total = crate.mesh.geometry.getIndex()!.count
+    crate.mesh.geometry.clearGroups()
+    crate.mesh.geometry.addGroup(0, total - 6, 0) // wood covers almost everything
+    crate.mesh.geometry.addGroup(total - 6, 6, 1) // one metal sliver
+    expect(ensureVoxelTarget(world, 'crate-1')?.metal).toBe(false)
   })
 })
