@@ -27,14 +27,17 @@ import {
 } from './roof-planes'
 import { hideForGameKeepingRoots, maskForGame } from './session'
 import {
+  cellToneAt,
   clearToneAudit,
   isUntexturedWhite,
   kindFallbackTone,
   mapAverageTone,
+  mapPatternGrid,
   reportToneFallback,
   resetSkinTones,
   resolveSurfaceTone,
   type SkinToneKind,
+  type ToneGrid,
 } from './skin-tone'
 import {
   cancelSettleTask,
@@ -300,6 +303,12 @@ export type VoxelTarget = {
    * a bump; paint coats re-apply on top via drainPaintTints (the paint
    * ledger's own serials never move). */
   skinRevision?: number
+  /** The surface texture's CPU pattern grid (skin-tone.ts mapPatternGrid)
+   * — when present, primedCellColor samples the PATTERN (brick courses,
+   * shingle rows) per cell instead of the flat baseColor. Set at voxelize
+   * for readable maps; pending textures deliver it with the async retint.
+   * Layered kinds only (item cells carry their pattern IN cellColors). */
+  toneGrid?: ToneGrid
   /** DORMANT prevoxelization (the grenade-lag fix): the grid + anatomy are
    * prebuilt off the blast frame, but the HOST keeps rendering and
    * colliding — no visual change until the first hit wakes the target
@@ -1003,6 +1012,21 @@ function sampleItemCellColors(
     g: number
     b: number
     metal: boolean
+    /** The region material's pattern grid (readable maps only) + the base
+     * color multiplier — cells inside this region sample the TEXTURE at a
+     * region-relative (u,v) instead of wearing the flat tone. */
+    pattern: ToneGrid | null
+    baseR: number
+    baseG: number
+    baseB: number
+    /** (u,v) plane = the box's two DOMINANT axes (largest extents,
+     * u = largest), world-position projection normalized over the box. */
+    u0: number
+    v0: number
+    uInv: number
+    vInv: number
+    uAxis: 0 | 1 | 2
+    vAxis: 0 | 1 | 2
   }> = []
   let anyMetal = false
   // Tone audit: an item counts as unresolved when ANY region wore a
@@ -1017,8 +1041,24 @@ function sampleItemCellColors(
     // Metal rides the SAME region attribution as the palette (QA P9R1 fix
     // 2): most metal items are MIXED — a couch's chrome handle or the
     // barbell's bar must spark without turning the whole item metallic.
-    const metal = isMetalItemMaterial(dominantMeshMaterial(mesh))
+    const material = dominantMeshMaterial(mesh)
+    const metal = isMetalItemMaterial(material)
     anyMetal ||= metal
+    // Pattern lane: a readable map paints the region's cells with the
+    // texture itself (one repeat across the region — items are small and
+    // their host UVs unrecoverable; the pattern READ is what matters).
+    const pattern = material?.map
+      ? mapPatternGrid(material.map as Parameters<typeof mapPatternGrid>[0])
+      : null
+    const extents: Array<[number, 0 | 1 | 2]> = [
+      [_regionSize.x, 0],
+      [_regionSize.y, 1],
+      [_regionSize.z, 2],
+    ]
+    extents.sort((a, b) => b[0] - a[0])
+    const [uExtent, uAxis] = extents[0]!
+    const [vExtent, vAxis] = extents[1]!
+    const minArr = [box.min.x, box.min.y, box.min.z]
     regions.push({
       box,
       score: _regionSize.x * _regionSize.y * _regionSize.z * REGION_VOLUME_WEIGHT,
@@ -1026,6 +1066,16 @@ function sampleItemCellColors(
       g: tone.g,
       b: tone.b,
       metal,
+      pattern: uExtent > 1e-6 && vExtent > 1e-6 ? pattern : null,
+      baseR: material?.color?.r ?? 1,
+      baseG: material?.color?.g ?? 1,
+      baseB: material?.color?.b ?? 1,
+      u0: minArr[uAxis]!,
+      v0: minArr[vAxis]!,
+      uInv: uExtent > 1e-6 ? 1 / uExtent : 0,
+      vInv: vExtent > 1e-6 ? 1 / vExtent : 0,
+      uAxis,
+      vAxis,
     })
   }
   if (fallbackWhy) reportToneFallback(nodeId, 'item', fallbackWhy)
@@ -1052,13 +1102,27 @@ function sampleItemCellColors(
         best = region
       }
     }
-    colors[i * 3] = best.r
-    colors[i * 3 + 1] = best.g
-    colors[i * 3 + 2] = best.b
+    let r = best.r
+    let g = best.g
+    let b = best.b
+    if (best.pattern) {
+      // Sample the region's texture at the cell's projected (u,v) — the
+      // per-cell pattern — modulated by the material's base color (the
+      // same multiply the flat itemRegionColor tone applies).
+      const u = ((best.uAxis === 0 ? x : best.uAxis === 1 ? y : z) - best.u0) * best.uInv
+      const v = ((best.vAxis === 0 ? x : best.vAxis === 1 ? y : z) - best.v0) * best.vInv
+      cellToneAt(_cellPattern, best.pattern, u, v)
+      r = _cellPattern.r * best.baseR
+      g = _cellPattern.g * best.baseG
+      b = _cellPattern.b * best.baseB
+    }
+    colors[i * 3] = r
+    colors[i * 3 + 1] = g
+    colors[i * 3 + 2] = b
     if (cellMetal && best.metal) cellMetal[i] = 1
-    sumR += best.r
-    sumG += best.g
-    sumB += best.b
+    sumR += r
+    sumG += g
+    sumB += b
   }
   return {
     colors,
@@ -1066,6 +1130,8 @@ function sampleItemCellColors(
     cellMetal,
   }
 }
+
+const _cellPattern = new Color()
 
 const _cellTint = new Color()
 
@@ -1325,16 +1391,18 @@ function dominantTargetMaterial(
 }
 
 /** The async-retint sink for a single target: when a pending tone lands
- * (texture finished loading / GPU readback), copy it into the LIVE
- * target's baseColor and bump skinRevision — voxel-walls re-primes the
- * skin layer once; paint coats re-apply from the ledger (drainPaintTints —
- * the serials never move). Looks the target up fresh: it may have dropped
- * (or the session reset) while the tone was pending. */
-function retintTarget(nodeId: string): (tone: Color) => void {
-  return (tone) => {
+ * (texture finished loading / GPU readback), copy it — and the texture's
+ * pattern grid — into the LIVE target and bump skinRevision — voxel-walls
+ * re-primes the skin layer once (cells now wear the pattern); paint coats
+ * re-apply from the ledger (drainPaintTints — the serials never move).
+ * Looks the target up fresh: it may have dropped (or the session reset)
+ * while the tone was pending. */
+function retintTarget(nodeId: string): (tone: Color, grid: ToneGrid | null) => void {
+  return (tone, grid) => {
     const live = useDestruction.getState().targets.get(nodeId)
     if (!live) return
     live.baseColor.copy(tone)
+    if (grid) live.toneGrid = grid
     live.skinRevision = (live.skinRevision ?? 0) + 1
   }
 }
@@ -1542,7 +1610,8 @@ function buildRoofPlaneTargets(
   // tells voxel-walls to re-prime colors (paint ledger serials stay
   // untouched; coats re-apply via drainPaintTints). The group registers a
   // few lines below; deliveries are async-only, so the lookup never races.
-  const baseColor = resolveSurfaceTone(nodeId, 'roof', dominantSlopedMaterial(meshes), (tone) => {
+  const roofMaterial = dominantSlopedMaterial(meshes)
+  const baseColor = resolveSurfaceTone(nodeId, 'roof', roofMaterial, (tone, grid) => {
     const live = useDestruction.getState().targets
     const group = roofGroups.get(nodeId)
     if (!group) return // roof dropped before the tone resolved
@@ -1553,9 +1622,14 @@ function buildRoofPlaneTargets(
       const member = live.get(id)
       if (!member) continue
       member.baseColor.copy(tone)
+      if (grid) member.toneGrid = grid
       member.skinRevision = (member.skinRevision ?? 0) + 1
     }
   })
+  // Readable shingle textures also hand every plane the PATTERN grid —
+  // cells sample real shingle rows (cellPatternTone) instead of one
+  // averaged tone; compressed maps deliver it via the retint above.
+  const roofToneGrid = mapPatternGrid(roofMaterial?.map) ?? undefined
   const built: VoxelTarget[] = []
   for (let p = 0; p < planes.length; p++) {
     const plane = planes[p]!
@@ -1604,6 +1678,7 @@ function buildRoofPlaneTargets(
       roof: true,
       grid,
       baseColor: baseColor.clone(),
+      toneGrid: roofToneGrid,
       segments,
       studs: segments,
       sheets: sheetInfo.sheets,
@@ -1712,6 +1787,7 @@ function buildRoofResidualTarget(
   if (grid.count === 0) return null
   const segments: SegmentMember[] = []
   const residualId = `${nodeId}${ROOF_RESIDUAL_SUFFIX}`
+  const residualMaterial = dominantResidualMaterial(meshes)
   return {
     nodeId: residualId,
     kind: 'volume',
@@ -1719,12 +1795,8 @@ function buildRoofResidualTarget(
     // The residual faces' OWN dominant tone (siding/trim on gable ends) —
     // never the shingle skin; the async roof retint skips this member too
     // (it carries its own pending-retry retint under the member id).
-    baseColor: resolveSurfaceTone(
-      residualId,
-      'volume',
-      dominantResidualMaterial(meshes),
-      retintTarget(residualId),
-    ),
+    baseColor: resolveSurfaceTone(residualId, 'volume', residualMaterial, retintTarget(residualId)),
+    toneGrid: mapPatternGrid(residualMaterial?.map) ?? undefined,
     segments,
     studs: segments,
     sheets: [],
@@ -1921,6 +1993,11 @@ export function ensureVoxelTarget(
   // per-cell mask localizes the sparks to the metal parts (shooting.ts's
   // isMetalHit — a couch sparks on its chrome handle only).
   const metal = item && itemPalette?.cellMetal !== undefined
+  // A wall's saved custom coat beats the mesh read (flat paint — the tone
+  // chain and the pattern lane both stand down); the dominant surface
+  // material feeds both otherwise.
+  const coatColor = wall ? nodeCoatColor(nodeId) : null
+  const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, kind)
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -1942,15 +2019,18 @@ export function ensureVoxelTarget(
     // non-white material color → the kind fallback palette. NEVER the old
     // first-material grab (white on every textured host surface), and
     // pending textures retint later via skinRevision (retintTarget).
-    baseColor:
-      itemPalette?.average ??
-      (wall ? nodeCoatColor(nodeId) : null) ??
-      resolveSurfaceTone(
-        nodeId,
-        kind,
-        dominantTargetMaterial(meshes, kind),
-        retintTarget(nodeId),
-      ),
+    baseColor: itemPalette?.average ?? coatColor ?? resolveSurfaceTone(
+      nodeId,
+      kind,
+      surfaceMaterial,
+      retintTarget(nodeId),
+    ),
+    // The PATTERN grid (readable maps): cells wear the texture's brick
+    // courses / floor tiles instead of the flat tone. A saved custom coat
+    // is flat paint over the surface — no pattern then; items carry theirs
+    // in cellColors.
+    toneGrid:
+      itemPalette || coatColor ? undefined : (mapPatternGrid(surfaceMaterial?.map) ?? undefined),
     cellColors: itemPalette?.colors,
     segments,
     studs: segments,

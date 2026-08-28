@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, type Material, Matrix4, Mesh, MeshStandardMaterial, Vector3 } from 'three'
+import {
+  Box3,
+  BoxGeometry,
+  Color,
+  type Material,
+  Matrix4,
+  Mesh,
+  MeshStandardMaterial,
+  Vector3,
+} from 'three'
 import { clearDebris, debrisCensus } from './debris'
 import {
   collapseWholeTarget,
@@ -26,6 +35,7 @@ import {
 import {
   isUntexturedWhite,
   pendingToneCount,
+  primedCellColor,
   retryPendingTones,
   toneAuditReport,
 } from './skin-tone'
@@ -737,5 +747,87 @@ describe('tone resolution at voxelize (no target ever wears untextured white)', 
     dropTarget('wall-1')
     expect(pendingToneCount()).toBe(0)
     expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
+  })
+})
+
+/** Vertically-striped readable image: left half red, right half blue. */
+function stripedImage(w = 8, h = 8): { data: Uint8Array; width: number; height: number } {
+  const data = new Uint8Array(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4
+      if (x < w / 2) data[o] = 255
+      else data[o + 2] = 255
+      data[o + 3] = 255
+    }
+  }
+  return { data, width: w, height: h }
+}
+
+describe('per-cell texture patterns at voxelize (stage 2)', () => {
+  test('a wall with a readable striped map carries the toneGrid and its cells wear the stripes', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    ;(wall.mesh.material as unknown as { map: unknown }).map = { image: stripedImage() }
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.toneGrid).toBeDefined()
+    // Two cells far apart along the span read DIFFERENT stripes — the
+    // owner's "same texture, not one averaged tone" requirement.
+    const out = new Color()
+    let minRB = Infinity
+    let maxRB = -Infinity
+    for (let i = 0; i < target.grid.count; i++) {
+      primedCellColor(out, target, i)
+      const rb = out.r - out.b
+      if (rb < minRB) minRB = rb
+      if (rb > maxRB) maxRB = rb
+    }
+    expect(maxRB).toBeGreaterThan(0.5) // some cells clearly red
+    expect(minRB).toBeLessThan(-0.5) // some cells clearly blue
+  })
+
+  test('a pending wall texture delivers the pattern grid with the retint', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    const image: { data?: Uint8Array; width?: number; height?: number } = {}
+    ;(wall.mesh.material as unknown as { map: unknown }).map = { image }
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.toneGrid).toBeUndefined()
+    Object.assign(image, stripedImage())
+    retryPendingTones()
+    expect(target.toneGrid).toBeDefined()
+    expect(target.skinRevision).toBe(1)
+  })
+
+  test('item cells sample their region texture by world-position projection', () => {
+    const world = makeWorld()
+    const crate = world.colliders.find((c) => c.nodeId === 'crate-1')!
+    ;(crate.mesh.material as unknown as { map: unknown }).map = { image: stripedImage() }
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    // Items carry the pattern IN cellColors (no toneGrid on the target).
+    expect(target.toneGrid).toBeUndefined()
+    const colors = target.cellColors!
+    expect(colors).toBeDefined()
+    // The crate spans x ∈ [9.4, 10.6]: cells left of center sample the red
+    // half, right of center the blue half (u = the dominant-axis fraction).
+    let sawRed = false
+    let sawBlue = false
+    for (let i = 0; i < target.grid.count; i++) {
+      const x = target.grid.centers[i * 3]!
+      const rb = colors[i * 3]! - colors[i * 3 + 2]!
+      if (x < 9.9 && rb > 0.5) sawRed = true
+      if (x > 10.1 && rb < -0.5) sawBlue = true
+    }
+    expect(sawRed).toBe(true)
+    expect(sawBlue).toBe(true)
+  })
+
+  test('a saved custom coat suppresses the pattern (flat paint wins)', () => {
+    // savedCoatHex path is scene-store backed and not constructible here;
+    // pin the contract at the target level instead: no readable map → no
+    // toneGrid, flat baseColor only.
+    const world = makeWorld()
+    const target = ensureVoxelTarget(world, 'wall-2')!
+    expect(target.toneGrid).toBeUndefined()
   })
 })

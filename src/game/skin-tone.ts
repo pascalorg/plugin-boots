@@ -38,29 +38,56 @@ import {
  */
 
 /** The VoxelTarget subset the tone math reads (structural — destruction's
- * VoxelTarget satisfies it directly). */
+ * VoxelTarget satisfies it directly). The optional grid dimensions only
+ * matter when `toneGrid` is present (the per-cell PATTERN lane needs cell
+ * sizes to place each cell on the texture). */
 export type SkinToneSource = {
   kind: 'wall' | 'slab' | 'volume' | 'roof'
   baseColor: Color
   /** Per-voxel RGB, 3 floats per index (item silhouette lane). */
   cellColors?: Float32Array
-  grid: { coords: Int16Array }
+  /** The surface texture's CPU color grid (mapPatternGrid) — when present,
+   * cells sample the PATTERN (brick courses, shingle rows) instead of the
+   * one flat baseColor. */
+  toneGrid?: ToneGrid | null
+  grid: {
+    coords: Int16Array
+    cellX?: number
+    cellY?: number
+    cellZ?: number
+    nx?: number
+    nz?: number
+  }
 }
 
 const _cellTone = new Color()
 const _derived = new Color()
+const _pattern = new Color()
 
 /**
  * Write cell `i`'s primed skin color into `out` and return it. Mirrors
- * primeSkin exactly: tone pick (cellColors / slab ceiling / roof deck +
- * course striping) then the deterministic per-cell jitter — a value spread
- * plus a whisper of saturation drift so voxel runs never band flat.
+ * primeSkin exactly: tone pick (cellColors / texture-pattern sample /
+ * slab ceiling / roof deck + course striping) then the deterministic
+ * per-cell jitter — a value spread plus a whisper of saturation drift so
+ * voxel runs never band flat.
+ *
+ * PATTERN lane: when the target carries a toneGrid (its surface texture's
+ * CPU color grid), the cell's tone comes from the texture at the cell's
+ * own (u,v) — see cellPatternTone — and the kind modifiers (ceiling
+ * lighten, deck pale, course stripe) apply RELATIVE to that sample, so
+ * the skins wear brick courses and shingle rows instead of one averaged
+ * tone. Without a toneGrid the math is bit-identical to the original
+ * flat-baseColor loop (paint.tsx feathers coats from exactly these tones).
  */
 export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Color {
   const j1 = ((i * 2654435761) % 97) / 97
   const j2 = ((i * 1597334677) % 89) / 89
   const cellColors = wall.cellColors
-  let base: Color = wall.baseColor
+  let tone: Color = wall.baseColor
+  if (!cellColors && wall.toneGrid) {
+    tone = cellPatternTone(_pattern, wall, i) ?? wall.baseColor
+  }
+  let base: Color = tone
   let jitter = 0.1
   if (cellColors) {
     // Item palette (destruction.ts sampleItemCellColors): each voxel wears
@@ -69,22 +96,188 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
   } else if (wall.kind === 'slab' && wall.grid.coords[i * 3 + 1] === 0) {
     // Bottom skin — the ceiling face a player looks up at — renders as
     // slightly lighter, desaturated drywall.
-    base = _derived.copy(wall.baseColor).offsetHSL(0, -0.06, 0.14)
+    base = _derived.copy(tone).offsetHSL(0, -0.06, 0.14)
   } else if (wall.kind === 'roof') {
     if (wall.grid.coords[i * 3 + 2] !== 0) {
       // Inner skin: the underside seen from the attic — pale bare deck.
-      base = _derived.copy(wall.baseColor).offsetHSL(0, -0.08, 0.16)
+      base = _derived.copy(tone).offsetHSL(0, -0.08, 0.16)
     } else {
       // Outer skin: every ~3rd in-plane row (grid Y = up the slope)
       // darkens slightly — the shingle course striping.
       base =
-        wall.grid.coords[i * 3 + 1]! % 3 === 2
-          ? _derived.copy(wall.baseColor).offsetHSL(0, 0, -0.055)
-          : wall.baseColor
+        wall.grid.coords[i * 3 + 1]! % 3 === 2 ? _derived.copy(tone).offsetHSL(0, 0, -0.055) : tone
       jitter = 0.16
     }
   }
   return out.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * jitter)
+}
+
+// ── Per-cell texture patterns (stage 2: "the same texture", not one tone) ───
+// A voxel replica should carry the host surface's PATTERN — brick courses,
+// shingle rows — not one averaged tone. Whenever the tone chain has a
+// readable albedo source (CPU-readable image or the GPU readback), the
+// SAME pixels also build a small ToneGrid (TONE_GRID_SIZE² working-space
+// RGB), cached per texture (bounded LRU). primeSkin then samples it per
+// cell through cellPatternTone: the cell's (u,v) on its face derives from
+// GRID INDICES (never per-frame math) and tiles at a plausible world scale
+// (SKIN_TILE_M per texture repeat) rather than the host's exact UVs — an
+// approximation, but the pattern READ is what matters at voxel size, and
+// it works uniformly for walls, slabs and pitched roof planes. Sampling
+// happens at voxelize/prime time only; zero per-frame work.
+
+/** A texture's CPU color grid: size² texels, working-space RGB packed
+ * 3 floats per texel, row-major with v=0 at the TOP row (image order). */
+export type ToneGrid = { size: number; rgb: Float32Array }
+
+/** Texels per side of a pattern grid (32² ≈ 12 KB as floats — tiny). */
+export const TONE_GRID_SIZE = 32
+
+/** World metres per texture repeat on voxel skins (~one brick-course
+ * palette or shingle row block per 1.2 m — the plausible-scale constant;
+ * host UV scales aren't recoverable from the merged meshes). */
+export const SKIN_TILE_M = 1.2
+
+/** Pattern grids kept alive (LRU, keyed by texture uuid). */
+const TONE_GRID_CACHE_MAX = 24
+
+const toneGridCache = new Map<string, ToneGrid>()
+
+/** Entries currently cached (tests + QA introspection). */
+export function patternGridCacheSize(): number {
+  return toneGridCache.size
+}
+
+const _gridTexel = new Color()
+
+/** Pure: resample RGBA pixels into a ToneGrid (nearest texel, sRGB decode
+ * when the source bytes are sRGB — GPU readbacks are already linear). */
+function toneGridFromPixels(pixels: MapPixels): ToneGrid {
+  const size = TONE_GRID_SIZE
+  const rgb = new Float32Array(size * size * 3)
+  const { data, width, height, srgb } = pixels
+  for (let gy = 0; gy < size; gy++) {
+    const sy = Math.min(height - 1, Math.floor(((gy + 0.5) / size) * height))
+    for (let gx = 0; gx < size; gx++) {
+      const sx = Math.min(width - 1, Math.floor(((gx + 0.5) / size) * width))
+      const s = (sy * width + sx) * 4
+      const o = (gy * size + gx) * 3
+      if (srgb) {
+        _gridTexel.setRGB(data[s]! / 255, data[s + 1]! / 255, data[s + 2]! / 255, 'srgb')
+        rgb[o] = _gridTexel.r
+        rgb[o + 1] = _gridTexel.g
+        rgb[o + 2] = _gridTexel.b
+      } else {
+        rgb[o] = data[s]! / 255
+        rgb[o + 1] = data[s + 1]! / 255
+        rgb[o + 2] = data[s + 2]! / 255
+      }
+    }
+  }
+  return { size, rgb }
+}
+
+/** Mean tone of a grid (working space) — the average the tone chain hands
+ * out; deriving it FROM the grid keeps the two views of one texture
+ * consistent by construction. */
+function toneGridAverage(grid: ToneGrid): Color {
+  let r = 0
+  let g = 0
+  let b = 0
+  const texels = grid.size * grid.size
+  for (let i = 0; i < texels * 3; i += 3) {
+    r += grid.rgb[i]!
+    g += grid.rgb[i + 1]!
+    b += grid.rgb[i + 2]!
+  }
+  return new Color(r / texels, g / texels, b / texels)
+}
+
+function cacheToneGrid(map: object, grid: ToneGrid): void {
+  const uuid = (map as { uuid?: unknown }).uuid
+  if (typeof uuid !== 'string') return // uuid-less test fakes stay uncached
+  toneGridCache.delete(uuid) // re-insert = most recently used
+  toneGridCache.set(uuid, grid)
+  if (toneGridCache.size > TONE_GRID_CACHE_MAX) {
+    // Map iteration order = insertion order; the first key is the LRU.
+    const oldest = toneGridCache.keys().next().value
+    if (oldest !== undefined) toneGridCache.delete(oldest)
+  }
+}
+
+/**
+ * The texture's pattern grid via the CPU lanes (LRU cache → data/canvas
+ * pixel read). Null when only the GPU could read it — the pending retry
+ * lane builds and delivers the grid alongside the tone then.
+ */
+export function mapPatternGrid(map: SurfaceMaterialLike['map']): ToneGrid | null {
+  if (!map) return null
+  const uuid = (map as { uuid?: unknown }).uuid
+  if (typeof uuid === 'string') {
+    const cached = toneGridCache.get(uuid)
+    if (cached) {
+      cacheToneGrid(map, cached) // LRU touch
+      return cached
+    }
+  }
+  const pixels = readMapPixels(map)
+  if (!pixels) return null
+  const grid = toneGridFromPixels(pixels)
+  cacheToneGrid(map, grid)
+  return grid
+}
+
+/** Sample a ToneGrid at (u, v), wrapping both axes (tiling). Pure. */
+export function cellToneAt(out: Color, grid: ToneGrid, u: number, v: number): Color {
+  let fu = u - Math.floor(u)
+  let fv = v - Math.floor(v)
+  if (fu < 0) fu += 1 // guard -0/-1e-17 edge
+  if (fv < 0) fv += 1
+  const x = Math.min(grid.size - 1, Math.floor(fu * grid.size))
+  const y = Math.min(grid.size - 1, Math.floor(fv * grid.size))
+  const o = (y * grid.size + x) * 3
+  return out.setRGB(grid.rgb[o]!, grid.rgb[o + 1]!, grid.rgb[o + 2]!)
+}
+
+/**
+ * The PATTERN tone of cell `i` on a layered target, or null when the grid
+ * dimensions are missing. The cell's face (u,v) derives from grid indices
+ * in METRES, then tiles at SKIN_TILE_M per repeat:
+ *
+ *   wall — u along the SPAN (the in-plane horizontal axis: whichever of
+ *          grid X/Z has more cells; the other is the thickness), v up the
+ *          height (grid Y);
+ *   slab — plan projection: u = grid X, v = grid Z;
+ *   roof — u across the eave (grid X), v up the slope (grid Y) — the
+ *          plane-frame convention of buildRoofPlaneTargets;
+ *   volume — u = grid X, v = grid Y (generic vertical projection).
+ *
+ * Both skins of a sandwich share the same (u,v) — the thickness axis is
+ * deliberately ignored, so the inner face wears the same courses.
+ */
+export function cellPatternTone(out: Color, wall: SkinToneSource, i: number): Color | null {
+  const toneGrid = wall.toneGrid
+  const { coords, cellX, cellY, cellZ } = wall.grid
+  if (!toneGrid || cellX === undefined || cellY === undefined || cellZ === undefined) return null
+  const ix = coords[i * 3]!
+  const iy = coords[i * 3 + 1]!
+  const iz = coords[i * 3 + 2]!
+  let u: number
+  let v: number
+  if (wall.kind === 'slab') {
+    u = ix * cellX
+    v = iz * cellZ
+  } else if (wall.kind === 'wall') {
+    // Span axis = the in-plane horizontal (more cells than the ≤3-layer
+    // thickness axis); anisotropic wall grids guarantee the asymmetry.
+    const spanIsX = (wall.grid.nx ?? 1) >= (wall.grid.nz ?? 1)
+    u = spanIsX ? ix * cellX : iz * cellZ
+    v = iy * cellY
+  } else {
+    // roof (across/upSlope) and generic volumes (x/y projection).
+    u = ix * cellX
+    v = iy * cellY
+  }
+  return cellToneAt(out, toneGrid, u / SKIN_TILE_M, v / SKIN_TILE_M)
 }
 
 // ── Surface tone resolution (the "no voxel stays white" chain) ──────────────
@@ -359,15 +552,17 @@ export function averagePixelTone(data: ArrayLike<number>, srgb: boolean): Color 
 const toneCache = new WeakMap<object, Color>()
 
 /** The map's average tone via the CPU lanes (cache → data/canvas read).
- * Null when only the GPU could read it (or nothing can). */
+ * Null when only the GPU could read it (or nothing can). Derived FROM the
+ * pattern grid the same read builds (mapPatternGrid), so the flat tone and
+ * the per-cell pattern always agree per texture. */
 export function mapAverageTone(map: SurfaceMaterialLike['map']): Color | null {
   if (!map) return null
   const cached = toneCache.get(map)
   if (cached) return cached.clone()
-  const pixels = readMapPixels(map)
-  if (!pixels) return null
-  const tone = averagePixelTone(pixels.data, pixels.srgb)
-  if (tone) toneCache.set(map, tone.clone())
+  const grid = mapPatternGrid(map)
+  if (!grid) return null
+  const tone = toneGridAverage(grid)
+  toneCache.set(map, tone.clone())
   return tone
 }
 
@@ -382,7 +577,7 @@ type PendingTone = {
   nodeId: string
   kind: SkinToneKind
   material: SurfaceMaterialLike
-  onTone: (tone: Color) => void
+  onTone: (tone: Color, grid: ToneGrid | null) => void
   attempts: number
   /** A GPU readback is in flight — don't stack another. */
   busy: boolean
@@ -408,13 +603,13 @@ function syncRetryTimer(): void {
   }
 }
 
-function deliverTone(p: PendingTone, mapTone: Color): void {
+function deliverTone(p: PendingTone, mapTone: Color, grid: ToneGrid | null): void {
   if (pendingTones.get(p.nodeId) === p) pendingTones.delete(p.nodeId)
   toneAudit.delete(p.nodeId) // resolved — even a late (post-give-up) landing counts
   syncRetryTimer()
   const tone = mapTone.clone()
   if (p.material.color) tone.multiply(p.material.color)
-  p.onTone(tone)
+  p.onTone(tone, grid)
 }
 
 /** One attempt for one pending entry: CPU lanes first, then (with a live
@@ -428,7 +623,7 @@ function attemptPendingTone(p: PendingTone): void {
   }
   const cpuTone = mapAverageTone(map)
   if (cpuTone) {
-    deliverTone(p, cpuTone)
+    deliverTone(p, cpuTone, mapPatternGrid(map))
     return
   }
   // GPU lane: only once the image EXISTS — rendering a still-loading map
@@ -437,12 +632,21 @@ function attemptPendingTone(p: PendingTone): void {
   p.busy = true
   void gpuReadMapPixels(map).then((pixels) => {
     p.busy = false
-    const tone = pixels ? averagePixelTone(pixels, false) : null
-    if (!tone) return
+    if (!pixels) return
+    // One readback feeds BOTH views of the texture: the pattern grid and
+    // the flat average derived from it (readbacks are linear already).
+    const grid = toneGridFromPixels({
+      data: pixels,
+      width: GPU_READ_SIZE,
+      height: GPU_READ_SIZE,
+      srgb: false,
+    })
+    cacheToneGrid(map, grid)
+    const tone = toneGridAverage(grid)
     toneCache.set(map, tone.clone())
     // Deliver unless a NEWER resolve replaced this entry for the node.
     const current = pendingTones.get(p.nodeId)
-    if (current === p || (current === undefined && p.gaveUp)) deliverTone(p, tone)
+    if (current === p || (current === undefined && p.gaveUp)) deliverTone(p, tone, grid)
   })
 }
 
@@ -469,15 +673,17 @@ export function retryPendingTones(): void {
  * Resolve a surface's tone through the fallback chain, SYNCHRONOUSLY
  * returning the best immediately-known color (never pure white) and — when
  * the map needs loading/GPU time — retrying in the background, delivering
- * the better tone through `onTone` (ASYNC ONLY, at most once; destruction
- * copies it into baseColor + bumps skinRevision). Registers/clears the
- * node's tone-audit entry as a side effect.
+ * the better tone AND its pattern grid through `onTone` (ASYNC ONLY, at
+ * most once; destruction copies them into baseColor/toneGrid + bumps
+ * skinRevision). Registers/clears the node's tone-audit entry as a side
+ * effect. Synchronously-readable maps: call mapPatternGrid for the grid —
+ * it rides the same cached pixel read.
  */
 export function resolveSurfaceTone(
   nodeId: string,
   kind: SkinToneKind,
   material: SurfaceMaterialLike | null,
-  onTone?: (tone: Color) => void,
+  onTone?: (tone: Color, grid: ToneGrid | null) => void,
 ): Color {
   pendingTones.delete(nodeId) // a re-resolve replaces any older retry
   toneAudit.delete(nodeId)
