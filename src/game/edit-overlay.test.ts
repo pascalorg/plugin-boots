@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { BuildPiece } from '../store'
-import { CELLS, cellDims } from './builder'
+import { CELLS, cellCenter, cellDims, piecePose } from './builder'
 import {
   boxEdgeSegments,
   FACE_LIFT,
@@ -48,8 +48,64 @@ describe('tile inset math', () => {
       const half = (piece === 'wall' ? dims[2] : dims[1]) / 2
       expect(faceLift(piece)).toBeCloseTo(half + FACE_LIFT)
     }
-    // Wall thickness 0.12 → the lattice floats 2 cm off each face.
+    // Wall thickness 0.12 → the lattice floats 5 cm off each face.
     expect(faceLift('wall')).toBeCloseTo(0.06 + FACE_LIFT)
+  })
+
+  test('faceLift clears the piece brick cladding on BOTH faces (owner report, wave 3)', () => {
+    // Placed pieces voxel-clad instantly through destruction.ts's isotropic
+    // volume lane: 0.15 m cells laid from the box MIN corner, so the layer
+    // through a piece's thickness overshoots the MAX face by up to
+    // ceil(t/0.15)·0.15 − t (all of it on one side). A lattice lift inside
+    // that layer is occluded by the bricks — it read as faint dashes
+    // through the mortar seams. Pin the clearance for every piece and both
+    // storey spans (legacy 2.8 and the ladder's 2.5).
+    const VOLUME_CELL = 0.15 // destruction.ts volume-lane cell size
+    for (const piece of PIECES) {
+      for (const span of [2.8, 2.5]) {
+        const dims = cellDims(piece, span)
+        const t = piece === 'wall' ? dims[2] : dims[1]
+        const cladMaxFace = -t / 2 + Math.ceil(t / VOLUME_CELL - 1e-6) * VOLUME_CELL
+        // MIN face never overshoots (cells lay from the min corner).
+        expect(faceLift(piece, span)).toBeGreaterThan(cladMaxFace + 0.01)
+      }
+    }
+  })
+})
+
+describe('overlay tile world positions (span-2.5 wall regression pin)', () => {
+  // The EXACT composition EditOverlay renders: group at (x, piecePose.y, z)
+  // rotated by yaw, each tile at cellCenter(col,row) with ±faceLift along
+  // local Z. Computed here with the same pure exports and checked against an
+  // independently hand-derived expectation — pins the adaptive-storey wiring
+  // (span-parameterized cellCenter/piecePose) to real-world coordinates.
+  test('all 18 tiles land on the wall grid, both faces', () => {
+    const span = 2.5
+    const piece = { position: [4.939, 0, 3.182] as const, yaw: Math.PI / 2 }
+    const pose = piecePose('wall', piece.position[1], span)
+    expect(pose.y).toBeCloseTo(1.25, 10)
+    const lift = faceLift('wall', span)
+    const cos = Math.cos(piece.yaw)
+    const sin = Math.sin(piece.yaw)
+    for (const side of [1, -1]) {
+      for (let bit = 0; bit < CELLS * CELLS; bit++) {
+        const col = bit % CELLS
+        const row = Math.floor(bit / CELLS)
+        const [cx, cy] = cellCenter('wall', col, row, span)
+        const lz = side * lift // walls float the lattice along local Z
+        const world = [
+          piece.position[0] + cx * cos + lz * sin,
+          pose.y + cy,
+          piece.position[2] + (-cx * sin + lz * cos),
+        ]
+        // Independent expectation: a 3 m wall centered on the piece running
+        // along world −Z (yaw π/2), rows span/3 tall from the base, faces
+        // offset ±lift along world X.
+        expect(world[0]).toBeCloseTo(piece.position[0] + side * lift, 10)
+        expect(world[1]).toBeCloseTo((row + 0.5) * (span / 3), 10)
+        expect(world[2]).toBeCloseTo(piece.position[2] + (1 - col), 10)
+      }
+    }
   })
 })
 

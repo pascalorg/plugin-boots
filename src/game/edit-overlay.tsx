@@ -54,9 +54,17 @@ import { CORNER_RISE, CORNER_XZ, type RoofCorners } from './roof-corners'
 /** Per-side tile inset as a fraction of the cell span — the grout gap that
  * separates the nine tiles. */
 export const TILE_INSET = 0.06
-/** Lattice float distance off the piece face (m) — clears coplanar z-fights
- * with the piece's own faces (transparent + no depthWrite still depth-TESTS). */
-export const FACE_LIFT = 0.02
+/** Lattice float distance off the piece face (m) — must clear the piece's
+ * own BRICK CLADDING, not just the naked box: placed pieces voxel-clad the
+ * moment they land (builder.tsx INSTANT BRICKS → destruction.ts's isotropic
+ * 0.15 m volume grid, cells laid from the box MIN corner), so a 0.12 m
+ * thickness is ONE 0.15 m cell whose layer overshoots the MAX face by up to
+ * 0.03 m. A smaller lift buries the lattice INSIDE the bricks on that face —
+ * it reads as faint broken dashes through the mortar seams (owner report,
+ * wave 3; the transforms were exact, the tiles were simply occluded). 0.05
+ * clears the worst brick face by 2 cm and still depth-clears the plain
+ * fallback mesh while a turbo-deferred piece waits for its cladding. */
+export const FACE_LIFT = 0.05
 
 /** In-plane tile size after the grout inset: walls tile col × row on the
  * wall plane (local X × Y), slabs on their plane (local X × Z). `span` is
