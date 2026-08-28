@@ -209,9 +209,14 @@ describe('full-speed slopes (movement.projectOnWalkableSlope)', () => {
     // Builder-style plank, low edge on the ground near z = 0, rising toward
     // +Z for ~6 m of run (5.6 m of rise).
     const ramp = boxCollider('ramp', 'stair', [3, 0.12, 8.2], [0, 2.8, 3], RAMP_TILT)
-    const up = simulate([ramp], new Vector3(0, 0, -1), 0, 1, 1.5)
+    // Stop at the top: the vertical ground resolve (collision.ts, QA
+    // 2026-08-28) climbs POSITIONALLY at full speed now, so a fixed-length
+    // run tops out (~1.15 s) and falls off the far edge before it ends.
+    const up = simulate([ramp], new Vector3(0, 0, -1), 0, 1, 1.5, 0.5, (p) => p.y >= 5)
     const flat = simulate([], new Vector3(0, 0, -1), 0, 1, 1.5)
-    expect(up.pos.y).toBeGreaterThan(3.5) // actually climbed the ramp
+    expect(up.pos.y).toBeGreaterThanOrEqual(5) // actually climbed the ramp…
+    expect(up.arrivedAt).toBeLessThan(1.3) // …the whole 5+ m rise, FAST —
+    // the POSITIONAL rate the live QA gate measures, not just velocity.
     // GENRE PARITY: uphill horizontal speed matches flat ground within 3%.
     expect(up.minSpeed).toBeGreaterThanOrEqual(flat.minSpeed * 0.97)
     expect(up.meanSpeed).toBeGreaterThanOrEqual(flat.meanSpeed * 0.97)

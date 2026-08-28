@@ -12,6 +12,7 @@ import {
   Vector3,
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
+import { perfSection } from './perf-monitor'
 import { type RoofToneRenderer, setRoofTextureRenderer } from './roof-planes'
 
 /**
@@ -86,7 +87,9 @@ export function queueDormantPrime(entry: DormantPrimeEntry): void {
 export function primeDormantNow(entry: DormantPrimeEntry): void {
   if (entry.primed) return
   entry.primed = true
+  const t0 = performance.now()
   entry.prime()
+  perfSection('prime-wake', performance.now() - t0)
 }
 
 /** Run up to `budget` queued primes; returns how many actually primed.
@@ -380,11 +383,17 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
   mesh.userData.__bootsPaintTarget = undefined
 }
 
+/** How far below the lot a freshly primed dormant replica renders for its
+ * one warm-up frame — deep enough that nothing (terrain, basements, blast
+ * craters) ever reveals it. */
+const WARM_DRAW_DROP = 600
+
 function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
   const groupRef = useRef<Group>(null!)
   const revision = useRef(-1)
   const skinRevision = useRef(0)
+  const warmDraw = useRef(0)
   const primeEntry = useRef<DormantPrimeEntry>(null!)
   const sandwich = wall as SandwichTarget
   const boards = sandwich.boards
@@ -410,6 +419,28 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
         revision.current = wall.revision
         skinRevision.current = wall.skinRevision ?? 0
         wall.removedQueue.length = 0
+        // WARM DRAW (first-blast decomposition, QA 2026-08-28): priming a
+        // HIDDEN replica fills CPU-side buffers only — the GPU upload of
+        // ~thousands of instance matrices (per layer) happens on the first
+        // frame the mesh actually DRAWS. A mid-house blast waking ~15
+        // replicas paid all of those first uploads in one frame (~100 ms
+        // unaccounted next to a 13 ms carve). So render the replica ONCE
+        // right now, far underground: same budgeted cadence as the primes
+        // (2/frame), buffers land on the GPU, and the wake frame is back
+        // to a visibility flip. Wake-path primes skip it — the replica is
+        // becoming visible this very frame anyway.
+        if (wall.dormant) {
+          const group = groupRef.current
+          if (group) {
+            group.visible = true
+            group.position.y -= WARM_DRAW_DROP
+            // 2, not 1: the drain (parent useFrame) may run BEFORE this
+            // replica's own useFrame in the same frame — a 1-frame latch
+            // would restore + re-hide before anything ever drew.
+            warmDraw.current = 2
+            perfSection('warm-draw-armed', 0)
+          }
+        }
       },
     }
     primeEntry.current = entry
@@ -426,6 +457,19 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
     const mesh = meshRef.current
     const group = groupRef.current
     if (!mesh || !group) return
+    // Post-prime warm draw in flight: keep the replica rendering
+    // underground (skip the dormant re-hide) until the countdown lands,
+    // then put the group back — syncDormantWallFrame re-hides it below.
+    if (warmDraw.current > 0) {
+      // Woken mid-warm (a blast within 2 frames of the prime): abort the
+      // warm NOW — the wall must render in place this frame, not blink
+      // out by drawing its one warm frame underground.
+      if (wall.dormant !== true) warmDraw.current = 1
+      warmDraw.current--
+      if (warmDraw.current > 0) return
+      group.position.y += WARM_DRAW_DROP
+      perfSection('warm-draw-done', 0)
+    }
     // Wake = visibility flip (+ an on-the-spot prime if the budgeted queue
     // hadn't reached this target). While dormant nothing below can change:
     // damage paths always wake first, so revision/skin drains wait here.

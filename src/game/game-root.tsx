@@ -29,15 +29,16 @@ import { GunTable } from './guntable'
 import { GameItems } from './item-place'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
-import { PerfMonitor, perfReset, perfSnapshot } from './perf-monitor'
+import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
 import { Player, playerDebug, playerRig } from './player'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { aimDirection, fire } from './shooting'
 import { GameSky } from './sky'
 import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
+import { settleTasksPending } from './structure'
 import { PipelineWarmup } from './warmup'
-import { VoxelWalls } from './voxel-walls'
+import { dormantPrimeQueueSize, VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
 import {
   collectMeshes,
@@ -483,6 +484,10 @@ function ActiveGame() {
           totalCount: target.grid.alive.length,
           revision: target.revision,
           brokenStuds: target.studs.reduce((n, s) => n + (s.broken ? 1 : 0), 0),
+          // Movement-handover flags (climb QA): which grids the capsule
+          // skips (walkOnly planks / dormant prebuilds) vs collides.
+          walkOnly: target.walkOnly === true,
+          dormant: target.dormant === true,
         })),
       studs: () =>
         Array.from(useDestruction.getState().targets.values()).flatMap((target) =>
@@ -562,6 +567,15 @@ function ActiveGame() {
       // Frame-lag recorder (perf-monitor.ts): spike log + p95/worst summary.
       perf: () => perfSnapshot(),
       perfReset,
+      // Where the blast milliseconds went (accumulated {ms, calls} per
+      // instrumented phase since the last perfReset) — boom decomposition.
+      perfSections,
+      // Drain-bound introspection (perf QA round 2026-08-28): unprimed
+      // dormant replicas still queued + whether budgeted settle tasks
+      // (island flood-fills / structure checks) are pending — both plain
+      // counters, so QA can assert the blast-frame drain bound directly.
+      dormantPrimeQueueSize,
+      settleTasksPending: (prefix?: string) => settleTasksPending(prefix),
     }
     return () => {
       delete (globalThis as Record<string, unknown>).__boots

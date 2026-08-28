@@ -1,6 +1,6 @@
 'use client'
 
-import { useFrame } from '@react-three/fiber'
+import { addAfterEffect, addEffect, useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
 
 /**
@@ -56,6 +56,14 @@ export type PerfSpike = {
   mean: number
   /** Most recent perfEvent within EVENT_WINDOW_MS, or '' (untagged). */
   tag: string
+  /** Milliseconds of the spike frame spent INSIDE the R3F loop (subscribers
+   * + render submit), when the loop-effect probes are wired (PerfMonitor
+   * does). delta − cpu = outside-loop time: batched React flush (store
+   * bumps commit at the microtask boundary AFTER the loop), GC, GPU sync. */
+  cpu?: number
+  /** Milliseconds of the spike frame's gl.render submit (PerfMonitor's
+   * render wrap). cpu − render ≈ the frame's subscriber work. */
+  render?: number
 }
 
 export type PerfSummary = {
@@ -74,6 +82,11 @@ export type PerfSummary = {
 export type FrameStats = {
   /** Fold one frame delta (ms) into the ring/mean and spike-test it. */
   recordFrame: (deltaMs: number) => void
+  /** Report the last completed loop's inside-the-loop duration (ms) — the
+   * next spike row carries it as `cpu`. Optional; NaN clears. */
+  frameCpu: (ms: number) => void
+  /** Report the last render submit's duration (ms) — spike field `render`. */
+  frameRender: (ms: number) => void
   /** Mark "an expensive thing just started/happened" for spike tagging. */
   event: (name: string) => void
   /** On-demand summary — copies, never live refs. */
@@ -95,6 +108,9 @@ export function createFrameStats(now: () => number = () => performance.now()): F
   let lastEventAt = Number.NEGATIVE_INFINITY
   const spikes: PerfSpike[] = []
 
+  let lastCpu = Number.NaN
+  let lastRender = Number.NaN
+
   const recordFrame = (deltaMs: number): void => {
     elapsed += deltaMs / 1000
     if (frames === 0) {
@@ -109,6 +125,8 @@ export function createFrameStats(now: () => number = () => performance.now()): F
           delta: deltaMs,
           mean,
           tag: now() - lastEventAt <= EVENT_WINDOW_MS ? lastEventName : '',
+          cpu: Number.isNaN(lastCpu) ? undefined : lastCpu,
+          render: Number.isNaN(lastRender) ? undefined : lastRender,
         })
       }
       mean += MEAN_ALPHA * (deltaMs - mean)
@@ -136,6 +154,12 @@ export function createFrameStats(now: () => number = () => performance.now()): F
 
   return {
     recordFrame,
+    frameCpu: (ms: number) => {
+      lastCpu = ms
+    },
+    frameRender: (ms: number) => {
+      lastRender = ms
+    },
     event: (name: string) => {
       lastEventName = name
       lastEventAt = now()
@@ -149,6 +173,8 @@ export function createFrameStats(now: () => number = () => performance.now()): F
       elapsed = 0
       lastEventName = ''
       lastEventAt = Number.NEGATIVE_INFINITY
+      lastCpu = Number.NaN
+      lastRender = Number.NaN
       spikes.length = 0
     },
   }
@@ -157,6 +183,33 @@ export function createFrameStats(now: () => number = () => performance.now()): F
 // --- Module singleton (the one the game wires into) --------------------------
 
 const monitor = createFrameStats()
+
+// --- Section stopwatch (boom decomposition, 2026-08-28 QA round) -------------
+// perfEvent names a spike; perfSection says WHERE the milliseconds went.
+// Callers time their own expensive phases (blast rings, glass, primes…) and
+// fold the duration in here — accumulated totals + call counts, read on
+// demand via `__boots.perfSections()`. Only rare moments call this (a blast
+// pays a handful of Map hits), never the per-frame idle path.
+
+const sectionTotals = new Map<string, { ms: number; calls: number }>()
+
+/** Fold `ms` of work into section `name` (totals survive until perfReset). */
+export function perfSection(name: string, ms: number): void {
+  const slot = sectionTotals.get(name)
+  if (slot) {
+    slot.ms += ms
+    slot.calls++
+  } else {
+    sectionTotals.set(name, { ms, calls: 1 })
+  }
+}
+
+/** Copies of the accumulated section totals (QA introspection). */
+export function perfSections(): Record<string, { ms: number; calls: number }> {
+  const out: Record<string, { ms: number; calls: number }> = {}
+  for (const [name, slot] of sectionTotals) out[name] = { ms: slot.ms, calls: slot.calls }
+  return out
+}
 
 /** Tag the next ~500 ms of spikes with `name` — call at the START of an
  * expensive moment (detonation, first trigger, voxelize, GLB landing…).
@@ -173,6 +226,7 @@ export function perfSnapshot(): PerfSummary {
 /** Start a fresh trace (also exposed on the `__boots` handle). */
 export function perfReset(): void {
   monitor.reset()
+  sectionTotals.clear()
 }
 
 /**
@@ -184,10 +238,78 @@ export function perfReset(): void {
  */
 export function PerfMonitor(): null {
   const lastNow = useRef(0)
+  const gl = useThree((s) => s.gl)
+  // Render-submit probe: wrap the renderer's own render for the session —
+  // pure CPU-side timing around the host's call, renderer-agnostic
+  // (works the same on the WebGL fallback and WebGPU), restored on exit.
+  useEffect(() => {
+    type RenderFn = (...args: unknown[]) => unknown
+    type RendererInfo = {
+      programs?: unknown[]
+      memory?: { geometries?: number; textures?: number }
+      render?: { calls?: number; triangles?: number }
+    }
+    const holder = gl as unknown as { render: RenderFn; info?: RendererInfo }
+    const original = holder.render
+    // Previous-frame renderer counters as plain numbers — the fast path
+    // stays allocation-free; strings only build on a slow submit.
+    let pPrograms = -1
+    let pGeoms = -1
+    let pTex = -1
+    let pCalls = -1
+    let pTris = -1
+    holder.render = function (this: unknown, ...args: unknown[]) {
+      const t0 = performance.now()
+      const out = original.apply(this, args)
+      const dt = performance.now() - t0
+      monitor.frameRender(dt)
+      // Slow-submit forensics: what the renderer's own counters said on a
+      // >30 ms submit vs the frame before — a programs jump = shader
+      // compile, textures = upload, calls/triangles = raw draw volume.
+      const info = holder.info
+      if (info) {
+        const programs = info.programs?.length ?? -1
+        const geoms = info.memory?.geometries ?? -1
+        const tex = info.memory?.textures ?? -1
+        const calls = info.render?.calls ?? -1
+        const tris = info.render?.triangles ?? -1
+        if (dt > 30) {
+          console.info(
+            `[boots] slow render ${dt.toFixed(1)}ms — programs:${programs} geoms:${geoms} tex:${tex} calls:${calls} tris:${tris} (prev programs:${pPrograms} geoms:${pGeoms} tex:${pTex} calls:${pCalls} tris:${pTris})`,
+          )
+        }
+        pPrograms = programs
+        pGeoms = geoms
+        pTex = tex
+        pCalls = calls
+        pTris = tris
+      }
+      return out
+    }
+    return () => {
+      holder.render = original
+    }
+  }, [gl])
   useEffect(() => {
     monitor.reset()
     lastNow.current = 0
+    // In-loop CPU probe: addEffect fires before the subscribers, then
+    // addAfterEffect after the render submit — their span is the loop's
+    // synchronous cost. What a spike's delta holds BEYOND that happened
+    // outside the loop: the batched React flush of store bumps (microtask,
+    // after the rAF callback), GC, or a GPU/compositor stall.
+    let loopStart = 0
+    const offStart = addEffect(() => {
+      loopStart = performance.now()
+      return true
+    })
+    const offEnd = addAfterEffect(() => {
+      monitor.frameCpu(performance.now() - loopStart)
+      return true
+    })
     return () => {
+      offStart()
+      offEnd()
       const summary = monitor.stats()
       if (summary.frames > 0) console.info('[boots] perf', summary)
     }

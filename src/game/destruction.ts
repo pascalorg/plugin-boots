@@ -16,7 +16,7 @@ import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { blastDebrisActive, queueDebris } from './grenade'
-import { perfEvent } from './perf-monitor'
+import { perfEvent, perfSection } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
 import {
@@ -1833,6 +1833,10 @@ let sessionWorld: GameWorld | null = null
  * on awake targets. */
 export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   if (!target.dormant) return
+  // Wakes are rare (once per target per session) — the tag can afford to
+  // name the node, which lets a spike log point at the exact culprit.
+  perfEvent(`wake ${target.nodeId}`)
+  const wakeT0 = performance.now()
   const groupId = roofMemberOf.get(target.nodeId)
   if (groupId !== undefined) {
     const meshes = dormantRoofHide.get(groupId)
@@ -1844,6 +1848,7 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
       if (member) member.dormant = false
     }
     state.bump()
+    perfSection('wake', performance.now() - wakeT0)
     return
   }
   target.walkOnly = hideHostNode(world, target.nodeId, target.hostMeshes ?? [], target.hostRoot)
@@ -1851,6 +1856,7 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   target.hostMeshes = undefined
   target.hostRoot = undefined
   useDestruction.getState().bump()
+  perfSection('wake', performance.now() - wakeT0)
 }
 
 const now: () => number =
@@ -3123,6 +3129,15 @@ const EXPLODABLE = new Set([
 const EXPLOSION_NIBBLES = 5
 /** Cap on framing segments snapped per blast. */
 const EXPLOSION_SEGMENT_CAP = 48
+/** Nodes carved per staggered blast step (~one display frame apart). The
+ * blast's frame cost — carve CPU, wakes, and the render submit behind
+ * them — scales with nodes touched per frame, so this bounds it. */
+export const EXPLOSION_NODES_PER_STEP = 4
+/** Gap between staggered blast steps — one display frame. */
+const EXPLOSION_STEP_MS = 16
+/** Bumped on resetDestruction — staggered blast steps from a torn-down
+ * session abort instead of carving into the next session's targets. */
+let blastEpoch = 0
 
 const _boomPoint = new Vector3()
 const _boomSeg = new Vector3()
@@ -3134,6 +3149,28 @@ const _boomSeg = new Vector3()
  * nibbles, then framing segments inside the radius snap (which arms the
  * 30%-support check). Returns the total voxels removed.
  */
+/** One node's share of a blast ring: the full-depth carve, plus the ragged
+ * rim nibbles on the outermost pass. */
+function carveExplosionNode(
+  world: GameWorld,
+  nodeId: string,
+  center: Vector3,
+  ring: number,
+  withNibbles: boolean,
+): number {
+  let total = damageTarget(world, nodeId, center, ring)
+  if (!withNibbles) return total
+  for (let i = 0; i < EXPLOSION_NIBBLES; i++) {
+    _boomPoint
+      .set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+      .normalize()
+      .multiplyScalar(ring * (0.75 + Math.random() * 0.3))
+      .add(center)
+    total += damageTarget(world, nodeId, _boomPoint, 0.3 + Math.random() * 0.2)
+  }
+  return total
+}
+
 /** One expanding ring of the blast: carve every explodable node whose
  * bounds sit within `ring`; nibbles only on the outermost pass. removeSphere
  * is idempotent, so each ring only pays for its own shell. */
@@ -3150,18 +3187,62 @@ function explosionRing(
     if (!EXPLODABLE.has(collider.nodeType)) continue
     if (collider.worldBox.distanceToPoint(center) > ring) continue
     seen.add(collider.nodeId)
-    total += damageTarget(world, collider.nodeId, center, ring)
-    if (!withNibbles) continue
-    for (let i = 0; i < EXPLOSION_NIBBLES; i++) {
-      _boomPoint
-        .set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
-        .normalize()
-        .multiplyScalar(ring * (0.75 + Math.random() * 0.3))
-        .add(center)
-      total += damageTarget(world, collider.nodeId, _boomPoint, 0.3 + Math.random() * 0.2)
-    }
+    total += carveExplosionNode(world, collider.nodeId, center, ring, withNibbles)
   }
   return total
+}
+
+/**
+ * WAKE-AHEAD (QA 2026-08-28): wake the nearest still-dormant explodable
+ * node within `radius` of `center` — one node per call, zero allocations.
+ * The grenade's ~2 s fuse calls this once per frame while the stick flies/
+ * cooks, so by detonation every node the blast can reach is already awake
+ * and the boom frame pays repeat-blast prices (the first-blast spike was
+ * the wake-frame render submit, and it scales with wakes per frame).
+ * Returns true when it woke something (callers budget one per frame).
+ */
+export function wakeAheadTick(world: GameWorld, center: Vector3, radius: number): boolean {
+  const targets = useDestruction.getState().targets
+  let best: VoxelTarget | null = null
+  let bestD = Number.POSITIVE_INFINITY
+  for (const collider of world.colliders) {
+    if (!EXPLODABLE.has(collider.nodeType)) continue
+    const d = collider.worldBox.distanceToPoint(center)
+    if (d > radius || d >= bestD) continue
+    // Roof shells enroll per PLANE under member ids — resolve through the
+    // group so the family wake (wakeTarget fans it out) still applies.
+    const groupId = roofGroups.has(collider.nodeId) ? collider.nodeId : undefined
+    const memberId = groupId ? (roofGroups.get(groupId)?.[0] ?? collider.nodeId) : collider.nodeId
+    const target = targets.get(memberId)
+    if (!target || !target.dormant) continue
+    best = target
+    bestD = d
+  }
+  if (!best) return false
+  wakeTarget(world, best)
+  return true
+}
+
+/** Explodable nodes whose bounds sit within `ring`, nearest first — the
+ * order the staggered carve walks so the blast reads as one expanding
+ * shockwave (per-BLAST allocations only, never per frame). */
+function collectExplosionNodes(
+  world: GameWorld,
+  center: Vector3,
+  ring: number,
+): { id: string; d: number }[] {
+  const seen = new Set<string>()
+  const out: { id: string; d: number }[] = []
+  for (const collider of world.colliders) {
+    if (seen.has(collider.nodeId)) continue
+    if (!EXPLODABLE.has(collider.nodeType)) continue
+    const d = collider.worldBox.distanceToPoint(center)
+    if (d > ring) continue
+    seen.add(collider.nodeId)
+    out.push({ id: collider.nodeId, d })
+  }
+  out.sort((a, b) => a.d - b.d)
+  return out
 }
 
 function explosionSegments(world: GameWorld, center: Vector3, radius: number): void {
@@ -3197,14 +3278,68 @@ export function damageExplosion(
     explosionSegments(world, center, radius)
     return total
   }
-  const total = explosionRing(world, center, radius * 0.5, false)
+  // PER-NODE stagger inside each ring (QA 2026-08-28): the frame cost of a
+  // blast scales with how many nodes carve — and, on the FIRST mid-house
+  // blast, WAKE — in one frame (a single wake doesn't even spike; ~15 in
+  // one frame was a ~100 ms render submit). So each ring walks its nodes
+  // nearest-first at EXPLOSION_NODES_PER_STEP per display frame instead of
+  // all at once. The 30/70 ms ring marks hold as "not before" gates, the
+  // rings still read as one expanding shockwave, and a 14-node house now
+  // spreads across ~10 frames of small steps instead of 3 long ones.
   const frozen = center.clone()
-  setTimeout(() => explosionRing(world, frozen, radius * 0.8, false), 30)
-  setTimeout(() => {
-    explosionRing(world, frozen, radius, true)
-    explosionSegments(world, frozen, radius)
-  }, 70)
-  return total
+  const blastT0 = now()
+  const rings = [
+    { ring: radius * 0.5, notBefore: blastT0, withNibbles: false, tag: 'boom-ring1' },
+    { ring: radius * 0.8, notBefore: blastT0 + 30, withNibbles: false, tag: 'boom-ring2' },
+    { ring: radius, notBefore: blastT0 + 70, withNibbles: true, tag: 'boom-ring3' },
+  ]
+  let ringIndex = -1 // step() advances to ring 0 on its first pass
+  let nodes: { id: string; d: number }[] = []
+  let cursor = 0
+  let coreTotal = 0
+  const epoch = blastEpoch
+  const step = (): void => {
+    // Session ended mid-blast (Save/Discard tears the store down) — drop
+    // the tail instead of carving into the next session's targets.
+    if (epoch !== blastEpoch) return
+    const stepT0 = performance.now()
+    let carved = 0
+    while (carved < EXPLOSION_NODES_PER_STEP) {
+      if (cursor >= nodes.length) {
+        // Ring exhausted — segments snap after the last ring, then done.
+        if (ringIndex >= rings.length - 1) {
+          if (ringIndex >= 0) perfSection(rings[ringIndex]!.tag, performance.now() - stepT0)
+          const segT0 = performance.now()
+          explosionSegments(world, frozen, radius)
+          perfSection('boom-segments', performance.now() - segT0)
+          return
+        }
+        const next = rings[ringIndex + 1]!
+        const wait = next.notBefore - now()
+        if (wait > 0) {
+          if (ringIndex >= 0) perfSection(rings[ringIndex]!.tag, performance.now() - stepT0)
+          setTimeout(step, wait)
+          return
+        }
+        ringIndex++
+        nodes = collectExplosionNodes(world, frozen, next.ring)
+        cursor = 0
+        continue
+      }
+      const ring = rings[ringIndex]!
+      const removed = carveExplosionNode(world, nodes[cursor]!.id, frozen, ring.ring, ring.withNibbles)
+      cursor++
+      if (ringIndex === 0) coreTotal += removed
+      carved++
+    }
+    perfSection(rings[ringIndex]!.tag, performance.now() - stepT0)
+    setTimeout(step, EXPLOSION_STEP_MS)
+  }
+  // The first pass runs synchronously: it advances into ring 0 and carves
+  // the nearest core nodes THIS frame — instant feedback at the blast
+  // point; everything else rides the staggered steps behind it.
+  step()
+  return coreTotal
 }
 
 export function damageSegment(
@@ -3325,6 +3460,11 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
     // smooth walkOnly plank in collideCapsule — colliding its coincident
     // voxel cells too would re-bump every lip the plank exists to hide.
     if (target.walkOnly) continue
+    // Dormant prebuilds: the HOST colliders still own collision (the hide/
+    // handover is deferred to wakeTarget) — colliding the coincident grid
+    // too double-solidifies every prebuilt slab/stair/item, bumping feet on
+    // voxel lips that stick out past the host surface.
+    if (target.dormant) continue
     const { grid } = target
     // Sphere radius keys off the LARGEST cell — any smaller and the capsule
     // could slip between skin voxels spaced a full length-cell apart.
@@ -3438,6 +3578,7 @@ export function dropTarget(nodeId: string): void {
 
 export function resetDestruction(): void {
   sessionWorld = null
+  blastEpoch++
   dormantRoofHide.clear()
   if (sceneSupportTimer !== null) {
     clearTimeout(sceneSupportTimer)

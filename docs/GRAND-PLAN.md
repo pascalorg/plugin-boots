@@ -108,6 +108,21 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   bases replace the uniform 2.8 m assumption; pieces conform to their
   slot's local span; Keep parents each piece to its real level). 731
   tests / 20.8k assertions green.
+- Phase 6 fix round 3 (2026-08-28, manager, post-QA night 3): CLIMB
+  positional (velocity had lied) — dormant piece grids skip capsule
+  collision + walkable ground contacts resolve VERTICALLY in
+  collideCapsule (tilted-normal push-out was cancelling horizontal
+  advance); live ratio 0.755 → 0.999 · FIRST BLAST — post-prime WARM
+  DRAW (one underground frame per dormant replica uploads its GPU
+  buffers early), blast rings walk nodes 4/frame nearest-first
+  (staggered steps, blastEpoch abort), grenade WAKE-AHEAD (fuse frames
+  pre-wake the blast zone): detonation frame is CLEAN; one residual
+  ~62–68 ms `wake item_…` spike at the first host-item wake (named
+  tag; next-round lead) · warmup BVH drain re-opens for late item-GLB
+  colliders · perf kit: `perfSections()`, spike `cpu`/`render` split,
+  slow-submit renderer.info forensics, named wake tags,
+  dormantPrimeQueueSize/settleTasksPending on `__boots`. 731 tests /
+  20.8k assertions green.
 
 ## In flight
 

@@ -67,6 +67,7 @@ export function PipelineWarmup({ world }: { world?: GameWorld } = {}) {
   const frames = useRef(0)
   const bvhCursor = useRef(0)
   const bvhDone = useRef(false)
+  const bvhSeenTail = useRef<unknown>(undefined)
 
   // First-use audio costs move into the session-start beat (finding A3).
   useEffect(() => {
@@ -93,11 +94,24 @@ export function PipelineWarmup({ world }: { world?: GameWorld } = {}) {
     }
     // Background BVH warmup — after the warm meshes retire, and only once
     // the prevoxelize pass has finished (both tick at ~4 ms; never stack).
-    if (bvhDone.current) return
     const w = world ?? readWorldHandle()
     if (!w) return
-    if (!prevoxelizeTick(w, 0)) return
     const colliders = w.colliders
+    if (bvhDone.current) {
+      // Colliders can ARRIVE mid-session: item GLBs replace their shot
+      // proxies after async load and push fresh entries (item-place.tsx).
+      // A one-shot warm left those to build their Draco-mesh BVH inside
+      // the first shot that touched them — the untagged ~106 ms "item
+      // window" spike (QA 2026-08-28). Re-open the drain when the array's
+      // TAIL entry changes (pushes append, so any arrival moves it; a
+      // same-length splice+push — proxy out, GLB in — moves it too).
+      // While nothing changes this is one identity compare per frame.
+      const tail = colliders.length > 0 ? colliders[colliders.length - 1] : undefined
+      if (tail === bvhSeenTail.current) return
+      bvhDone.current = false
+      bvhCursor.current = Math.min(bvhCursor.current, colliders.length)
+    }
+    if (!prevoxelizeTick(w, 0)) return
     const deadline = performance.now() + BVH_BUDGET_MS
     let i = bvhCursor.current
     while (i < colliders.length && performance.now() < deadline) {
@@ -108,7 +122,10 @@ export function PipelineWarmup({ world }: { world?: GameWorld } = {}) {
       i++
     }
     bvhCursor.current = i
-    if (i >= colliders.length) bvhDone.current = true
+    if (i >= colliders.length) {
+      bvhDone.current = true
+      bvhSeenTail.current = colliders.length > 0 ? colliders[colliders.length - 1] : undefined
+    }
   })
 
   // Re-warm on every session (component remounts with ActiveGame).

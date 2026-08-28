@@ -1,4 +1,5 @@
 import { Box3, Line3, Vector3 } from 'three'
+import { WALKABLE_NORMAL_Y } from './movement'
 import type { ColliderEntry } from './world'
 
 /**
@@ -105,7 +106,21 @@ export function collideCapsule(
           _normal.subVectors(_capsulePoint, _triPoint)
           if (_normal.lengthSq() < 1e-12) return false
           _normal.normalize().transformDirection(collider.mesh.matrixWorld)
-          pos.addScaledVector(_normal, depth)
+          if (_normal.y >= WALKABLE_NORMAL_Y) {
+            // WALKABLE GROUND: resolve the embed VERTICALLY (depth / n.y) —
+            // the classic character-controller ground resolve. Push-out
+            // along the tilted normal cancels horizontal advance: on a
+            // smooth 43° plank the ride alternated full frames with
+            // one-fifth frames (QA 2026-08-28 — uphill ratio 0.75 while
+            // VELOCITY stayed at full run speed) because the step retry's
+            // down-settle lands GRAZING (distance == radius, never
+            // penetrating → not grounded) and aborts. Vertical resolve
+            // keeps the capsule ON the plane at full horizontal speed;
+            // walls, ceilings and too-steep faces keep the normal push.
+            pos.y += depth / _normal.y
+          } else {
+            pos.addScaledVector(_normal, depth)
+          }
           if (_normal.y > 0.55) {
             grounded = true
             if (groundNormalOut && _normal.y < _groundNy) {

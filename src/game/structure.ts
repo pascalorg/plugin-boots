@@ -1,3 +1,4 @@
+import { perfSection } from './perf-monitor'
 import { raycastVoxels, type VoxelGridData } from './voxel'
 
 /**
@@ -273,6 +274,7 @@ export function drainSettleTasks(budget = SETTLE_DRAIN_BUDGET, t = now()): numbe
     if (dueKeys.length >= budget) break
   }
   let ran = 0
+  const t0 = performance.now()
   for (const key of dueKeys) {
     const task = settleQueue.get(key)
     if (!task) continue // cancelled by an earlier task in this drain
@@ -280,6 +282,7 @@ export function drainSettleTasks(budget = SETTLE_DRAIN_BUDGET, t = now()): numbe
     task.run()
     ran++
   }
+  if (ran > 0) perfSection('settle-drain', performance.now() - t0)
   return ran
 }
 

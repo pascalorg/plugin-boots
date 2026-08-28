@@ -13,7 +13,7 @@ import { collideVoxelTargets, damageSegment, damageTarget, useDestruction } from
 import { spawnDust, spawnHaze } from './dust'
 import { raycastGlass, shatterPane } from './glass'
 import { bots, damageBot } from './enemies-state'
-import { perfEvent } from './perf-monitor'
+import { perfEvent, perfSection } from './perf-monitor'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
 import type { GameWorld, GlassPane } from './world'
@@ -382,6 +382,7 @@ const SCRAP = new Color('#5d5a52')
  */
 export function explodeAt(world: GameWorld, center: Vector3): void {
   perfEvent('grenade-boom')
+  const explodeT0 = performance.now()
   // Open the debris window FIRST — the segment snaps it governs land both
   // on this frame (immediate carves) and 70 ms out (the outer ring).
   blastDebrisWindow = BLAST_DEBRIS_WINDOW
@@ -400,6 +401,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   const GLASS_MID = 3
   let glassHits = 0
   let deferredPanes: GlassPane[] | null = null
+  let glassT0 = performance.now()
   for (const pane of world.glass) {
     if (pane.mesh.getWorldPosition(_paneCenter).distanceTo(center) > BLAST_RADIUS) continue
     if (glassHits < GLASS_NOW) {
@@ -410,14 +412,19 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
     }
     glassHits++
   }
+  perfSection('boom-glass', performance.now() - glassT0)
   if (deferredPanes) {
     const wave = deferredPanes
     setTimeout(() => {
+      glassT0 = performance.now()
       for (let i = 0; i < wave.length && i < GLASS_MID; i++) shatterPane(wave[i]!)
+      perfSection('boom-glass', performance.now() - glassT0)
     }, 40)
     if (wave.length > GLASS_MID) {
       setTimeout(() => {
+        glassT0 = performance.now()
         for (let i = GLASS_MID; i < wave.length; i++) shatterPane(wave[i]!)
+        perfSection('boom-glass', performance.now() - glassT0)
       }, 80)
     }
   }
@@ -466,7 +473,9 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
 
   // Ground scar — craters.tsx owns the green-vs-road/building call and the
   // 16-slot ring buffer; a blast on pavement or indoors is a no-op here.
+  const craterT0 = performance.now()
   spawnCrater(world, center, BLAST_RADIUS)
+  perfSection('boom-crater', performance.now() - craterT0)
 
   // Dust storm — a handful of plumes (each auto-spawns haze) ringed by
   // puffs, plus one wide lingering haze. All feature-checked (contract).
@@ -492,6 +501,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   for (let i = 0; i < 8; i++) {
     spawnDebris(center.x, center.y + 0.3, center.z, 0.05 + Math.random() * 0.05, SCRAP, 4, 1.6)
   }
+  perfSection('boom-explode', performance.now() - explodeT0)
 }
 
 // --- Integration -------------------------------------------------------------
@@ -510,8 +520,18 @@ export function updateGrenades(world: GameWorld, dt: number): void {
   lastWorld = world
   if (cooldownLeft > 0) cooldownLeft = Math.max(0, cooldownLeft - dt)
   if (blastDebrisWindow > 0) blastDebrisWindow = Math.max(0, blastDebrisWindow - dt)
+  // WAKE-AHEAD: while a stick cooks, wake ONE dormant target near it per
+  // frame — the ~2 s fuse is ~100+ frames, plenty for a whole mid-house
+  // blast zone, so detonation lands on already-awake targets and the boom
+  // frame pays repeat-blast prices (feature-detected like damageExplosion).
+  let wakeBudget = 1
+  const wakeAhead = (destruct as { wakeAheadTick?: (w: GameWorld, c: Vector3, r: number) => boolean })
+    .wakeAheadTick
   for (const g of pool) {
     if (!g.alive) continue
+    if (wakeBudget > 0 && typeof wakeAhead === 'function' && wakeAhead(world, g.pos, BLAST_RADIUS)) {
+      wakeBudget--
+    }
     g.fuse -= dt
     if (g.fuse <= 0) {
       g.alive = false
@@ -600,7 +620,11 @@ export function Grenades({ world }: { world: GameWorld }) {
     const dtRender = Math.min(rawDt, 1 / 30)
     updateGrenades(world, dtRender)
     // Blast debris arrives over frames, not all at once — no-op when empty.
-    drainDebrisQueue()
+    if (debrisLen > 0) {
+      const t0 = performance.now()
+      drainDebrisQueue()
+      perfSection('boom-debris-drain', performance.now() - t0)
+    }
     // HUD grenade-ready pip (change-gated on the HUD side, so per-frame is
     // free while the value holds). This component owns the drive — hud.ts
     // only renders.

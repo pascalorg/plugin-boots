@@ -12,6 +12,7 @@ import {
 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
 import { CELL, type GridAnchor, STOREY } from './grid'
+import { perfEvent } from './perf-monitor'
 
 /**
  * One-shot world snapshot taken when the game starts: which host meshes are
@@ -314,6 +315,9 @@ function fallbackBvh(): MeshBVH {
 export function bvhFor(mesh: Mesh): MeshBVH {
   let bvh = bvhCache.get(mesh.geometry)
   if (!bvh) {
+    // Attribution for the perf monitor: a cache-miss build inside a shot /
+    // wake frame is a known first-hit cost — tag it so spikes name it.
+    perfEvent('bvh-build')
     try {
       let geometry = mesh.geometry
       const position = geometry.getAttribute('position')

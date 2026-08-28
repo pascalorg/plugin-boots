@@ -8,6 +8,7 @@ import { sfx } from './audio'
 import { EYE_HEIGHT, moveCapsule, PLAYER_CAPSULE } from './collision'
 import { collideVoxelWalls } from './destruction'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
+import { perfEvent } from './perf-monitor'
 import { getSession } from './session'
 import type { GameWorld } from './world'
 
@@ -280,6 +281,9 @@ export function applyTeleport(
   pitch = 0,
   y = 0,
 ): void {
+  // QA teleports jump the camera across the map — the culling/BVH work the
+  // next frame pays is not a gameplay spike, so let the perf log name it.
+  perfEvent('teleport')
   feet.set(x, y, z)
   vel.set(0, 0, 0)
   playerRig.yaw = yaw
@@ -350,6 +354,11 @@ export function Player({ world }: { world: GameWorld }) {
         staggerT,
         recoverT,
         speed: playerRig.speed,
+        // Climb-feel QA: the contact plane the next tick's velocity rides
+        // (projectOnWalkableSlope) + whether the mover is grounded at all.
+        grounded: playerRig.grounded,
+        groundNy: groundNormal.current.y,
+        velY: vel.current.y,
       }
     }
     // Page-eval mirror of the dev handle (headless stagger tuning) — game-

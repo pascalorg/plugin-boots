@@ -1239,3 +1239,86 @@ per frame behind the boom).
 
 731 tests / 20,757 assertions green (was 655 at round start); tsc
 clean; real exit codes 0, full suite re-run stable.
+
+## Phase 6 fix round 3 — QA night-3 flagged items (2026-08-28, manager)
+
+QA verdict on cd82556: NOT GREEN — (1) first BIG blast boom frame still
+80–119 ms tagged `grenade-boom`; (2) untagged 75–106 ms spikes on a fresh
+session's first ceiling/item shots; (3) placed-piece ramps pulse uphill
+(0.77–0.88 vs the ≥0.9 gate). Fixes, in dependency order:
+
+CLIMB (3) — two layers deep:
+- Layer 1: placed pieces now PREBUILD DORMANT, and collideVoxelTargets
+  still collided their coincident voxel grids while the HOST plank
+  collider also collided — voxel lips past the plank surface bumped the
+  feet. Dormant targets now skip capsule collision exactly like
+  walkOnly planks (the host owns collision until wakeTarget hands it
+  over).
+- Layer 2 (the one the ratio was made of — VELOCITY lied): with layer 1
+  fixed, velocity read a perfect 6.5 m/s parallel ride while POSITION
+  advanced at ~0.6× in a full/one-fifth/one-fifth frame cycle. Cause:
+  collideCapsule pushed ground contacts out along the TILTED normal
+  (horizontal advance cancelled), and the step retry's down-settle
+  lands GRAZING (distance == radius, never penetrating → "not
+  grounded") so the step aborted and the clipped flat slide stood.
+  Fix: walkable ground contacts (normal.y ≥ WALKABLE_NORMAL_Y) now
+  resolve VERTICALLY (depth / n.y) — the classic character-controller
+  ground resolve; walls/ceilings/too-steep faces keep the normal push.
+  climb-feel.test.ts's ramp sim now pins the POSITIONAL rate (goal at
+  the top, arrive < 1.3 s), not just velocity.
+Live gate (qa-night3-climb2.mjs, headed, 3 ascents of the 43° placed
+plank): flat 6.502 → best contiguous ascent 6.498, RATIO 0.999 (was
+0.755–0.88; gate ≥ 0.9; steady 6.5 through the whole rise, all repeats).
+
+PERF ATTRIBUTION (1)(2) — wired + extended the recorder instead of
+guessing: `__boots.dormantPrimeQueueSize` + `settleTasksPending(prefix?)`
+(QA drain-bound asserts); `perfEvent('wake <nodeId>')` at wakeTarget,
+'teleport' at applyTeleport, 'bvh-build' at bvhFor cache misses;
+`perfSection(name, ms)` accumulator (`__boots.perfSections()`) timing
+boom rings/glass/crater/segments/debris-drain/settle-drain/prime;
+PerfMonitor spike rows now carry `cpu` (addEffect→addAfterEffect span)
+and `render` (a wrap around the renderer's own render) + a >30 ms
+slow-submit console line with renderer.info counters. What it proved:
+the 100 ms first-blast frame was 14 ms of carve + ~95 ms INSIDE the
+render submit, on the frame the first wakes flip visible — carve CPU,
+wakes (0.4 ms/14) and settle drain (budgeted, ~7 ms over 26 pumps)
+were all innocent.
+
+FIRST-BLAST (1), three legs:
+- WARM DRAW: a dormant replica primed while hidden uploads nothing —
+  its GPU buffers landed on the mass-wake frame. After each budgeted
+  background prime the replica now renders ONE frame far underground
+  (visible, y −600, 2-frame countdown vs drain/subscriber order, abort
+  guard if woken mid-warm) so buffers are resident before any wake.
+- STAGGERED RING NODES: damageExplosion's 30/70 ms rings now walk their
+  nodes nearest-first at EXPLOSION_NODES_PER_STEP (4) per display frame
+  (16 ms steps, "not before" gates keep the ring marks, blastEpoch
+  aborts a torn-down session's tail). Bounds carve + wake breadth per
+  frame; still reads as one expanding shockwave.
+- WAKE-AHEAD: while a stick grenade cooks (~2 s fuse ≈ 100+ frames),
+  updateGrenades wakes ONE dormant explodable node near the grenade per
+  frame (wakeAheadTick, zero-alloc nearest scan, roof groups resolve
+  through their member ids) — detonation lands on already-awake targets
+  and the boom frame pays repeat-blast prices.
+
+FIRST-SHOT SPIKES (2): PipelineWarmup's background BVH drain was
+one-shot — item GLBs that replace their shot proxies AFTER load pushed
+fresh colliders nobody warmed, so the first shot built a Draco-mesh BVH
+(the untagged ~106 ms "item window"). The drain now re-opens when the
+collider array's TAIL entry changes (pushes append; same-length
+splice+push moves it too) — one identity compare per frame while idle.
+
+Headed QA (qa-grenade-perf.mjs, 2×2 house + roof + saved items,
+mid-house G-grenade): boom frame CLEAN (no spike at detonation; repeat
+blasts worst 10–19 ms). One residual spike remains, moved OFF the boom:
+the first HOST CATALOG ITEM wake (~62–68 ms, tag `wake item_…`, once
+per session, during the wind-up). Renderer forensics say it is a
+monolithic render-submit stall with NO program/texture/geometry count
+change and identical triangle volume — not carve, not our buffers
+(slab/wall wakes with far bigger replicas are clean, a lone table wake
+is free). Next-round lead: host-side interplay when the host's GLB item
+meshes get visibility-hidden.
+
+Ceiling regress: clean, no spikes. Discard identity + censuses
+byte-identical; zero INVARIANT VIOLATION; zero deduped console errors.
+731 tests / 20,757 assertions green; tsc clean; real exit codes.
