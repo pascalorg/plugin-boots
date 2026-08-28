@@ -96,14 +96,65 @@ const GABLE = {
   ridge: new Vector3(0, 5, 0),
 }
 
-/** Full gable shell: two opposite planes sharing the ridge at GABLE.ridge. */
-function gableShellMesh(): Mesh {
+/** Push one triangle, winding flipped to face `n`. */
+function pushTri(out: number[], a: Vector3, b: Vector3, c: Vector3, n: Vector3): void {
+  const u = new Vector3().subVectors(b, a)
+  const w = new Vector3().subVectors(c, a)
+  if (new Vector3().crossVectors(u, w).dot(n) < 0) {
+    out.push(a.x, a.y, a.z, c.x, c.y, c.z, b.x, b.y, b.z)
+  } else {
+    out.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z)
+  }
+}
+
+/** The two OUTER eave-edge midpoints (down each slope from the ridge). */
+function gableEaves(): [Vector3, Vector3] {
+  const f = roofPlaneFrame(GABLE.yaw, GABLE.pitch)
+  const g = roofPlaneFrame(GABLE.yaw + Math.PI, GABLE.pitch)
+  return [
+    GABLE.ridge.clone().addScaledVector(new Vector3(...f.upSlope), -GABLE.slopeLength),
+    GABLE.ridge.clone().addScaledVector(new Vector3(...g.upSlope), -GABLE.slopeLength),
+  ]
+}
+
+/** Centroid of the gable-end triangle at `sign` × half the eave length
+ * along the ridge — a point on the VERTICAL end face that no thin plane
+ * slab covers (the residual lane's home turf). */
+function gableEndCenter(sign: 1 | -1): Vector3 {
+  const A = new Vector3(...roofPlaneFrame(GABLE.yaw, GABLE.pitch).across)
+  const [eave1, eave2] = gableEaves()
+  return GABLE.ridge
+    .clone()
+    .add(eave1)
+    .add(eave2)
+    .divideScalar(3)
+    .addScaledVector(A, (sign * GABLE.eaveLength) / 2)
+}
+
+/** Full gable shell: two opposite planes sharing the ridge at GABLE.ridge.
+ * `withEnds` appends the two VERTICAL gable-end triangles (outward normals
+ * ±across — the faces the plane enumeration excludes by pitch). */
+function gableShellMesh(withEnds = false): Mesh {
   const out: number[] = []
   for (const yaw of [GABLE.yaw, GABLE.yaw + Math.PI]) {
     const f = roofPlaneFrame(yaw, GABLE.pitch)
     const U = new Vector3(...f.upSlope)
     const eave = GABLE.ridge.clone().addScaledVector(U, -GABLE.slopeLength)
     pushPlaneShell(out, yaw, GABLE.pitch, eave, GABLE.eaveLength, GABLE.slopeLength, GABLE.t)
+  }
+  if (withEnds) {
+    const A = new Vector3(...roofPlaneFrame(GABLE.yaw, GABLE.pitch).across)
+    const [eave1, eave2] = gableEaves()
+    for (const sign of [1, -1] as const) {
+      const off = A.clone().multiplyScalar((sign * GABLE.eaveLength) / 2)
+      pushTri(
+        out,
+        GABLE.ridge.clone().add(off),
+        eave1.clone().add(off),
+        eave2.clone().add(off),
+        A.clone().multiplyScalar(sign),
+      )
+    }
   }
   const geometry = new BufferGeometry()
   geometry.setAttribute('position', new BufferAttribute(Float32Array.from(out), 3))
@@ -226,6 +277,36 @@ describe('enumerateRoofPlanes', () => {
     mesh.updateMatrixWorld(true)
     expect(enumerateRoofPlanes([mesh])).toEqual([])
   })
+
+  test('the residual out-set is exactly the vertical gable-end triangles', () => {
+    const residual: number[] = []
+    const planes = enumerateRoofPlanes([gableShellMesh(true)], residual)
+    expect(planes.length).toBe(2) // the end caps never pollute the planes
+    // Two end triangles, 9 packed world floats each — the sloped outer
+    // faces and their covered undersides never leak in.
+    expect(residual.length).toBe(18)
+    const A = new Vector3(...roofPlaneFrame(GABLE.yaw, GABLE.pitch).across)
+    for (let k = 0; k < residual.length; k += 9) {
+      const u = new Vector3(
+        residual[k + 3]! - residual[k]!,
+        residual[k + 4]! - residual[k + 1]!,
+        residual[k + 5]! - residual[k + 2]!,
+      )
+      const w = new Vector3(
+        residual[k + 6]! - residual[k]!,
+        residual[k + 7]! - residual[k + 1]!,
+        residual[k + 8]! - residual[k + 2]!,
+      )
+      const n = new Vector3().crossVectors(u, w).normalize()
+      // VERTICAL faces along the ridge axis — the constructed end caps.
+      expect(Math.abs(n.y)).toBeLessThan(1e-6)
+      expect(Math.abs(n.dot(A))).toBeCloseTo(1, 6)
+    }
+    // A pure shell (every face sloped) leaves the residual set EMPTY.
+    const none: number[] = []
+    enumerateRoofPlanes([gableShellMesh()], none)
+    expect(none.length).toBe(0)
+  })
 })
 
 describe('roof target lane (per-plane pitched grids, Phase C2)', () => {
@@ -344,6 +425,48 @@ describe('roof target lane (per-plane pitched grids, Phase C2)', () => {
     // …and at least one shingle sheet tore off wholesale along the way.
     const anySheetFlew = targets.some((t) => t.sheets.some((sheet) => sheet.flownOff))
     expect(anySheetFlew).toBe(true)
+  })
+
+  test('gable ends join the roof group as a #residual member a shot can carve', () => {
+    const world = roofWorld(gableShellMesh(true))
+    ensureVoxelTarget(world, 'roof-1')
+    const targets = useDestruction.getState().targets
+    // 2 planes + the residual — and the group owns all three ids.
+    expect(Array.from(targets.keys()).sort()).toEqual([
+      'roof-1#p0',
+      'roof-1#p1',
+      'roof-1#residual',
+    ])
+    const residual = targets.get('roof-1#residual')!
+    expect(residual.kind).toBe('volume')
+    expect(residual.grid.aliveCount).toBeGreaterThan(0)
+    // Group membership does the work: a shot at the CENTER of a gable end
+    // (a point no thin plane slab covers — the exact spot that used to
+    // VANISH with nothing behind it) fans out through the real node id and
+    // bites the residual grid.
+    const before = residual.grid.aliveCount
+    const removed = damageTarget(world, 'roof-1', gableEndCenter(1), 0.3)
+    expect(removed).toBeGreaterThan(0)
+    expect(residual.grid.aliveCount).toBeLessThan(before)
+  })
+
+  test('a pure shell (no residual faces) builds NO residual member', () => {
+    const world = roofWorld(gableShellMesh())
+    ensureVoxelTarget(world, 'roof-1')
+    expect(useDestruction.getState().targets.has('roof-1#residual')).toBe(false)
+  })
+
+  test('dormant prebuilds include the residual and the first hit wakes it with the family', () => {
+    const world = roofWorld(gableShellMesh(true))
+    ensureVoxelTarget(world, 'roof-1', { dormant: true })
+    const residual = useDestruction.getState().targets.get('roof-1#residual')!
+    expect(residual.dormant).toBe(true)
+    // First blood on the OTHER end still wakes every member (family wake)…
+    const removed = damageTarget(world, 'roof-1', gableEndCenter(-1), 0.3)
+    expect(residual.dormant).toBe(false)
+    // …and that same first shot already carves the end it hit.
+    expect(removed).toBeGreaterThan(0)
+    expect(residual.grid.aliveCount).toBeLessThan(residual.grid.count)
   })
 })
 

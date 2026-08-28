@@ -77,7 +77,7 @@ function slopedPitchOk(absNy: number): boolean {
   return absNy > Math.cos(MAX_PITCH) && absNy < Math.cos(MIN_PITCH)
 }
 
-function collectSlopedTris(meshes: readonly Mesh[], up: Tri[], down: Tri[]): void {
+function collectSlopedTris(meshes: readonly Mesh[], up: Tri[], down: Tri[], rest?: Tri[]): void {
   for (const mesh of meshes) {
     const geometry = mesh.geometry
     const position = geometry.getAttribute('position')
@@ -113,9 +113,9 @@ function collectSlopedTris(meshes: readonly Mesh[], up: Tri[], down: Tri[]): voi
       const len = Math.sqrt(cx * cx + cy * cy + cz * cz)
       if (len < 1e-8) continue
       const ny = cy / len
-      if (!slopedPitchOk(Math.abs(ny))) continue
       const tri: Tri = { nx: cx / len, ny, nz: cz / len, area: len / 2, v }
-      if (ny > 0) up.push(tri)
+      if (!slopedPitchOk(Math.abs(ny))) rest?.push(tri)
+      else if (ny > 0) up.push(tri)
       else down.push(tri)
     }
   }
@@ -169,12 +169,26 @@ export type RoofPlane = RoofPlaneBasis & {
  * buildRafters input plus what the voxel lane needs). Flat roofs and pure
  * walls yield an empty array — the caller keeps its volume grid and simply
  * frames nothing.
+ *
+ * `residual` (optional out-array) receives the shell faces the returned
+ * planes do NOT cover, as packed world-space triangles (ax,ay,az,…cz — 9
+ * floats per face): faces the pitch gate excludes (near-VERTICAL gable-end
+ * triangles, fascia caps, flat soffits) plus sloped faces no kept cluster
+ * claimed (MIN_PLANE_AREA slivers). Down-facing tris opposing a kept plane
+ * lie on that plane's inner surface — inside its slab — so they never count
+ * as residual. The destruction residual lane voxelizes this set so gable
+ * ends stop VANISHING when the merged host mesh hides on first hit.
  */
-export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
+export function enumerateRoofPlanes(meshes: readonly Mesh[], residual?: number[]): RoofPlane[] {
   const up: Tri[] = []
   const down: Tri[] = []
-  collectSlopedTris(meshes, up, down)
-  if (up.length === 0) return []
+  const rest: Tri[] | undefined = residual ? [] : undefined
+  collectSlopedTris(meshes, up, down, rest)
+  if (up.length === 0) {
+    // No planes → nothing is covered; every collected face is residual.
+    if (residual && rest) fillResidual(residual, rest, up, down, [])
+    return []
+  }
 
   const upClusters = clusterNormals(up).filter((c) => c.area >= MIN_PLANE_AREA)
   const downClusters = clusterNormals(down)
@@ -216,6 +230,9 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
   }
 
   const planes: RoofPlane[] = []
+  /** Unit normals of the KEPT planes, packed x,y,z — residual matching
+   * runs the exact complement of the polyTris assignment test below. */
+  const keptNormals: number[] = []
   for (const cluster of upClusters) {
     const len = Math.sqrt(
       cluster.nx * cluster.nx + cluster.ny * cluster.ny + cluster.nz * cluster.nz,
@@ -296,8 +313,37 @@ export function enumerateRoofPlanes(meshes: readonly Mesh[]): RoofPlane[] {
       thickness,
       polyTris,
     })
+    keptNormals.push(nx, ny, nz)
   }
+  if (residual && rest) fillResidual(residual, rest, up, down, keptNormals)
   return planes
+}
+
+/**
+ * Append every face the kept planes leave uncovered to `out` (packed world
+ * triangles): all pitch-gate rejects, up tris outside every kept normal's
+ * CLUSTER_DOT cone (the same test that assigns polyTris — exact
+ * complement), and down tris whose OPPOSITE misses every kept plane (an
+ * opposing underside sits on its plane's inner surface, inside the slab
+ * the plane target already voxelizes).
+ */
+function fillResidual(
+  out: number[],
+  rest: readonly Tri[],
+  up: readonly Tri[],
+  down: readonly Tri[],
+  keptNormals: readonly number[],
+): void {
+  const covered = (nx: number, ny: number, nz: number): boolean => {
+    for (let k = 0; k < keptNormals.length; k += 3) {
+      if (nx * keptNormals[k]! + ny * keptNormals[k + 1]! + nz * keptNormals[k + 2]! > CLUSTER_DOT)
+        return true
+    }
+    return false
+  }
+  for (const tri of rest) out.push(...tri.v)
+  for (const tri of up) if (!covered(tri.nx, tri.ny, tri.nz)) out.push(...tri.v)
+  for (const tri of down) if (!covered(-tri.nx, -tri.ny, -tri.nz)) out.push(...tri.v)
 }
 
 /** Minimal material slice roofSurfaceColor needs (Mesh['material'] items). */
@@ -340,12 +386,15 @@ function averageMapColor(material: MaterialLike): Color | null {
 }
 
 /**
- * The material owning the most sloped UP-facing triangle area across the
- * shell's material groups (0 Wall/Trim, 1 Deck, 2 Interior, 3 Shingle on
- * host roofs) — the roof SURFACE material. Null when no sloped face
- * carries a colored material.
+ * The material owning the most `accept`ed triangle area (by world face-
+ * normal Y) across the shell's material groups (0 Wall/Trim, 1 Deck,
+ * 2 Interior, 3 Shingle on host roofs). Null when no accepted face carries
+ * a colored material.
  */
-function dominantSlopedMaterial(meshes: readonly Mesh[]): MaterialLike | null {
+function dominantMaterialBy(
+  meshes: readonly Mesh[],
+  accept: (ny: number) => boolean,
+): MaterialLike | null {
   const areas = new Map<MaterialLike, number>()
   const v = [0, 0, 0, 0, 0, 0, 0, 0, 0]
   for (const mesh of meshes) {
@@ -390,9 +439,7 @@ function dominantSlopedMaterial(meshes: readonly Mesh[]): MaterialLike | null {
         const len = Math.sqrt(cx * cx + cy * cy + cz * cz)
         if (len < 1e-8) continue
         const ny = cy / len
-        // Sloped and UP-facing only — the shingle side, never undersides,
-        // fascia, or gable-end trim.
-        if (ny <= 0 || !slopedPitchOk(ny)) continue
+        if (!accept(ny)) continue
         area += len / 2
       }
       if (area > 0) areas.set(material, (areas.get(material) ?? 0) + area)
@@ -409,6 +456,12 @@ function dominantSlopedMaterial(meshes: readonly Mesh[]): MaterialLike | null {
   return best
 }
 
+/** The roof SURFACE material: dominant over sloped UP-facing area only —
+ * the shingle side, never undersides, fascia, or gable-end trim. */
+function dominantSlopedMaterial(meshes: readonly Mesh[]): MaterialLike | null {
+  return dominantMaterialBy(meshes, (ny) => ny > 0 && slopedPitchOk(ny))
+}
+
 /**
  * Dominant ROOF SURFACE color of the merged shell, resolved SYNCHRONOUSLY —
  * the fix for the C2 QA defect where targetBaseColor grabbed the FIRST
@@ -422,6 +475,21 @@ function dominantSlopedMaterial(meshes: readonly Mesh[]): MaterialLike | null {
  */
 export function roofSurfaceColor(meshes: readonly Mesh[]): Color | null {
   const best = dominantSlopedMaterial(meshes)
+  if (!best?.color) return null
+  const mapTone = averageMapColor(best)
+  return mapTone ? mapTone.multiply(best.color) : best.color.clone()
+}
+
+/**
+ * Dominant color of the shell's RESIDUAL faces — the ones the sloped gate
+ * excludes (gable-end triangles, fascia, flat caps) — resolved the
+ * roofSurfaceColor way (base color × canvas map average). The residual
+ * lane (destruction.ts) tints its gable-end replica with this instead of
+ * the shingle tone: gable ends read as siding/trim, not roofing. Null when
+ * no residual face carries a colored material.
+ */
+export function residualSurfaceColor(meshes: readonly Mesh[]): Color | null {
+  const best = dominantMaterialBy(meshes, (ny) => !slopedPitchOk(Math.abs(ny)))
   if (!best?.color) return null
   const mapTone = averageMapColor(best)
   return mapTone ? mapTone.multiply(best.color) : best.color.clone()
