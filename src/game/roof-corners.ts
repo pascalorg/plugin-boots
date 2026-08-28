@@ -204,6 +204,15 @@ export function cornerRoofGeometry(corners: RoofCorners, rise = CORNER_RISE): Bu
   return geometry
 }
 
+/** Session teardown (builder.tsx calls it next to resetStoreyLadder): the
+ * cache above keys on the raw float RISE (a piece's storey span) — one
+ * 16-shape family per building level height, unbounded across an editor
+ * run's Jump-ins without this release. */
+export function disposeCornerRoofGeometryCache(): void {
+  for (const geometry of geometryCache.values()) geometry.dispose()
+  geometryCache.clear()
+}
+
 export type RoofCornerHit = { t: number; corner: number }
 
 /** raycastRoofCorner lattice scratch — the F-edit hover raycasts every

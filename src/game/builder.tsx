@@ -9,7 +9,7 @@ import { sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
 import { spawnDebris } from './debris'
 import { dropTarget, ensureVoxelTarget, useDestruction } from './destruction'
-import { CornerEditOverlay, EditOverlay } from './edit-overlay'
+import { CornerEditOverlay, disposeOverlayGeometryCaches, EditOverlay } from './edit-overlay'
 import {
   CELL,
   getGridAnchor,
@@ -46,6 +46,7 @@ import {
   CORNER_RISE,
   cornerRoofGeometry,
   cornersEqual,
+  disposeCornerRoofGeometryCache,
   raycastRoofCorner,
   ROOF_PRESETS,
   type RoofCorners,
@@ -311,6 +312,20 @@ function geometryForMask(piece: BuildPiece, mask: number, span = WALL_H): Buffer
     maskGeometryCache.set(key, geometry)
   }
   return geometry
+}
+
+/** Session teardown (next to resetStoreyLadder): the caches above key on
+ * the raw float SPAN, and spans derive from each building's measured level
+ * elevations — a long editor run Jumping into many buildings would grow
+ * merged-geometry CPU+GPU memory monotonically (up to 511 masks × pieces
+ * per span family) with no other release path. dispose() is idempotent,
+ * so the FULL_MASK fallback rows shared with pieceGeometries are safe. */
+export function disposePieceGeometryCaches(): void {
+  for (const geometry of pieceGeometries.values()) geometry.dispose()
+  pieceGeometries.clear()
+  for (const geometry of maskGeometryCache.values()) geometry.dispose()
+  maskGeometryCache.clear()
+  pieceDimsCache.clear()
 }
 
 // --- Pose equality --------------------------------------------------------
@@ -1095,6 +1110,11 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
       resetGridAnchor() // the lattice frame dies with the session — back to identity
       resetStoreyLadder() // …and the storeys fall back to uniform 2.8
       resetCladQueue() // pending clads die too (their meshes just unmounted)
+      // Span-keyed geometry caches die with the ladder that minted their
+      // spans (they'd otherwise grow per building across an editor run).
+      disposePieceGeometryCaches()
+      disposeOverlayGeometryCaches()
+      disposeCornerRoofGeometryCache()
     }
   }, [world])
 

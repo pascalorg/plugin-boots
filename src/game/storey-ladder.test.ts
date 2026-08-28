@@ -103,6 +103,32 @@ describe('ladder installed: storeys follow the building', () => {
     setStoreyLadder([0.03, 2.53])
     expect(getStoreyLadder()).toEqual([0.03, 2.53])
   })
+
+  test('sunk building: a slightly buried bottom rung snaps to the terrain plane', () => {
+    // Without the snap NO storey base sat on the terrain (|base| ≤ 5 cm),
+    // so piece-slots could never root the support graph on open ground —
+    // ground placement was refused building-wide.
+    setStoreyLadder([-0.3, 2.2, 4.7])
+    expect(getStoreyLadder()).toEqual([0, 2.2, 4.7])
+    expect(isTerrainGrounded('Wz:0,0,0')).toBe(true)
+    expect(storeySpan(0)).toBeCloseTo(2.2, 10)
+  })
+
+  test('low first level: the bottom rung becomes the terrain rung, no degenerate sliver', () => {
+    // Prepending 0 under a 0.4 m base minted a 0.4 m storey — shorter than
+    // the MIN_STOREY_SPAN merge deriveStoreyLadder applies to real levels.
+    setStoreyLadder([0.4, 2.9, 5.4])
+    expect(getStoreyLadder()).toEqual([0, 2.9, 5.4])
+    expect(isTerrainGrounded('Wz:0,0,0')).toBe(true)
+    expect(storeySpan(0)).toBeCloseTo(2.9, 10)
+  })
+
+  test('basement ladder keeps its own ground rung untouched', () => {
+    setStoreyLadder([-2.5, 0, 2.8])
+    expect(getStoreyLadder()).toEqual([-2.5, 0, 2.8])
+    expect(isTerrainGrounded('Wz:0,0,0')).toBe(false) // base −2.5 — the basement
+    expect(isTerrainGrounded('Wz:0,0,1')).toBe(true) // base 0 — the ground level
+  })
 })
 
 describe('terrain grounding under a ladder', () => {

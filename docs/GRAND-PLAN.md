@@ -175,6 +175,13 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
    plugin-trees — cross-repo).
 6. Bots: door-opening behavior, navmesh (Yuka) if hordes grow.
 7. Third-person camera option; co-op (the far horizon).
+8. Settle-drain hardening (night-3 review, REFUTED but cheap): structure.ts
+   drainSettleTasks re-fetches a task mid-run without re-checking `due` —
+   no current path re-arms inside the drain, but add
+   `if (!task || task.due > t) continue` next time the file is open.
+9. Wake-ahead v2: key the pre-wake off a PREDICTED landing point during
+   flight (tonight's fix gates it to the fuse's final second — at-rest in
+   practice; a predictor would buy back ~1 more second of wake budget).
 
 ## Standing rules (never violate)
 

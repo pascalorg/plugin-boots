@@ -142,6 +142,10 @@ export function gridToWorld(x: number, z: number, yaw = 0): { x: number; z: numb
  * ground; doubles as the terrain-grounding tolerance on storey bases. */
 const TERRAIN_EPS = 0.05
 
+/** Shortest storey worth minting a terrain sliver for — mirrors world.ts's
+ * MIN_STOREY_SPAN (grid stays import-free of world; kept in sync). */
+const MIN_TERRAIN_SPAN = 1
+
 /** Live ladder — null = legacy uniform storeys (every existing test/QA
  * path stays green by construction). */
 let _storeyY: number[] | null = null
@@ -162,7 +166,26 @@ export function setStoreyLadder(ys: readonly number[] | null | undefined): void 
     if (ladder.length > 0 && y <= ladder[ladder.length - 1]! + TERRAIN_EPS) continue
     ladder.push(y)
   }
-  if (ladder.length > 0 && ladder[0]! > TERRAIN_EPS) ladder.unshift(0)
+  // Terrain rung: grounding needs SOME storey whose base sits ON the
+  // terrain plane (isTerrainGrounded — piece-slots roots the support graph
+  // there, and without one GROUND placement is refused building-wide). A
+  // bottom rung within a real storey of the plane IS that rung — snap it
+  // to 0: a slightly SUNK building (ladder[0] < −EPS) used to get no
+  // terrain storey at all, and a slightly RAISED one minted a degenerate
+  // sub-MIN_TERRAIN_SPAN sliver [0, base] that deriveStoreyLadder would
+  // have merged. Only a bottom rung a full storey up gets the [0, base]
+  // terrain storey prepended; basement ladders (bottom rung a storey or
+  // more DOWN) keep their own ground-level rung untouched.
+  if (ladder.length > 0 && Math.abs(ladder[0]!) > TERRAIN_EPS) {
+    if (ladder[0]! >= MIN_TERRAIN_SPAN) {
+      ladder.unshift(0)
+    } else if (
+      ladder[0]! > -MIN_TERRAIN_SPAN &&
+      (ladder.length < 2 || ladder[1]! > TERRAIN_EPS)
+    ) {
+      ladder[0] = 0
+    }
+  }
   _storeyY = ladder.length >= 2 ? ladder : null
 }
 

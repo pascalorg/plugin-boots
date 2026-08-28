@@ -49,10 +49,24 @@ export function isFullyDestroyed(target: {
  */
 export function captureDemolition(): number {
   const destroyed: DestroyedNode[] = []
+  // Roof shells enroll per PLANE under `<nodeId>#p<n>` member ids plus one
+  // `#residual` (destruction.ts roofGroups) — member ids exist in no scene
+  // store, so deleteNodes on them silently no-ops. Fold members back onto
+  // their GROUP node: it qualifies only when EVERY member is leveled.
+  const roofLeveled = new Map<string, boolean>()
   for (const target of useDestruction.getState().targets.values() as Iterable<VoxelTarget>) {
     if (target.nodeId.startsWith('__boots')) continue
+    const hash = target.nodeId.indexOf('#')
+    if (hash !== -1) {
+      const groupId = target.nodeId.slice(0, hash)
+      roofLeveled.set(groupId, (roofLeveled.get(groupId) ?? true) && isFullyDestroyed(target))
+      continue
+    }
     if (!isFullyDestroyed(target)) continue
     destroyed.push({ nodeId: target.nodeId, kind: target.kind === 'wall' ? 'wall' : 'volume' })
+  }
+  for (const [groupId, leveled] of roofLeveled) {
+    if (leveled) destroyed.push({ nodeId: groupId, kind: 'volume' })
   }
   useDemolition.getState().setDestroyed(destroyed)
   return destroyed.length

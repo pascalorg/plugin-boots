@@ -175,6 +175,17 @@ function hoverOutlineGeometry(piece: BuildPiece, span: number): BufferGeometry {
   return geometry
 }
 
+/** Session teardown (builder.tsx calls it next to resetStoreyLadder): the
+ * three caches above key on the raw float span — one family per building
+ * level height, unbounded across an editor run's Jump-ins. The fixed-size
+ * corner-marker singletons stay: they never grow. */
+export function disposeOverlayGeometryCaches(): void {
+  for (const cache of [fillCache, outlineCache, hoverOutlineCache]) {
+    for (const geometry of cache.values()) geometry.dispose()
+    cache.clear()
+  }
+}
+
 /** Corner-marker cube size — matches the pre-restyle 0.5 m marker. */
 const CORNER_MARKER = 0.5
 /** Marker float above its corner's patch height (pre-restyle convention). */

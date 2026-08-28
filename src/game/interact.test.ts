@@ -401,6 +401,24 @@ describe('aim-pick priority', () => {
     unmountInteract(states)
   })
 
+  test('DORMANT prebuilds do NOT stand operables down (still rendering, untouched)', () => {
+    const door = buildOperable('door-a', 'door', [1, 2.1, 0.06], [0, 1.05, -1])
+    const world = makeWorld({
+      doors: [{ built: door, nodeId: 'door-a', node: { doorType: 'hinged', openingKind: 'door' } }],
+    })
+    const states = mountInteract(world)
+    const origin = new Vector3(0, 1.05, 0.5)
+    const forward = new Vector3(0, 0, -1)
+    // Session-start prevoxelize builds a SLEEPING replica for every
+    // explodable (doors included) — the host keeps rendering and colliding,
+    // so E-interact must keep working until a first hit actually wakes it.
+    useDestruction.getState().targets.set('door-a', { dormant: true } as never)
+    expect(pickAimedOperable(states.values(), origin, forward)?.nodeId).toBe('door-a')
+    // Point-blank fallback from inside DOOR_FALLBACK_RANGE of the leaf.
+    expect(nearestDoorFallback(states.values(), new Vector3(0, 1.05, -0.2))?.nodeId).toBe('door-a')
+    unmountInteract(states)
+  })
+
   test('point-blank fallback: doors answer by proximity, windows/cabinets are aim-only', () => {
     const door = buildOperable('door-a', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
     const win = buildOperable('win-a', 'window', [1.2, 1.2, 0.1], [5, 1.5, 0])

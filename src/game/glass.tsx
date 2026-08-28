@@ -5,7 +5,7 @@ import { CanvasTexture, Color, Matrix4, type Mesh, Quaternion, Ray, Vector3 } fr
 import { create } from 'zustand'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
-import { hideForGame } from './session'
+import { getSession, hideForGame } from './session'
 import { bvhFor, type GameWorld, type GlassPane } from './world'
 
 /**
@@ -77,6 +77,12 @@ export function raycastGlass(
 const GLASS_COLOR = new Color('#bcd8e2')
 
 export function shatterPane(pane: GlassPane): void {
+  // A grenade's deferred glass waves (40/80 ms setTimeout in explodeAt) can
+  // outlive the session — Esc inside that window runs resetGlass first, and
+  // a late shatter would then mark the STILL-RENDERING pane in the fresh
+  // store (an unbreakable window all next session), spray shards into the
+  // cleared pool, and play the voice in the editor. No session → no-op.
+  if (!getSession()) return
   const state = useGlass.getState()
   if (state.shattered.has(pane.mesh)) return
   hideForGame(pane.mesh)

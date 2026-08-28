@@ -115,6 +115,22 @@ describe('prevoxelizeTick', () => {
     expect(done).toBe(true)
     expect(prevoxelizeTick(world, 8)).toBe(true) // idempotent once done
   })
+
+  test('placed items (__boots-item-*) never prebuild and never wedge completeness', () => {
+    const world = makeWorld()
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
+    expect(done).toBe(true)
+    // A placed item's GLB collider arrives MID-session (item-place.tsx
+    // swaps the shot proxy after async load) — item-place owns its whole
+    // voxel lifecycle, so the zero-budget completeness probe (warmup.tsx
+    // gates its background BVH drain on it) must stay true and no dormant
+    // target may be built for it.
+    world.colliders.push(boxCollider('__boots-item-7', 'item', [0.8, 0.8, 0.8], [8, 0.4, 2]))
+    expect(prevoxelizeTick(world, 0)).toBe(true)
+    expect(prevoxelizeTick(world, 8)).toBe(true)
+    expect(useDestruction.getState().targets.has('__boots-item-7')).toBe(false)
+  })
 })
 
 describe('skin-respecting carve (pierce fix)', () => {

@@ -109,7 +109,10 @@ export function PipelineWarmup({ world }: { world?: GameWorld } = {}) {
       const tail = colliders.length > 0 ? colliders[colliders.length - 1] : undefined
       if (tail === bvhSeenTail.current) return
       bvhDone.current = false
-      bvhCursor.current = Math.min(bvhCursor.current, colliders.length)
+      // Re-walk from 0: a same-length splice+push (proxy out, GLB in) can
+      // land NEW entries below a completed cursor, and bvhFor's WeakMap
+      // makes re-touching already-built entries nearly free.
+      bvhCursor.current = 0
     }
     if (!prevoxelizeTick(w, 0)) return
     const deadline = performance.now() + BVH_BUDGET_MS

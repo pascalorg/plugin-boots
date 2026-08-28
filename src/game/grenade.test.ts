@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Color, Matrix4, Mesh, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { clearDebris, debrisCensus, debrisDump } from './debris'
-import { resetDestruction, useDestruction } from './destruction'
+import { ensureVoxelTarget, resetDestruction, useDestruction } from './destruction'
 import { bots, resetBots, spawnBot } from './enemies-state'
 import {
   BLAST_RADIUS,
@@ -23,6 +23,7 @@ import {
   throwGrenade,
   throwVelocity,
   updateGrenades,
+  WAKE_AHEAD_FUSE,
 } from './grenade'
 import { playerRig } from './player'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -138,6 +139,30 @@ describe('throw gating', () => {
     const world = makeWorld()
     expect(grenadeApi.throw(world)).toBe(true)
     expect(liveGrenades()).toBe(1)
+  })
+})
+
+describe('wake-ahead (dormant invariant: no visual change before a hit)', () => {
+  test('the flight arc never wakes a dormant target; the fuse tail does, before the boom', () => {
+    // A big dormant slab under the whole arc — the stick is inside
+    // BLAST_RADIUS of its bounds from the moment it leaves the hand.
+    const slab = boxCollider('slab-1', 'slab', [6, 0.2, 6], [0, 0.1, -1])
+    const world = makeWorld([slab])
+    ensureVoxelTarget(world, 'slab-1', { dormant: true })
+    expect(useDestruction.getState().targets.get('slab-1')?.dormant).toBe(true)
+    // Aim slightly down so the stick lands and RESTS beside/on the slab
+    // (a level throw's post-bounce skid would carry it past the far edge).
+    playerRig.pitch = -0.5
+    expect(throwGrenade(world)).toBe(true)
+    // Whole flight + bounce + skid with the fuse still above the wake
+    // window: the host must keep rendering untouched (waking off the
+    // MOVING stick popped intact walls/roofs along the arc to voxels).
+    step(world, GRENADE_FUSE - WAKE_AHEAD_FUSE - 0.1)
+    expect(useDestruction.getState().targets.get('slab-1')?.dormant).toBe(true)
+    // Inside the final-second window: pre-woken BEFORE detonation.
+    step(world, 0.5)
+    expect(liveGrenades()).toBe(1) // fuse not spent yet
+    expect(useDestruction.getState().targets.get('slab-1')?.dormant).toBe(false)
   })
 })
 

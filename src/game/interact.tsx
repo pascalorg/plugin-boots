@@ -234,9 +234,14 @@ const _inverse = new Matrix4()
 
 /** Once gunfire voxelizes a node, destruction owns its colliders and its
  * mesh is hidden — the interact system must stand down (no prompt, no pose,
- * and NEVER re-enable colliders over the carved voxel grid). */
+ * and NEVER re-enable colliders over the carved voxel grid). DORMANT
+ * prebuilds don't count: prevoxelize builds a sleeping replica for every
+ * explodable (doors/windows/cabinets included) at session start while the
+ * host keeps rendering and colliding untouched — those stay operable until
+ * the first hit actually wakes the target. */
 function isVoxelized(nodeId: string): boolean {
-  return useDestruction.getState().targets.has(nodeId)
+  const target = useDestruction.getState().targets.get(nodeId)
+  return !!target && !target.dormant
 }
 
 function easeOutCubic(k: number): number {

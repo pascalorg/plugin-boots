@@ -1895,6 +1895,13 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
       targets.has(nodeId) ||
       prevoxelizeSkip.has(nodeId) ||
       roofGroups.has(nodeId) ||
+      // Placed catalog items run their OWN voxel lifecycle (item-place.tsx
+      // drops the target on every proxy→GLB swap and re-voxelizes on first
+      // hit) — never prebuild them, and never count them against
+      // completeness: warmup.tsx gates its background BVH drain on a
+      // ZERO-budget call of this function, and a target-less placed item
+      // arriving mid-session would wedge that gate false forever.
+      nodeId.startsWith(ITEM_NODE_PREFIX) ||
       !EXPLODABLE.has(collider.nodeType)
     ) {
       continue
@@ -1907,6 +1914,10 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
 
 /** Walls ensureVoxelTarget refused (degenerate) — skipped on later ticks. */
 const prevoxelizeSkip = new Set<string>()
+
+/** Collider nodeId prefix item-place.tsx gives placed items (kept in
+ * sync, the PLACED_PIECE_PREFIX convention). */
+const ITEM_NODE_PREFIX = '__boots-item-'
 
 /** Settle-drain key for a target's pending island check (structure.ts's
  * shared budgeted queue — see scheduleSettleTask). The logical 140 ms +

@@ -71,6 +71,10 @@ import type { GameWorld, GlassPane } from './world'
 export const GRENADE_COOLDOWN = 0.6
 export const GRENADE_FUSE = 2.5
 export const BLAST_RADIUS = 3.2
+/** Fuse seconds left under which wake-ahead runs — the stick is at rest by
+ * then (thrown sticks bounce and skid out within ~1.5 s of a 2.5 s fuse),
+ * so pre-wakes hit the real blast zone, not the flight arc. */
+export const WAKE_AHEAD_FUSE = 1.0
 /** Bots inside this radius take BLAST_BOT_DAMAGE and get flung. */
 const BOT_RADIUS = 6
 const BOT_DAMAGE = 120
@@ -521,15 +525,26 @@ export function updateGrenades(world: GameWorld, dt: number): void {
   if (cooldownLeft > 0) cooldownLeft = Math.max(0, cooldownLeft - dt)
   if (blastDebrisWindow > 0) blastDebrisWindow = Math.max(0, blastDebrisWindow - dt)
   // WAKE-AHEAD: while a stick cooks, wake ONE dormant target near it per
-  // frame — the ~2 s fuse is ~100+ frames, plenty for a whole mid-house
-  // blast zone, so detonation lands on already-awake targets and the boom
-  // frame pays repeat-blast prices (feature-detected like damageExplosion).
+  // frame, so detonation lands on already-awake targets and the boom frame
+  // pays repeat-blast prices (feature-detected like damageExplosion). Only
+  // in the fuse's FINAL second — the stick has come to rest by then, so the
+  // wakes trace the actual blast zone. Waking from the throw used the
+  // MOVING stick as center and popped every intact wall/roof/stair along
+  // the whole flight arc to voxel replicas with zero damage dealt (the
+  // dormant invariant: no visual change until the first hit). ~60 frames
+  // at one wake each still covers a mid-house blast (~15 nodes) several
+  // times over; anything left dormant rides the blast rings' own wakes.
   let wakeBudget = 1
   const wakeAhead = (destruct as { wakeAheadTick?: (w: GameWorld, c: Vector3, r: number) => boolean })
     .wakeAheadTick
   for (const g of pool) {
     if (!g.alive) continue
-    if (wakeBudget > 0 && typeof wakeAhead === 'function' && wakeAhead(world, g.pos, BLAST_RADIUS)) {
+    if (
+      g.fuse <= WAKE_AHEAD_FUSE &&
+      wakeBudget > 0 &&
+      typeof wakeAhead === 'function' &&
+      wakeAhead(world, g.pos, BLAST_RADIUS)
+    ) {
       wakeBudget--
     }
     g.fuse -= dt
