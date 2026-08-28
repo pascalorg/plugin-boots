@@ -16,7 +16,7 @@ import { bots, damageBot } from './enemies-state'
 import { perfEvent } from './perf-monitor'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
-import type { GameWorld } from './world'
+import type { GameWorld, GlassPane } from './world'
 
 /**
  * THE MEGA-GRENADE — G throws it, 2.5 s later a whole corner of the house
@@ -46,8 +46,14 @@ import type { GameWorld } from './world'
  *   updateGrenades(world,dt) the sim step the component drives; exported
  *                            for headless tests (throw → step → boom).
  *   explodeAt(world, center) detonation effects at a point (tests/E2E).
- *   resetGrenades()          clear pool + cooldown (session teardown; the
- *                            component does this on mount and unmount).
+ *   resetGrenades()          clear pool + cooldown + debris queue (session
+ *                            teardown; the component does this on mount and
+ *                            unmount).
+ *   queueDebris(...)         spawnDebris-shaped enqueue into the blast
+ *   drainDebrisQueue(max?)   debris ring; the component drains a fixed
+ *   blastDebrisActive()      budget per frame. destruction.ts routes its
+ *   debrisQueueSize()        segment-snap debris here while a blast window
+ *                            is open (boom-trim — see the queue block).
  *
  * ── Destruction routing ───────────────────────────────────────────────
  * Detonation routes through destruction.ts's damageExplosion(world,
@@ -135,6 +141,104 @@ export function liveGrenades(): number {
 export function resetGrenades(): void {
   for (const g of pool) g.alive = false
   cooldownLeft = 0
+  // Queued blast debris must never survive into the next Jump in.
+  debrisHead = 0
+  debrisLen = 0
+  blastDebrisWindow = 0
+}
+
+// --- Blast debris queue (boom-trim) -------------------------------------------
+// One blast's framing snaps shed ~600 debris chunks in the SAME frame (≤48
+// segments × ~12 spawnDebris calls each from destruction's damageSegment).
+// The burst still reads rich — the chunks just arrive over the next few
+// frames: while blastDebrisActive(), destruction routes segment-snap debris
+// through queueDebris() instead of spawnDebris(), and <Grenades/>'s useFrame
+// drains DEBRIS_DRAIN_PER_FRAME chunks per frame (same spread-the-cost idiom
+// as damageExplosion's staggered rings). Fixed ring, preallocated slots, zero
+// per-frame allocation; overflow past DEBRIS_QUEUE_CAP drops (nobody counts
+// past a couple hundred chunks inside a dust storm).
+
+/** Hard per-blast budget — the ring size IS the cap. */
+export const DEBRIS_QUEUE_CAP = 240
+/** Chunks spawned per drained frame (~3 frames to empty a full ring). */
+export const DEBRIS_DRAIN_PER_FRAME = 80
+/** Seconds after a boom during which segment debris queues — covers the
+ * 70 ms outer ring of destruction's staggered detonation with slack. */
+const BLAST_DEBRIS_WINDOW = 0.25
+
+type QueuedDebris = {
+  x: number
+  y: number
+  z: number
+  size: number
+  hex: number
+  speed: number
+  ttl: number
+}
+
+const debrisQueue: QueuedDebris[] = Array.from({ length: DEBRIS_QUEUE_CAP }, () => ({
+  x: 0,
+  y: 0,
+  z: 0,
+  size: 0,
+  hex: 0,
+  speed: 0,
+  ttl: 0,
+}))
+let debrisHead = 0
+let debrisLen = 0
+let blastDebrisWindow = 0
+const _drainColor = new Color()
+
+/** True just after a detonation — destruction.ts checks this to route
+ * segment-snap debris through the queue instead of spawning inline. */
+export function blastDebrisActive(): boolean {
+  return blastDebrisWindow > 0
+}
+
+/**
+ * spawnDebris-shaped enqueue (drop-in at the call site; the directional
+ * `dir` launch is NOT carried — sheet fly-offs keep their own inline path).
+ * Returns false when the per-blast budget is spent and the chunk dropped.
+ */
+export function queueDebris(
+  x: number,
+  y: number,
+  z: number,
+  size: number,
+  color: Color,
+  speed: number,
+  ttl = 2.6,
+): boolean {
+  if (debrisLen >= DEBRIS_QUEUE_CAP) return false
+  const slot = debrisQueue[(debrisHead + debrisLen) % DEBRIS_QUEUE_CAP]!
+  slot.x = x
+  slot.y = y
+  slot.z = z
+  slot.size = size
+  slot.hex = color.getHex()
+  slot.speed = speed
+  slot.ttl = ttl
+  debrisLen++
+  return true
+}
+
+/** Spawn up to `max` queued chunks — one frame's budget. Returns spawned. */
+export function drainDebrisQueue(max = DEBRIS_DRAIN_PER_FRAME): number {
+  let spawned = 0
+  while (debrisLen > 0 && spawned < max) {
+    const slot = debrisQueue[debrisHead]!
+    debrisHead = (debrisHead + 1) % DEBRIS_QUEUE_CAP
+    debrisLen--
+    spawnDebris(slot.x, slot.y, slot.z, slot.size, _drainColor.setHex(slot.hex), slot.speed, slot.ttl)
+    spawned++
+  }
+  return spawned
+}
+
+/** Chunks waiting in the ring (tests/debug). */
+export function debrisQueueSize(): number {
+  return debrisLen
 }
 
 /** Look direction × throw speed + loft — pure, exported for headless tests.
@@ -278,6 +382,9 @@ const SCRAP = new Color('#5d5a52')
  */
 export function explodeAt(world: GameWorld, center: Vector3): void {
   perfEvent('grenade-boom')
+  // Open the debris window FIRST — the segment snaps it governs land both
+  // on this frame (immediate carves) and 70 ms out (the outer ring).
+  blastDebrisWindow = BLAST_DEBRIS_WINDOW
   // Carve — feature-detect the phase-4 collapse export.
   const boom = (
     destruct as { damageExplosion?: (w: GameWorld, c: Vector3, r: number) => number }
@@ -285,10 +392,33 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   if (typeof boom === 'function') boom(world, center, BLAST_RADIUS)
   else fallbackCarve(world, center)
 
-  // Glass inside the blast shatters outright (shatterPane is idempotent).
+  // Glass inside the blast shatters (shatterPane is idempotent) — but each
+  // pane pays 26 shards + a store bump, so only a couple break on the boom
+  // frame; the rest ride 40/80 ms behind, the same staggered-ring idiom as
+  // damageExplosion (per-BLAST allocations only, never per frame).
+  const GLASS_NOW = 2
+  const GLASS_MID = 3
+  let glassHits = 0
+  let deferredPanes: GlassPane[] | null = null
   for (const pane of world.glass) {
-    if (pane.mesh.getWorldPosition(_paneCenter).distanceTo(center) <= BLAST_RADIUS) {
+    if (pane.mesh.getWorldPosition(_paneCenter).distanceTo(center) > BLAST_RADIUS) continue
+    if (glassHits < GLASS_NOW) {
       shatterPane(pane)
+    } else {
+      if (!deferredPanes) deferredPanes = []
+      deferredPanes.push(pane)
+    }
+    glassHits++
+  }
+  if (deferredPanes) {
+    const wave = deferredPanes
+    setTimeout(() => {
+      for (let i = 0; i < wave.length && i < GLASS_MID; i++) shatterPane(wave[i]!)
+    }, 40)
+    if (wave.length > GLASS_MID) {
+      setTimeout(() => {
+        for (let i = GLASS_MID; i < wave.length; i++) shatterPane(wave[i]!)
+      }, 80)
     }
   }
 
@@ -379,6 +509,7 @@ const _flightDir = new Vector3()
 export function updateGrenades(world: GameWorld, dt: number): void {
   lastWorld = world
   if (cooldownLeft > 0) cooldownLeft = Math.max(0, cooldownLeft - dt)
+  if (blastDebrisWindow > 0) blastDebrisWindow = Math.max(0, blastDebrisWindow - dt)
   for (const g of pool) {
     if (!g.alive) continue
     g.fuse -= dt
@@ -468,6 +599,8 @@ export function Grenades({ world }: { world: GameWorld }) {
   useFrame((_, rawDt) => {
     const dtRender = Math.min(rawDt, 1 / 30)
     updateGrenades(world, dtRender)
+    // Blast debris arrives over frames, not all at once — no-op when empty.
+    drainDebrisQueue()
     // HUD grenade-ready pip (change-gated on the HUD side, so per-frame is
     // free while the value holds). This component owns the drive — hud.ts
     // only renders.

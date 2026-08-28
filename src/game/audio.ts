@@ -147,6 +147,39 @@ function rr(): number {
   return RR_STEPS[rrIndex] ?? 1
 }
 
+/**
+ * Segment-snap voice governor (grenade boom-trim): full studSnap voices
+ * allowed per rolling window before the flood collapses. Pure window math,
+ * exported for tests; studSnap feeds it performance.now().
+ */
+export const SNAP_WINDOW_MS = 120
+export const SNAP_VOICE_CAP = 5
+let snapWindowStart = Number.NEGATIVE_INFINITY
+let snapWindowCount = 0
+
+/**
+ * One call per would-be snap voice: 'snap' voices the normal crack (calls
+ * 1..CAP of a window), 'crack' voices the single collapsed meaty crack
+ * (call CAP+1), 'skip' is silent (the rest of the window). A gap longer
+ * than SNAP_WINDOW_MS since the window OPENED starts a fresh window.
+ */
+export function snapVoiceGate(nowMs: number): 'snap' | 'crack' | 'skip' {
+  if (nowMs - snapWindowStart > SNAP_WINDOW_MS) {
+    snapWindowStart = nowMs
+    snapWindowCount = 0
+  }
+  snapWindowCount++
+  if (snapWindowCount <= SNAP_VOICE_CAP) return 'snap'
+  return snapWindowCount === SNAP_VOICE_CAP + 1 ? 'crack' : 'skip'
+}
+
+/** Test hook — clears the rolling window (module state survives across
+ * bun test files otherwise). */
+export function resetSnapVoiceGate(): void {
+  snapWindowStart = Number.NEGATIVE_INFINITY
+  snapWindowCount = 0
+}
+
 type BurstOpts = {
   duration: number
   gain: number
@@ -400,9 +433,33 @@ export const sfx = {
     burst({ duration: 0.03, gain: 0.12, freq: 1600 + Math.random() * 900, q: 2.5 }, 0.075)
   },
 
-  /** Sharp wood crack: hot burst + resonant body + trailing splinter ticks. */
+  /**
+   * Sharp wood crack: hot burst + resonant body + trailing splinter ticks.
+   * FLOOD-GATED (boom-trim 2026-08-27): a grenade snaps up to 48 framing
+   * segments in one burst and each snap calls this — the ear can't tell 48
+   * overlapping cracks from a handful, but the mixer pays ~5 node chains
+   * per voice. snapVoiceGate caps full voices per rolling window; the first
+   * call past the cap collapses into ONE meatier "whole bay letting go"
+   * crack, the rest of the window is silent. Single snaps (a rifle shot
+   * breaking one stud) always voice — the window only bites on floods.
+   */
   studSnap(): void {
+    const gate = snapVoiceGate(performance.now())
+    if (gate === 'skip') return
     const v = rr()
+    if (gate === 'crack') {
+      // The collapsed flood voice: hotter attack, doubled deeper body, a
+      // spray of splinter ticks — one voice standing in for dozens.
+      burst({ duration: 0.055, gain: 1, filterType: 'highpass', freq: 950 * v, q: 0.7 })
+      thump(140 * v, 0.14, 0.65)
+      thump(90 * v, 0.2, 0.45, 0.025)
+      let sprayAt = 0
+      for (let i = 0; i < 4; i++) {
+        sprayAt += 0.025 + Math.random() * 0.04
+        burst({ duration: 0.025, gain: 0.16, freq: 2000 + Math.random() * 2000, q: 3 }, sprayAt)
+      }
+      return
+    }
     burst({ duration: 0.04, gain: 0.85, filterType: 'highpass', freq: 1200 * v, q: 0.7 })
     thump(180 * v, 0.09, 0.5)
     const ticks = 2 + Math.floor(Math.random() * 2)

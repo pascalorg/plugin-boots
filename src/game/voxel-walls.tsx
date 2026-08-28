@@ -5,6 +5,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
   Color,
   DynamicDrawUsage,
+  type Group,
   type InstancedMesh,
   Matrix4,
   Quaternion,
@@ -53,6 +54,81 @@ import { type RoofToneRenderer, setRoofTextureRenderer } from './roof-planes'
  * member state change bumps `revision` OR just mutates hp/flags (both are
  * picked up — the checksum runs every frame).
  */
+
+// ── Dormant pre-mount + budgeted prime (perf 2026-08-27 night 3) ────────────
+// The 391 ms mass-wake fix. Dormant prebuilds used to be FILTERED out of the
+// render list, so the first mid-house grenade woke ~15 targets in one frame
+// and each wake mounted a fresh InstancedMesh + ran a full primeSkin inside
+// the blast frame. Now every target — dormant included — mounts its replica
+// at PREVOXELIZE time (already spread across session-start frames by the
+// Prevoxelize budget) but keeps it `visible = false` while the HOST still
+// renders; priming is spread further through this small queue at
+// DORMANT_PRIME_PER_FRAME per frame. A wake is then just a visibility flip
+// (plus an immediate prime for the rare target the queue hadn't reached).
+// No InstancedMesh creation, no primeSkin, no pipeline compile in the blast
+// frame — the material/geometry combo is identical to the awake walls
+// rendering from session start, so the GPU pipeline is warm too.
+
+/** One pending dormant prime. `primed` doubles as the unmount tombstone. */
+export type DormantPrimeEntry = { primed: boolean; prime: () => void }
+
+/** Dormant replica primes executed per frame (VoxelWalls' drain). */
+export const DORMANT_PRIME_PER_FRAME = 2
+
+const primeQueue: DormantPrimeEntry[] = []
+
+/** Enqueue a dormant replica's prime for the budgeted drain. */
+export function queueDormantPrime(entry: DormantPrimeEntry): void {
+  primeQueue.push(entry)
+}
+
+/** Prime immediately (wake path) — idempotent, tombstone-safe. */
+export function primeDormantNow(entry: DormantPrimeEntry): void {
+  if (entry.primed) return
+  entry.primed = true
+  entry.prime()
+}
+
+/** Run up to `budget` queued primes; returns how many actually primed.
+ * Tombstoned/woken entries drop for free (never counted against budget). */
+export function drainDormantPrimes(budget = DORMANT_PRIME_PER_FRAME): number {
+  let primed = 0
+  while (primeQueue.length > 0 && primed < budget) {
+    const entry = primeQueue.shift()!
+    if (entry.primed) continue
+    entry.primed = true
+    entry.prime()
+    primed++
+  }
+  return primed
+}
+
+/** Unprimed entries still waiting (tests + QA introspection). */
+export function dormantPrimeQueueSize(): number {
+  let n = 0
+  for (const entry of primeQueue) {
+    if (!entry.primed) n++
+  }
+  return n
+}
+
+/**
+ * Per-frame dormant sync for one wall replica — the WAKE-IS-A-VISIBILITY-
+ * FLIP contract, pure so tests can pin it: while the target is dormant the
+ * replica group stays hidden (the host renders); the frame the target's
+ * `dormant` flag drops, the group flips visible and the replica primes on
+ * the spot if the budgeted queue hadn't reached it yet. Returns awake.
+ */
+export function syncDormantWallFrame(
+  group: { visible: boolean },
+  wall: { dormant?: boolean },
+  entry: DormantPrimeEntry,
+): boolean {
+  const awake = wall.dormant !== true
+  if (group.visible !== awake) group.visible = awake
+  if (awake) primeDormantNow(entry)
+  return awake
+}
 
 const _matrix = new Matrix4()
 const _pos = new Vector3()
@@ -306,8 +382,10 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
 
 function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   const meshRef = useRef<InstancedMesh>(null!)
+  const groupRef = useRef<Group>(null!)
   const revision = useRef(-1)
   const skinRevision = useRef(0)
+  const primeEntry = useRef<DormantPrimeEntry>(null!)
   const sandwich = wall as SandwichTarget
   const boards = sandwich.boards
   // Until destruction-core lands `segments`, the studs render as the wood
@@ -318,15 +396,40 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   useLayoutEffect(() => {
     const mesh = meshRef.current
     mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    primeSkin(mesh, wall)
     mesh.frustumCulled = false
+    // Awake targets prime here, at mount, like always. DORMANT prebuilds
+    // stay hidden with identity matrices and prime through the budgeted
+    // queue (or on their wake, whichever comes first) — the mount itself is
+    // already spread across session-start frames by the Prevoxelize budget.
+    const entry: DormantPrimeEntry = {
+      primed: false,
+      prime: () => {
+        primeSkin(mesh, wall)
+        // primeSkin reads grid.alive directly, so removals queued while the
+        // prime waited are already baked in — sync counters, drop the queue.
+        revision.current = wall.revision
+        skinRevision.current = wall.skinRevision ?? 0
+        wall.removedQueue.length = 0
+      },
+    }
+    primeEntry.current = entry
     revision.current = wall.revision
     skinRevision.current = wall.skinRevision ?? 0
+    if (wall.dormant) queueDormantPrime(entry)
+    else primeDormantNow(entry)
+    return () => {
+      entry.primed = true // tombstone — the drain skips unmounted replicas
+    }
   }, [wall])
 
   useFrame(() => {
     const mesh = meshRef.current
-    if (!mesh) return
+    const group = groupRef.current
+    if (!mesh || !group) return
+    // Wake = visibility flip (+ an on-the-spot prime if the budgeted queue
+    // hadn't reached this target). While dormant nothing below can change:
+    // damage paths always wake first, so revision/skin drains wait here.
+    if (!syncDormantWallFrame(group, wall, primeEntry.current)) return
     if (revision.current !== wall.revision) {
       revision.current = wall.revision
       const queue = wall.removedQueue
@@ -344,7 +447,7 @@ function VoxelWallMesh({ wall }: { wall: VoxelTarget }) {
   })
 
   return (
-    <group userData={{ __boots: true }}>
+    <group ref={groupRef} userData={{ __boots: true }} visible={!wall.dormant}>
       <instancedMesh args={[undefined, undefined, wall.grid.count]} ref={meshRef}>
         <boxGeometry />
         <meshStandardMaterial roughness={0.92} />
@@ -382,14 +485,26 @@ export function VoxelWalls() {
   const gl = useThree((s) => s.gl)
   useEffect(() => {
     setRoofTextureRenderer(gl as unknown as RoofToneRenderer)
-    return () => setRoofTextureRenderer(null)
+    return () => {
+      setRoofTextureRenderer(null)
+      // Session exit: every entry is a tombstone by now (mesh unmounts
+      // ran first) — drop them so their mesh/grid closures free with the
+      // session instead of lingering until next session's first drains.
+      primeQueue.length = 0
+    }
   }, [gl])
   const walls = useMemo(() => {
     void version
-    // Dormant prebuilds stay invisible — the HOST still renders them; the
-    // wake bump() re-runs this memo and mounts the replicas.
-    return Array.from(useDestruction.getState().targets.values()).filter((t) => !t.dormant)
+    // DORMANT prebuilds mount too — hidden (`visible = false`) while the
+    // HOST keeps rendering — so a wake is a visibility flip on an already
+    // mounted, already primed replica instead of a blast-frame mount storm.
+    return Array.from(useDestruction.getState().targets.values())
   }, [version])
+  // Spread the dormant replicas' skin primes a couple per frame — an empty
+  // queue costs one length check.
+  useFrame(() => {
+    drainDormantPrimes()
+  })
   return (
     <>
       {walls.map((wall) => (

@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import { Box3, BoxGeometry, Color, Matrix4, Mesh, Vector3 } from 'three'
 import { useBoots } from '../store'
+import { clearDebris, debrisCensus, debrisDump } from './debris'
 import { resetDestruction, useDestruction } from './destruction'
 import { bots, resetBots, spawnBot } from './enemies-state'
 import {
   BLAST_RADIUS,
+  blastDebrisActive,
+  DEBRIS_DRAIN_PER_FRAME,
+  DEBRIS_QUEUE_CAP,
+  debrisQueueSize,
+  drainDebrisQueue,
   explodeAt,
   GRENADE_COOLDOWN,
   GRENADE_FUSE,
@@ -12,6 +18,7 @@ import {
   grenadeCooldownLeft,
   grenadeReady,
   liveGrenades,
+  queueDebris,
   resetGrenades,
   throwGrenade,
   throwVelocity,
@@ -202,5 +209,64 @@ describe('explodeAt fallback carve', () => {
 
   test('blast radius constant matches the contract', () => {
     expect(BLAST_RADIUS).toBeCloseTo(3.2, 5)
+  })
+})
+
+describe('blast debris queue (boom-trim)', () => {
+  const WOOD = new Color('#6b4f33')
+
+  test('enqueue caps at DEBRIS_QUEUE_CAP and reports drops', () => {
+    for (let i = 0; i < DEBRIS_QUEUE_CAP; i++) {
+      expect(queueDebris(i, 1, 2, 0.03, WOOD, 2, 0.9)).toBe(true)
+    }
+    expect(debrisQueueSize()).toBe(DEBRIS_QUEUE_CAP)
+    // Budget spent — overflow drops, size holds.
+    expect(queueDebris(0, 0, 0, 0.03, WOOD, 2)).toBe(false)
+    expect(debrisQueueSize()).toBe(DEBRIS_QUEUE_CAP)
+  })
+
+  test('drain spends a fixed per-frame budget, FIFO, until empty', () => {
+    clearDebris()
+    for (let i = 0; i < 200; i++) queueDebris(50 + i, 30, 0, 0.03, WOOD, 0, 0.9)
+    expect(drainDebrisQueue()).toBe(DEBRIS_DRAIN_PER_FRAME)
+    expect(debrisQueueSize()).toBe(200 - DEBRIS_DRAIN_PER_FRAME)
+    expect(drainDebrisQueue()).toBe(DEBRIS_DRAIN_PER_FRAME)
+    expect(drainDebrisQueue()).toBe(200 - 2 * DEBRIS_DRAIN_PER_FRAME)
+    expect(debrisQueueSize()).toBe(0)
+    expect(drainDebrisQueue()).toBe(0) // empty drain is a free no-op
+    // Every queued chunk actually reached the debris ring.
+    expect(debrisCensus().live).toBe(200)
+  })
+
+  test('drained chunks keep their queued position', () => {
+    clearDebris()
+    queueDebris(77, 41, -9, 0.05, WOOD, 0, 0)
+    expect(drainDebrisQueue()).toBe(1)
+    const dump = debrisDump()
+    expect(dump.length).toBe(1)
+    // spawnDebris jitters velocity, not the spawn point.
+    expect(dump[0]!.x).toBeCloseTo(77, 3)
+    expect(dump[0]!.y).toBeCloseTo(41, 3)
+    expect(dump[0]!.z).toBeCloseTo(-9, 3)
+  })
+
+  test('explodeAt opens the routing window; the sim ticks it shut', () => {
+    const world = makeWorld()
+    expect(blastDebrisActive()).toBe(false)
+    explodeAt(world, new Vector3(0, 1, 0))
+    expect(blastDebrisActive()).toBe(true)
+    step(world, 0.1) // 70 ms segment ring still inside the window
+    expect(blastDebrisActive()).toBe(true)
+    step(world, 0.2)
+    expect(blastDebrisActive()).toBe(false)
+  })
+
+  test('resetGrenades clears queued chunks and the window', () => {
+    queueDebris(0, 0, 0, 0.03, WOOD, 2)
+    explodeAt(makeWorld(), new Vector3(0, 1, 0))
+    resetGrenades()
+    expect(debrisQueueSize()).toBe(0)
+    expect(blastDebrisActive()).toBe(false)
+    expect(drainDebrisQueue()).toBe(0)
   })
 })

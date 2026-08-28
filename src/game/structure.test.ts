@@ -10,8 +10,13 @@ import {
 import { slotId } from './grid'
 import { onCollapse, registerPlacement, resetPieceSlots, setSceneSupportProbe } from './piece-slots'
 import {
+  cancelSettleTask,
+  drainSettleTasks,
   probeTargetSupport,
   runStructureTickNow,
+  scheduleSettleTask,
+  SETTLE_DRAIN_BUDGET,
+  settleTasksPending,
   STRUCTURE_TICK_MS,
   STRUCTURE_WAVE_MS,
   structurePendingWork,
@@ -130,6 +135,67 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 afterEach(() => {
   resetDestruction() // also resets structure.ts
   resetPieceSlots()
+})
+
+describe('shared settle drain (perf night 3 — the coalesced-batch fix)', () => {
+  test('a drain executes at most the budget per call; the rest stays queued', () => {
+    const ran: number[] = []
+    for (let i = 0; i < SETTLE_DRAIN_BUDGET * 2 + 1; i++) {
+      scheduleSettleTask(`test:${i}`, 0, () => ran.push(i))
+    }
+    // Everything is DUE, but one drain (≈ one frame) runs only the budget.
+    expect(drainSettleTasks(SETTLE_DRAIN_BUDGET, performance.now() + 1)).toBe(SETTLE_DRAIN_BUDGET)
+    expect(ran).toEqual([0, 1, 2])
+    expect(settleTasksPending('test:')).toBe(true) // deferred, never dropped
+    drainSettleTasks(SETTLE_DRAIN_BUDGET, performance.now() + 1)
+    drainSettleTasks(SETTLE_DRAIN_BUDGET, performance.now() + 1)
+    expect(ran.length).toBe(SETTLE_DRAIN_BUDGET * 2 + 1)
+    expect(settleTasksPending()).toBe(false)
+  })
+
+  test('a task not due yet stays queued — the logical stagger survives the budget', () => {
+    let ran = 0
+    scheduleSettleTask('test:later', 10_000, () => ran++)
+    expect(drainSettleTasks(SETTLE_DRAIN_BUDGET)).toBe(0)
+    expect(ran).toBe(0)
+    expect(settleTasksPending('test:later')).toBe(true)
+    // …until its due time passes (simulated clock — no real wait).
+    expect(drainSettleTasks(SETTLE_DRAIN_BUDGET, performance.now() + 10_001)).toBe(1)
+    expect(ran).toBe(1)
+  })
+
+  test("'replace' re-arms a key's delay; 'keep' preserves the first schedule; cancel forgets", () => {
+    let first = 0
+    let second = 0
+    scheduleSettleTask('test:key', 0, () => first++)
+    scheduleSettleTask('test:key', 10_000, () => second++) // replace: pushed out
+    expect(drainSettleTasks(8, performance.now() + 1)).toBe(0)
+    expect(drainSettleTasks(8, performance.now() + 10_001)).toBe(1)
+    expect(first).toBe(0)
+    expect(second).toBe(1)
+
+    scheduleSettleTask('test:keep', 0, () => first++)
+    scheduleSettleTask('test:keep', 10_000, () => second++, 'keep') // no-op
+    expect(drainSettleTasks(8, performance.now() + 1)).toBe(1)
+    expect(first).toBe(1)
+
+    scheduleSettleTask('test:gone', 0, () => first++)
+    cancelSettleTask('test:gone')
+    expect(drainSettleTasks(8, performance.now() + 1)).toBe(0)
+    expect(first).toBe(1)
+  })
+
+  test('the self-scheduling pump finishes over-budget work on its own (real timers)', async () => {
+    let ran = 0
+    const total = SETTLE_DRAIN_BUDGET * 3 // needs ≥ 3 pump passes
+    for (let i = 0; i < total; i++) {
+      scheduleSettleTask(`test:pump:${i}`, 0, () => ran++)
+    }
+    // Pump cadence is ~16 ms per budget-load; give it a comfortable window.
+    await sleep(200)
+    expect(ran).toBe(total)
+    expect(settleTasksPending()).toBe(false)
+  })
 })
 
 describe('probeTargetSupport — geometry', () => {

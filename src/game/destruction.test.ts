@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import {
+  collapseWholeTarget,
   damageExplosion,
   damageSegment,
   damageTarget,
@@ -11,6 +12,7 @@ import {
   savedCoatHex,
   useDestruction,
 } from './destruction'
+import { settleTasksPending } from './structure'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -408,6 +410,18 @@ describe('damageExplosion (grenade detonation carve)', () => {
     const targets = useDestruction.getState().targets
     expect(targets.has('wall-2')).toBe(false)
     expect(targets.has('crate-1')).toBe(false)
+  })
+})
+
+describe('island checks ride the shared settle drain (perf night 3)', () => {
+  test('a carve queues its island task; whole-target collapse cancels it', () => {
+    const world = makeWorld()
+    damageTarget(world, 'wall-1', new Vector3(0, 1.35, 0), 0.3)
+    // The logical 140 ms + jitter delay is queued, not an own setTimeout —
+    // the drain executes it budget-capped (structure.test.ts pins the cap).
+    expect(settleTasksPending('island:wall-1')).toBe(true)
+    collapseWholeTarget('wall-1')
+    expect(settleTasksPending('island:wall-1')).toBe(false)
   })
 })
 

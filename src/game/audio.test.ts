@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test'
-import { heartbeatBpm, lowHpSeverity, sfx } from './audio'
+import {
+  heartbeatBpm,
+  lowHpSeverity,
+  resetSnapVoiceGate,
+  sfx,
+  SNAP_VOICE_CAP,
+  SNAP_WINDOW_MS,
+  snapVoiceGate,
+} from './audio'
 
 /**
  * Headless contract tests — bun test has no `window`, so ensureContext()
@@ -75,5 +83,41 @@ describe('heartbeat mapping stays the single severity source', () => {
     expect(lowHpSeverity(0)).toBe(1)
     expect(heartbeatBpm(100)).toBe(70)
     expect(heartbeatBpm(0)).toBe(150)
+  })
+})
+
+describe('segment-snap voice governor (grenade boom-trim)', () => {
+  test('a blast flood voices CAP snaps, ONE collapsed crack, then silence', () => {
+    resetSnapVoiceGate()
+    // 48 snaps land within ~1 ms of each other on the segment-ring frame.
+    for (let i = 0; i < SNAP_VOICE_CAP; i++) {
+      expect(snapVoiceGate(1000 + i)).toBe('snap')
+    }
+    expect(snapVoiceGate(1000 + SNAP_VOICE_CAP)).toBe('crack')
+    for (let i = SNAP_VOICE_CAP + 1; i < 48; i++) {
+      expect(snapVoiceGate(1000 + i)).toBe('skip')
+    }
+  })
+
+  test('single snaps outside the window always voice (rifle-shot path)', () => {
+    resetSnapVoiceGate()
+    expect(snapVoiceGate(0)).toBe('snap')
+    expect(snapVoiceGate(SNAP_WINDOW_MS + 1)).toBe('snap') // fresh window
+    expect(snapVoiceGate(3 * SNAP_WINDOW_MS)).toBe('snap')
+  })
+
+  test('a saturated window reopens after SNAP_WINDOW_MS', () => {
+    resetSnapVoiceGate()
+    for (let i = 0; i < 48; i++) snapVoiceGate(500)
+    expect(snapVoiceGate(500 + SNAP_WINDOW_MS)).toBe('skip') // still inside
+    expect(snapVoiceGate(500 + SNAP_WINDOW_MS + 1)).toBe('snap')
+  })
+
+  test('studSnap flood is a silent no-op headless (never throws)', () => {
+    resetSnapVoiceGate()
+    expect(() => {
+      for (let i = 0; i < 60; i++) sfx.studSnap()
+    }).not.toThrow()
+    resetSnapVoiceGate() // leave no window for other test files
   })
 })

@@ -5,16 +5,19 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
+import { blastDebrisActive, queueDebris } from './grenade'
 import { perfEvent } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
 import { enumerateRoofPlanes, resolveRoofSkinTone, roofSurfaceColor } from './roof-planes'
 import { hideForGameKeepingRoots } from './session'
 import {
+  cancelSettleTask,
   dropStructureTarget,
   noteStructureCarve,
   registerStructureTarget,
   resetStructure,
+  scheduleSettleTask,
   wireStructureDriver,
 } from './structure'
 import {
@@ -271,8 +274,10 @@ export type VoxelTarget = {
   /** DORMANT prevoxelization (the grenade-lag fix): the grid + anatomy are
    * prebuilt off the blast frame, but the HOST keeps rendering and
    * colliding — no visual change until the first hit wakes the target
-   * (wakeTarget: hide host, hand colliders over, render replicas). Dormant
-   * targets are invisible to the voxel/segment raycasts and to the
+   * (wakeTarget: hide host, hand colliders over, flip the replica visible —
+   * voxel-walls.tsx pre-mounts + pre-primes dormant replicas HIDDEN, so a
+   * wake never mounts or primes anything in the blast frame). Dormant
+   * targets are invisible to the voxel/segment raycasts and hidden in the
    * renderer; damage paths wake them first. */
   dormant?: boolean
   /** Deferred hideHostNode arguments while dormant (plain targets). */
@@ -1662,9 +1667,11 @@ const dormantRoofHide = new Map<string, Mesh[]>()
 let sessionWorld: GameWorld | null = null
 
 /** Promote a dormant prebuild: hide the host meshes, hand the colliders
- * over, render the replicas — the exact work ensureVoxelTarget deferred.
- * Roof planes wake as a family (the host shell is ONE merged mesh).
- * Idempotent; no-op on awake targets. */
+ * over, and flip `dormant` — voxel-walls.tsx's replica is ALREADY mounted
+ * and primed (hidden), so the visual side of a wake is a per-frame
+ * visibility flip, never a mount (the 391 ms first-blast fix). Roof planes
+ * wake as a family (the host shell is ONE merged mesh). Idempotent; no-op
+ * on awake targets. */
 export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   if (!target.dormant) return
   const groupId = roofMemberOf.get(target.nodeId)
@@ -1736,7 +1743,11 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
 /** Walls ensureVoxelTarget refused (degenerate) — skipped on later ticks. */
 const prevoxelizeSkip = new Set<string>()
 
-const islandTimers = new Map<string, ReturnType<typeof setTimeout>>()
+/** Settle-drain key for a target's pending island check (structure.ts's
+ * shared budgeted queue — see scheduleSettleTask). The logical 140 ms +
+ * jitter stagger is unchanged; only EXECUTION is budget-capped per frame,
+ * so a mass-carve's island flood-fills can't all run in one macrotask. */
+const islandKey = (nodeId: string) => `island:${nodeId}`
 
 let settleJitterRr = 0
 /** B2 (perf 2026-08-27): round-robin 0–150 ms added to the fixed settle
@@ -2051,11 +2062,7 @@ export function collapseWholeTarget(nodeId: string): number {
   target.revision++
   useDestruction.getState().bump()
   // Nothing is left for a pending island pass to find.
-  const timer = islandTimers.get(nodeId)
-  if (timer !== undefined) {
-    clearTimeout(timer)
-    islandTimers.delete(nodeId)
-  }
+  cancelSettleTask(islandKey(nodeId))
   if (first >= 0) {
     spawnHaze(grid.centers[first * 3]!, grid.centers[first * 3 + 1]!, grid.centers[first * 3 + 2]!)
   }
@@ -2579,16 +2586,14 @@ function damageTargetOne(
   // volumes voice their own crunch here (avoids the two sounds layering).
   if (!layered) sfx.voxelCrunch(Math.min(1, removed.length / 12))
 
-  const prior = islandTimers.get(nodeId)
-  if (prior) clearTimeout(prior)
-  islandTimers.set(
-    nodeId,
-    setTimeout(() => {
-      islandTimers.delete(nodeId)
-      crumbleIslands(world, target)
-      settleSupportAfterRemoval(target) // island crumble can zero a piece
-    }, 140 + nextSettleJitter()),
-  )
+  // Island check through the shared settle drain (structure.ts): same
+  // 140 ms + jitter logical delay, 'replace' re-arms it per carve exactly
+  // like the old clearTimeout+setTimeout — but a blast's dozen checks now
+  // EXECUTE at most SETTLE_DRAIN_BUDGET per frame instead of coalescing.
+  scheduleSettleTask(islandKey(nodeId), 140 + nextSettleJitter(), () => {
+    crumbleIslands(world, target)
+    settleSupportAfterRemoval(target) // island crumble can zero a piece
+  })
   // Cladding all gone? The bare frame can't stand — skeleton snap.
   maybeSkeletonSnap(target)
   settleSupportAfterRemoval(target)
@@ -2758,19 +2763,15 @@ export const raycastStuds = raycastSegments
 // avalanche read), remaining sheets fly, remaining segments snap.
 
 const STRUCT_RATIO = 0.3
-const structTimers = new Map<string, ReturnType<typeof setTimeout>>()
+/** Settle-drain key of a wall's pending 30%-support check — rides the same
+ * budgeted queue as the island checks (see islandKey). */
+const framingKey = (nodeId: string) => `framing:${nodeId}`
 
 function scheduleStructureCheck(world: GameWorld, nodeId: string): void {
-  const prior = structTimers.get(nodeId)
-  if (prior) clearTimeout(prior)
-  structTimers.set(
-    nodeId,
-    setTimeout(() => {
-      structTimers.delete(nodeId)
-      const target = useDestruction.getState().targets.get(nodeId)
-      if (target) checkStructuralCollapse(world, target)
-    }, 160 + nextSettleJitter()),
-  )
+  scheduleSettleTask(framingKey(nodeId), 160 + nextSettleJitter(), () => {
+    const target = useDestruction.getState().targets.get(nodeId)
+    if (target) checkStructuralCollapse(world, target)
+  })
 }
 
 function breakSegmentQuiet(target: VoxelTarget, segment: SegmentMember): void {
@@ -3050,8 +3051,11 @@ export function damageSegment(
   const segment = target.segments.find((s) => s.id === segmentId)
   if (!segment || segment.broken) return false
   segment.hp -= damage
+  // Blast frames route snap debris through the grenade queue (capped +
+  // drained a budget per frame); single gunshot breaks keep the inline path.
+  const emit = blastDebrisActive() ? queueDebris : spawnDebris
   for (let i = 0; i < 4; i++) {
-    spawnDebris(point.x, point.y, point.z, 0.02 + Math.random() * 0.02, WOOD, 2, 0.9)
+    emit(point.x, point.y, point.z, 0.02 + Math.random() * 0.02, WOOD, 2, 0.9)
   }
   if (segment.hp > 0) {
     sfx.studHit()
@@ -3078,7 +3082,7 @@ export function damageSegment(
   const pieces = 2 + (Math.random() < 0.5 ? 1 : 0)
   for (let i = 0; i < pieces; i++) {
     const t = ((i + 0.5) / pieces - 0.5) * long
-    spawnDebris(
+    emit(
       segment.center[0] + ax * t,
       segment.center[1] + ay * t,
       segment.center[2] + az * t,
@@ -3089,7 +3093,7 @@ export function damageSegment(
     )
   }
   for (let i = 0; i < 6; i++) {
-    spawnDebris(point.x, point.y, point.z, 0.02 + Math.random() * 0.025, WOOD, 2.4, 1.2)
+    emit(point.x, point.y, point.z, 0.02 + Math.random() * 0.025, WOOD, 2.4, 1.2)
   }
   sfx.studSnap()
   // A break may drop hanging sticks or trip the 30%-support rule — check
@@ -3246,11 +3250,8 @@ export function dropTarget(nodeId: string): void {
     return
   }
   roofMemberOf.delete(nodeId)
-  const timer = islandTimers.get(nodeId)
-  if (timer !== undefined) {
-    clearTimeout(timer)
-    islandTimers.delete(nodeId)
-  }
+  cancelSettleTask(islandKey(nodeId))
+  cancelSettleTask(framingKey(nodeId))
   const state = useDestruction.getState()
   if (state.targets.delete(nodeId)) {
     state.bump()
@@ -3270,10 +3271,8 @@ export function resetDestruction(): void {
     clearTimeout(sceneSupportTimer)
     sceneSupportTimer = null
   }
-  for (const timer of islandTimers.values()) clearTimeout(timer)
-  islandTimers.clear()
-  for (const timer of structTimers.values()) clearTimeout(timer)
-  structTimers.clear()
+  // Island + framing settle tasks die with the whole drain in
+  // resetStructure() below (the queue is shared — see structure.ts).
   for (const timer of skeletonTimers) clearTimeout(timer)
   skeletonTimers.length = 0
   skeletonSnapped.clear()

@@ -172,6 +172,123 @@ export function probeTargetSupport(target: SupportTargetLike, ctx: SupportProbeC
   return false
 }
 
+// ── Shared settle drain (perf 2026-08-27 night 3) ───────────────────────────
+// The 267 ms coalesced-crumble fix. Island crumbles (destruction.ts), the
+// 30%-framing checks, and this module's own settle/cascade ticks used to be
+// INDEPENDENT setTimeouts. Behind one long frame (the first mid-house
+// grenade) every one of them expired simultaneously and the browser flushed
+// them in a single macrotask — a dozen flood-fills plus whole-target
+// crumbles inside one frame. This keyed queue keeps every LOGICAL delay (a
+// task not due yet stays queued, jitter stagger intact) but EXECUTES at
+// most SETTLE_DRAIN_BUDGET tasks per pump, with pumps one display frame
+// apart — so a full house of pending checks drains across ~10-15 frames.
+// It lives here rather than in destruction.ts because destruction already
+// imports this module and the reverse runtime import would cycle.
+
+/** Max settle tasks executed per pump (~one per frame). At 3 tasks per
+ * ~16 ms pump a 35-40 target house drains in 12-14 frames. */
+export const SETTLE_DRAIN_BUDGET = 3
+/** Pump cadence while due-but-over-budget work remains — one frame. */
+export const SETTLE_DRAIN_PUMP_MS = 16
+
+type SettleTask = { due: number; run: () => void }
+const settleQueue = new Map<string, SettleTask>()
+let settlePumpTimer: ReturnType<typeof setTimeout> | null = null
+let settlePumpDue = 0
+
+/**
+ * Queue `run` under `key` to execute `delayMs` from now, subject to the
+ * per-pump budget. 'replace' re-arms an existing key's delay (the classic
+ * clearTimeout-then-setTimeout idiom); 'keep' leaves an already-queued
+ * task untouched (the "if a timer is armed, return" idiom).
+ */
+export function scheduleSettleTask(
+  key: string,
+  delayMs: number,
+  run: () => void,
+  mode: 'replace' | 'keep' = 'replace',
+): void {
+  if (mode === 'keep' && settleQueue.has(key)) return
+  settleQueue.set(key, { due: now() + delayMs, run })
+  armSettlePump(delayMs)
+}
+
+/** Forget a queued task (no-op when absent). */
+export function cancelSettleTask(key: string): void {
+  settleQueue.delete(key)
+}
+
+/** True while any task under `prefix` (default: any at all) is queued. */
+export function settleTasksPending(prefix?: string): boolean {
+  if (prefix === undefined) return settleQueue.size > 0
+  for (const key of settleQueue.keys()) {
+    if (key.startsWith(prefix)) return true
+  }
+  return false
+}
+
+function armSettlePump(delayMs: number): void {
+  const due = now() + Math.max(0, delayMs)
+  if (settlePumpTimer !== null) {
+    if (due >= settlePumpDue) return // an earlier (or equal) pump covers it
+    clearTimeout(settlePumpTimer)
+  }
+  settlePumpDue = due
+  settlePumpTimer = setTimeout(pumpSettleTasks, Math.max(0, delayMs))
+}
+
+function pumpSettleTasks(): void {
+  settlePumpTimer = null
+  drainSettleTasks()
+  if (settleQueue.size === 0) return
+  // Work remains. Due-but-over-budget tasks → next pump one frame out;
+  // otherwise sleep until the earliest task comes due.
+  const t = now()
+  let next = Number.POSITIVE_INFINITY
+  for (const task of settleQueue.values()) {
+    if (task.due <= t) {
+      next = t + SETTLE_DRAIN_PUMP_MS
+      break
+    }
+    if (task.due < next) next = task.due
+  }
+  armSettlePump(next - t)
+}
+
+/**
+ * Execute up to `budget` due tasks; returns how many ran. Runtime work
+ * arrives through the self-scheduling pump above — the export is for
+ * deterministic tests. Due keys snapshot before running because a task may
+ * re-schedule itself or its neighbors mid-drain.
+ */
+export function drainSettleTasks(budget = SETTLE_DRAIN_BUDGET, t = now()): number {
+  if (settleQueue.size === 0) return 0
+  const dueKeys: string[] = []
+  for (const [key, task] of settleQueue) {
+    if (task.due > t) continue
+    dueKeys.push(key)
+    if (dueKeys.length >= budget) break
+  }
+  let ran = 0
+  for (const key of dueKeys) {
+    const task = settleQueue.get(key)
+    if (!task) continue // cancelled by an earlier task in this drain
+    settleQueue.delete(key)
+    task.run()
+    ran++
+  }
+  return ran
+}
+
+/** Drop every queued task + the pump (session teardown — resetStructure). */
+export function resetSettleDrain(): void {
+  settleQueue.clear()
+  if (settlePumpTimer !== null) {
+    clearTimeout(settlePumpTimer)
+    settlePumpTimer = null
+  }
+}
+
 // ── Session registry + cascade ticker (driver-injected, no runtime deps) ────
 
 /** What the ticker needs from destruction.ts — injected there at module
@@ -203,8 +320,10 @@ const entries = new Map<string, StructureEntry>()
 const dirty = new Set<string>()
 const lastCheck = new Map<string, number>()
 let lastWorld: WorldLike | null = null
-let tickTimer: ReturnType<typeof setTimeout> | null = null
-const waveTimers = new Set<ReturnType<typeof setTimeout>>()
+/** Settle-drain key of the (single) pending settle tick. */
+const STRUCTURE_TICK_KEY = 'structure:tick'
+/** Unique-key serial for cascade wave tasks (several can be in flight). */
+let waveSerial = 0
 
 const now: () => number =
   typeof performance !== 'undefined' ? () => performance.now() : () => Date.now()
@@ -299,11 +418,13 @@ export function noteStructureCarve(world: WorldLike, nodeId: string): void {
 }
 
 function scheduleTick(delayMs: number): void {
-  if (tickTimer !== null) return
-  tickTimer = setTimeout(() => {
-    tickTimer = null
-    runWave([...dirty], 0)
-  }, delayMs)
+  // 'keep' preserves an already-armed tick's delay — the exact semantics of
+  // the old "if (tickTimer !== null) return" guard, now budget-drained.
+  scheduleSettleTask(STRUCTURE_TICK_KEY, delayMs, structureTickTask, 'keep')
+}
+
+function structureTickTask(): void {
+  runWave([...dirty], 0)
 }
 
 /**
@@ -361,26 +482,22 @@ function runWave(candidates: readonly string[], wave: number): void {
     scheduleTick(STRUCTURE_TICK_MS)
     return
   }
-  const timer = setTimeout(() => {
-    waveTimers.delete(timer)
+  scheduleSettleTask(`structure:wave:${++waveSerial}`, STRUCTURE_WAVE_MS, () => {
     runWave(next, wave + 1)
-  }, STRUCTURE_WAVE_MS)
-  waveTimers.add(timer)
+  })
 }
 
 /** Run the settle tick NOW (deterministic tests) — wave 0 executes
- * synchronously; later waves still stagger on STRUCTURE_WAVE_MS timers. */
+ * synchronously; later waves still stagger through the settle drain on
+ * STRUCTURE_WAVE_MS delays. */
 export function runStructureTickNow(): void {
-  if (tickTimer !== null) {
-    clearTimeout(tickTimer)
-    tickTimer = null
-  }
+  cancelSettleTask(STRUCTURE_TICK_KEY)
   runWave([...dirty], 0)
 }
 
 /** True while a settle tick or a cascade wave is still scheduled. */
 export function structurePendingWork(): boolean {
-  return tickTimer !== null || waveTimers.size > 0 || dirty.size > 0
+  return dirty.size > 0 || settleTasksPending('structure:')
 }
 
 /** Forget one target (builder undo dropTarget). Dependents keep their dirty
@@ -391,14 +508,11 @@ export function dropStructureTarget(nodeId: string): void {
   lastCheck.delete(nodeId)
 }
 
-/** Session teardown — cancel timers, forget everything. */
+/** Session teardown — drop the WHOLE settle drain (island/framing tasks
+ * included: resetStructure only runs from resetDestruction), forget
+ * everything. */
 export function resetStructure(): void {
-  if (tickTimer !== null) {
-    clearTimeout(tickTimer)
-    tickTimer = null
-  }
-  for (const timer of waveTimers) clearTimeout(timer)
-  waveTimers.clear()
+  resetSettleDrain()
   entries.clear()
   dirty.clear()
   lastCheck.clear()
