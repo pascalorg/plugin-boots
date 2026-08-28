@@ -136,10 +136,14 @@ import { bvhFor, type GameWorld, ITEM_FAMILY_KINDS } from './world'
  *                             volume (≤ 1600 voxels).
  *                             `ensureVoxelWall` is a legacy alias.
  *   prevoxelizeTick(world, budgetMs?)   voxelize the scene's remaining
- *                             walls a few per tick (host meshes hide in the
- *                             SAME tick, via the ensureVoxelTarget path).
- *                             Returns true once every wall is done — drive
- *                             it from a useFrame until then.
+ *                             walls AND item-family nodes a few per tick,
+ *                             AWAKE (host meshes hide in the SAME tick, via
+ *                             the ensureVoxelTarget path — voxel-first:
+ *                             items read as voxels from session start and
+ *                             never morph on first hit); everything else a
+ *                             blast can reach prebuilds DORMANT. Returns
+ *                             true once every node is handled — drive it
+ *                             from a useFrame until then.
  *   damageTarget(world, nodeId, point, radius, direction?)   carve a sphere
  *                             at a world point (voxelizes on first hit);
  *                             direction aims the tear dust plume. Wall
@@ -804,6 +808,36 @@ const VOXEL_FILL_CEILING = 1600
 /** Item carve dust intensity cap — the 'concrete'-lite voice (see
  * damageTarget's porcelain note). */
 const ITEM_DUST_MAX = 0.55
+
+// ── Item carve debris (natural breakage, owner call 2026-08-28) ─────────────
+// An item must read as COMING APART, not as shedding wall crumbs: silhouette
+// cells are small (0.055–0.11 m), so the wall recipe (up to 10 pieces at
+// 0.6–1.1 × cell) reads as dust on a toilet. Item carves instead throw
+// FEWER, LARGER tumbling chunks — one per ~2–3 removed cells, capped — each
+// sampled from the exact cells the carve removed and wearing that cell's own
+// region color (cellTint), so a chrome faucet sheds chrome and the bowl
+// sheds porcelain.
+
+/** ~One tumbling chunk per this many removed cells… */
+export const ITEM_CHUNK_PER_CELLS = 2.5
+/** …capped per carve so a warhammer smash can't flood the debris ring. */
+export const ITEM_CHUNK_CAP = 14
+/** Chunk draw-size band in CELLS: 1.6–2.6 × the grid cell — ~2–3× the wall
+ * crumb band (0.6–1.1 × cell). Fewer, larger, heavier-reading pieces. */
+export const ITEM_CHUNK_SCALE_MIN = 1.6
+export const ITEM_CHUNK_SCALE_SPAN = 1.0
+
+/** Pure (exported for tests): how many chunks one item carve spawns. */
+export function itemChunkCount(removedCells: number): number {
+  if (removedCells <= 0) return 0
+  return Math.min(ITEM_CHUNK_CAP, Math.max(1, Math.round(removedCells / ITEM_CHUNK_PER_CELLS)))
+}
+
+/** Pure (exported for tests): one chunk's world size from the grid cell and
+ * a 0..1 roll — always inside the 1.6–2.6 × cell band. */
+export function itemChunkSize(cell: number, rand01: number): number {
+  return cell * (ITEM_CHUNK_SCALE_MIN + rand01 * ITEM_CHUNK_SCALE_SPAN)
+}
 
 const _itemSize = new Vector3()
 
@@ -1982,12 +2016,13 @@ const now: () => number =
   typeof performance !== 'undefined' ? () => performance.now() : () => Date.now()
 
 /**
- * Pre-clad the scene's walls in voxels a few per tick, so the building
- * already reads voxel at session start instead of walls flipping on first
- * hit. Every wall goes through ensureVoxelTarget — host meshes hide and
- * colliders hand over IN THE SAME TICK a wall voxelizes, never later.
- * Returns true once every wall in the snapshot has a target; drive it from
- * a per-frame loop until then (game-root's Prevoxelize does).
+ * Pre-clad the scene's walls — and, voxel-first, its item-family nodes —
+ * in voxels a few per tick, so the building already reads voxel at session
+ * start instead of anything flipping on first hit. Every awake node goes
+ * through ensureVoxelTarget — host meshes hide and colliders hand over IN
+ * THE SAME TICK it voxelizes, never later. Returns true once every node in
+ * the snapshot has a target; drive it from a per-frame loop until then
+ * (game-root's Prevoxelize does).
  */
 export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
   const deadline = now() + budgetMs
@@ -2006,8 +2041,16 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
   // mid-house built several BIG grids (BVH occupancy sweeps, segments,
   // sheets) inside the blast frame, the "big lag when grenades explode"
   // live report. Prebuilt DORMANT: the host keeps rendering/colliding
-  // untouched (no whole-house voxel look at spawn); the first hit wakes a
-  // target with the expensive part already done. Same budget, walls first.
+  // untouched; the first hit wakes a target with the expensive part already
+  // done. Same budget, walls first.
+  //
+  // VOXEL-FIRST ITEMS (owner call 2026-08-28): item-family nodes are the
+  // exception — they voxelize AWAKE, exactly like walls. The host GLB hides
+  // through the session ledger in the same tick and the silhouette replica
+  // (fine shape-tracing cells + per-cell region palette) renders FROM
+  // SESSION START — an item never morphs into voxels on its first hit, it
+  // just starts losing chunks. This also deletes the first-item-wake spike
+  // (62–68 ms live finding): there is no item wake left to pay for.
   for (const collider of world.colliders) {
     const nodeId = collider.nodeId
     if (
@@ -2029,7 +2072,10 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
       continue
     }
     if (now() >= deadline) return false
-    if (!ensureVoxelTarget(world, nodeId, { dormant: true })) prevoxelizeSkip.add(nodeId)
+    const awakeItem = ITEM_FAMILY_KINDS.has(collider.nodeType)
+    if (!ensureVoxelTarget(world, nodeId, awakeItem ? undefined : { dormant: true })) {
+      prevoxelizeSkip.add(nodeId)
+    }
   }
   return true
 }
@@ -2267,7 +2313,9 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
       target.grid.centers[idx * 3]!,
       target.grid.centers[idx * 3 + 1]!,
       target.grid.centers[idx * 3 + 2]!,
-      target.grid.cell,
+      // Items collapse in the same CHUNKY band their carves shed (natural
+      // breakage) — cell-size pieces read as dust at silhouette cells.
+      target.item ? itemChunkSize(target.grid.cell, Math.random()) : target.grid.cell,
       cellTint(target, idx),
       1.6,
     )
@@ -2355,7 +2403,8 @@ export function collapseWholeTarget(nodeId: string): number {
         grid.centers[idx * 3]!,
         grid.centers[idx * 3 + 1]!,
         grid.centers[idx * 3 + 2]!,
-        grid.cell,
+        // Item collapses shed the same chunky band as item carves.
+        target.item ? itemChunkSize(grid.cell, Math.random()) : grid.cell,
         cellTint(target, idx),
         1.6,
       )
@@ -2802,17 +2851,38 @@ function damageTargetOne(
   for (let i = 0; i < removed.length; i++) target.removedQueue.push(removed[i]!)
   target.revision++
   useDestruction.getState().bump()
-  const debrisCount = Math.min(removed.length, 10)
-  for (let i = 0; i < debrisCount; i++) {
-    const idx = removed[Math.floor(Math.random() * removed.length)]!
-    spawnDebris(
-      target.grid.centers[idx * 3]!,
-      target.grid.centers[idx * 3 + 1]!,
-      target.grid.centers[idx * 3 + 2]!,
-      target.grid.cell * (0.6 + Math.random() * 0.5),
-      cellTint(target, idx),
-      2.6,
-    )
+  if (target.item) {
+    // NATURAL BREAKAGE: chunky, material-true pieces — one per ~2–3 removed
+    // cells (capped), sampled EVENLY across the exact cells this carve took
+    // out so the chunks fly from the hole, each tinted by its own cell's
+    // region color. Slower launch + longer ttl than wall crumbs: big pieces
+    // tumble and settle instead of pinging away.
+    const chunks = itemChunkCount(removed.length)
+    for (let i = 0; i < chunks; i++) {
+      const idx = removed[Math.floor(((i + 0.5) * removed.length) / chunks)]!
+      spawnDebris(
+        target.grid.centers[idx * 3]!,
+        target.grid.centers[idx * 3 + 1]!,
+        target.grid.centers[idx * 3 + 2]!,
+        itemChunkSize(target.grid.cell, Math.random()),
+        cellTint(target, idx),
+        2.0,
+        3.2,
+      )
+    }
+  } else {
+    const debrisCount = Math.min(removed.length, 10)
+    for (let i = 0; i < debrisCount; i++) {
+      const idx = removed[Math.floor(Math.random() * removed.length)]!
+      spawnDebris(
+        target.grid.centers[idx * 3]!,
+        target.grid.centers[idx * 3 + 1]!,
+        target.grid.centers[idx * 3 + 2]!,
+        target.grid.cell * (0.6 + Math.random() * 0.5),
+        cellTint(target, idx),
+        2.6,
+      )
+    }
   }
   // Dust (single-emission policy: this module owns ALL wall carve dust —
   // shooting.ts is deliberately silent for walls). Drywall tears throw a

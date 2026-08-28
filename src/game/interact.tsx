@@ -233,13 +233,15 @@ const _aimRay = new Ray()
 const _localRay = new Ray()
 const _inverse = new Matrix4()
 
-/** Once gunfire voxelizes a node, destruction owns its colliders and its
+/** Once a node voxelizes AWAKE, destruction owns its colliders and its
  * mesh is hidden — the interact system must stand down (no prompt, no pose,
  * and NEVER re-enable colliders over the carved voxel grid). DORMANT
- * prebuilds don't count: prevoxelize builds a sleeping replica for every
- * explodable (doors/windows/cabinets included) at session start while the
- * host keeps rendering and colliding untouched — those stay operable until
- * the first hit actually wakes the target. */
+ * prebuilds don't count: prevoxelize builds a sleeping replica for doors,
+ * windows, slabs… at session start while the host keeps rendering and
+ * colliding untouched — those stay operable until the first hit actually
+ * wakes the target. ITEM-FAMILY operables (cabinets, cabinet-modules) are
+ * VOXEL-FIRST since 2026-08-28 — they voxelize awake at session start, so
+ * they stand down from frame one (a voxel replica has no doors to pose). */
 function isVoxelized(nodeId: string): boolean {
   const target = useDestruction.getState().targets.get(nodeId)
   return !!target && !target.dormant
