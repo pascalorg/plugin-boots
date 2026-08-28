@@ -80,7 +80,8 @@ function ResurrectionSweep() {
     const targets = useDestruction.getState().targets
     if (targets.size === 0) return
     const fence = collectSolidRoots()
-    for (const nodeId of targets.keys()) {
+    for (const [nodeId, target] of targets) {
+      if (target.dormant) continue // the host mesh is SUPPOSED to render
       const root = sceneRegistry.nodes.get(nodeId as never)
       if (!root) continue
       for (const mesh of collectMeshes(root, fence)) hideForGame(mesh)

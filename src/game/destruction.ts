@@ -268,6 +268,16 @@ export type VoxelTarget = {
    * a bump; paint coats re-apply on top via drainPaintTints (the paint
    * ledger's own serials never move). */
   skinRevision?: number
+  /** DORMANT prevoxelization (the grenade-lag fix): the grid + anatomy are
+   * prebuilt off the blast frame, but the HOST keeps rendering and
+   * colliding — no visual change until the first hit wakes the target
+   * (wakeTarget: hide host, hand colliders over, render replicas). Dormant
+   * targets are invisible to the voxel/segment raycasts and to the
+   * renderer; damage paths wake them first. */
+  dormant?: boolean
+  /** Deferred hideHostNode arguments while dormant (plain targets). */
+  hostMeshes?: Mesh[]
+  hostRoot?: Object3D
   /** True for roof nodes (Phase C): the target frames RAFTERS instead of
    * studs/joists, sheet fly-offs voice shingleRip, and torn shards wear the
    * shingle debris tone. */
@@ -1315,6 +1325,7 @@ function buildRoofPlaneTargets(
   nodeId: string,
   meshes: Mesh[],
   sources: VoxelSource[],
+  dormant?: boolean,
 ): VoxelTarget | null {
   const planes = enumerateRoofPlanes(meshes)
   if (planes.length === 0) return null
@@ -1384,8 +1395,14 @@ function buildRoofPlaneTargets(
   if (built.length === 0) return null
 
   // Every plane replica is ready — hide the merged host mesh ONCE, in the
-  // same tick, and hand the node's colliders over.
-  hideHostNode(world, nodeId, meshes)
+  // same tick, and hand the node's colliders over. Dormant prebuilds defer
+  // that hide to wakeTarget (group-wide: one map entry per roof node).
+  if (dormant) {
+    dormantRoofHide.set(nodeId, meshes)
+    for (const target of built) target.dormant = true
+  } else {
+    hideHostNode(world, nodeId, meshes)
+  }
   const state = useDestruction.getState()
   const ids: string[] = []
   for (const target of built) {
@@ -1424,10 +1441,18 @@ function buildRoofPlaneTargets(
  * (buildItemGrid — fine shape-preserving cells); every other node type
  * (doors, roofs…) becomes a plain adaptive volume capped at 1600 voxels.
  */
-export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget | null {
+export function ensureVoxelTarget(
+  world: GameWorld,
+  nodeId: string,
+  opts?: { dormant?: boolean },
+): VoxelTarget | null {
   const state = useDestruction.getState()
   const existing = state.targets.get(nodeId)
-  if (existing) return existing
+  if (existing) {
+    // An awake request (the default) promotes a dormant prebuild in place.
+    if (existing.dormant && !opts?.dormant) wakeTarget(world, existing)
+    return existing
+  }
   // A roof node that already decomposed into per-plane targets must never
   // rebuild from its (hidden, disabled) host meshes — hand back the first
   // live member instead.
@@ -1435,12 +1460,16 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   if (roofGroup) {
     for (const id of roofGroup) {
       const member = state.targets.get(id)
-      if (member) return member
+      if (member) {
+        if (member.dormant && !opts?.dormant) wakeTarget(world, member)
+        return member
+      }
     }
     return null
   }
 
   perfEvent('voxelize')
+  sessionWorld = world
   const wall = world.walls.get(nodeId)
   const meshes: Mesh[] = []
   let nodeType: string | null = null
@@ -1468,7 +1497,7 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   // thin plane-aligned target per slope — see buildRoofPlaneTargets. Flat
   // or degenerate shells return null here and keep the volume lane below.
   if (!wall && nodeType !== null && ROOF_KINDS.has(nodeType)) {
-    const primary = buildRoofPlaneTargets(world, nodeId, meshes, sources)
+    const primary = buildRoofPlaneTargets(world, nodeId, meshes, sources, opts?.dormant)
     if (primary) return primary
   }
 
@@ -1603,8 +1632,15 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
   }
 
   // Hide the host meshes + hand the colliders over (keep-aware — see
-  // hideHostNode for the hosted-children fencing rules).
-  hideHostNode(world, nodeId, meshes, wall?.root)
+  // hideHostNode for the hosted-children fencing rules). Dormant prebuilds
+  // defer the hide to wakeTarget — the host keeps rendering AND colliding.
+  if (opts?.dormant) {
+    target.dormant = true
+    target.hostMeshes = meshes
+    target.hostRoot = wall?.root
+  } else {
+    hideHostNode(world, nodeId, meshes, wall?.root)
+  }
 
   state.targets.set(nodeId, target)
   state.bump()
@@ -1616,6 +1652,40 @@ export function ensureVoxelTarget(world: GameWorld, nodeId: string): VoxelTarget
 
 /** Legacy alias — works for any node kind now, not just walls. */
 export const ensureVoxelWall = ensureVoxelTarget
+
+/** Deferred hideHostNode meshes for DORMANT roof groups (keyed by the real
+ * roof node id — one hide for the whole plane family). */
+const dormantRoofHide = new Map<string, Mesh[]>()
+
+/** The session's world, stamped by every voxelize — wakeTarget's fallback
+ * for callers without a world in hand (structure crumbles). */
+let sessionWorld: GameWorld | null = null
+
+/** Promote a dormant prebuild: hide the host meshes, hand the colliders
+ * over, render the replicas — the exact work ensureVoxelTarget deferred.
+ * Roof planes wake as a family (the host shell is ONE merged mesh).
+ * Idempotent; no-op on awake targets. */
+export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
+  if (!target.dormant) return
+  const groupId = roofMemberOf.get(target.nodeId)
+  if (groupId !== undefined) {
+    const meshes = dormantRoofHide.get(groupId)
+    dormantRoofHide.delete(groupId)
+    if (meshes) hideHostNode(world, groupId, meshes)
+    const state = useDestruction.getState()
+    for (const id of roofGroups.get(groupId) ?? []) {
+      const member = state.targets.get(id)
+      if (member) member.dormant = false
+    }
+    state.bump()
+    return
+  }
+  hideHostNode(world, target.nodeId, target.hostMeshes ?? [], target.hostRoot)
+  target.dormant = false
+  target.hostMeshes = undefined
+  target.hostRoot = undefined
+  useDestruction.getState().bump()
+}
 
 const now: () => number =
   typeof performance !== 'undefined' ? () => performance.now() : () => Date.now()
@@ -1639,6 +1709,26 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
       // so don't let it wedge the driver in a forever-false loop.
       prevoxelizeSkip.add(nodeId)
     }
+  }
+  // Then EVERYTHING else a blast can reach (slabs, ceilings, roofs, items,
+  // fixtures): first hits used to voxelize these synchronously — a grenade
+  // mid-house built several BIG grids (BVH occupancy sweeps, segments,
+  // sheets) inside the blast frame, the "big lag when grenades explode"
+  // live report. Prebuilt DORMANT: the host keeps rendering/colliding
+  // untouched (no whole-house voxel look at spawn); the first hit wakes a
+  // target with the expensive part already done. Same budget, walls first.
+  for (const collider of world.colliders) {
+    const nodeId = collider.nodeId
+    if (
+      targets.has(nodeId) ||
+      prevoxelizeSkip.has(nodeId) ||
+      roofGroups.has(nodeId) ||
+      !EXPLODABLE.has(collider.nodeType)
+    ) {
+      continue
+    }
+    if (now() >= deadline) return false
+    if (!ensureVoxelTarget(world, nodeId, { dormant: true })) prevoxelizeSkip.add(nodeId)
   }
   return true
 }
@@ -1929,6 +2019,11 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
 export function collapseWholeTarget(nodeId: string): number {
   const target = useDestruction.getState().targets.get(nodeId)
   if (!target || target.grid.aliveCount === 0) return 0
+  // A structure cascade can crumble a still-DORMANT prebuild (support shot
+  // out from under a wall the blast never touched) — wake it first or the
+  // host mesh keeps floating over the falling voxels. sessionWorld is the
+  // world every voxelize call stamped (cleared on resetDestruction).
+  if (target.dormant && sessionWorld) wakeTarget(sessionWorld, target)
   const { grid } = target
   const total = grid.aliveCount
   const debrisChance = Math.min(1, CRUMBLE_DEBRIS_CAP / total)
@@ -2312,10 +2407,14 @@ export function damageTarget(
     const targets = useDestruction.getState().targets
     for (const id of group) {
       const member = targets.get(id)
-      if (member) total += damageTargetOne(world, member, point, radius, direction)
+      if (member) {
+        if (member.dormant) wakeTarget(world, member) // wakes the family
+        total += damageTargetOne(world, member, point, radius, direction)
+      }
     }
     return total
   }
+  if (target.dormant) wakeTarget(world, target)
   let total = damageTargetOne(world, target, point, radius, direction)
   // COINCIDENT LAYERS (the "undestroyable wall" live report): room-drawn
   // houses ship one wall per ROOM side, so shared boundaries are TWO
@@ -2329,7 +2428,12 @@ export function damageTarget(
   // coincident layer. Pristine far walls stay untouched (voxelizing on a
   // miss would be wasted work; they enroll when a shot actually reaches
   // them through the hole).
-  if (total > 0 && target.kind !== 'volume') {
+  // BULLET-CLASS ONLY (radius under the pierce gate): the twin problem IS
+  // the pierce gate, and explosion rings already sweep every collider in
+  // range — fanning them re-carved the whole house per ring node, O(N²)
+  // on a mid-house grenade (the "big lag when grenades explode" live
+  // report, one day after this fan-out shipped).
+  if (total > 0 && radius < WALL_PIERCE_RADIUS && target.kind !== 'volume') {
     for (const other of useDestruction.getState().targets.values()) {
       if (other === target || other.kind === 'volume') continue
       // Interpenetration test, not sphere reach: duplicates share the very
@@ -2338,6 +2442,7 @@ export function damageTarget(
       // sphere at a joint must not chew the neighbor through the fan-out
       // (locality there stays the per-target carve's job).
       if (!gridContainsPoint(other.grid, point.x, point.y, point.z)) continue
+      if (other.dormant) wakeTarget(world, other)
       total += damageTargetOne(world, other, point, radius, direction)
     }
   }
@@ -2581,6 +2686,7 @@ export function raycastSegments(
   let bestNode: string | null = null
   let bestSegment = -1
   for (const target of useDestruction.getState().targets.values()) {
+    if (target.dormant) continue // framing hides behind the live host mesh
     for (const segment of target.segments) {
       if (segment.broken) continue
       const t = segment.pitch
@@ -2893,6 +2999,7 @@ function explosionSegments(world: GameWorld, center: Vector3, radius: number): v
   const radiusSq = radius * radius
   let snapped = 0
   outer: for (const target of useDestruction.getState().targets.values()) {
+    if (target.dormant) continue // the blast rings wake what they reach
     for (const segment of target.segments) {
       if (segment.broken) continue
       _boomSeg.set(segment.center[0], segment.center[1], segment.center[2])
@@ -3006,6 +3113,7 @@ export function raycastVoxelTargets(
 ): TargetRayHit | null {
   let best: TargetRayHit | null = null
   for (const target of useDestruction.getState().targets.values()) {
+    if (target.dormant) continue // the host mesh still owns rays/collision
     const hit = raycastVoxels(
       target.grid,
       origin.x,
@@ -3156,6 +3264,8 @@ export function dropTarget(nodeId: string): void {
 }
 
 export function resetDestruction(): void {
+  sessionWorld = null
+  dormantRoofHide.clear()
   if (sceneSupportTimer !== null) {
     clearTimeout(sceneSupportTimer)
     sceneSupportTimer = null

@@ -386,7 +386,9 @@ export function VoxelWalls() {
   }, [gl])
   const walls = useMemo(() => {
     void version
-    return Array.from(useDestruction.getState().targets.values())
+    // Dormant prebuilds stay invisible — the HOST still renders them; the
+    // wake bump() re-runs this memo and mounts the replicas.
+    return Array.from(useDestruction.getState().targets.values()).filter((t) => !t.dormant)
   }, [version])
   return (
     <>

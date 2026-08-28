@@ -88,8 +88,13 @@ describe('prevoxelizeTick', () => {
     const targets = useDestruction.getState().targets
     expect(targets.get('wall-1')?.kind).toBe('wall')
     expect(targets.get('wall-2')?.kind).toBe('wall')
-    expect(targets.has('crate-1')).toBe(false)
-    // Host handover happened in the same path as first-hit voxelization.
+    // Walls wake instantly (the bricks-from-the-start look); everything
+    // else a blast can reach is PREBUILT DORMANT — grid ready, host mesh
+    // still rendering and colliding until the first hit wakes it (the
+    // grenade-lag fix: no big grids built inside the blast frame).
+    expect(targets.get('wall-1')?.dormant).toBeFalsy()
+    expect(targets.get('crate-1')?.dormant).toBe(true)
+    // Host handover happened for WALLS only; dormant prebuilds keep theirs.
     for (const collider of world.colliders) {
       expect(Boolean(collider.disabled)).toBe(collider.nodeType === 'wall')
     }
