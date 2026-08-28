@@ -1,8 +1,9 @@
 import { type AnyNode, type AnyNodeId, nodeRegistry, useScene } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
-import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, type WallPocket } from './builder'
-import { classifyRoofShape, CORNER_RISE, type RoofCorners } from './roof-corners'
+import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, WALL_H, type WallPocket } from './builder'
+import { classifyRoofShape, type RoofCorners } from './roof-corners'
+import { collectStackedLevels, type StackedLevel } from './world'
 
 /**
  * The bridge back to the editor: after a session, Keep converts the pieces
@@ -67,6 +68,21 @@ import { classifyRoofShape, CORNER_RISE, type RoofCorners } from './roof-corners
  * registry kind or a schema-parse failure counts the piece as skipped so
  * it stays game-only — the attempt never throws past keepPlaced.
  *
+ * ── ADAPTIVE STOREYS ───────────────────────────────────────────────────────
+ * Every piece carries its storey span (PlacedPiece.height; legacy 2.8) and
+ * the kept nodes conform: wall height = span·rows/3, shed pitch =
+ * atan2(span, 3), flat-cap terrace at base + span, window pockets center on
+ * span/2 with span/3-tall cells.
+ * LEVEL PARENTING: a piece whose base elevation sits ON a level's stacked
+ * base (grid ladder rung = level base by construction) parents to THAT
+ * level — the pre-ladder code always used the viewer's selected level, so a
+ * storey-1 wall kept from the ground-floor selection rendered at ground
+ * elevation (wall nodes carry no Y of their own — the latent bug the
+ * storey-coupling investigation flagged). Y-carrying nodes (slab elevation,
+ * roof-segment position) are written LEVEL-LOCAL against the parent's
+ * stacked base. Terrain and extended-sky storeys match no level and fall
+ * back to the selection level, exactly the old behavior.
+ *
  * Discard forgets everything.
  */
 
@@ -107,18 +123,24 @@ function safeDefaults(def: RegistryDef): Record<string, unknown> {
  * Wall-local frame: origin at the wall START, X along the wall, so the
  * pocket at column c sits at (c + 0.5) cell widths along the (untrimmed)
  * 3 m span; position[1] is the child's center height (the host renders
- * child boxes centered). */
-function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number): boolean {
+ * child boxes centered). `span` is the wall's storey span — windows center
+ * on it and size to its cells. */
+function createPocketNode(
+  pocket: WallPocket,
+  wallId: string,
+  pocketCol: number,
+  span: number,
+): boolean {
   const def = nodeRegistry.get(pocket) as RegistryDef | undefined
   if (!def?.schema) return false
   const cellW = PIECE_DIMS.wall[0] / CELLS
-  const cellH = PIECE_DIMS.wall[1] / CELLS
+  const cellH = span / CELLS
   const defaults = safeDefaults(def)
   const doorHeight =
     typeof (defaults as { height?: unknown }).height === 'number'
       ? ((defaults as { height: number }).height as number)
       : 2
-  const centerY = pocket === 'window' ? PIECE_DIMS.wall[1] / 2 : doorHeight / 2
+  const centerY = pocket === 'window' ? span / 2 : doorHeight / 2
   try {
     const node = def.schema.parse({
       ...defaults,
@@ -153,20 +175,28 @@ function createPocketNode(pocket: WallPocket, wallId: string, pocketCol: number)
 function createRoofNode(
   piece: PlacedPiece,
   levelId: string,
-  shedParent: () => string,
+  baseY: number,
+  span: number,
+  shedParent: (levelId: string) => string,
 ): { ok: boolean; exact: boolean } {
   const corners = piece.corners as RoofCorners | undefined
   if (corners) {
     const shape = classifyRoofShape(corners)
     if (shape.kind === 'flat') {
-      const elevation = piece.position[1] + (shape.high ? CORNER_RISE : 0)
+      const elevation = baseY + (shape.high ? span : 0)
       return { ok: createSlabNode(piece, levelId, elevation), exact: true }
     }
     const quarter = shape.kind === 'saddle' ? 0 : shape.quarter
-    const ok = createShedNode(piece, shedParent(), piece.yaw + (quarter * Math.PI) / 2)
+    const ok = createShedNode(
+      piece,
+      shedParent(levelId),
+      baseY,
+      span,
+      piece.yaw + (quarter * Math.PI) / 2,
+    )
     return { ok, exact: shape.kind === 'slope' }
   }
-  return { ok: createShedNode(piece, shedParent(), piece.yaw), exact: true }
+  return { ok: createShedNode(piece, shedParent(levelId), baseY, span, piece.yaw), exact: true }
 }
 
 /** The host's roof system only BUILDS geometry for 'roof-segment' children
@@ -196,12 +226,20 @@ function createRoofParentNode(levelId: string): string | null {
   }
 }
 
-/** The classic shed 'roof-segment' attempt (3 m plan run rising WALL_H). */
-function createShedNode(piece: PlacedPiece, parentId: string, rotation: number): boolean {
+/** The classic shed 'roof-segment' attempt: a 3 m plan run rising the
+ * piece's own storey span (`span`; legacy WALL_H). `baseY` is the node's
+ * PARENT-LOCAL base elevation. */
+function createShedNode(
+  piece: PlacedPiece,
+  parentId: string,
+  baseY: number,
+  span: number,
+  rotation: number,
+): boolean {
   const def = nodeRegistry.get('roof-segment') as RegistryDef | undefined
   if (!def?.schema) return false
-  const run = PIECE_DIMS.wall[0] // roofs rise WALL_H over a 3 m plan run
-  const pitchDeg = (Math.atan2(PIECE_DIMS.wall[1], run) * 180) / Math.PI
+  const run = PIECE_DIMS.wall[0] // roofs rise one storey span over a 3 m plan run
+  const pitchDeg = (Math.atan2(span, run) * 180) / Math.PI
   try {
     const segment = def.schema.parse({
       ...safeDefaults(def),
@@ -209,7 +247,7 @@ function createShedNode(piece: PlacedPiece, parentId: string, rotation: number):
       parentId,
       visible: true,
       metadata: {},
-      position: [piece.position[0], piece.position[1], piece.position[2]],
+      position: [piece.position[0], baseY, piece.position[2]],
       rotation,
       roofType: 'shed',
       width: run,
@@ -229,9 +267,10 @@ function createShedNode(piece: PlacedPiece, parentId: string, rotation: number):
  * the piece's square footprint in world XZ (slab polygons are [x, z]
  * pairs, same plane convention as wall start/end), rotated by the piece
  * yaw about its center — a no-op for the square v2 slots (yaw snaps to
- * 90°) but correct for any legacy pose. Missing kind / schema throw →
- * false, and the caller counts the piece as skipped. */
-function createSlabNode(piece: PlacedPiece, levelId: string, elevation?: number): boolean {
+ * 90°) but correct for any legacy pose. `elevation` is PARENT-LEVEL-LOCAL.
+ * Missing kind / schema throw → false, and the caller counts the piece as
+ * skipped. */
+function createSlabNode(piece: PlacedPiece, levelId: string, elevation: number): boolean {
   const def = nodeRegistry.get('slab') as RegistryDef | undefined
   if (!def?.schema) return false
   const hx = PIECE_DIMS.floor[0] / 2
@@ -253,7 +292,7 @@ function createSlabNode(piece: PlacedPiece, levelId: string, elevation?: number)
       metadata: {},
       polygon: [corner(-hx, -hz), corner(hx, -hz), corner(hx, hz), corner(-hx, hz)],
       holes: [],
-      elevation: elevation ?? piece.position[1],
+      elevation,
       autoFromWalls: false,
     })
     useScene.getState().createNode(slab as AnyNode, levelId as AnyNodeId)
@@ -263,26 +302,62 @@ function createSlabNode(piece: PlacedPiece, levelId: string, elevation?: number)
   }
 }
 
+/** A piece base within this of a level's stacked base parents to that level
+ * — pieces sit EXACTLY on ladder rungs (which ARE the level bases), so the
+ * tolerance only absorbs matrixWorld float folding across two snap reads. */
+const LEVEL_MATCH_EPS = 0.05
+
+/** The level whose stacked base the piece's base elevation sits on, or
+ * null for terrain / extended-sky / legacy-uniform storeys (the caller
+ * falls back to the selection level). Levels are meters apart, so the
+ * first match is the match. */
+function levelForBaseY(levels: readonly StackedLevel[], baseY: number): StackedLevel | null {
+  for (const level of levels) {
+    if (Math.abs(level.y - baseY) <= LEVEL_MATCH_EPS) return level
+  }
+  return null
+}
+
 export function keepPlaced(): KeepResult {
   const placed = useBoots.getState().placed
   const def = nodeRegistry.get('wall') as RegistryDef | undefined
-  const levelId = useViewer.getState().selection.levelId
+  const selectionLevelId = useViewer.getState().selection.levelId
   const result: KeepResult = { kept: 0, skipped: 0, windows: 0, doors: 0, roofs: 0, floors: 0 }
-  if (!def?.schema || !levelId) {
+  if (!def?.schema || !selectionLevelId) {
     useBoots.getState().resolvePlaced()
     return { ...result, skipped: placed.length }
   }
-  // One 'roof' container per save, minted lazily on the first shed attempt
-  // (see createRoofParentNode) — flat caps and roofless saves never mint it.
-  let roofParent: string | null | undefined
-  const shedParent = () => {
-    if (roofParent === undefined) roofParent = createRoofParentNode(levelId)
-    return roofParent ?? levelId
+  // Stacked level bases for the storey → level mapping. Read through the
+  // host's snap util (the editor may sit exploded/solo again by Keep time —
+  // piece positions are STACKED world coordinates from the session).
+  const levels = collectStackedLevels()
+  const selectionBase = levels.find((level) => level.id === selectionLevelId)?.y ?? 0
+  // One 'roof' container per PARENT LEVEL per save, minted lazily on the
+  // first shed attempt (see createRoofParentNode) — flat caps and roofless
+  // saves never mint one.
+  const roofParents = new Map<string, string | null>()
+  const shedParent = (parentLevelId: string): string => {
+    let minted = roofParents.get(parentLevelId)
+    if (minted === undefined) {
+      minted = createRoofParentNode(parentLevelId)
+      roofParents.set(parentLevelId, minted)
+    }
+    return minted ?? parentLevelId
   }
   for (const piece of placed) {
+    // ADAPTIVE STOREYS: the piece's own span, and the level its storey maps
+    // to (base elevation = ladder rung = level base). Y-carrying payloads
+    // are written LEVEL-LOCAL against the parent's stacked base.
+    const pieceSpan = piece.height ?? WALL_H
+    const level = levelForBaseY(levels, piece.position[1])
+    const parentLevelId = level?.id ?? selectionLevelId
+    const parentBase = level?.y ?? selectionBase
+    const localBaseY = piece.position[1] - parentBase
     if (piece.piece === 'stairs' || piece.piece === 'roof') {
       const made =
-        (piece.mask & FULL_MASK) !== 0 ? createRoofNode(piece, levelId, shedParent) : null
+        (piece.mask & FULL_MASK) !== 0
+          ? createRoofNode(piece, parentLevelId, localBaseY, pieceSpan, shedParent)
+          : null
       if (made?.ok) {
         result.kept++
         result.roofs++
@@ -293,7 +368,7 @@ export function keepPlaced(): KeepResult {
       continue
     }
     if (piece.piece === 'floor') {
-      if ((piece.mask & FULL_MASK) !== 0 && createSlabNode(piece, levelId)) {
+      if ((piece.mask & FULL_MASK) !== 0 && createSlabNode(piece, parentLevelId, localBaseY)) {
         result.kept++
         result.floors++
       } else {
@@ -315,22 +390,24 @@ export function keepPlaced(): KeepResult {
       const wall = def.schema.parse({
         ...safeDefaults(def),
         object: 'node',
-        parentId: levelId,
+        parentId: parentLevelId,
         visible: true,
         metadata: {},
         start: span.start,
         end: span.end,
-        // Dead TOP rows trim the kept height: mask 7 → 0.93 m, 63 → 1.87 m.
-        height: PIECE_DIMS.wall[1] * ((CELLS - plan.trimTopRows) / CELLS),
+        // Dead TOP rows trim the kept height — of the piece's OWN storey
+        // span: mask 7 keeps span/3, 63 keeps 2·span/3.
+        height: pieceSpan * ((CELLS - plan.trimTopRows) / CELLS),
         thickness: PIECE_DIMS.wall[2],
       })
-      useScene.getState().createNode(wall as AnyNode, levelId as AnyNodeId)
+      useScene.getState().createNode(wall as AnyNode, parentLevelId as AnyNodeId)
       result.kept++
       if (!plan.exact) result.skipped++ // interior detail approximated away
       if (plan.pocket !== 'none') {
         const wallId = (wall as { id?: unknown }).id
         const created =
-          typeof wallId === 'string' && createPocketNode(plan.pocket, wallId, plan.pocketCol)
+          typeof wallId === 'string' &&
+          createPocketNode(plan.pocket, wallId, plan.pocketCol, pieceSpan)
         if (created) {
           if (plan.pocket === 'window') result.windows++
           else result.doors++

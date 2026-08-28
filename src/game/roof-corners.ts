@@ -47,7 +47,9 @@ export function presetCorners(preset: number): RoofCorners {
 const HALF = 1.5
 /** Slab thickness of the surface (matches PIECE_DIMS roof thickness). */
 const THICK = 0.12
-/** Corner rise when a corner is high (builder WALL_H). */
+/** LEGACY corner rise when a corner is high (builder WALL_H) — the default
+ * everywhere a caller passes no explicit rise. Adaptive-storey pieces pass
+ * their own span (PlacedPiece.height) instead. */
 export const CORNER_RISE = 2.8
 
 /** Local corner center positions, indexed like RoofCorners. */
@@ -150,10 +152,12 @@ const geometryCache = new Map<string, BufferGeometry>()
  * bottom sheets THICK apart plus the four closing side strips, centered on
  * the piece origin with y = 0 at eave level (mesh position uses the
  * piece's base y directly — no piecePose tilt/lift for corner roofs).
- * Cached per pattern (16 shapes max, shared by meshes AND colliders).
+ * `rise` is the high-corner elevation — the piece's storey span (legacy
+ * CORNER_RISE by default). Cached per (pattern, rise) — 16 shapes per span,
+ * one span per building level, shared by meshes AND colliders.
  */
-export function cornerRoofGeometry(corners: RoofCorners): BufferGeometry {
-  const key = cornersKey(corners)
+export function cornerRoofGeometry(corners: RoofCorners, rise = CORNER_RISE): BufferGeometry {
+  const key = `${cornersKey(corners)}|${rise}`
   const cached = geometryCache.get(key)
   if (cached) return cached
 
@@ -168,7 +172,7 @@ export function cornerRoofGeometry(corners: RoofCorners): BufferGeometry {
   }
   const at = (u: number, v: number, lift: number): [number, number, number] => [
     -HALF + u * 2 * HALF,
-    bilinearHeight(corners, u, v) * CORNER_RISE + lift,
+    bilinearHeight(corners, u, v) * rise + lift,
     -HALF + v * 2 * HALF,
   ]
   for (let i = 0; i < SEGS; i++) {
@@ -214,9 +218,10 @@ function patchPoint(
   corners: RoofCorners,
   u: number,
   v: number,
+  rise: number,
 ): void {
   out[0] = -HALF + u * 2 * HALF
-  out[1] = bilinearHeight(corners, u, v) * CORNER_RISE + THICK
+  out[1] = bilinearHeight(corners, u, v) * rise + THICK
   out[2] = -HALF + v * 2 * HALF
 }
 
@@ -225,6 +230,8 @@ function patchPoint(
  * triangles), in WORLD space given the piece pose. Returns the nearest hit
  * with the corner index closest to the hit point — the F-edit targeting
  * for corner roofs (the 3×3 cell raycast has no meaning on a patch).
+ * `rise` is the piece's high-corner elevation (its storey span; legacy
+ * CORNER_RISE by default) — it must match the rendered geometry's.
  */
 export function raycastRoofCorner(
   corners: RoofCorners,
@@ -236,6 +243,7 @@ export function raycastRoofCorner(
   dy: number,
   dz: number,
   maxT: number,
+  rise = CORNER_RISE,
 ): RoofCornerHit | null {
   // World → local: translate, then rotate by −yaw about Y (the inverse of
   // keep.ts' local→world corner map).
@@ -290,10 +298,10 @@ export function raycastRoofCorner(
   }
   for (let i = 0; i < SEGS; i++) {
     for (let j = 0; j < SEGS; j++) {
-      patchPoint(_pA, corners, i / SEGS, j / SEGS)
-      patchPoint(_pB, corners, i / SEGS, (j + 1) / SEGS)
-      patchPoint(_pC, corners, (i + 1) / SEGS, (j + 1) / SEGS)
-      patchPoint(_pD, corners, (i + 1) / SEGS, j / SEGS)
+      patchPoint(_pA, corners, i / SEGS, j / SEGS, rise)
+      patchPoint(_pB, corners, i / SEGS, (j + 1) / SEGS, rise)
+      patchPoint(_pC, corners, (i + 1) / SEGS, (j + 1) / SEGS, rise)
+      patchPoint(_pD, corners, (i + 1) / SEGS, j / SEGS, rise)
       tri(_pA, _pB, _pC)
       tri(_pA, _pC, _pD)
     }

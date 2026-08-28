@@ -33,6 +33,16 @@
  * section below. All slot math above stays integer and unchanged; only the
  * resolveTargetSlot inputs (world→grid) and slotPose outputs (grid→world)
  * transform, and the default identity anchor keeps both seams no-ops.
+ *
+ * STOREY LADDER: real buildings use the host default 2.5 m per level (and
+ * can vary per level), not this module's uniform 2.8 m STOREY — so a
+ * session may also install a LADDER (setStoreyLadder): ascending boundary
+ * elevations storeyY[] where storey s spans [storeyY[s], storeyY[s+1]).
+ * Slot indices stay integers; only the Y seams change — storeyBase /
+ * storeySpan / storeyOfY and the floor-piece y-plane march read the ladder.
+ * The ladder composes with the anchor cleanly: the anchor transforms
+ * XZ+yaw ONLY and the ladder transforms Y ONLY. No ladder set → pure
+ * STOREY multiples, bit-exact legacy behavior.
  */
 
 export const CELL = 3
@@ -117,6 +127,121 @@ export function gridToWorld(x: number, z: number, yaw = 0): { x: number; z: numb
   }
 }
 
+// ── STOREY LADDER (session storey elevations) ───────────────────────────────
+// The uniform STOREY (2.8) is the fort-builder's own module, but the REAL
+// building stacks its levels at the host default 2.5 m (and can vary per
+// level) — pieces at s=1 would float 0.3 m above the real second floor.
+// Once per session the game installs the building's ladder (derived in
+// world.ts from the post-snap level group Ys): storeyY[] boundaries, storey
+// s spanning [storeyY[s], storeyY[s+1]). Outside the ladder — above the sky
+// rungs or below the bottom — storeys extend by pure STOREY multiples, so
+// every helper stays total. No ladder → bit-exact legacy 2.8 multiples.
+
+/** A building floating more than this above the terrain plane gets a
+ * TERRAIN storey [0, base] prepended, so ground pieces still land ON the
+ * ground; doubles as the terrain-grounding tolerance on storey bases. */
+const TERRAIN_EPS = 0.05
+
+/** Live ladder — null = legacy uniform storeys (every existing test/QA
+ * path stays green by construction). */
+let _storeyY: number[] | null = null
+
+/** Install the session storey ladder (copied + normalized: non-finite and
+ * non-climbing entries drop, a lowest boundary above the terrain plane
+ * prepends the terrain storey [0, base, …]). Fewer than two surviving
+ * boundaries — or a null — resets to the uniform-STOREY fallback.
+ * world.ts derives it; builder.tsx wires it alongside the grid anchor. */
+export function setStoreyLadder(ys: readonly number[] | null | undefined): void {
+  if (!ys || ys.length < 2) {
+    _storeyY = null
+    return
+  }
+  const ladder: number[] = []
+  for (const y of ys) {
+    if (!Number.isFinite(y)) continue
+    if (ladder.length > 0 && y <= ladder[ladder.length - 1]! + TERRAIN_EPS) continue
+    ladder.push(y)
+  }
+  if (ladder.length > 0 && ladder[0]! > TERRAIN_EPS) ladder.unshift(0)
+  _storeyY = ladder.length >= 2 ? ladder : null
+}
+
+/** The live ladder (normalized), or null in legacy uniform mode — QA/tests
+ * read it through builderDebug; never mutate the returned array. */
+export function getStoreyLadder(): readonly number[] | null {
+  return _storeyY
+}
+
+/** Back to uniform 2.8 storeys — session teardown (next to resetGridAnchor). */
+export function resetStoreyLadder(): void {
+  _storeyY = null
+}
+
+/** Elevation of ladder boundary `b`, extended past both ends by pure
+ * STOREY multiples (b may be negative or beyond the top sky rung). Callers
+ * guarantee a ladder is installed. */
+function boundaryY(b: number): number {
+  const ladder = _storeyY!
+  const last = ladder.length - 1
+  if (b <= 0) return ladder[0]! + b * STOREY
+  if (b >= last) return ladder[last]! + (b - last) * STOREY
+  return ladder[b]!
+}
+
+/** Base elevation of storey `s` — STOREY·s in legacy mode. */
+export function storeyBase(s: number): number {
+  if (!_storeyY) return s * STOREY
+  return boundaryY(s)
+}
+
+/** Height of storey `s` (its base to the next boundary) — STOREY outside
+ * the ladder and in legacy mode. Pieces conform to this span. */
+export function storeySpan(s: number): number {
+  if (!_storeyY) return STOREY
+  return boundaryY(s + 1) - boundaryY(s)
+}
+
+/** Storey containing elevation `y`. Feet resting exactly ON a floor plane
+ * belong to that storey (the legacy +0.1 grace). Below the ladder the
+ * index runs negative — callers clamp, exactly like the legacy floor
+ * division did for y < 0. */
+export function storeyOfY(y: number): number {
+  const yy = y + 0.1
+  if (!_storeyY) return Math.floor(yy / STOREY)
+  const ladder = _storeyY
+  const last = ladder.length - 1
+  if (yy < ladder[0]!) return Math.floor((yy - ladder[0]!) / STOREY)
+  if (yy >= ladder[last]!) return last + Math.floor((yy - ladder[last]!) / STOREY)
+  for (let s = 0; s < last; s++) {
+    if (yy < ladder[s + 1]!) return s
+  }
+  return last - 1 // unreachable: the loop covers [ladder[0], ladder[last])
+}
+
+/** Smallest boundary index at/above `y` (ladder mode y-plane march). */
+function boundaryCeil(y: number): number {
+  const ladder = _storeyY!
+  const last = ladder.length - 1
+  if (y <= ladder[0]!) return -Math.floor((ladder[0]! - y) / STOREY)
+  if (y > ladder[last]!) return last + Math.ceil((y - ladder[last]!) / STOREY)
+  for (let b = 1; b <= last; b++) {
+    if (ladder[b]! >= y) return b
+  }
+  return last // unreachable: y ≤ ladder[last] was handled by the loop
+}
+
+/** Largest boundary index at/below `y` (ladder mode y-plane march). */
+function boundaryFloor(y: number): number {
+  const ladder = _storeyY!
+  const last = ladder.length - 1
+  if (y < ladder[0]!) return -Math.ceil((ladder[0]! - y) / STOREY)
+  if (y >= ladder[last]!) return last + Math.floor((y - ladder[last]!) / STOREY)
+  for (let b = last - 1; b >= 0; b--) {
+    if (ladder[b]! <= y) return b
+  }
+  return 0 // unreachable: y ≥ ladder[0] was handled by the loop
+}
+
 export type SlotPose = {
   /** [x, baseY, z] — PlacedPiece.position semantics (builder piecePose). */
   position: [number, number, number]
@@ -159,9 +284,10 @@ export function parseSlotId(id: string): Slot | null {
 /** World pose of a slot. `rotQuarter` only matters for roofs. The lattice
  * pose is computed in the GRID frame, then the anchor OUT seam carries it
  * grid→world (identity skips the trig — poses stay bit-exact un-anchored).
- * Y is baseY either way: the anchor never touches elevation. */
+ * Y is baseY either way: the anchor never touches elevation (the STOREY
+ * LADDER owns Y — storeyBase reads it). */
 export function slotPose(slot: Slot, rotQuarter = 0): SlotPose {
-  const baseY = slot.s * STOREY
+  const baseY = storeyBase(slot.s)
   let x: number
   let z: number
   let yaw: number
@@ -200,8 +326,9 @@ export function slotPose(slot: Slot, rotQuarter = 0): SlotPose {
 }
 
 const cellOf = (v: number): number => Math.floor(v / CELL)
-/** Feet resting exactly ON a floor plane belong to that storey. */
-const storeyOf = (y: number): number => Math.floor((y + 0.1) / STOREY)
+/** Feet resting exactly ON a floor plane belong to that storey — the +0.1
+ * grace lives in storeyOfY, which reads the session ladder when one is set. */
+const storeyOf = storeyOfY
 
 /** IN-seam scratch — one TargetInput reused every call (resolveTargetSlot
  * runs per frame; fresh objects here would be steady GC — same rationale as
@@ -293,6 +420,27 @@ function marchAxis(o: number, d: number, step: number, axis: 'x' | 'z' | 'y'): v
   }
 }
 
+/** Y-plane march over the STOREY LADDER's boundaries (the crossing `plane`
+ * is the BOUNDARY INDEX — the storey whose floor that boundary is, same
+ * semantics as marchAxis's uniform plane index). No ladder → the legacy
+ * uniform marchAxis, bit-exact. */
+function marchYPlanes(o: number, d: number): void {
+  if (!_storeyY) {
+    marchAxis(o, d, STOREY, 'y')
+    return
+  }
+  if (Math.abs(d) < 1e-9) return
+  const dir = Math.sign(d)
+  const start = o + d * RAY_START
+  let b = dir > 0 ? boundaryCeil(start) : boundaryFloor(start)
+  for (let guard = 0; guard < 8; guard++) {
+    const t = (boundaryY(b) - o) / d
+    if (t > REACH) return
+    if (t >= RAY_START) pushCrossing(t, 'y', b)
+    b += dir
+  }
+}
+
 function rayOverride(input: TargetInput): Slot | null {
   const [px, py, pz] = input.position
   const ox = px
@@ -306,7 +454,7 @@ function rayOverride(input: TargetInput): Slot | null {
   _crossings.length = 0
   marchAxis(ox, dx, CELL, 'x')
   marchAxis(oz, dz, CELL, 'z')
-  marchAxis(oy, dy, STOREY, 'y')
+  marchYPlanes(oy, dy)
   _crossings.sort(byT)
 
   for (const c of _crossings) {
@@ -596,8 +744,14 @@ export function slotsTouching(id: string): string[] {
   return out.map(slotId)
 }
 
-/** Terrain rule: slots whose base sits on the ground plane are self-grounded. */
+/** Terrain rule: slots whose base sits ON the ground plane are self-grounded.
+ * Legacy mode that is exactly storey 0 (base 0); under a ladder it is the
+ * storey whose base elevation is the terrain plane — for an elevated
+ * building that's the prepended terrain storey, for a basement ladder it's
+ * the ground level's own rung (the basement storey below is NOT terrain). */
 export function isTerrainGrounded(id: string): boolean {
   const slot = parseSlotId(id)
-  return slot !== null && slot.s === 0
+  if (!slot) return false
+  if (!_storeyY) return slot.s === 0
+  return Math.abs(storeyBase(slot.s)) <= TERRAIN_EPS
 }

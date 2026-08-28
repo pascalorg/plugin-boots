@@ -11,7 +11,7 @@ import {
   Vector3,
 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
-import { CELL, type GridAnchor } from './grid'
+import { CELL, type GridAnchor, STOREY } from './grid'
 
 /**
  * One-shot world snapshot taken when the game starts: which host meshes are
@@ -166,6 +166,13 @@ export type GameWorld = {
    * hand-built test worlds don't carry it (identity assumed); collectWorld
    * always fills it. builder.tsx installs it via grid.setGridAnchor. */
   gridAnchor?: GridAnchor
+  /** Session storey ladder — ascending boundary elevations aligning the
+   * grid's storeys to the building's REAL levels (deriveStoreyLadder: the
+   * post-snap level group Ys, a measured top span, then sky rungs).
+   * Optional so hand-built test worlds don't carry it (the grid falls back
+   * to uniform 2.8 m storeys); collectWorld fills it whenever the scene has
+   * registered levels. builder.tsx installs it via grid.setStoreyLadder. */
+  storeyLadder?: number[]
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -988,6 +995,98 @@ function lowestLevelGroundY(): number {
 
 const _levelWorldPos = new Vector3()
 
+// ---------------------------------------------------------------------------
+// Storey ladder — the grid's storeys follow the building's real levels
+// ---------------------------------------------------------------------------
+
+export type StackedLevel = { id: string; y: number }
+
+/**
+ * Every registered level with its TRUE STACKED base elevation, ascending.
+ * The read goes through the host's own snap util and RESTORES afterwards —
+ * safe outside a session too (Keep runs back in the editor, which may sit
+ * in exploded/solo where group Ys are nowhere near their stacked bases;
+ * inside collectWorld the groups are already snapped, so the round-trip is
+ * a no-op). A host without the util degrades to the current group Ys.
+ */
+export function collectStackedLevels(): StackedLevel[] {
+  let restore: (() => void) | undefined
+  try {
+    restore = snapLevelsToTruePositions()
+  } catch {
+    restore = undefined
+  }
+  const levels: StackedLevel[] = []
+  const levelIds = sceneRegistry.byType.level
+  if (levelIds) {
+    for (const id of levelIds) {
+      const obj = sceneRegistry.nodes.get(id)
+      if (!obj) continue
+      obj.updateWorldMatrix(true, false)
+      levels.push({ id, y: _levelWorldPos.setFromMatrixPosition(obj.matrixWorld).y })
+    }
+  }
+  try {
+    restore?.()
+  } catch {
+    // A restore that throws leaves the groups snapped — the LevelSystem
+    // lerp reconverges, same posture as snapLevelsForSnapshot.
+  }
+  levels.sort((a, b) => a.y - b.y)
+  return levels
+}
+
+/** Rungs extended above the top level's ceiling boundary (pure STOREY
+ * multiples) — sky forts keep building past the roof line. */
+const LADDER_SKY_RUNGS = 3
+/** Level bases closer than this merge into one rung: a "storey" that thin
+ * is a data artifact, not a floor a piece could stand under. */
+const MIN_STOREY_SPAN = 1
+
+/** The TOP level's own height — the tallest wall/ceiling child height in
+ * the scene store (the same children the host's level-height util reads;
+ * that util is not exported from the viewer package root, so the scan is
+ * replicated here). Nothing measurable → STOREY. */
+function levelTopSpan(levelId: string, nodes: Record<string, Record<string, unknown>>): number {
+  const level = nodes[levelId]
+  const children = Array.isArray(level?.children) ? (level.children as string[]) : []
+  let span = 0
+  for (const childId of children) {
+    const child = nodes[childId]
+    if (!child) continue
+    if (child.type !== 'wall' && child.type !== 'ceiling') continue
+    const height = child.height
+    if (typeof height === 'number' && Number.isFinite(height) && height > span) span = height
+  }
+  return span > 0 ? span : STOREY
+}
+
+/**
+ * Derive the session storey ladder from the stacked levels: each level base
+ * is a boundary (sub-MIN_STOREY_SPAN rungs merge), the top level closes at
+ * its own measured height, then LADDER_SKY_RUNGS pure-STOREY rungs extend
+ * above so building keeps working past the roof. No levels → null (the
+ * grid keeps its uniform 2.8 fallback). The terrain-storey prepend for
+ * elevated buildings lives in grid.setStoreyLadder — this is the raw
+ * building read. Exported for the derivation tests.
+ */
+export function deriveStoreyLadder(
+  levels: readonly StackedLevel[],
+  nodes: Record<string, Record<string, unknown>>,
+): number[] | null {
+  if (levels.length === 0) return null
+  const ys: number[] = []
+  let topId = levels[0]!.id
+  for (const level of levels) {
+    if (ys.length > 0 && level.y - ys[ys.length - 1]! < MIN_STOREY_SPAN) continue
+    ys.push(level.y)
+    topId = level.id
+  }
+  ys.push(ys[ys.length - 1]! + levelTopSpan(topId, nodes))
+  for (let rung = 0; rung < LADDER_SKY_RUNGS; rung++) ys.push(ys[ys.length - 1]! + STOREY)
+  return ys
+}
+
 export function collectWorld(): GameWorld {
   // Whole-building presence: bake the snapshot at true stacked elevations,
   // never mid-lerp (see snapLevelsForSnapshot).
@@ -1112,6 +1211,10 @@ export function collectWorld(): GameWorld {
   // The build lattice adopts the building's frame — identity when nothing
   // dominates (empty lot) or the building already sits on the legacy grid.
   const gridAnchor = deriveGridAnchor(walls.values())
+  // …and its storeys adopt the building's REAL level elevations (the level
+  // groups are already snapped to their stacked bases — see above). No
+  // registered levels → undefined, the grid keeps uniform 2.8 storeys.
+  const storeyLadder = deriveStoreyLadder(collectStackedLevels(), nodes) ?? undefined
 
   // Spawn: outside the building along +X of its center, eye toward it.
   // Y is the LOWEST level's ground (usually 0) — with the whole stacked
@@ -1153,6 +1256,7 @@ export function collectWorld(): GameWorld {
     roadFootprints,
     hostTrees,
     gridAnchor,
+    storeyLadder,
     buildingAabb,
     spawn,
     spawnYaw,

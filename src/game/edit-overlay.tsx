@@ -12,7 +12,7 @@ import {
   PlaneGeometry,
 } from 'three'
 import type { BuildPiece } from '../store'
-import { CELLS, cellCenter, cellDims } from './builder'
+import { CELLS, cellCenter, cellDims, WALL_H } from './builder'
 import { CORNER_RISE, CORNER_XZ, type RoofCorners } from './roof-corners'
 
 /**
@@ -59,9 +59,10 @@ export const TILE_INSET = 0.06
 export const FACE_LIFT = 0.02
 
 /** In-plane tile size after the grout inset: walls tile col × row on the
- * wall plane (local X × Y), slabs on their plane (local X × Z). */
-export function tileSize(piece: BuildPiece): [number, number] {
-  const [w, h, d] = cellDims(piece)
+ * wall plane (local X × Y), slabs on their plane (local X × Z). `span` is
+ * the piece's storey span (legacy WALL_H) — wall tiles are span/3 tall. */
+export function tileSize(piece: BuildPiece, span = WALL_H): [number, number] {
+  const [w, h, d] = cellDims(piece, span)
   const scale = 1 - 2 * TILE_INSET
   if (piece === 'wall') return [w * scale, h * scale]
   return [w * scale, d * scale]
@@ -69,8 +70,8 @@ export function tileSize(piece: BuildPiece): [number, number] {
 
 /** Piece-center → floating-lattice-face distance: half the piece thickness
  * (local Z for walls, local Y for slabs) plus FACE_LIFT. */
-export function faceLift(piece: BuildPiece): number {
-  const dims = cellDims(piece)
+export function faceLift(piece: BuildPiece, span = WALL_H): number {
+  const dims = cellDims(piece, span)
   return (piece === 'wall' ? dims[2] : dims[1]) / 2 + FACE_LIFT
 }
 
@@ -135,36 +136,41 @@ function segmentsGeometry(points: Float32Array, slab: boolean): BufferGeometry {
   return geometry
 }
 
-const fillCache = new Map<BuildPiece, BufferGeometry>()
-function fillGeometry(piece: BuildPiece): BufferGeometry {
-  let geometry = fillCache.get(piece)
+// Geometry caches key on (piece, span): tiles on a 2.5 m wall are shorter
+// than on a legacy 2.8 one. One span per building level — the maps stay tiny.
+const fillCache = new Map<string, BufferGeometry>()
+function fillGeometry(piece: BuildPiece, span: number): BufferGeometry {
+  const key = `${piece}|${span}`
+  let geometry = fillCache.get(key)
   if (!geometry) {
-    const [w, h] = tileSize(piece)
+    const [w, h] = tileSize(piece, span)
     geometry = new PlaneGeometry(w, h)
     if (piece !== 'wall') geometry.rotateX(-Math.PI / 2)
-    fillCache.set(piece, geometry)
+    fillCache.set(key, geometry)
   }
   return geometry
 }
 
-const outlineCache = new Map<BuildPiece, BufferGeometry>()
-function outlineGeometry(piece: BuildPiece): BufferGeometry {
-  let geometry = outlineCache.get(piece)
+const outlineCache = new Map<string, BufferGeometry>()
+function outlineGeometry(piece: BuildPiece, span: number): BufferGeometry {
+  const key = `${piece}|${span}`
+  let geometry = outlineCache.get(key)
   if (!geometry) {
-    const [w, h] = tileSize(piece)
+    const [w, h] = tileSize(piece, span)
     geometry = segmentsGeometry(rectSegments(w, h), piece !== 'wall')
-    outlineCache.set(piece, geometry)
+    outlineCache.set(key, geometry)
   }
   return geometry
 }
 
-const hoverOutlineCache = new Map<BuildPiece, BufferGeometry>()
-function hoverOutlineGeometry(piece: BuildPiece): BufferGeometry {
-  let geometry = hoverOutlineCache.get(piece)
+const hoverOutlineCache = new Map<string, BufferGeometry>()
+function hoverOutlineGeometry(piece: BuildPiece, span: number): BufferGeometry {
+  const key = `${piece}|${span}`
+  let geometry = hoverOutlineCache.get(key)
   if (!geometry) {
-    const [w, h] = tileSize(piece)
+    const [w, h] = tileSize(piece, span)
     geometry = segmentsGeometry(hoverRectSegments(w, h), piece !== 'wall')
-    hoverOutlineCache.set(piece, geometry)
+    hoverOutlineCache.set(key, geometry)
   }
   return geometry
 }
@@ -265,12 +271,14 @@ const FACE_SIDES = [1, -1] as const
 
 /** 3×3 cell-editor overlay. Props mirror EditState: x/z the piece position,
  * y/tilt its RENDERED pose (piecePose output), mask the live-cell bits,
- * hover the bit under the crosshair. 'roof' here is the legacy corner-less
- * slab — it lattices like a floor. */
+ * hover the bit under the crosshair, span the piece's storey span (legacy
+ * WALL_H when omitted). 'roof' here is the legacy corner-less slab — it
+ * lattices like a floor. */
 export function EditOverlay({
   piece,
   mask,
   hover,
+  span = WALL_H,
   x,
   y,
   z,
@@ -280,23 +288,24 @@ export function EditOverlay({
   piece: BuildPiece
   mask: number
   hover: number
+  span?: number
   x: number
   y: number
   z: number
   yaw: number
   tilt: number
 }) {
-  const lift = faceLift(piece)
-  const fill = fillGeometry(piece)
-  const outline = outlineGeometry(piece)
-  const hoverOutline = hoverOutlineGeometry(piece)
+  const lift = faceLift(piece, span)
+  const fill = fillGeometry(piece, span)
+  const outline = outlineGeometry(piece, span)
+  const hoverOutline = hoverOutlineGeometry(piece, span)
   const wall = piece === 'wall'
   return (
     <group position={[x, y, z]} rotation={[tilt, yaw, 0, 'YXZ']} userData={{ __boots: true }}>
       <HoverPulse />
       {FACE_SIDES.map((side) =>
         TILE_BITS.map((bit) => {
-          const [cx, cy, cz] = cellCenter(piece, bit % CELLS, Math.floor(bit / CELLS))
+          const [cx, cy, cz] = cellCenter(piece, bit % CELLS, Math.floor(bit / CELLS), span)
           const hovered = hover === bit
           const alive = (mask & (1 << bit)) !== 0
           return (
@@ -322,10 +331,13 @@ export function EditOverlay({
 
 /** Corner-roof editor overlay: one marker per corner AT its current patch
  * height — hovered hot + pulsing, raised cool blue, dropped faint red (the
- * wire keeps it clickable-looking, same as a dead lattice tile). */
+ * wire keeps it clickable-looking, same as a dead lattice tile). `rise` is
+ * the piece's high-corner elevation (its storey span; legacy CORNER_RISE
+ * when omitted) — markers must sit on the rendered patch. */
 export function CornerEditOverlay({
   corners,
   hover,
+  rise = CORNER_RISE,
   x,
   y,
   z,
@@ -333,6 +345,7 @@ export function CornerEditOverlay({
 }: {
   corners: RoofCorners
   hover: number
+  rise?: number
   x: number
   y: number
   z: number
@@ -346,7 +359,7 @@ export function CornerEditOverlay({
         const hovered = hover === index
         return (
           // biome-ignore lint/suspicious/noArrayIndexKey: corners are positional
-          <group key={index} position={[cx, height * CORNER_RISE + CORNER_MARKER_LIFT, cz]}>
+          <group key={index} position={[cx, height * rise + CORNER_MARKER_LIFT, cz]}>
             <mesh
               geometry={cornerFillGeometry()}
               material={hovered ? HOVER_FILL : height ? RAISED_FILL : DROPPED_FILL}

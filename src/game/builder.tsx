@@ -13,13 +13,17 @@ import { CornerEditOverlay, EditOverlay } from './edit-overlay'
 import {
   CELL,
   getGridAnchor,
+  getStoreyLadder,
   type GridAnchor,
   parseSlotId,
   resetGridAnchor,
+  resetStoreyLadder,
   resolveTargetSlot,
   setGridAnchor,
+  setStoreyLadder,
   type Slot,
-  STOREY,
+  storeyBase,
+  storeySpan,
   type TargetInput,
   type TargetResult,
   worldToGrid,
@@ -39,6 +43,7 @@ import {
 } from './piece-slots'
 import { playerRig } from './player'
 import {
+  CORNER_RISE,
   cornerRoofGeometry,
   cornersEqual,
   raycastRoofCorner,
@@ -129,7 +134,10 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * NOTE: needs 'KeyF' in input.ts GAME_KEYS to receive the key.
  *
  * ── API (exported for tests / other systems) ──────────────────────────────
- *   PIECE_DIMS / piecePose      piece geometry + pose from base elevation.
+ *   PIECE_DIMS / pieceDims / piecePose    piece geometry + pose from base
+ *       elevation; span-parameterized where height matters (ADAPTIVE
+ *       STOREYS: pieces conform to their slot's grid.storeySpan, stamped
+ *       into PlacedPiece.height at placement — legacy default WALL_H).
  *   CELLS / maskBit / cellDims / cellCenter    3×3 cell math (local frame).
  *   raycastPieceCell(piece, ox, oy, oz, dx, dy, dz, maxDist)   ray vs the
  *       FULL piece box (mask-independent so dead cells can be re-added) →
@@ -152,7 +160,11 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * ──────────────────────────────────────────────────────────────────────────
  */
 
-const WALL_H = 2.8
+/** The LEGACY storey span — the default wherever a piece carries no
+ * `height` of its own (pieces placed before adaptive storeys, hand-built
+ * test fixtures). Placement stamps grid.storeySpan(slot.s) instead, so
+ * pieces conform to the building's real level heights. */
+export const WALL_H = 2.8
 /** Turbo hold-to-place cadence: the fresh-press stamp arms the longer
  * lockout, held new-slot re-stamps run at the fast one (≥0.05 s apart). */
 export const TURBO_FIRST = 0.15
@@ -164,7 +176,9 @@ export const TURBO_NEXT = 0.05
  * length is the hypotenuse √(3² + 2.8²) ≈ 4.103, hence 4.1. Deliberately
  * NOT a 45° / 4.24 m plank: STOREY (2.8) ≠ CELL (3), and a 45° rise would
  * top out 0.2 m proud of the storey line, so stacked levels and the
- * ramp-chain flow wouldn't land flush. */
+ * ramp-chain flow wouldn't land flush.
+ * These are the LEGACY (span 2.8) dims — span-aware callers go through
+ * pieceDims(piece, span). */
 export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   wall: [3, WALL_H, 0.12],
   floor: [3, 0.12, 3],
@@ -172,13 +186,54 @@ export const PIECE_DIMS: Record<BuildPiece, [number, number, number]> = {
   roof: [3, 0.12, 3],
 }
 
+/** Span-parameterized dims cache — a handful of spans per session (one per
+ * building level), so the maps stay tiny. Nested (piece → span) so hot
+ * paths (raycastPieceCell runs per frame in edit mode) never build key
+ * strings on cache hits. */
+const pieceDimsCache = new Map<BuildPiece, Map<number, [number, number, number]>>()
+
+/** Piece dims under a storey span: walls are span tall, the stairs plank is
+ * the hypotenuse over a CELL run rising exactly the span; floors/roof
+ * fallback boxes don't care. The legacy span returns PIECE_DIMS itself
+ * (bit-exact, including the deliberate 4.1 plank). Treat the result as
+ * read-only — tuples are cached and shared. */
+export function pieceDims(piece: BuildPiece, span = WALL_H): [number, number, number] {
+  if (span === WALL_H || (piece !== 'wall' && piece !== 'stairs')) return PIECE_DIMS[piece]
+  let bySpan = pieceDimsCache.get(piece)
+  if (!bySpan) {
+    bySpan = new Map()
+    pieceDimsCache.set(piece, bySpan)
+  }
+  let dims = bySpan.get(span)
+  if (!dims) {
+    dims =
+      piece === 'wall'
+        ? [PIECE_DIMS.wall[0], span, PIECE_DIMS.wall[2]]
+        : [PIECE_DIMS.stairs[0], PIECE_DIMS.stairs[1], Math.hypot(CELL, span)]
+    bySpan.set(span, dims)
+  }
+  return dims
+}
+
 /** ≈ −43.0°, atan2(rise = one STOREY, run = one CELL) — not 45° by design
  * (see the PIECE_DIMS.stairs note above). */
 const STAIR_TILT = -Math.atan2(WALL_H, 3)
 
-export function piecePose(piece: BuildPiece, baseY: number): { y: number; tilt: number } {
-  if (piece === 'wall') return { y: baseY + WALL_H / 2, tilt: 0 }
-  if (piece === 'stairs') return { y: baseY + WALL_H / 2, tilt: STAIR_TILT }
+/** Rendered pose from a base elevation. `span` is the piece's storey span
+ * (PlacedPiece.height; legacy 2.8): walls center at span/2, the stairs
+ * plank tilts to rise exactly one LOCAL storey over its CELL run. */
+export function piecePose(
+  piece: BuildPiece,
+  baseY: number,
+  span = WALL_H,
+): { y: number; tilt: number } {
+  if (piece === 'wall') return { y: baseY + span / 2, tilt: 0 }
+  if (piece === 'stairs') {
+    return {
+      y: baseY + span / 2,
+      tilt: span === WALL_H ? STAIR_TILT : -Math.atan2(span, CELL),
+    }
+  }
   return { y: baseY + 0.06, tilt: 0 }
 }
 
@@ -193,9 +248,10 @@ export function maskBit(col: number, row: number): number {
 }
 
 /** One cell's box dims in the piece's local frame: walls split width ×
- * height (full thickness), floors/stairs split their plane (full slab). */
-export function cellDims(piece: BuildPiece): [number, number, number] {
-  const [w, h, d] = PIECE_DIMS[piece]
+ * height (full thickness), floors/stairs split their plane (full slab).
+ * `span` is the piece's storey span — wall rows are span/3 tall. */
+export function cellDims(piece: BuildPiece, span = WALL_H): [number, number, number] {
+  const [w, h, d] = pieceDims(piece, span)
   if (piece === 'wall') return [w / CELLS, h / CELLS, d]
   return [w / CELLS, h, d / CELLS]
 }
@@ -203,46 +259,53 @@ export function cellDims(piece: BuildPiece): [number, number, number] {
 /** Local-frame center of grid cell (col, row). Col 0 sits at local −X;
  * wall row 0 is the BOTTOM row, floor/stairs row 0 is the local −Z edge
  * (the stairs' LOW edge given STAIR_TILT). */
-export function cellCenter(piece: BuildPiece, col: number, row: number): [number, number, number] {
-  const [w, h, d] = PIECE_DIMS[piece]
+export function cellCenter(
+  piece: BuildPiece,
+  col: number,
+  row: number,
+  span = WALL_H,
+): [number, number, number] {
+  const [w, h, d] = pieceDims(piece, span)
   const x = -w / 2 + (col + 0.5) * (w / CELLS)
   if (piece === 'wall') return [x, -h / 2 + (row + 0.5) * (h / CELLS), 0]
   return [x, 0, -d / 2 + (row + 0.5) * (d / CELLS)]
 }
 
-const pieceGeometries = new Map<BuildPiece, BoxGeometry>()
-function geometryFor(piece: BuildPiece): BoxGeometry {
-  let geometry = pieceGeometries.get(piece)
+const pieceGeometries = new Map<string, BoxGeometry>()
+function geometryFor(piece: BuildPiece, span: number): BoxGeometry {
+  const key = `${piece}|${span}`
+  let geometry = pieceGeometries.get(key)
   if (!geometry) {
-    geometry = new BoxGeometry(...PIECE_DIMS[piece])
-    pieceGeometries.set(piece, geometry)
+    geometry = new BoxGeometry(...pieceDims(piece, span))
+    pieceGeometries.set(key, geometry)
   }
   return geometry
 }
 
-/** Merged-box geometry for a piece's live cells, cached per (piece, mask) —
- * placed meshes AND their colliders come from here, so a mask edit swaps
- * both at once. Null when every cell is dead (nothing to render/collide). */
+/** Merged-box geometry for a piece's live cells, cached per (piece, mask,
+ * span) — placed meshes AND their colliders come from here, so a mask edit
+ * swaps both at once. Null when every cell is dead (nothing to
+ * render/collide). */
 const maskGeometryCache = new Map<string, BufferGeometry>()
-function geometryForMask(piece: BuildPiece, mask: number): BufferGeometry | null {
+function geometryForMask(piece: BuildPiece, mask: number, span = WALL_H): BufferGeometry | null {
   const live = mask & FULL_MASK
   if (live === 0) return null
-  if (live === FULL_MASK) return geometryFor(piece)
-  const key = `${piece}|${live}`
+  if (live === FULL_MASK) return geometryFor(piece, span)
+  const key = `${piece}|${live}|${span}`
   let geometry = maskGeometryCache.get(key)
   if (!geometry) {
-    const dims = cellDims(piece)
+    const dims = cellDims(piece, span)
     const parts: BoxGeometry[] = []
     for (let row = 0; row < CELLS; row++) {
       for (let col = 0; col < CELLS; col++) {
         if (!(live & (1 << maskBit(col, row)))) continue
-        const center = cellCenter(piece, col, row)
+        const center = cellCenter(piece, col, row, span)
         const box = new BoxGeometry(dims[0], dims[1], dims[2])
         box.translate(center[0], center[1], center[2])
         parts.push(box)
       }
     }
-    geometry = mergeGeometries(parts) ?? geometryFor(piece)
+    geometry = mergeGeometries(parts) ?? geometryFor(piece, span)
     for (const part of parts) part.dispose()
     geometry.computeBoundingBox()
     maskGeometryCache.set(key, geometry)
@@ -352,7 +415,7 @@ function clampCell(v: number, extent: number): number {
  * RETURNS A REUSED MODULE OBJECT, copy fields to keep them.
  */
 export function raycastPieceCell(
-  piece: Pick<PlacedPiece, 'piece' | 'position' | 'yaw'>,
+  piece: Pick<PlacedPiece, 'piece' | 'position' | 'yaw' | 'height'>,
   ox: number,
   oy: number,
   oz: number,
@@ -361,7 +424,8 @@ export function raycastPieceCell(
   dz: number,
   maxDist: number,
 ): CellHit | null {
-  const pose = piecePose(piece.piece, piece.position[1])
+  const span = piece.height ?? WALL_H
+  const pose = piecePose(piece.piece, piece.position[1], span)
   // Translate to the piece center, then rotate by Ry(−yaw) followed by
   // Rx(−tilt) (inverse of the YXZ world rotation).
   let lox = ox - piece.position[0]
@@ -391,7 +455,7 @@ export function raycastPieceCell(
     ldy = ty
   }
 
-  const dims = PIECE_DIMS[piece.piece]
+  const dims = pieceDims(piece.piece, span)
   const hx = dims[0] / 2
   const hy = dims[1] / 2
   const hz = dims[2] / 2
@@ -621,6 +685,9 @@ type GhostState = {
   z: number
   yaw: number
   piece: BuildPiece
+  /** The resolved slot's storey span — the piece the click will place
+   * conforms to it (wall height, stairs rise, roof corner rise). */
+  span: number
   /** Roof only: the R-cycled shape preset's corner pattern (the ghost
    * previews the patch the click will place). Null for other pieces. */
   corners: RoofCorners | null
@@ -638,6 +705,7 @@ const _debugGhost: GhostState = {
   z: 0,
   yaw: 0,
   piece: 'wall',
+  span: WALL_H,
   corners: null,
   valid: false,
   reason: 'unsupported',
@@ -655,19 +723,25 @@ const _debugGhost: GhostState = {
  * `anchor()` snapshots the session grid anchor and `worldToGrid(x, z, yaw?)`
  * maps a world pose under it — with a non-identity anchor the ghost pose is
  * OFF the absolute lattice by design, so QA asserts lattice membership in
- * the GRID frame instead.
+ * the GRID frame instead. `ladder()` snapshots the session storey ladder
+ * (null = legacy uniform 2.8 storeys) — ghost baseY sits on its rungs.
  */
 export const builderDebug: {
   holdFire: boolean
   isEditing: boolean
   ghost: () => GhostState
   anchor: () => GridAnchor
+  ladder: () => number[] | null
   worldToGrid: (x: number, z: number, yaw?: number) => { x: number; z: number; yaw: number }
 } = {
   holdFire: false,
   isEditing: false,
   ghost: () => ({ ..._debugGhost }),
   anchor: () => ({ ...getGridAnchor() }),
+  ladder: () => {
+    const ladder = getStoreyLadder()
+    return ladder ? [...ladder] : null
+  },
   worldToGrid: (x, z, yaw = 0) => worldToGrid(x, z, yaw),
 }
 
@@ -726,11 +800,12 @@ const _probeBox = new Box3()
 function setSlotBox(slot: Slot, box: Box3): void {
   const x0 = slot.i * CELL
   const z0 = slot.k * CELL
-  const y0 = slot.s * STOREY
-  // Grid-frame extents (Wx/Wz are zero-thickness planes, F a face).
+  const y0 = storeyBase(slot.s)
+  // Grid-frame extents (Wx/Wz are zero-thickness planes, F a face) — the
+  // vertical extent follows the slot's LOCAL storey span (ladder-aware).
   const x1 = slot.kind === 'Wx' ? x0 : x0 + CELL
   const z1 = slot.kind === 'Wz' ? z0 : z0 + CELL
-  const y1 = slot.kind === 'F' ? y0 : y0 + STOREY
+  const y1 = slot.kind === 'F' ? y0 : y0 + storeySpan(slot.s)
   const anchor = getGridAnchor()
   if (anchor.x === 0 && anchor.z === 0 && anchor.yaw === 0) {
     box.min.set(x0, y0, z0)
@@ -901,12 +976,15 @@ const COLLAPSE_DEBRIS = 7
  * the door colliderIndices. */
 function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorld }) {
   const meshRef = useRef<Mesh>(null)
+  // Every piece conforms to ITS OWN storey span (stamped at placement from
+  // the grid ladder; legacy pieces read as the classic 2.8).
+  const span = piece.height ?? WALL_H
   // Corner roofs render/collide as the bilinear patch (roof-corners.ts);
   // the 3×3 mask has no meaning on a patch, so it is ignored for them.
   const geometry =
     piece.piece === 'roof' && piece.corners
-      ? cornerRoofGeometry(piece.corners)
-      : geometryForMask(piece.piece, piece.mask)
+      ? cornerRoofGeometry(piece.corners, span)
+      : geometryForMask(piece.piece, piece.mask, span)
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
@@ -946,7 +1024,7 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
   }, [world, piece, geometry])
 
   if (!geometry) return null // every cell dead — nothing to render or collide
-  const pose = piecePose(piece.piece, piece.position[1])
+  const pose = piecePose(piece.piece, piece.position[1], span)
   // Corner-roof patches carry their heights IN the geometry: base-y
   // position, no plank tilt.
   const cornered = piece.piece === 'roof' && piece.corners !== undefined
@@ -983,13 +1061,16 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     // whole session — same lifecycle as the scene-support probe. Hand-built
     // worlds without one run the legacy identity grid.
     setGridAnchor(world.gridAnchor ?? IDENTITY_ANCHOR)
+    // STOREY LADDER: the storeys adopt the building's real level elevations
+    // (same lifecycle). Worlds without one keep the uniform 2.8 fallback.
+    setStoreyLadder(world.storeyLadder ?? null)
     for (const p of useBoots.getState().placed) {
       if (p.slotId) registerPlacement(p.slotId, p.id)
     }
     const off = onCollapse((pieceId) => {
       const piece = useBoots.getState().removePlaced(pieceId)
       if (!piece) return
-      const pose = piecePose(piece.piece, piece.position[1])
+      const pose = piecePose(piece.piece, piece.position[1], piece.height ?? WALL_H)
       for (let n = 0; n < COLLAPSE_DEBRIS; n++) {
         spawnDebris(
           piece.position[0] + (Math.random() - 0.5) * 2.4,
@@ -1006,6 +1087,7 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
       off()
       resetPieceSlots() // cancels pending rings; probe + registry die with the session
       resetGridAnchor() // the lattice frame dies with the session — back to identity
+      resetStoreyLadder() // …and the storeys fall back to uniform 2.8
       resetCladQueue() // pending clads die too (their meshes just unmounted)
     }
   }, [world])
@@ -1047,6 +1129,9 @@ type EditState = {
   /** Mirror of a corner roof's heights; null = 3×3 cell editing. */
   corners: RoofCorners | null
   piece: BuildPiece
+  /** The piece's storey span (PlacedPiece.height; legacy 2.8) — overlay
+   * lattice rows and corner-marker rises follow it. */
+  span: number
   x: number
   y: number
   z: number
@@ -1076,6 +1161,7 @@ function raycastEditTarget(
       dy,
       dz,
       maxT,
+      piece.height ?? CORNER_RISE, // aim at the patch the piece renders
     )
     return hit ? { t: hit.t, bit: hit.corner } : null
   }
@@ -1332,6 +1418,7 @@ export function Builder() {
           mask: best.mask,
           corners: best.piece === 'roof' && best.corners ? best.corners : null,
           piece: best.piece,
+          span: best.height ?? WALL_H,
           x: best.position[0],
           y: best.position[1],
           z: best.position[2],
@@ -1380,6 +1467,9 @@ export function Builder() {
     const target = resolveTargetSlot(_targetInput, slotWorldProbe)
     const pose = target.pose
     const occupied = target.reason === 'occupied'
+    // The slot's LOCAL storey span — the placed piece will conform to it
+    // (wall height, stairs rise, roof corner rise; legacy 2.8 off-ladder).
+    const span = storeySpan(target.slot.s)
     // Roof ghost previews the R-cycled shape preset (the exact patch the
     // click will place); other pieces carry no corner pattern. The CANONICAL
     // preset reference (read-only here) keeps the change gate an identity
@@ -1392,6 +1482,7 @@ export function Builder() {
       ghost.slotId !== target.slotId ||
       ghost.piece !== buildPiece ||
       ghost.yaw !== pose.yaw ||
+      ghost.span !== span ||
       ghost.valid !== target.valid ||
       ghost.reason !== target.reason ||
       ghost.corners !== ghostCorners
@@ -1403,6 +1494,7 @@ export function Builder() {
         z: pose.position[2],
         yaw: pose.yaw,
         piece: buildPiece,
+        span,
         corners: ghostCorners,
         valid: target.valid,
         reason: target.reason,
@@ -1415,6 +1507,7 @@ export function Builder() {
     _debugGhost.z = pose.position[2]
     _debugGhost.yaw = pose.yaw
     _debugGhost.piece = buildPiece
+    _debugGhost.span = span
     _debugGhost.corners = ghostCorners
     _debugGhost.valid = target.valid
     _debugGhost.reason = target.reason
@@ -1452,6 +1545,9 @@ export function Builder() {
           position: [pose.position[0], pose.position[1], pose.position[2]],
           yaw: pose.yaw,
           slotId: target.slotId,
+          // The piece conforms to its slot's LOCAL storey span for its
+          // whole life (render, collide, edit, Keep).
+          height: span,
           // Pyramid grammar: a roof lands AS its previewed shape preset;
           // F-edit toggles corners afterwards (2×2 corner heights). Fresh
           // array — the placed piece owns its pattern.
@@ -1496,6 +1592,7 @@ export function Builder() {
       <CornerEditOverlay
         corners={edit.corners}
         hover={edit.hover}
+        rise={edit.span}
         x={edit.x}
         y={edit.y}
         z={edit.z}
@@ -1507,12 +1604,13 @@ export function Builder() {
   // Cell-edit overlay (edit-overlay.tsx): outlined 3×3 lattice floating off
   // both piece faces — live blue, dead outline-only, hovered pulsing.
   if (edit) {
-    const pose = piecePose(edit.piece, edit.y)
+    const pose = piecePose(edit.piece, edit.y, edit.span)
     return (
       <EditOverlay
         piece={edit.piece}
         mask={edit.mask}
         hover={edit.hover}
+        span={edit.span}
         x={edit.x}
         y={pose.y}
         z={edit.z}
@@ -1530,7 +1628,7 @@ export function Builder() {
     return (
       <group ref={ghostRef} userData={{ __boots: true }}>
         <mesh
-          geometry={cornerRoofGeometry(ghost.corners ?? SLOPE_CORNERS)}
+          geometry={cornerRoofGeometry(ghost.corners ?? SLOPE_CORNERS, ghost.span)}
           position={[ghost.x, ghost.y, ghost.z]}
           rotation={[0, ghost.yaw, 0]}
           scale={1.03}
@@ -1545,11 +1643,11 @@ export function Builder() {
       </group>
     )
   }
-  const pose = piecePose(ghost.piece, ghost.y)
+  const pose = piecePose(ghost.piece, ghost.y, ghost.span)
   // Inflated 1.03 like the edit overlay above: a ghost hovering over an
   // already-placed piece would otherwise sit exactly coplanar with its
   // faces and z-fight (transparent + no depthWrite still depth-TESTS).
-  const ghostDims = PIECE_DIMS[ghost.piece]
+  const ghostDims = pieceDims(ghost.piece, ghost.span)
   return (
     <group ref={ghostRef} userData={{ __boots: true }}>
       <mesh
