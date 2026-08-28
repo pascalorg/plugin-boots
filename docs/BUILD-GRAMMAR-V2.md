@@ -33,6 +33,17 @@ never floats.
 **Grid.** `i = floor(x/3)`, `k = floor(z/3)`, storey `s = floor(y/2.8)`.
 Grid is world-anchored — never derived from the camera.
 
+**Adaptive storeys.** The uniform 2.8 storey is the FALLBACK. Real
+buildings stack at the host default 2.5 m (and can vary per level), so a
+session installs the building's STOREY LADDER (`grid.setStoreyLadder`,
+derived in world.ts from the post-snap level group Ys): storey `s` spans
+`[storeyY[s], storeyY[s+1])`, the top level closes at its own measured
+height, sky rungs extend above at 2.8, and an elevated building gets a
+terrain storey `[0, base]` prepended. Pieces conform to their slot's LOCAL
+span (`PlacedPiece.height`): wall height, stairs rise/tilt, roof corner
+rise, 3×3 rows = span/3. Every 2.8 figure below reads "one storey span"
+under a ladder.
+
 **Slots.**
 - Wall → cell edge: `Wx[i][k][s]` (plane x=3i) or `Wz[i][k][s]` (plane z=3k).
 - Floor → cell face: `F[i][k][s]` at y = 2.8·s.

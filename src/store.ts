@@ -37,6 +37,11 @@ export type PlacedPiece = {
    * stairs (the tilted plank, including stair-mask wall folds — see
    * transformPlaced) and legacy pieces. */
   corners?: [number, number, number, number]
+  /** The storey span (m) this piece conforms to — stamped at placement from
+   * the slot's grid.storeySpan, so pieces on a 2.5 m level are 2.5 m tall
+   * (wall height, stairs rise, roof corner rise; footprints stay 3×3).
+   * OPTIONAL: legacy pieces carry none and read as the classic 2.8. */
+  height?: number
 }
 
 export type BootsPhase = 'editor' | 'game'
