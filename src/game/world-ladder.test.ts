@@ -101,6 +101,19 @@ describe('deriveStoreyLadder (pure)', () => {
     expect(ladder[5]).toBeCloseTo(5 + 3 * STOREY, 10)
   })
 
+  test('height-less walls → the top span falls back to the LEVEL node height', () => {
+    // Fresh host scene: the level carries height 2.5 (host default) but
+    // its wall children have NO height property. The ladder must read the
+    // real 2.5, not the 2.8 STOREY constant (Gate D, QA round 2).
+    const nodes = {
+      level_top: { type: 'level', height: 2.5, children: ['w1'] },
+      w1: { type: 'wall' },
+    } as unknown as Record<string, Record<string, unknown>>
+    const ladder = deriveStoreyLadder([{ id: 'level_top', y: 0 }], nodes)!
+    expect(ladder.slice(0, 2)).toEqual([0, 2.5])
+    expect(ladder[2]).toBeCloseTo(2.5 + STOREY, 10)
+  })
+
   test('no measurable top-level children → the top span falls back to 2.8', () => {
     const ladder = deriveStoreyLadder([{ id: 'level_only', y: 0 }], {})!
     expect(ladder[0]).toBe(0)

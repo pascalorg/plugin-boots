@@ -1064,7 +1064,9 @@ const MIN_STOREY_SPAN = 1
 /** The TOP level's own height — the tallest wall/ceiling child height in
  * the scene store (the same children the host's level-height util reads;
  * that util is not exported from the viewer package root, so the scan is
- * replicated here). Nothing measurable → STOREY. */
+ * replicated here). No measurable children → the level node's OWN numeric
+ * `height` (host-default walls carry no per-node height, but the level
+ * does — 2.5 on a fresh scene). Nothing at all → STOREY. */
 function levelTopSpan(levelId: string, nodes: Record<string, Record<string, unknown>>): number {
   const level = nodes[levelId]
   const children = Array.isArray(level?.children) ? (level.children as string[]) : []
@@ -1076,7 +1078,10 @@ function levelTopSpan(levelId: string, nodes: Record<string, Record<string, unkn
     const height = child.height
     if (typeof height === 'number' && Number.isFinite(height) && height > span) span = height
   }
-  return span > 0 ? span : STOREY
+  if (span > 0) return span
+  const own = level?.height
+  if (typeof own === 'number' && Number.isFinite(own) && own > 0) return own
+  return STOREY
 }
 
 /**
