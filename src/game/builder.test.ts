@@ -1028,6 +1028,31 @@ describe('scene-support probe: AABB overlap alone never grants (PIN)', () => {
     expect(probe('not-a-slot')).toBe(false)
   })
 
+  test('REGRESSION: a voxelized ROOF props through its MEMBER targets (`id#pN`)', () => {
+    // Roof shells voxelize into `id#pN`/`#residual` member targets ONLY,
+    // while hideHostNode disables the colliders under the BARE id — the
+    // old bare-id lookup missed, read a fully-alive roof as zero support,
+    // and cascaded every roof-anchored build.
+    const entry = hostWall('host-roof-m', 'roof')
+    entry.disabled = true
+    const world = hostWorld(entry)
+    const member = (aliveByte: number) =>
+      ({
+        nodeId: 'host-roof-m#p0',
+        kind: 'roof',
+        grid: {
+          count: 1,
+          alive: new Uint8Array([aliveByte]),
+          centers: new Float32Array([1.5, 2.7, 0]), // the wall-top contact point
+        },
+      }) as unknown as import('./destruction').VoxelTarget
+    useDestruction.getState().targets.set('host-roof-m#p0', member(1))
+    expect(makeSceneSupportProbe(world)('Wz:0,0,1')).toBe(true)
+    // Every member voxel dead: no support (the demolished-roof cascade).
+    useDestruction.getState().targets.set('host-roof-m#p0', member(0))
+    expect(makeSceneSupportProbe(world)('Wz:0,0,1')).toBe(false)
+  })
+
   test('props never anchor: items, item placements and non-structural kinds are skipped', () => {
     // Identical geometry under the slot — only the structural kind grants.
     expect(makeSceneSupportProbe(hostWorld(hostWall('host-col', 'column')))('Wz:0,0,1')).toBe(true)

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   COAT_ADD,
+  coatBaseStrength,
   DRIP_MAX_PER_TICK,
   DRIP_P,
   DRIP_STRENGTH_GATE,
@@ -126,6 +127,24 @@ describe('packed ledger values ((color << 8) | strength)', () => {
     expect(paintValue(3, 1.7)).toBe((3 << 8) | 255)
     expect(paintValue(3, -0.4)).toBe(3 << 8)
     expect(paintColorOf(paintValue(6, 99))).toBe(6)
+  })
+})
+
+describe('coatBaseStrength (color change restarts the coat)', () => {
+  test('same color accumulates, a new color restarts from zero', () => {
+    const sage = paintValue(2, 0.8)
+    expect(coatBaseStrength(sage, 2)).toBeCloseTo(0.8, 2)
+    expect(coatBaseStrength(sage, 4)).toBe(0)
+    expect(coatBaseStrength(undefined, 4)).toBe(0)
+  })
+
+  test('REGRESSION: one navy rim fleck on a saturated sage cell reads faint navy, never full', () => {
+    // The old carry — min(1, 1.0 + 0.16) — flipped the cell to navy at 255.
+    const saturatedSage = paintValue(2, 1)
+    const before = coatBaseStrength(saturatedSage, 4)
+    const after = paintValue(4, Math.min(1, before + RIM_SPECKLE_ADD))
+    expect(paintColorOf(after)).toBe(4)
+    expect(paintStrengthOf(after)).toBeCloseTo(RIM_SPECKLE_ADD, 2)
   })
 })
 

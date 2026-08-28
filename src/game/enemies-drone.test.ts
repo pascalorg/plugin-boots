@@ -200,6 +200,17 @@ describe('drone steering probes: pure path/descent decisions', () => {
   })
 })
 
+describe('DRONE_CAPSULE geometry', () => {
+  test('REGRESSION: stays a LEGAL capsule — height ≥ 2·radius', () => {
+    // radius 0.3 × height 0.5 inverted the core segment (start above end),
+    // so both narrow phases resolved a hull overhanging the y..y+height
+    // broad-phase box by 0.1 m below AND above: drones hovered proud of
+    // floors and bumped lintels early.
+    expect(DRONE_CAPSULE.height).toBeGreaterThanOrEqual(2 * DRONE_CAPSULE.radius)
+    expect(DRONE_CAPSULE.radius).toBeGreaterThan(0)
+  })
+})
+
 describe('DRONE WALL RULE: the capsule is truth', () => {
   test('a drone above a placed floor cannot descend through it', () => {
     // Elevated floor slab, top at y = 5; the drone starts at y 6.5 and lerps

@@ -9,6 +9,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
 import { buildTablePosition, minigunTablePosition, tablePosition } from './guntable'
+import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
 import { getSession } from './session'
 import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world'
@@ -292,6 +293,11 @@ function applyNamedPose(
 /** Toggle open/close: retarget the animation and handle colliders + sfx. */
 export function toggleOperable(state: OperableState): void {
   state.open = !state.open
+  // Paint decals are world-space splats baked at the host's clip-time pose
+  // (doors/windows are PAINTABLE): the swinging leaf would leave them
+  // floating in the opening, so a toggle frees them (cheap map miss for
+  // the unpainted 99%).
+  releaseNodeDecals(state.nodeId)
   state.from = state.value
   state.to = state.open ? 1 : 0
   state.animT = 0

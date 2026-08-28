@@ -927,26 +927,52 @@ export function makeSceneSupportProbe(world: GameWorld): SceneSupportProbe {
         if (entry.bvh.intersectsBox(_slotObb, _obbToLocal)) return true
         continue
       }
-      const target = useDestruction.getState().targets.get(entry.nodeId)
-      if (!target) continue
-      const { centers, alive, count } = target.grid
-      for (let v = 0; v < count; v++) {
-        if (alive[v] === 0) continue
-        const c = v * 3
-        const wy = centers[c + 1]!
-        if (wy < _slotObb.min.y || wy > _slotObb.max.y) continue
-        // Voxel center world→grid (the IN seam), then point-in-OBB.
-        const dx = centers[c]! - anchor.x
-        const dz = centers[c + 2]! - anchor.z
-        const gx = dx * ac - dz * as
-        const gz = dx * as + dz * ac
-        if (gx >= _slotObb.min.x && gx <= _slotObb.max.x && gz >= _slotObb.min.z && gz <= _slotObb.max.z) {
-          return true
-        }
+      const targets = useDestruction.getState().targets
+      const target = targets.get(entry.nodeId)
+      if (target) {
+        if (gridSupportsSlotObb(target.grid, anchor.x, anchor.z, ac, as)) return true
+        continue
+      }
+      // Roof shells voxelize into MEMBER targets only (`id#pN` planes +
+      // `#residual` — destruction's plane lane) while the DISABLED colliders
+      // stay under the bare scene id: a bare-id miss here read a fully-alive
+      // roof as zero support and cascaded every roof-anchored build. Walk
+      // the family instead.
+      const prefix = `${entry.nodeId}#`
+      for (const [id, member] of targets) {
+        if (!id.startsWith(prefix)) continue
+        if (gridSupportsSlotObb(member.grid, anchor.x, anchor.z, ac, as)) return true
       }
     }
     return false
   }
+}
+
+/** At least one ALIVE voxel center of `grid` inside the margin-expanded
+ * slot OBB (`_slotObb` — set by the enclosing probe call): voxel center
+ * world→grid (the IN seam), then point-in-OBB. */
+function gridSupportsSlotObb(
+  grid: { centers: ArrayLike<number>; alive: ArrayLike<number>; count: number },
+  anchorX: number,
+  anchorZ: number,
+  ac: number,
+  as: number,
+): boolean {
+  const { centers, alive, count } = grid
+  for (let v = 0; v < count; v++) {
+    if (alive[v] === 0) continue
+    const c = v * 3
+    const wy = centers[c + 1]!
+    if (wy < _slotObb.min.y || wy > _slotObb.max.y) continue
+    const dx = centers[c]! - anchorX
+    const dz = centers[c + 2]! - anchorZ
+    const gx = dx * ac - dz * as
+    const gz = dx * as + dz * ac
+    if (gx >= _slotObb.min.x && gx <= _slotObb.max.x && gz >= _slotObb.min.z && gz <= _slotObb.max.z) {
+      return true
+    }
+  }
+  return false
 }
 
 // --- Budgeted clad queue (TURBO CLAD BUDGET — see the header block) ----------

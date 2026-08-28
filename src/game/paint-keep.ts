@@ -105,28 +105,50 @@ export const DECAL_VOTE_PER_M2 = 255 / (0.15 * 0.15)
 export function capturePaint(): number {
   const painted: PaintedNode[] = []
   const targets = useDestruction.getState().targets
-  const ledger = getPaintedByNode()
   const decals = getDecalVotesByNode()
-  const nodeIds = new Set<string>([...ledger.keys(), ...decals.keys()])
-  for (const nodeId of nodeIds) {
-    if (nodeId.startsWith('__boots')) continue
-    const cells = ledger.get(nodeId)
-    const target = targets.get(nodeId)
+  // Votes aggregate per SCENE node id: roof shells ledger under
+  // `<sceneId>#p<n>`/`#residual` MEMBER target ids (destruction's plane
+  // lane — the drain needs the member grids), but buildPaintPatches can
+  // only patch the bare id, so member votes merge into it here. The alive
+  // filter still reads each member's OWN grid.
+  const votesByNode = new Map<string, Map<number, number>>()
+  const cellsByNode = new Map<string, number>()
+  for (const [ledgerId, cells] of getPaintedByNode()) {
+    if (cells.size === 0) continue
+    const hash = ledgerId.indexOf('#')
+    const nodeId = hash === -1 ? ledgerId : ledgerId.slice(0, hash)
+    const target = targets.get(ledgerId)
     const alive = target ? (cell: number) => target.grid.alive[cell] === 1 : undefined
-    let votes =
-      cells !== undefined && cells.size > 0 ? paintVotes(cells, alive) : new Map<number, number>()
+    let votes = paintVotes(cells, alive)
     // Every painted cell died: the full ledger votes instead — the
     // player's explicit act still counts even after the surface took fire.
-    if (votes.size === 0 && cells !== undefined && cells.size > 0) votes = paintVotes(cells)
-    const areaVotes = decals.get(nodeId)
-    let decalCellEquivalents = 0
-    if (areaVotes) {
-      for (const [color, area] of areaVotes) {
-        const weight = area * DECAL_VOTE_PER_M2
-        votes.set(color, (votes.get(color) ?? 0) + weight)
-        decalCellEquivalents += weight / 255
-      }
+    if (votes.size === 0) votes = paintVotes(cells)
+    let merged = votesByNode.get(nodeId)
+    if (!merged) {
+      merged = new Map()
+      votesByNode.set(nodeId, merged)
     }
+    for (const [color, weight] of votes) merged.set(color, (merged.get(color) ?? 0) + weight)
+    cellsByNode.set(nodeId, (cellsByNode.get(nodeId) ?? 0) + cells.size)
+  }
+  for (const [decalNodeId, areaVotes] of decals) {
+    const hash = decalNodeId.indexOf('#')
+    const nodeId = hash === -1 ? decalNodeId : decalNodeId.slice(0, hash)
+    let merged = votesByNode.get(nodeId)
+    if (!merged) {
+      merged = new Map()
+      votesByNode.set(nodeId, merged)
+    }
+    let decalCellEquivalents = 0
+    for (const [color, area] of areaVotes) {
+      const weight = area * DECAL_VOTE_PER_M2
+      merged.set(color, (merged.get(color) ?? 0) + weight)
+      decalCellEquivalents += weight / 255
+    }
+    cellsByNode.set(nodeId, (cellsByNode.get(nodeId) ?? 0) + Math.round(decalCellEquivalents))
+  }
+  for (const [nodeId, votes] of votesByNode) {
+    if (nodeId.startsWith('__boots')) continue
     const index = winningPaint(votes)
     if (index === null) continue
     const swatch = PAINT_PALETTE[index]!
@@ -134,7 +156,7 @@ export function capturePaint(): number {
       nodeId,
       color: swatch.hex,
       colorName: swatch.name,
-      cells: (cells?.size ?? 0) + Math.round(decalCellEquivalents),
+      cells: cellsByNode.get(nodeId) ?? 0,
     })
   }
   usePaintKeep.getState().setPainted(painted)

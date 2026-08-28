@@ -91,8 +91,15 @@ export const GROUND_BOT_CAPSULE = { radius: 0.35, height: 1.2 }
 /** Drone capsule for the same wall rule (DRONE WALL RULE in enemies.tsx) —
  * sized to the rotor frame. A drone's position is its BODY CENTER (no feet),
  * so enemies.tsx offsets by half the height into the feet-based collide*
- * calls and back. */
-export const DRONE_CAPSULE = { radius: 0.3, height: 0.5 }
+ * calls and back. MUST stay a legal capsule (height ≥ 2·radius): the old
+ * radius 0.3 × height 0.5 inverted the core segment, so the narrow-phase
+ * hull overhung the y..y+height broad-phase box by 0.1 m below AND above —
+ * drones hovered proud of floors and bumped lintels early. 0.3 × 0.72
+ * keeps the rotor width AND the old effective hull (body ± 0.36 vs the
+ * inverted ± 0.35) with a REAL core segment: a degenerate point-sphere at
+ * body center sits exactly midway between 0.15 m voxel rows and can thread
+ * a wall's row channel (the wall-rule pin caught it). */
+export const DRONE_CAPSULE = { radius: 0.3, height: 0.72 }
 
 export const BOT_STATS: Record<
   BotKind,

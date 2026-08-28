@@ -165,6 +165,15 @@ export const paintColorOf = (value: number): number => value >> 8
 /** Strength half of a packed ledger value, back in 0..1. */
 export const paintStrengthOf = (value: number): number => (value & 0xff) / 255
 
+/** The strength a coat of `color` BUILDS ON at a cell: same color
+ * accumulates; a DIFFERENT color covers the old coat and restarts from
+ * zero — carrying the previous color's strength would flip a saturated
+ * sage cell to navy at FULL strength off one 0.16 rim fleck (and inflate
+ * its paint-keep vote ~16×). Pure — exported for tests. */
+export function coatBaseStrength(prev: number | undefined, color: number): number {
+  return prev !== undefined && paintColorOf(prev) === color ? paintStrengthOf(prev) : 0
+}
+
 /** nodeId → voxel cell index → packed (color << 8) | strength coat. */
 const paintedByNode = new Map<string, Map<number, number>>()
 /** Per-node write serial — the renderer-drain's change gate (also the
@@ -621,11 +630,35 @@ export function decalCensus(nodeId?: string): number {
   return n
 }
 
+/** Evicted decal geometries awaiting disposal. releaseSlot runs inside the
+ * spray tick while the slot's `<mesh dispose={null}>` is still mounted for
+ * THIS frame's render — the uSES re-render only flushes at the microtask
+ * boundary, after R3F's same-rAF gl.render. Disposing right there makes
+ * three re-register the freed geometry on that last draw (WebGLGeometries
+ * .get re-uploads; bindingStates keeps a VAO under the never-reused
+ * geometry id with no dispose event left to clear it — a GL leak per
+ * eviction). Dispose is DEFERRED to the next PaintTool frame, after the
+ * remount has actually dropped the mesh. */
+const retiredDecalGeometries: BufferGeometry[] = []
+
+/** Retired-but-undisposed geometries (QA/tests). */
+export function retiredDecalCensus(): number {
+  return retiredDecalGeometries.length
+}
+
+/** Dispose everything the ring evicted since the last flush — called at
+ * the top of PaintTool's frame (the evicting render is over by then) and
+ * from resetPaintDecals (mount/unmount: no live mesh references remain). */
+export function flushRetiredDecalGeometries(): void {
+  for (const geometry of retiredDecalGeometries) geometry.dispose()
+  retiredDecalGeometries.length = 0
+}
+
 function releaseSlot(index: number): void {
   const s = decalSlots[index]!
   if (!s.alive) return
   s.alive = false
-  s.geometry?.dispose()
+  if (s.geometry) retiredDecalGeometries.push(s.geometry)
   s.geometry = null
   const list = nodeDecals.get(s.nodeId)
   if (list) {
@@ -639,6 +672,22 @@ export function resetPaintDecals(): void {
   for (let i = 0; i < DECAL_CAP; i++) releaseSlot(i)
   nodeDecals.clear()
   decalCursor = 0
+  emitDecals()
+  // Mount/unmount lane: no slot mesh survives this commit, dispose now.
+  flushRetiredDecalGeometries()
+}
+
+/**
+ * Free every decal on `nodeId`. Splats are WORLD-SPACE DecalGeometry baked
+ * at the host's clip-time pose — an operable door/window leaf swinging away
+ * (interact.tsx toggleOperable) would leave them floating in the opening,
+ * so the toggle releases them instead (the coat was never persisted paint;
+ * saveable votes come from Save while the decals are live).
+ */
+export function releaseNodeDecals(nodeId: string): void {
+  const indices = nodeDecals.get(nodeId)
+  if (!indices || indices.length === 0) return
+  for (const index of [...indices]) releaseSlot(index)
   emitDecals()
 }
 
@@ -818,8 +867,7 @@ export function convertDecalsForNode(nodeId: string): void {
       }
       for (const { cell, add } of coats) {
         const strength = Math.min(1, add / COAT_ADD)
-        const prev = painted.get(cell)
-        const before = prev === undefined ? 0 : paintStrengthOf(prev)
+        const before = coatBaseStrength(painted.get(cell), s.color)
         painted.set(cell, paintValue(s.color, Math.min(1, before + strength)))
       }
       wrote = true
@@ -988,8 +1036,7 @@ export function sprayPaint(world: GameWorld): boolean {
   const dripYaw = Math.atan2(nx, nz)
   let drips = 0
   for (const { cell, add } of coats) {
-    const prev = painted.get(cell)
-    const before = prev === undefined ? 0 : paintStrengthOf(prev)
+    const before = coatBaseStrength(painted.get(cell), colorIndex)
     if (shouldDrip(target.kind, before, drips, Math.random())) {
       drips++
       spawnDrip(
@@ -1281,6 +1328,9 @@ export function PaintTool({ world }: { world: GameWorld }) {
   }, [])
 
   useFrame((_, rawDt) => {
+    // The render that last drew any ring-evicted decal geometry is over —
+    // safe to dispose now (see retiredDecalGeometries).
+    flushRetiredDecalGeometries()
     const session = getSession()
     if (!session) return
     const dt = Math.min(rawDt, 1 / 30)

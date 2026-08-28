@@ -9,13 +9,16 @@ import {
   decalEligibleTris,
   decalMaterialFor,
   convertDecalsForNode,
+  flushRetiredDecalGeometries,
   getDecalVotesByNode,
   getPaintedByNode,
   PAINT_PALETTE,
   paintColorOf,
   paintStrengthOf,
+  releaseNodeDecals,
   resetPaint,
   resetPaintDecals,
+  retiredDecalCensus,
   spawnPaintDecal,
 } from './paint'
 import { capturePaint, DECAL_VOTE_PER_M2, usePaintKeep } from './paint-keep'
@@ -92,6 +95,34 @@ describe('spawnPaintDecal (pristine hosts, P5)', () => {
       }
     }
     expect(decalCensus()).toBe(DECAL_CAP)
+  })
+})
+
+describe('decal slot lifecycle (deferred dispose + operable release)', () => {
+  test('eviction DEFERS geometry disposal until the flush (VAO-leak regression)', () => {
+    const mesh = wallMesh()
+    expect(spawnPaintDecal(mesh, 'wall_a', at(0), N, 0.3, 1)).toBe(true)
+    flushRetiredDecalGeometries() // clear anything earlier tests queued
+    // Over-spray the node past its cap: each eviction retires a geometry
+    // but must NOT dispose it inside the tick (the slot mesh still renders
+    // once more this frame).
+    for (let i = 0; i < DECAL_NODE_CAP; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_a', at((i % 12) * 0.25 - 1.5), N, 0.2, 1)).toBe(true)
+    }
+    expect(decalCensus('wall_a')).toBe(DECAL_NODE_CAP)
+    expect(retiredDecalCensus()).toBe(1)
+    flushRetiredDecalGeometries()
+    expect(retiredDecalCensus()).toBe(0)
+  })
+
+  test('releaseNodeDecals frees exactly one node (the door-toggle hook)', () => {
+    const mesh = wallMesh()
+    expect(spawnPaintDecal(mesh, 'door_1', at(0), N, 0.3, 2)).toBe(true)
+    expect(spawnPaintDecal(mesh, 'wall_z', at(1), N, 0.3, 2)).toBe(true)
+    releaseNodeDecals('door_1')
+    expect(decalCensus('door_1')).toBe(0)
+    expect(decalCensus('wall_z')).toBe(1)
+    releaseNodeDecals('never_painted') // cheap no-op
   })
 })
 
@@ -172,6 +203,40 @@ describe('capturePaint with live decals (area-weighted votes)', () => {
     expect(captured.color).toBe(PAINT_PALETTE[4]!.hex)
     const expectedCells = Math.round((Math.PI * 0.16 * DECAL_VOTE_PER_M2) / 255)
     expect(captured.cells).toBe(expectedCells)
+  })
+
+  test('REGRESSION: roof member-id ledger entries save under the BARE scene id', () => {
+    // Roof shells voxelize into `<sceneId>#p<n>` member targets; the
+    // decal→ledger conversion (and plain spraying of a voxelized roof)
+    // keys the ledger by those ids. Save must merge them into the bare id —
+    // buildPaintPatches can only patch real scene nodes.
+    const p0 = fakeTarget('roof1#p0')
+    const p1 = fakeTarget('roof1#p1')
+    useDestruction.getState().targets.set('roof1#p0', p0)
+    useDestruction.getState().targets.set('roof1#p1', p1)
+    const ledger = getPaintedByNode() as Map<string, Map<number, number>>
+    ledger.set('roof1#p0', new Map([[0, (2 << 8) | 255]]))
+    ledger.set('roof1#p1', new Map([[1, (2 << 8) | 200], [2, (4 << 8) | 40]]))
+    expect(capturePaint()).toBe(1)
+    const captured = usePaintKeep.getState().painted[0]!
+    expect(captured.nodeId).toBe('roof1')
+    expect(captured.color).toBe(PAINT_PALETTE[2]!.hex)
+    expect(captured.cells).toBe(3)
+  })
+
+  test('REGRESSION: decals converted on a roof member reach the Save patch', () => {
+    const mesh = wallMesh()
+    // The plane family lives ONLY under member ids (destruction.ts:1513).
+    const member = fakeTarget('roof2#p0')
+    useDestruction.getState().targets.set('roof2#p0', member)
+    // Spray the pristine roof (decals key by the scene id the collider has)…
+    expect(spawnPaintDecal(mesh, 'roof2', at(0), N, 0.4, 3)).toBe(true)
+    // …then a bullet voxelizes it: the target-live hook converts.
+    convertDecalsForNode('roof2')
+    expect(decalCensus('roof2')).toBe(0)
+    expect(getPaintedByNode().has('roof2#p0')).toBe(true) // drain keeps rendering
+    expect(capturePaint()).toBe(1)
+    expect(usePaintKeep.getState().painted[0]!.nodeId).toBe('roof2') // Save patches
   })
 
   test('decal area outvotes a couple of faint ledger cells', () => {
