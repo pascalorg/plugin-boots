@@ -1,5 +1,15 @@
 import { type AnyNodeId, useScene } from '@pascal-app/core'
-import { Box3, Color, Matrix4, type Mesh, type Object3D, Quaternion, Vector3 } from 'three'
+import {
+  Box3,
+  BufferAttribute,
+  BufferGeometry,
+  Color,
+  Matrix4,
+  Mesh,
+  type Object3D,
+  Quaternion,
+  Vector3,
+} from 'three'
 import { create } from 'zustand'
 import { useBoots } from '../store'
 import { sfx } from './audio'
@@ -8,7 +18,12 @@ import { spawnDust, spawnHaze } from './dust'
 import { perfEvent } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
-import { enumerateRoofPlanes, resolveRoofSkinTone, roofSurfaceColor } from './roof-planes'
+import {
+  enumerateRoofPlanes,
+  residualSurfaceColor,
+  resolveRoofSkinTone,
+  roofSurfaceColor,
+} from './roof-planes'
 import { hideForGameKeepingRoots } from './session'
 import {
   dropStructureTarget,
@@ -1276,8 +1291,10 @@ function hideHostNode(
 // the MIN-z face), instead of the old single axis-aligned volume whose
 // adaptive cells stair-stepped the silhouette and could grow past every
 // weapon's holeRadius (the QA "bulletproof roof"). Member targets live in
-// the normal target map under `<nodeId>#p<n>` ids; the real node id keeps a
-// group record so damage through EITHER id fans out to every sibling plane
+// the normal target map under `<nodeId>#p<n>` ids — plus one `#residual`
+// member tracing the shell faces NO plane covers (vertical gable-end
+// triangles; see buildRoofResidualTarget) — and the real node id keeps a
+// group record so damage through EITHER id fans out to every sibling
 // (the planes overlap a hair at ridges/hips — a seam shot must open both).
 // Roof targets register with structure.ts as SUPPORTERS only (kind 'roof'
 // is never a crumble candidate, matching the V1 pitched-grid rule).
@@ -1327,7 +1344,8 @@ function buildRoofPlaneTargets(
   sources: VoxelSource[],
   dormant?: boolean,
 ): VoxelTarget | null {
-  const planes = enumerateRoofPlanes(meshes)
+  const residualTris: number[] = []
+  const planes = enumerateRoofPlanes(meshes, residualTris)
   if (planes.length === 0) return null
   // One flat rafter layout over all planes, split per plane (ids re-based
   // 0..n−1 within each group — the SegmentMember contract per target).
@@ -1394,6 +1412,16 @@ function buildRoofPlaneTargets(
   }
   if (built.length === 0) return null
 
+  // RESIDUAL LANE (the vanishing-gable-end fix): the shell's NON-SLOPED
+  // faces — vertical gable-end triangles, fascia, flat caps — join no
+  // plane cluster, yet hiding the merged host mesh below hides THEM too,
+  // so the first hit used to erase them with nothing in their place (the
+  // skeleton showed end-on on intersecting-gable roofs). One extra
+  // fine-celled volume member traces exactly those excluded faces; a roof
+  // with no residual faces builds nothing here (zero cost).
+  const residualTarget = buildRoofResidualTarget(nodeId, meshes, residualTris)
+  if (residualTarget) built.push(residualTarget)
+
   // Every plane replica is ready — hide the merged host mesh ONCE, in the
   // same tick, and hand the node's colliders over. Dormant prebuilds defer
   // that hide to wakeTarget (group-wide: one map entry per roof node).
@@ -1425,6 +1453,9 @@ function buildRoofPlaneTargets(
     const group = roofGroups.get(nodeId)
     if (!group) return // roof dropped before the readback landed
     for (const id of group) {
+      // The residual member wears its OWN faces' tone (siding/trim), never
+      // the shingle skin — see buildRoofResidualTarget.
+      if (id.endsWith(ROOF_RESIDUAL_SUFFIX)) continue
       const member = live.get(id)
       if (!member) continue
       member.baseColor.copy(tone)
@@ -1432,6 +1463,81 @@ function buildRoofPlaneTargets(
     }
   })
   return built[0]!
+}
+
+/** The roof group's member id suffix for the excluded-faces target — the
+ * same `#` membership pattern as the `#p<n>` plane ids (never a scene node
+ * id on its own; damage fan-out, family wake, dropTarget, and the
+ * demolition capture all treat it exactly like a plane member). */
+const ROOF_RESIDUAL_SUFFIX = '#residual'
+
+const _residualBounds = new Box3()
+
+/**
+ * Build the roof group's RESIDUAL member from the triangles
+ * enumerateRoofPlanes excluded (packed world-space positions): a plain
+ * 'volume' target whose grid is a fine SURFACE trace of exactly those
+ * faces, so gable ends keep a replica when the merged host mesh hides.
+ * The soup is OPEN geometry — buildVoxelGrid runs surfaceOnly (the
+ * interior backface fill would flood the whole attic between two end
+ * caps). Cell sizing is the item recipe's two stages leaning on
+ * buildVoxelGrid's own adaptive loop (the soup is thin like a wall, so the
+ * occupancy-discounted raw budget applies), and a build that lands on the
+ * fill ceiling (= possibly truncated) rebuilds coarser until it fits
+ * whole. Null when the roof has no residual faces or they trace to
+ * nothing. Voxelize-time work only.
+ */
+function buildRoofResidualTarget(
+  nodeId: string,
+  meshes: Mesh[],
+  tris: number[],
+): VoxelTarget | null {
+  if (tris.length === 0) return null
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', new BufferAttribute(Float32Array.from(tris), 3))
+  // Identity matrixWorld — the residual positions are world-space already.
+  const soup = new Mesh(geometry)
+  const sources: VoxelSource[] = [{ bvh: bvhFor(soup), matrixWorld: soup.matrixWorld }]
+  geometry.computeBoundingBox()
+  _residualBounds.copy(geometry.boundingBox!)
+  let grid = buildVoxelGrid(
+    sources,
+    _residualBounds.clone(),
+    ITEM_CELL_MAX,
+    false,
+    undefined,
+    0,
+    undefined,
+    true,
+  )
+  for (let guard = 0; guard < 4 && grid.count >= VOXEL_FILL_CEILING; guard++) {
+    grid = buildVoxelGrid(
+      sources,
+      _residualBounds.clone(),
+      grid.cell * 1.35,
+      false,
+      undefined,
+      0,
+      undefined,
+      true,
+    )
+  }
+  if (grid.count === 0) return null
+  const segments: SegmentMember[] = []
+  return {
+    nodeId: `${nodeId}${ROOF_RESIDUAL_SUFFIX}`,
+    kind: 'volume',
+    grid,
+    // The residual faces' OWN dominant tone (siding/trim on gable ends) —
+    // never the shingle skin; the async roof retint skips this member too.
+    baseColor: residualSurfaceColor(meshes) ?? targetBaseColor(meshes),
+    segments,
+    studs: segments,
+    sheets: [],
+    sheetByCell: EMPTY_SHEET_MAP,
+    removedQueue: [],
+    revision: 0,
+  }
 }
 
 /**

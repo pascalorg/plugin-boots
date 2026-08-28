@@ -167,6 +167,11 @@ export function buildVoxelGrid(
    * `yaw`. This is how destruction.ts will later hand in a roof-plane
    * frame (Qy(yaw)·Qx(pitch)) so a pitched slab voxelizes plane-aligned. */
   basis?: VoxelBasis,
+  /** Skip the interior backface fill — SURFACE trace only. Open triangle
+   * SOUPS (the roof residual lane's gable-end faces) have no watertight
+   * inside: a ray cast from anywhere behind a lone face hits its backface,
+   * so the voxelize.js trick would flood every cell up to it. */
+  surfaceOnly = false,
 ): VoxelGridData {
   const size = new Vector3()
   worldBounds.getSize(size)
@@ -239,6 +244,7 @@ export function buildVoxelGrid(
             inside = true
             break
           }
+          if (surfaceOnly) continue
           // Interior test: a local-space ray that first hits a backface
           // started inside the mesh (voxelize.js recipe).
           _p.set(cx, cy, cz).applyMatrix4(inv)
