@@ -34,6 +34,7 @@ import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monit
 import { Player, playerDebug, playerRig } from './player'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { aimDirection, fire } from './shooting'
+import { pendingToneCount, toneAuditReport } from './skin-tone'
 import { GameSky } from './sky'
 import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
@@ -557,6 +558,12 @@ function ActiveGame() {
             ? target.cellMetal.reduce((n, v) => n + v, 0)
             : 0,
         })),
+      // Tone audit (voxel-fidelity QA): every node still wearing a
+      // FALLBACK skin tone instead of its surface's real albedo, and why
+      // ('pending' entries are still retrying ~1/s). Empty = no voxel
+      // renders the untextured default. Plain copies via skin-tone.ts.
+      toneAudit: () => toneAuditReport(),
+      pendingTones: () => pendingToneCount(),
       studs: () =>
         Array.from(useDestruction.getState().targets.values()).flatMap((target) =>
           target.studs.map((stud) => ({

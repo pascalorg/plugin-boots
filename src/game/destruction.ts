@@ -20,12 +20,25 @@ import { perfEvent, perfSection } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, pieceReplicaDead, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
 import {
+  dominantMaterialBy,
+  dominantResidualMaterial,
+  dominantSlopedMaterial,
   enumerateRoofPlanes,
-  residualSurfaceColor,
-  resolveRoofSkinTone,
-  roofSurfaceColor,
 } from './roof-planes'
 import { hideForGameKeepingRoots, maskForGame } from './session'
+import {
+  cellToneAt,
+  clearToneAudit,
+  isUntexturedWhite,
+  kindFallbackTone,
+  mapAverageTone,
+  mapPatternGrid,
+  reportToneFallback,
+  resetSkinTones,
+  resolveSurfaceTone,
+  type SkinToneKind,
+  type ToneGrid,
+} from './skin-tone'
 import {
   cancelSettleTask,
   dropStructureTarget,
@@ -290,6 +303,12 @@ export type VoxelTarget = {
    * a bump; paint coats re-apply on top via drainPaintTints (the paint
    * ledger's own serials never move). */
   skinRevision?: number
+  /** The surface texture's CPU pattern grid (skin-tone.ts mapPatternGrid)
+   * — when present, primedCellColor samples the PATTERN (brick courses,
+   * shingle rows) per cell instead of the flat baseColor. Set at voxelize
+   * for readable maps; pending textures deliver it with the async retint.
+   * Layered kinds only (item cells carry their pattern IN cellColors). */
+  toneGrid?: ToneGrid
   /** DORMANT prevoxelization (the grenade-lag fix): the grid + anatomy are
    * prebuilt off the blast frame, but the HOST keeps rendering and
    * colliding — no visual change until the first hit wakes the target
@@ -884,38 +903,12 @@ type ItemMaterialLike = {
 }
 
 /**
- * Average tone of a material's texture map through a tiny 2D canvas —
- * the averageMapColor recipe from the roof-surface-color work (kept local:
- * roof-planes.ts's helper is module-private and also owns an async GPU
- * path items don't need). Null headless or for compressed/undrawable
- * images — callers keep the base color then.
+ * Average tone of a material's texture map — skin-tone.ts's cached CPU
+ * read (data-image or tiny-canvas down-draw). Null headless or for
+ * compressed/undrawable images — callers walk the fallback chain then.
  */
 function itemMapAverage(material: ItemMaterialLike): Color | null {
-  const image = material.map?.image
-  if (!image || typeof document === 'undefined') return null
-  try {
-    const size = 8
-    const canvas = document.createElement('canvas')
-    canvas.width = size
-    canvas.height = size
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return null
-    ctx.drawImage(image as CanvasImageSource, 0, 0, size, size)
-    const data = ctx.getImageData(0, 0, size, size).data
-    let r = 0
-    let g = 0
-    let b = 0
-    for (let i = 0; i < data.length; i += 4) {
-      r += data[i]!
-      g += data[i + 1]!
-      b += data[i + 2]!
-    }
-    const n = (data.length / 4) * 255
-    // Canvas bytes are sRGB — convert into three's working color space.
-    return new Color().setRGB(r / n, g / n, b / n, 'srgb')
-  } catch {
-    return null
-  }
+  return mapAverageTone(material.map as Parameters<typeof mapAverageTone>[0])
 }
 
 /** Dominant material of one sub-mesh: single materials win outright;
@@ -966,16 +959,24 @@ export function isMetalItemMaterial(material: ItemMaterialLike | null): boolean 
 }
 
 /** One sub-mesh's resolved tone: base color × map average when the map is
- * drawable (host GLB materials often carry the look in the MAP over a
- * white base — reading `color` alone yields white), else the base color,
- * else the neutral targetBaseColor fallback tone. */
-function itemRegionColor(mesh: Mesh): Color {
+ * readable (host GLB materials often carry the look in the MAP over a
+ * white base — reading `color` alone yields white), else the base color
+ * (UNLESS it's the untextured white default masking an unreadable map),
+ * else the item fallback tone. `fallback` reports what the tone audit
+ * should know (null = truthful tone). */
+function itemRegionColor(mesh: Mesh): { tone: Color; fallback: 'no-material' | 'map-unreadable' | null } {
   const material = dominantMeshMaterial(mesh)
   const base = material?.color
   const mapTone = material ? itemMapAverage(material) : null
-  if (mapTone) return base ? mapTone.multiply(base) : mapTone
-  if (base) return base.clone()
-  return new Color('#d8d2c7')
+  if (mapTone) return { tone: base ? mapTone.multiply(base) : mapTone, fallback: null }
+  if (material?.map && base && isUntexturedWhite(base)) {
+    // A TEXTURED region rendering plain white is a lie (the map carries the
+    // look; the base is the host's white default) — wear the item fallback
+    // tone instead. A map-less white base stays: porcelain is porcelain.
+    return { tone: kindFallbackTone('item'), fallback: 'map-unreadable' }
+  }
+  if (base) return { tone: base.clone(), fallback: material?.map ? 'map-unreadable' : null }
+  return { tone: kindFallbackTone('item'), fallback: 'no-material' }
 }
 
 /** Region-volume tiebreak weight (m³ → score): at d² parity (cell inside
@@ -999,6 +1000,7 @@ const _regionSize = new Vector3()
  * ≤ ~2600 × a handful. Null when the node exposes no solid meshes.
  */
 function sampleItemCellColors(
+  nodeId: string,
   grid: VoxelGridData,
   meshes: readonly Mesh[],
 ): { colors: Float32Array; average: Color; cellMetal?: Uint8Array } | null {
@@ -1010,18 +1012,53 @@ function sampleItemCellColors(
     g: number
     b: number
     metal: boolean
+    /** The region material's pattern grid (readable maps only) + the base
+     * color multiplier — cells inside this region sample the TEXTURE at a
+     * region-relative (u,v) instead of wearing the flat tone. */
+    pattern: ToneGrid | null
+    baseR: number
+    baseG: number
+    baseB: number
+    /** (u,v) plane = the box's two DOMINANT axes (largest extents,
+     * u = largest), world-position projection normalized over the box. */
+    u0: number
+    v0: number
+    uInv: number
+    vInv: number
+    uAxis: 0 | 1 | 2
+    vAxis: 0 | 1 | 2
   }> = []
   let anyMetal = false
+  // Tone audit: an item counts as unresolved when ANY region wore a
+  // fallback tone (unreadable map beats missing material as the reason).
+  let fallbackWhy: 'no-material' | 'map-unreadable' | null = null
   for (const mesh of meshes) {
     if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
     const box = mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld)
     box.getSize(_regionSize)
-    const tone = itemRegionColor(mesh)
+    const { tone, fallback } = itemRegionColor(mesh)
+    if (fallback && fallbackWhy !== 'map-unreadable') fallbackWhy = fallback
     // Metal rides the SAME region attribution as the palette (QA P9R1 fix
     // 2): most metal items are MIXED — a couch's chrome handle or the
     // barbell's bar must spark without turning the whole item metallic.
-    const metal = isMetalItemMaterial(dominantMeshMaterial(mesh))
+    const material = dominantMeshMaterial(mesh)
+    const metal = isMetalItemMaterial(material)
     anyMetal ||= metal
+    // Pattern lane: a readable map paints the region's cells with the
+    // texture itself (one repeat across the region — items are small and
+    // their host UVs unrecoverable; the pattern READ is what matters).
+    const pattern = material?.map
+      ? mapPatternGrid(material.map as Parameters<typeof mapPatternGrid>[0])
+      : null
+    const extents: Array<[number, 0 | 1 | 2]> = [
+      [_regionSize.x, 0],
+      [_regionSize.y, 1],
+      [_regionSize.z, 2],
+    ]
+    extents.sort((a, b) => b[0] - a[0])
+    const [uExtent, uAxis] = extents[0]!
+    const [vExtent, vAxis] = extents[1]!
+    const minArr = [box.min.x, box.min.y, box.min.z]
     regions.push({
       box,
       score: _regionSize.x * _regionSize.y * _regionSize.z * REGION_VOLUME_WEIGHT,
@@ -1029,8 +1066,20 @@ function sampleItemCellColors(
       g: tone.g,
       b: tone.b,
       metal,
+      pattern: uExtent > 1e-6 && vExtent > 1e-6 ? pattern : null,
+      baseR: material?.color?.r ?? 1,
+      baseG: material?.color?.g ?? 1,
+      baseB: material?.color?.b ?? 1,
+      u0: minArr[uAxis]!,
+      v0: minArr[vAxis]!,
+      uInv: uExtent > 1e-6 ? 1 / uExtent : 0,
+      vInv: vExtent > 1e-6 ? 1 / vExtent : 0,
+      uAxis,
+      vAxis,
     })
   }
+  if (fallbackWhy) reportToneFallback(nodeId, 'item', fallbackWhy)
+  else clearToneAudit(nodeId)
   const colors = new Float32Array(grid.count * 3)
   const cellMetal = anyMetal ? new Uint8Array(grid.count) : undefined
   let sumR = 0
@@ -1053,13 +1102,27 @@ function sampleItemCellColors(
         best = region
       }
     }
-    colors[i * 3] = best.r
-    colors[i * 3 + 1] = best.g
-    colors[i * 3 + 2] = best.b
+    let r = best.r
+    let g = best.g
+    let b = best.b
+    if (best.pattern) {
+      // Sample the region's texture at the cell's projected (u,v) — the
+      // per-cell pattern — modulated by the material's base color (the
+      // same multiply the flat itemRegionColor tone applies).
+      const u = ((best.uAxis === 0 ? x : best.uAxis === 1 ? y : z) - best.u0) * best.uInv
+      const v = ((best.vAxis === 0 ? x : best.vAxis === 1 ? y : z) - best.v0) * best.vInv
+      cellToneAt(_cellPattern, best.pattern, u, v)
+      r = _cellPattern.r * best.baseR
+      g = _cellPattern.g * best.baseG
+      b = _cellPattern.b * best.baseB
+    }
+    colors[i * 3] = r
+    colors[i * 3 + 1] = g
+    colors[i * 3 + 2] = b
     if (cellMetal && best.metal) cellMetal[i] = 1
-    sumR += best.r
-    sumG += best.g
-    sumB += best.b
+    sumR += r
+    sumG += g
+    sumB += b
   }
   return {
     colors,
@@ -1067,6 +1130,8 @@ function sampleItemCellColors(
     cellMetal,
   }
 }
+
+const _cellPattern = new Color()
 
 const _cellTint = new Color()
 
@@ -1307,13 +1372,39 @@ function buildSheets(
   return { sheets, sheetByCell }
 }
 
-function targetBaseColor(meshes: Mesh[]): Color {
-  for (const mesh of meshes) {
-    const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
-    const color = (material as { color?: Color } | undefined)?.color
-    if (color) return color.clone()
+/**
+ * The material a target's tone chain should read: the one owning the most
+ * FACE AREA (the old first-material grab returned white cap/trim slots on
+ * textured hosts — the "voxels are still the default untextured white"
+ * live complaint). Slabs prefer their upward-facing area (the floor
+ * finish) and fall back to all faces; everything else reads all faces.
+ */
+function dominantTargetMaterial(
+  meshes: readonly Mesh[],
+  kind: SkinToneKind,
+): Parameters<typeof resolveSurfaceTone>[2] {
+  if (kind === 'slab') {
+    const top = dominantMaterialBy(meshes, (ny) => ny > 0.7)
+    if (top) return top
   }
-  return new Color('#d8d2c7')
+  return dominantMaterialBy(meshes, () => true)
+}
+
+/** The async-retint sink for a single target: when a pending tone lands
+ * (texture finished loading / GPU readback), copy it — and the texture's
+ * pattern grid — into the LIVE target and bump skinRevision — voxel-walls
+ * re-primes the skin layer once (cells now wear the pattern); paint coats
+ * re-apply from the ledger (drainPaintTints — the serials never move).
+ * Looks the target up fresh: it may have dropped (or the session reset)
+ * while the tone was pending. */
+function retintTarget(nodeId: string): (tone: Color, grid: ToneGrid | null) => void {
+  return (tone, grid) => {
+    const live = useDestruction.getState().targets.get(nodeId)
+    if (!live) return
+    live.baseColor.copy(tone)
+    if (grid) live.toneGrid = grid
+    live.skinRevision = (live.skinRevision ?? 0) + 1
+  }
 }
 
 /**
@@ -1512,8 +1603,33 @@ function buildRoofPlaneTargets(
   const rafterGroups = splitRaftersByPlane(buildRafters(null, null, planes), planes.length)
   // Skin tone: the roof SURFACE material (dominant sloped-face area), not
   // whatever material slot happens to come first on the merged mesh (QA c:
-  // roofs rendered in the white Wall/Trim tone).
-  const baseColor = roofSurfaceColor(meshes) ?? targetBaseColor(meshes)
+  // roofs rendered in the white Wall/Trim tone). resolveSurfaceTone walks
+  // the full chain (map thumbnail → GPU readback for compressed KTX2 →
+  // non-white base → dark-shingle fallback) and retints EVERY plane member
+  // of the group when a pending texture resolves later — skinRevision
+  // tells voxel-walls to re-prime colors (paint ledger serials stay
+  // untouched; coats re-apply via drainPaintTints). The group registers a
+  // few lines below; deliveries are async-only, so the lookup never races.
+  const roofMaterial = dominantSlopedMaterial(meshes)
+  const baseColor = resolveSurfaceTone(nodeId, 'roof', roofMaterial, (tone, grid) => {
+    const live = useDestruction.getState().targets
+    const group = roofGroups.get(nodeId)
+    if (!group) return // roof dropped before the tone resolved
+    for (const id of group) {
+      // The residual member wears its OWN faces' tone (siding/trim), never
+      // the shingle skin — see buildRoofResidualTarget.
+      if (id.endsWith(ROOF_RESIDUAL_SUFFIX)) continue
+      const member = live.get(id)
+      if (!member) continue
+      member.baseColor.copy(tone)
+      if (grid) member.toneGrid = grid
+      member.skinRevision = (member.skinRevision ?? 0) + 1
+    }
+  })
+  // Readable shingle textures also hand every plane the PATTERN grid —
+  // cells sample real shingle rows (cellPatternTone) instead of one
+  // averaged tone; compressed maps deliver it via the retint above.
+  const roofToneGrid = mapPatternGrid(roofMaterial?.map) ?? undefined
   const built: VoxelTarget[] = []
   for (let p = 0; p < planes.length; p++) {
     const plane = planes[p]!
@@ -1562,6 +1678,7 @@ function buildRoofPlaneTargets(
       roof: true,
       grid,
       baseColor: baseColor.clone(),
+      toneGrid: roofToneGrid,
       segments,
       studs: segments,
       sheets: sheetInfo.sheets,
@@ -1607,26 +1724,6 @@ function buildRoofPlaneTargets(
   state.bump()
   // Paint decal lane: the plane family is live under the scene node id.
   if (!dormant) targetLiveListener?.(nodeId)
-  // Async skin tone (QA phase-6 round 3: post-vox roofs rendered WHITE —
-  // host shingle materials are white-base + compressed KTX2 map, so the
-  // synchronous sample above can't see the real tone). resolveRoofSkinTone
-  // reads the map through the live renderer and retints every plane target
-  // when it lands; skinRevision tells voxel-walls to re-prime colors (paint
-  // ledger serials stay untouched — coats re-apply via drainPaintTints).
-  resolveRoofSkinTone(meshes, (tone) => {
-    const live = useDestruction.getState().targets
-    const group = roofGroups.get(nodeId)
-    if (!group) return // roof dropped before the readback landed
-    for (const id of group) {
-      // The residual member wears its OWN faces' tone (siding/trim), never
-      // the shingle skin — see buildRoofResidualTarget.
-      if (id.endsWith(ROOF_RESIDUAL_SUFFIX)) continue
-      const member = live.get(id)
-      if (!member) continue
-      member.baseColor.copy(tone)
-      member.skinRevision = (member.skinRevision ?? 0) + 1
-    }
-  })
   return built[0]!
 }
 
@@ -1689,13 +1786,17 @@ function buildRoofResidualTarget(
   }
   if (grid.count === 0) return null
   const segments: SegmentMember[] = []
+  const residualId = `${nodeId}${ROOF_RESIDUAL_SUFFIX}`
+  const residualMaterial = dominantResidualMaterial(meshes)
   return {
-    nodeId: `${nodeId}${ROOF_RESIDUAL_SUFFIX}`,
+    nodeId: residualId,
     kind: 'volume',
     grid,
     // The residual faces' OWN dominant tone (siding/trim on gable ends) —
-    // never the shingle skin; the async roof retint skips this member too.
-    baseColor: residualSurfaceColor(meshes) ?? targetBaseColor(meshes),
+    // never the shingle skin; the async roof retint skips this member too
+    // (it carries its own pending-retry retint under the member id).
+    baseColor: resolveSurfaceTone(residualId, 'volume', residualMaterial, retintTarget(residualId)),
+    toneGrid: mapPatternGrid(residualMaterial?.map) ?? undefined,
     segments,
     studs: segments,
     sheets: [],
@@ -1885,13 +1986,18 @@ export function ensureVoxelTarget(
   // the voxels (and their debris) wear the item's own tones, and the
   // target's flat baseColor becomes the palette average so dust/fallbacks
   // stay in family.
-  const itemPalette = item ? sampleItemCellColors(grid, meshes) : null
+  const itemPalette = item ? sampleItemCellColors(nodeId, grid, meshes) : null
   // Metal read (phase 9 juice lane): ANY sub-mesh whose dominant material
   // reads metal (metalness OR pascal_material library tag — see
   // isMetalItemMaterial) flags the target, and the palette sampler's
   // per-cell mask localizes the sparks to the metal parts (shooting.ts's
   // isMetalHit — a couch sparks on its chrome handle only).
   const metal = item && itemPalette?.cellMetal !== undefined
+  // A wall's saved custom coat beats the mesh read (flat paint — the tone
+  // chain and the pattern lane both stand down); the dominant surface
+  // material feeds both otherwise.
+  const coatColor = wall ? nodeCoatColor(nodeId) : null
+  const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, kind)
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -1907,8 +2013,24 @@ export function ensureVoxelTarget(
     metal,
     cellMetal: itemPalette?.cellMetal,
     grid,
-    baseColor:
-      itemPalette?.average ?? (wall ? nodeCoatColor(nodeId) : null) ?? targetBaseColor(meshes),
+    // Tone chain: item palettes average their region tones; a wall's saved
+    // custom coat beats the mesh read (see nodeCoatColor); everything else
+    // resolves through resolveSurfaceTone — map thumbnail → GPU readback →
+    // non-white material color → the kind fallback palette. NEVER the old
+    // first-material grab (white on every textured host surface), and
+    // pending textures retint later via skinRevision (retintTarget).
+    baseColor: itemPalette?.average ?? coatColor ?? resolveSurfaceTone(
+      nodeId,
+      kind,
+      surfaceMaterial,
+      retintTarget(nodeId),
+    ),
+    // The PATTERN grid (readable maps): cells wear the texture's brick
+    // courses / floor tiles instead of the flat tone. A saved custom coat
+    // is flat paint over the surface — no pattern then; items carry theirs
+    // in cellColors.
+    toneGrid:
+      itemPalette || coatColor ? undefined : (mapPatternGrid(surfaceMaterial?.map) ?? undefined),
     cellColors: itemPalette?.colors,
     segments,
     studs: segments,
@@ -2051,6 +2173,16 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
   // SESSION START — an item never morphs into voxels on its first hit, it
   // just starts losing chunks. This also deletes the first-item-wake spike
   // (62–68 ms live finding): there is no item wake left to pay for.
+  //
+  // VOXEL-FIRST ROOFS + SLABS (owner call 2026-08-28 round 2: "the roof
+  // looked like editor, and 1st bullet it changed into voxels" — NO
+  // morphing anywhere): roof and slab/ceiling/floor kinds voxelize AWAKE
+  // too, wearing their per-cell texture patterns from frame one. The same
+  // prevoxelize budget spreads the cost (the entry veil covers gear-up);
+  // Esc-restore is untouched — the hide rides the same session ledger.
+  // Only doors/windows and the block/column/stair family still prebuild
+  // dormant: their hosts keep live behaviors (Doors renderer, stair walk
+  // feel) that should not hand over until first damage.
   for (const collider of world.colliders) {
     const nodeId = collider.nodeId
     if (
@@ -2072,8 +2204,11 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
       continue
     }
     if (now() >= deadline) return false
-    const awakeItem = ITEM_FAMILY_KINDS.has(collider.nodeType)
-    if (!ensureVoxelTarget(world, nodeId, awakeItem ? undefined : { dormant: true })) {
+    const awake =
+      ITEM_FAMILY_KINDS.has(collider.nodeType) ||
+      ROOF_KINDS.has(collider.nodeType) ||
+      SLAB_KINDS.has(collider.nodeType)
+    if (!ensureVoxelTarget(world, nodeId, awake ? undefined : { dormant: true })) {
       prevoxelizeSkip.add(nodeId)
     }
   }
@@ -3764,6 +3899,9 @@ export function dropTarget(nodeId: string): void {
   const group = roofGroups.get(nodeId)
   if (group) {
     roofGroups.delete(nodeId)
+    // The group's shingle tone resolved (and audited) under the REAL node
+    // id — the member recursion below only clears the member ids.
+    clearToneAudit(nodeId)
     for (const id of group) {
       roofMemberOf.delete(id)
       dropTarget(id)
@@ -3773,6 +3911,9 @@ export function dropTarget(nodeId: string): void {
   roofMemberOf.delete(nodeId)
   cancelSettleTask(islandKey(nodeId))
   cancelSettleTask(framingKey(nodeId))
+  // Tone audit: nothing renders this node's fallback anymore, and any
+  // pending texture retry would deliver to a dead target.
+  clearToneAudit(nodeId)
   const state = useDestruction.getState()
   if (state.targets.get(nodeId)?.dormant) dormantCount--
   if (state.targets.delete(nodeId)) {
@@ -3803,6 +3944,7 @@ export function resetDestruction(): void {
   prevoxelizeSkip.clear()
   roofGroups.clear()
   roofMemberOf.clear()
+  resetSkinTones()
   resetStructure()
   useDestruction.getState().reset()
 }

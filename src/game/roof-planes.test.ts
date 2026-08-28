@@ -10,6 +10,7 @@ import {
 } from './destruction'
 import { RAFTER_D, roofPlaneFrame } from './roof-framing'
 import { enumerateRoofPlanes } from './roof-planes'
+import { isUntexturedWhite, toneAuditReport } from './skin-tone'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -454,6 +455,22 @@ describe('roof target lane (per-plane pitched grids, Phase C2)', () => {
     const world = roofWorld(gableShellMesh())
     ensureVoxelTarget(world, 'roof-1')
     expect(useDestruction.getState().targets.has('roof-1#residual')).toBe(false)
+  })
+
+  test('a default-white shell resolves to the dark-shingle fallback (never white) and audits', () => {
+    const world = roofWorld(gableShellMesh(true)) // three's default white material
+    const target = ensureVoxelTarget(world, 'roof-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    // Every plane member shares the tone; the residual wears its own.
+    const residual = useDestruction.getState().targets.get('roof-1#residual')!
+    expect(isUntexturedWhite(residual.baseColor)).toBe(false)
+    const report = toneAuditReport()
+    expect(report).toContainEqual({ nodeId: 'roof-1', kind: 'roof', why: 'white-base' })
+    expect(report).toContainEqual({
+      nodeId: 'roof-1#residual',
+      kind: 'volume',
+      why: 'white-base',
+    })
   })
 
   test('dormant prebuilds include the residual and the first hit wakes it with the family', () => {

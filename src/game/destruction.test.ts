@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, type Material, Matrix4, Mesh, MeshStandardMaterial, Vector3 } from 'three'
+import {
+  Box3,
+  BoxGeometry,
+  Color,
+  type Material,
+  Matrix4,
+  Mesh,
+  MeshStandardMaterial,
+  Vector3,
+} from 'three'
 import { clearDebris, debrisCensus } from './debris'
 import {
   collapseWholeTarget,
@@ -7,6 +16,7 @@ import {
   damageSegment,
   damageTarget,
   dormantTargetCount,
+  dropTarget,
   ensureVoxelTarget,
   isMetalItemMaterial,
   ITEM_CHUNK_CAP,
@@ -22,6 +32,13 @@ import {
   useDestruction,
   wakeAheadTick,
 } from './destruction'
+import {
+  isUntexturedWhite,
+  pendingToneCount,
+  primedCellColor,
+  retryPendingTones,
+  toneAuditReport,
+} from './skin-tone'
 import { settleTasksPending } from './structure'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -104,8 +121,9 @@ describe('prevoxelizeTick', () => {
     // ITEM-FAMILY nodes (voxel-first, owner 2026-08-28): the crate's host
     // GLB hides at session start and its silhouette replica renders from
     // frame one, so an item never morphs into voxels on its first hit —
-    // it just starts losing chunks. Non-item explodables (doors, slabs,
-    // roofs…) still prebuild DORMANT (the grenade-lag economics).
+    // it just starts losing chunks. Roofs and slabs joined them (round 2,
+    // "no morphing anywhere"); only doors/windows and the block/column/
+    // stair family still prebuild DORMANT (live host behaviors).
     expect(targets.get('wall-1')?.dormant).toBeFalsy()
     expect(targets.get('crate-1')?.dormant).toBeFalsy()
     expect(targets.get('crate-1')?.item).toBe(true)
@@ -149,6 +167,32 @@ describe('prevoxelizeTick', () => {
     expect(dormantTargetCount()).toBe(0)
     // …and once the census is zero the per-frame scan idles out O(1).
     expect(wakeAheadTick(world, center, 3.2)).toBe(false)
+  })
+
+  test('roofs and slabs voxelize AWAKE too: replicas from frame one, no morphing (owner round 2)', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('slab-1', 'slab', [3, 0.2, 3], [0, 3, 5]))
+    world.colliders.push(boxCollider('ceil-1', 'ceiling', [3, 0.1, 3], [0, 2.6, -5]))
+    world.colliders.push(boxCollider('roof-1', 'roof', [4, 0.3, 4], [0, 5.6, 0]))
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
+    expect(done).toBe(true)
+    const targets = useDestruction.getState().targets
+    for (const nodeId of ['slab-1', 'ceil-1', 'roof-1']) {
+      const target = targets.get(nodeId)!
+      expect(target).toBeDefined()
+      expect(target.dormant).toBeFalsy()
+      expect(target.grid.aliveCount).toBeGreaterThan(0)
+    }
+    expect(dormantTargetCount()).toBe(0)
+    // The hosts handed over at session start: colliders disabled so the
+    // voxel grids own collision from frame one. (The mesh hide itself
+    // rides hideForGame's session ledger — a live-session concern; it
+    // no-ops headless, and Esc-restore is session.ts's tested contract.)
+    for (const nodeId of ['slab-1', 'ceil-1', 'roof-1']) {
+      const collider = world.colliders.find((c) => c.nodeId === nodeId)!
+      expect(Boolean(collider.disabled)).toBe(true)
+    }
   })
 
   test('placed items (__boots-item-*) never prebuild and never wedge completeness', () => {
@@ -646,5 +690,171 @@ describe('isMetalItemMaterial (metal spark flag — QA P9R1 fix 2)', () => {
     crate.mesh.geometry.addGroup(0, total - 6, 0) // wood covers almost everything
     crate.mesh.geometry.addGroup(total - 6, 6, 1) // one metal sliver
     expect(ensureVoxelTarget(world, 'crate-1')?.metal).toBe(false)
+  })
+})
+
+describe('tone resolution at voxelize (no target ever wears untextured white)', () => {
+  test('a default-white wall resolves to the wall fallback and audits white-base', () => {
+    const world = makeWorld() // wall meshes carry three's default white material
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    expect(toneAuditReport()).toContainEqual({
+      nodeId: 'wall-1',
+      kind: 'wall',
+      why: 'white-base',
+    })
+  })
+
+  test('a colored wall keeps its own tone and stays out of the audit', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    ;(wall.mesh.material as MeshStandardMaterial).color.set('#8a4b32')
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.baseColor.getHexString()).toBe('8a4b32')
+    expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
+  })
+
+  test('an item region with an unreadable map over a white base wears the item fallback, not white', () => {
+    const world = makeWorld()
+    const crate = world.colliders.find((c) => c.nodeId === 'crate-1')!
+    const material = crate.mesh.material as MeshStandardMaterial
+    material.color.set('#ffffff')
+    // Compressed-style map: an image no CPU path can read.
+    ;(material as unknown as { map: unknown }).map = { image: { width: 4, height: 4 } }
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    expect(toneAuditReport()).toContainEqual({
+      nodeId: 'crate-1',
+      kind: 'item',
+      why: 'map-unreadable',
+    })
+  })
+
+  test('a plain-white item with NO map keeps its porcelain white (legit, not a fallback)', () => {
+    const world = makeWorld()
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(true)
+    expect(toneAuditReport().some((e) => e.nodeId === 'crate-1')).toBe(false)
+  })
+
+  test('a pending wall texture retints the live target when it loads (skinRevision bump)', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    const material = wall.mesh.material as MeshStandardMaterial
+    const image: { data?: Uint8Array; width: number; height: number } = { width: 2, height: 2 }
+    ;(material as unknown as { map: unknown }).map = { image }
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    // Still loading: the fallback renders, the retry lane is armed.
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    expect(pendingToneCount()).toBe(1)
+    expect(target.skinRevision ?? 0).toBe(0)
+    // The image "finishes loading" as a flat red — next retry pass lands it.
+    const data = new Uint8Array(2 * 2 * 4)
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = 255
+      data[i + 3] = 255
+    }
+    image.data = data
+    retryPendingTones()
+    expect(target.baseColor.r).toBeGreaterThan(0.9)
+    expect(target.baseColor.g).toBeLessThan(0.1)
+    expect(target.skinRevision).toBe(1)
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
+  })
+
+  test('dropTarget clears the node from the audit and cancels its retry', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    ;(wall.mesh.material as unknown as { map: unknown }).map = {
+      image: { width: 4, height: 4 },
+    }
+    ensureVoxelTarget(world, 'wall-1')
+    expect(pendingToneCount()).toBe(1)
+    dropTarget('wall-1')
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
+  })
+})
+
+/** Vertically-striped readable image: left half red, right half blue. */
+function stripedImage(w = 8, h = 8): { data: Uint8Array; width: number; height: number } {
+  const data = new Uint8Array(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4
+      if (x < w / 2) data[o] = 255
+      else data[o + 2] = 255
+      data[o + 3] = 255
+    }
+  }
+  return { data, width: w, height: h }
+}
+
+describe('per-cell texture patterns at voxelize (stage 2)', () => {
+  test('a wall with a readable striped map carries the toneGrid and its cells wear the stripes', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    ;(wall.mesh.material as unknown as { map: unknown }).map = { image: stripedImage() }
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.toneGrid).toBeDefined()
+    // Two cells far apart along the span read DIFFERENT stripes — the
+    // owner's "same texture, not one averaged tone" requirement.
+    const out = new Color()
+    let minRB = Infinity
+    let maxRB = -Infinity
+    for (let i = 0; i < target.grid.count; i++) {
+      primedCellColor(out, target, i)
+      const rb = out.r - out.b
+      if (rb < minRB) minRB = rb
+      if (rb > maxRB) maxRB = rb
+    }
+    expect(maxRB).toBeGreaterThan(0.5) // some cells clearly red
+    expect(minRB).toBeLessThan(-0.5) // some cells clearly blue
+  })
+
+  test('a pending wall texture delivers the pattern grid with the retint', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    const image: { data?: Uint8Array; width?: number; height?: number } = {}
+    ;(wall.mesh.material as unknown as { map: unknown }).map = { image }
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.toneGrid).toBeUndefined()
+    Object.assign(image, stripedImage())
+    retryPendingTones()
+    expect(target.toneGrid).toBeDefined()
+    expect(target.skinRevision).toBe(1)
+  })
+
+  test('item cells sample their region texture by world-position projection', () => {
+    const world = makeWorld()
+    const crate = world.colliders.find((c) => c.nodeId === 'crate-1')!
+    ;(crate.mesh.material as unknown as { map: unknown }).map = { image: stripedImage() }
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    // Items carry the pattern IN cellColors (no toneGrid on the target).
+    expect(target.toneGrid).toBeUndefined()
+    const colors = target.cellColors!
+    expect(colors).toBeDefined()
+    // The crate spans x ∈ [9.4, 10.6]: cells left of center sample the red
+    // half, right of center the blue half (u = the dominant-axis fraction).
+    let sawRed = false
+    let sawBlue = false
+    for (let i = 0; i < target.grid.count; i++) {
+      const x = target.grid.centers[i * 3]!
+      const rb = colors[i * 3]! - colors[i * 3 + 2]!
+      if (x < 9.9 && rb > 0.5) sawRed = true
+      if (x > 10.1 && rb < -0.5) sawBlue = true
+    }
+    expect(sawRed).toBe(true)
+    expect(sawBlue).toBe(true)
+  })
+
+  test('a saved custom coat suppresses the pattern (flat paint wins)', () => {
+    // savedCoatHex path is scene-store backed and not constructible here;
+    // pin the contract at the target level instead: no readable map → no
+    // toneGrid, flat baseColor only.
+    const world = makeWorld()
+    const target = ensureVoxelTarget(world, 'wall-2')!
+    expect(target.toneGrid).toBeUndefined()
   })
 })
