@@ -89,6 +89,25 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   `__boots.perf()` snapshot ({frames, mean, p95, worst, spikes}) +
   `__boots.perfReset`, console dump on session exit. 634 tests / 19.9k
   assertions green.
+- Phase 6 round 3 (2026-08-27 night 3, fleet: 2 perf lanes + 3 worktree
+  branches, manager integrated): FIRST-BLAST HITCH KILLED — dormant
+  replicas pre-mount hidden at prevoxelize time (skin priming drained
+  2/frame; wake = a visibility flip, no InstancedMesh mount or primeSkin
+  in the blast frame) + keyed budgeted settle drain (3 tasks / 16 ms
+  pump; island, framing, structure-tick and cascade-wave timers ride
+  it) · BOOM TRIM — snapVoiceGate (120 ms window, 5 snaps then one
+  collapsed crack: 48-snap floods → ~6 voices), 240-slot preallocated
+  blast debris queue drained 80/frame (damageSegment routes through it
+  while the 0.25 s post-blast window is open), glass shatter staggered
+  2/+40 ms/+80 ms · gable-residual — roof shells' excluded faces
+  (gable ends, fascia) get their own #residual volume member, so first
+  shots stop vanishing them · smooth-climb — walkOnClad/walkOnly
+  handover (feet ride the smooth plank while bullets see voxels, demote
+  at >12% damage), 0.35 m step offset in moveCapsule, full-speed slope
+  projection · adaptive-storeys — session storey ladder (real level
+  bases replace the uniform 2.8 m assumption; pieces conform to their
+  slot's local span; Keep parents each piece to its real level). 731
+  tests / 20.8k assertions green.
 
 ## In flight
 

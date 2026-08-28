@@ -1158,3 +1158,84 @@ corners must move down-LEFT/down on screen ((700,420)→(807,683) gives
 then click the visible "Hip" text after the two-click draft.
 
 639 tests / 20,115 assertions green; tsc clean; real exit codes 0.
+
+## Phase 6 round 3 — first-blast hitch + three worktree branches (2026-08-27 night 3, 2 lanes + manager)
+
+Profiled root cause of the remaining FIRST mid-house grenade hitch:
+391 ms = ~15 dormant-target wakes in ONE frame each mounting a fresh
+InstancedMesh + full primeSkin, then 267 ms = island flood-fills +
+settle timers expiring behind that long frame and coalescing.
+
+WAKE PRE-MOUNT (voxel-walls.tsx, lane 1):
+- Dormant replicas mount HIDDEN at prevoxelize time (group.visible =
+  false, host keeps rendering); pipeline warm from frame 1. Skin
+  priming for dormant replicas defers through a module queue drained at
+  DORMANT_PRIME_PER_FRAME = 2; wake = syncDormantWallFrame (pure,
+  exported): visibility flip + primeDormantNow fallback if the queue
+  had not reached the target yet. Blast frame cost per wake: one
+  boolean write. Paint gates intact (primeSkin clears the mesh-side
+  serials; paint's resolveMesh traverses invisible meshes). Unmount
+  tombstones keep the drain O(1) past dead replicas; queue cleared on
+  VoxelWalls unmount. Debug: dormantPrimeQueueSize().
+
+SETTLE DRAIN (structure.ts + destruction.ts, lane 1):
+- Keyed settle-task queue (scheduleSettleTask/cancelSettleTask/…,
+  SETTLE_DRAIN_BUDGET = 3 per 16 ms self-rescheduling pump). Logical
+  delays + jitter unchanged; only EXECUTION is capped — a 35-40-target
+  house drains in ~12-14 frames instead of one macrotask. Riders:
+  structure:tick ('keep'), structure:wave:N, island:<nodeId> (140 ms,
+  'replace'), framing:<nodeId> (160 ms). Skeleton-snap, blast-ring and
+  sceneSupport timers deliberately untouched. Debug:
+  settleTasksPending(prefix?). Cascade-cadence tests pass UNCHANGED.
+
+BOOM TRIM (audio.ts + grenade.tsx, lane 2; wiring by manager):
+- snapVoiceGate: rolling 120 ms window, first 5 studSnaps voice, 6th
+  becomes ONE meatier collapsed crack, rest silent — 48-snap floods
+  (~240 WebAudio node chains) drop to ~6 voices. Single shots always
+  voice. No wiring needed (destruction calls sfx.studSnap()).
+- Blast debris queue: 240 preallocated slots, hex colors, drained
+  80/frame by <Grenades/>; explodeAt opens a 0.25 s window. Manager
+  wired destruction.ts damageSegment: emit = blastDebrisActive() ?
+  queueDebris : spawnDebris for the 4 chips / 2-3 stick pieces / 6
+  splinters (~600 inline ring spawns off the blast frame). Gunshot
+  breaks keep the inline path. Glass shatter staggered: 2 panes on the
+  boom frame, 3 at +40 ms, rest at +80 ms (shatterPane idempotent).
+- Dust/crater audited: already budgeted ring-slot writes; left alone.
+
+MERGED WORKTREE BRANCHES (in order, all --no-ff, all auto-merged clean,
+suite verified green after EACH):
+- feat/gable-residual (45fc91d): enumerateRoofPlanes fills a residual
+  out-array (pitch-gate rejects, cluster-cone misses, orphan
+  undersides); buildRoofPlaneTargets builds one '<nodeId>#residual'
+  volume member via buildVoxelGrid surfaceOnly (open soup — no interior
+  fill), tinted by residualSurfaceColor (gable ends read as siding, not
+  shingle; async roof retint skips it). Registers in roofGroups like
+  any plane: damage fan-out, dormant wake, dropTarget, demolition all
+  cover it. Gable ends stop vanishing on first shot.
+- feat/smooth-climb (bf535af): placed stairs/roof planks mark
+  walkOnClad; voxelize handover keeps the collider capsule-solid as
+  walkOnly (movement rides the smooth plane, bullets/paint/melee see
+  voxels) until >WALK_ONLY_MAX_DAMAGE (12%) of cells gone, then holes
+  get real. moveCapsule step offset 0.35 m with headroom guard +
+  velocity restore; grounded velocity projects onto walkable slopes
+  (normal.y >= cos 50°) keeping horizontal speed — 43° stairs climb at
+  flat-run speed. Bots/grenades keep plain collideCapsule.
+- feat/adaptive-storeys (48f3642): session storey LADDER (setStoreyLadder,
+  storeyBase/Span/OfY, ladder-aware floor DDA) derived in world.ts from
+  post-snap stacked level Ys (top level closes at measured height,
+  +3 sky rungs); anchor owns XZ+yaw, ladder owns Y; no ladder =
+  bit-exact legacy 2.8 multiples. PlacedPiece.height stamps the slot's
+  local span at placement — walls, stair rise/tilt/plank, roof corner
+  rise, 3x3 rows, ghost/overlays/support boxes all conform. Keep
+  parents each piece to the level its base maps to (fixes the latent
+  everything-parents-to-selected-level bug), payloads level-local.
+
+Integration notes: lanes' destruction/structure edits and gable/climb
+branches overlapped in destruction.ts + structure.ts — ort auto-merged
+all of it and the combined suite is green after each step; no manual
+conflict resolution was needed. Re-measure the first-blast spike with
+qa-grenade-perf.mjs next session (expect ≤ ~3 settle tasks + ≤2 primes
+per frame behind the boom).
+
+731 tests / 20,757 assertions green (was 655 at round start); tsc
+clean; real exit codes 0, full suite re-run stable.
