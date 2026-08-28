@@ -38,11 +38,13 @@ const row = (count: number, spacing: number, dead: number[] = []) => {
 }
 
 describe('splatRadiusAt (the spray cone)', () => {
-  test('anchors pinned: narrow plateau close, full fan far', () => {
-    // ≤ 1 m the splat is one 0.15 m cell wide — the writing stroke.
+  test('anchors pinned: generous near pass close, full fan far', () => {
+    // The near floor is the owner's "larger area" call: 0.25 m strokes
+    // still WRITE against 0.15 m cells, but a close pass feels like paint.
+    expect(SPLAT_NEAR_RADIUS).toBe(0.25)
     expect(splatRadiusAt(0)).toBe(SPLAT_NEAR_RADIUS)
-    expect(splatRadiusAt(0.4)).toBe(0.12)
-    expect(splatRadiusAt(SPLAT_NEAR_DIST)).toBe(0.12)
+    expect(splatRadiusAt(0.4)).toBe(0.25)
+    expect(splatRadiusAt(SPLAT_NEAR_DIST)).toBe(0.25)
     // ≥ 8 m the fan is fully open.
     expect(splatRadiusAt(SPLAT_FAR_DIST)).toBe(SPLAT_FAR_RADIUS)
     expect(splatRadiusAt(8)).toBe(1.4)
@@ -51,12 +53,12 @@ describe('splatRadiusAt (the spray cone)', () => {
 
   test('mid values pinned — quadratic ease, not linear', () => {
     // Writing range stays tight: 2 m has barely opened.
-    expect(splatRadiusAt(2)).toBeCloseTo(0.14612, 4)
+    expect(splatRadiusAt(2)).toBeCloseTo(0.27347, 4)
     // Halfway (4.5 m) sits at the t² midpoint…
-    expect(splatRadiusAt(4.5)).toBeCloseTo(0.44, 10)
-    // …well under the LINEAR midpoint 0.76: the cone blooms late.
-    expect(splatRadiusAt(4.5)).toBeLessThan((0.12 + 1.4) / 2)
-    expect(splatRadiusAt(6.5)).toBeCloseTo(0.9102, 4)
+    expect(splatRadiusAt(4.5)).toBeCloseTo(0.5375, 10)
+    // …well under the LINEAR midpoint 0.825: the cone blooms late.
+    expect(splatRadiusAt(4.5)).toBeLessThan((0.25 + 1.4) / 2)
+    expect(splatRadiusAt(6.5)).toBeCloseTo(0.95995, 4)
   })
 
   test('monotonic non-decreasing across the reach', () => {
@@ -69,7 +71,8 @@ describe('splatRadiusAt (the spray cone)', () => {
   })
 
   test('writing threshold sits on the narrow plateau side of the curve', () => {
-    expect(splatRadiusAt(WRITING_DISTANCE)).toBeLessThan(0.15)
+    // Inside writing range the cone has opened < 3 cm past the near floor.
+    expect(splatRadiusAt(WRITING_DISTANCE)).toBeLessThan(SPLAT_NEAR_RADIUS + 0.03)
   })
 })
 
@@ -83,10 +86,11 @@ describe('selectSplatCells (the paint splat)', () => {
     expect(selectSplatCells(grid, 0.5, 0, 0, 0.25)).toEqual([1, 2, 3])
   })
 
-  test('cone ends on real 0.15 m wall cells: 1-cell stroke close, broad far', () => {
+  test('cone ends on real 0.15 m wall cells: 3-cell dab close, broad far', () => {
     const wall = row(21, 0.15)
-    // Nose against the wall: the splat is a single cell — legible strokes.
-    expect(selectSplatCells(wall, 1.5, 0, 0, splatRadiusAt(1))).toEqual([10])
+    // Nose against the wall: the generous 0.25 m pass is a 3-cell dab —
+    // still narrow enough to write with, no longer a pencil point.
+    expect(selectSplatCells(wall, 1.5, 0, 0, splatRadiusAt(1))).toEqual([9, 10, 11])
     // Fully open fan blankets a ~2.8 m run of the row.
     const far = selectSplatCells(wall, 1.5, 0, 0, splatRadiusAt(SPLAT_FAR_DIST))
     expect(far.length).toBeGreaterThanOrEqual(17)
