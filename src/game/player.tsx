@@ -5,9 +5,9 @@ import { useEffect, useRef } from 'react'
 import { type PerspectiveCamera, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { collideCapsule, EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
+import { EYE_HEIGHT, moveCapsule, PLAYER_CAPSULE } from './collision'
 import { collideVoxelWalls } from './destruction'
-import { MOVE, type MoveConfig, stepVelocity } from './movement'
+import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { getSession } from './session'
 import type { GameWorld } from './world'
 
@@ -290,6 +290,9 @@ export function Player({ world }: { world: GameWorld }) {
   const camera = useThree((s) => s.camera) as PerspectiveCamera
   const feet = useRef(new Vector3())
   const vel = useRef(new Vector3())
+  /** Ground contact normal from the LAST move (moveCapsule writes it) —
+   * the plane the next tick's grounded velocity rides at full speed. */
+  const groundNormal = useRef(new Vector3(0, 1, 0))
   const bobPhase = useRef(0)
   const stride = useRef(0)
   const prevGrounded = useRef(true)
@@ -312,6 +315,7 @@ export function Player({ world }: { world: GameWorld }) {
     }
     feet.current.copy(world.spawn)
     vel.current.set(0, 0, 0)
+    groundNormal.current.set(0, 1, 0)
     playerRig.yaw = world.spawnYaw
     playerRig.pitch = 0
     playerRig.yawVelocity = 0
@@ -430,6 +434,21 @@ export function Player({ world }: { world: GameWorld }) {
     )
     if (jumped) sfx.jump()
 
+    // FULL-SPEED SLOPES (genre parity): while grounded on a walkable slope
+    // (last move's contact plane), ride the plane — vel keeps its horizontal
+    // speed and takes exactly the rise/drop the slope demands, so ramps climb
+    // as fast as flat ground runs and nothing patters airborne downhill.
+    // Jump frames keep their fresh vel.y; the projection is a no-op on flat
+    // ground and leaves steeper-than-walkable contacts to the legacy clip.
+    if (playerRig.grounded && !jumped) {
+      projectOnWalkableSlope(
+        vel.current,
+        groundNormal.current.x,
+        groundNormal.current.y,
+        groundNormal.current.z,
+      )
+    }
+
     // Consume queued knockback impulses (playerRig.shove) into velocity.
     if (shoveAccum.x !== 0 || shoveAccum.z !== 0) {
       vel.current.x += shoveAccum.x
@@ -445,9 +464,18 @@ export function Player({ world }: { world: GameWorld }) {
     }
 
     fallSpeed.current = vel.current.y
-    feet.current.addScaledVector(vel.current, dt)
-
-    let grounded = collideCapsule(feet.current, vel.current, world.colliders, PLAYER_CAPSULE)
+    // Integrate + slide + STEP OFFSET + ground snap (collision.moveCapsule):
+    // blocked risers within STEP_OFFSET lift in-stride at full speed.
+    let grounded = moveCapsule(
+      feet.current,
+      vel.current,
+      dt,
+      world.colliders,
+      playerRig.grounded,
+      jumped,
+      PLAYER_CAPSULE,
+      groundNormal.current,
+    )
     grounded = collideVoxelWalls(
       feet.current,
       vel.current,

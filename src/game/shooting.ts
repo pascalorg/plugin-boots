@@ -350,7 +350,9 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
   _worldRay.origin.copy(_origin)
   _worldRay.direction.copy(_direction)
   for (const collider of world.colliders) {
-    if (collider.disabled) continue
+    // walkOnly planks are capsule-only (FEET SEE THE PLANE) — bullets see
+    // the voxel grid, so shots keep opening real holes in placed ramps.
+    if (collider.disabled || collider.walkOnly) continue
     const entry = _worldRay.intersectBox(collider.worldBox, _boxHit)
     if (entry === null || entry.distanceTo(_origin) > bestDist) continue
     _inverse.copy(collider.inverse)

@@ -298,6 +298,14 @@ export type VoxelTarget = {
   /** Deferred hideHostNode arguments while dormant (plain targets). */
   hostMeshes?: Mesh[]
   hostRoot?: Object3D
+  /** FEET SEE THE PLANE (climb feel): true while this target's source
+   * collider(s) stayed capsule-solid as `walkOnly` planks at the handover
+   * (placed stairs/roof pieces — builder.tsx marks them walkOnClad).
+   * While set, collideVoxelTargets SKIPS this grid (movement uses the
+   * smooth plank; bullets/raycasts still see the voxels). Cleared — and the
+   * planks demoted to `disabled` — by settleWalkOnly once damage crosses
+   * WALK_ONLY_MAX_DAMAGE, so real holes take over collision too. */
+  walkOnly?: boolean
   /** True for roof nodes (Phase C): the target frames RAFTERS instead of
    * studs/joists, sheet fly-offs voice shingleRip, and torn shards wear the
    * shingle debris tone. */
@@ -1271,21 +1279,66 @@ function nodeCoatColor(nodeId: string): Color | null {
  * them rendering; every other node's own root is fenced the same way the
  * collect-time mesh sweep fences (world.solidRoots). The node's OWN root
  * must not fence its own hide.
+ *
+ * FEET SEE THE PLANE: entries marked `walkOnClad` (placed stairs/roof
+ * planks — builder.tsx) hand over as `walkOnly` instead of `disabled`, so
+ * the capsule keeps the smooth merged-box surface while bullets, raycasts
+ * and support probes switch to the voxel grid. Returns whether any entry
+ * was promoted (the caller stamps target.walkOnly so collideVoxelTargets
+ * skips the coincident grid).
  */
 function hideHostNode(
   world: GameWorld,
   nodeId: string,
   meshes: readonly Mesh[],
   wallRoot?: Object3D,
-): void {
+): boolean {
   const keepRoots = new Set(world.solidRoots ?? [])
   if (wallRoot) keepRoots.delete(wallRoot)
   for (const collider of world.colliders) {
     if (collider.nodeId === nodeId) keepRoots.delete(collider.root)
   }
   for (const mesh of meshes) hideForGameKeepingRoots(mesh, keepRoots)
+  let walkOnly = false
   for (const collider of world.colliders) {
-    if (collider.nodeId === nodeId) collider.disabled = true
+    if (collider.nodeId !== nodeId) continue
+    if (collider.walkOnClad) {
+      collider.walkOnly = true
+      walkOnly = true
+    } else {
+      collider.disabled = true
+    }
+  }
+  return walkOnly
+}
+
+/** FEET SEE THE PLANE retires past this damage: once a walk-only piece has
+ * lost MORE than this fraction of its voxel cells, its smooth plank collider
+ * demotes to `disabled` and the voxel grid (holes and all) owns movement
+ * too. 12 % was chosen over per-column footprint checks because it is one
+ * cheap compare per carve with no per-frame work — and a hole the capsule
+ * (r 0.34 m) could actually fall through costs well past 12 % of a 3 m
+ * plank's cells, so light chip damage never bumps the feet. */
+export const WALK_ONLY_MAX_DAMAGE = 0.12
+
+/** Pure flip decision (exported for tests): has this grid lost more than
+ * WALK_ONLY_MAX_DAMAGE of its cells? */
+export function walkOnlyExpired(aliveCount: number, count: number): boolean {
+  return count - aliveCount > count * WALK_ONLY_MAX_DAMAGE
+}
+
+/** Demote a damaged-past-threshold walk-only target: clear target.walkOnly
+ * (collideVoxelTargets collides its grid again) and flip its plank
+ * colliders walkOnly → disabled (holes become real for feet too). No-op —
+ * one boolean check — for everything else; every cell-removal path calls
+ * it (carves, island crumbles, whole-target collapses). */
+function settleWalkOnly(world: GameWorld, target: VoxelTarget): void {
+  if (!target.walkOnly || !walkOnlyExpired(target.grid.aliveCount, target.grid.count)) return
+  target.walkOnly = false
+  for (const collider of world.colliders) {
+    if (collider.nodeId !== target.nodeId || !collider.walkOnly) continue
+    collider.walkOnly = false
+    collider.disabled = true
   }
 }
 
@@ -1750,7 +1803,7 @@ export function ensureVoxelTarget(
     target.hostMeshes = meshes
     target.hostRoot = wall?.root
   } else {
-    hideHostNode(world, nodeId, meshes, wall?.root)
+    target.walkOnly = hideHostNode(world, nodeId, meshes, wall?.root)
   }
 
   state.targets.set(nodeId, target)
@@ -1793,7 +1846,7 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
     state.bump()
     return
   }
-  hideHostNode(world, target.nodeId, target.hostMeshes ?? [], target.hostRoot)
+  target.walkOnly = hideHostNode(world, target.nodeId, target.hostMeshes ?? [], target.hostRoot)
   target.dormant = false
   target.hostMeshes = undefined
   target.hostRoot = undefined
@@ -1903,7 +1956,8 @@ export function slabSeedPredicate(world: GameWorld, target: VoxelTarget): (i: nu
   // probe tolerance.
   const boxes: Array<{ minX: number; maxX: number; minZ: number; maxZ: number }> = []
   for (const collider of world.colliders) {
-    if (collider.disabled || collider.nodeId === target.nodeId) continue
+    // walkOnly planks defer to their voxel target here, same as disabled.
+    if (collider.disabled || collider.walkOnly || collider.nodeId === target.nodeId) continue
     const top = collider.worldBox.max.y
     if (top < bottomY - SLAB_PROBE_DROP || top > bottomY + SLAB_PROBE_XZ) continue
     if (collider.worldBox.min.y > bottomY) continue
@@ -1980,7 +2034,8 @@ export function roofSeedPredicate(world: GameWorld, target: VoxelTarget): (i: nu
   // Live collider tops that can reach ANY roof cell's support band.
   const boxes: Array<{ minX: number; maxX: number; minZ: number; maxZ: number; top: number }> = []
   for (const collider of world.colliders) {
-    if (collider.disabled) continue
+    // walkOnly planks defer to their voxel target here, same as disabled.
+    if (collider.disabled || collider.walkOnly) continue
     const top = collider.worldBox.max.y
     if (top < minY - ROOF_PROBE_DROP) continue
     boxes.push({
@@ -2113,6 +2168,8 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
   else sfx.crumble(total)
   // An island crumble can take the LAST cladding cells with it.
   maybeSkeletonSnap(target)
+  // FEET SEE THE PLANE retires once the piece is damaged past threshold.
+  settleWalkOnly(world, target)
   // Material left the world — walls resting on this target must re-probe.
   noteStructureCarve(world, target.nodeId)
 }
@@ -2183,6 +2240,8 @@ export function collapseWholeTarget(nodeId: string): number {
   else sfx.crumble(total)
   maybeSkeletonSnap(target) // the whole frame rains down top-first
   settleSupportAfterRemoval(target) // piece-graph notification (goal 3)
+  // Nothing is left — a walk-only plank must not keep carrying the capsule.
+  if (sessionWorld) settleWalkOnly(sessionWorld, target)
   return total
 }
 
@@ -2703,6 +2762,8 @@ function damageTargetOne(
   // Cladding all gone? The bare frame can't stand — skeleton snap.
   maybeSkeletonSnap(target)
   settleSupportAfterRemoval(target)
+  // FEET SEE THE PLANE retires once the piece is damaged past threshold.
+  settleWalkOnly(world, target)
   // Cross-target support (Phase B3): whatever rested on this target must
   // re-probe its footing once the carve settles.
   noteStructureCarve(world, nodeId)
@@ -2746,7 +2807,8 @@ export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
 export function probeLandingY(world: GameWorld, x: number, y: number, z: number): number {
   let best = 0
   for (const collider of world.colliders) {
-    if (collider.disabled) continue
+    // walkOnly planks defer to their voxel target here, same as disabled.
+    if (collider.disabled || collider.walkOnly) continue
     const box = collider.worldBox
     const top = box.max.y
     if (top <= best || top > y + 0.02) continue
@@ -3259,6 +3321,10 @@ const _capsuleLocal = { x: 0, y: 0, z: 0 }
 export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, height: number): boolean {
   let grounded = false
   for (const target of useDestruction.getState().targets.values()) {
+    // FEET SEE THE PLANE: a lightly-damaged placed ramp/roof piece keeps its
+    // smooth walkOnly plank in collideCapsule — colliding its coincident
+    // voxel cells too would re-bump every lip the plank exists to hide.
+    if (target.walkOnly) continue
     const { grid } = target
     // Sphere radius keys off the LARGEST cell — any smaller and the capsule
     // could slip between skin voxels spaced a full length-cell apart.

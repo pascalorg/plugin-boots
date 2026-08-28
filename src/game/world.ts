@@ -42,6 +42,20 @@ export type ColliderEntry = {
   nodeType: string
   /** Set when this target was voxelized — the grid takes over collision. */
   disabled?: boolean
+  /** FEET SEE THE PLANE (climb feel): placed ramp/roof planks set this at
+   * entry creation (builder.tsx PlacedPieceMesh). At the voxelize handover
+   * (destruction.hideHostNode) a marked entry becomes `walkOnly` instead of
+   * `disabled`, so the capsule keeps the smooth merged-box surface while
+   * the voxel grid takes bullets. Host nodes never set it. */
+  walkOnClad?: boolean
+  /** Active FEET-SEE-THE-PLANE state, set by the voxelize handover on
+   * `walkOnClad` entries: capsule sweeps (collision.collideCapsule — player,
+   * bots, grenades) still collide with this smooth collider, while bullets,
+   * aim/paint raycasts and support probes see the voxel grid instead (they
+   * skip it exactly like `disabled`). Flips off — `disabled` takes over —
+   * once the piece's voxel target loses more than WALK_ONLY_MAX_DAMAGE of
+   * its cells (destruction.settleWalkOnly): holes become real. */
+  walkOnly?: boolean
 }
 
 export type GlassPane = {

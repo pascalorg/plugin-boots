@@ -42,6 +42,29 @@ export const MOVE: MoveConfig = {
   jumpSpeed: 5.4,
 }
 
+/** Steepest walkable slope, as the ground normal's minimum y (~50°): flat
+ * ground is 1, the 43° stairs plank is ~0.73. Grounded movement on normals
+ * at or above this rides the slope plane at FULL horizontal speed
+ * (projectOnWalkableSlope); steeper contacts keep the legacy velocity clip
+ * (partial climb) so near-vertical faces never become runnable. */
+export const WALKABLE_NORMAL_Y = Math.cos((50 * Math.PI) / 180)
+
+/**
+ * FULL-SPEED SLOPES (genre parity): tilt a grounded velocity into the slope
+ * plane KEEPING its horizontal components — vel.y becomes exactly the rise
+ * the plane demands for that horizontal motion, so uphill horizontal speed
+ * equals flat-ground speed (a 43° ramp climbs as fast as flat ground runs)
+ * and downhill motion hugs the plane instead of pattering airborne. On flat
+ * ground (n = up) this writes vel.y = 0 — the same rest the grounded branch
+ * of stepVelocity already enforces. Steeper-than-walkable normals are left
+ * untouched. Pure; mutates `vel`. Never call it on a jump frame — it would
+ * overwrite the fresh jump impulse.
+ */
+export function projectOnWalkableSlope(vel: Vec3, nx: number, ny: number, nz: number): void {
+  if (ny < WALKABLE_NORMAL_Y) return
+  vel.y = -(nx * vel.x + nz * vel.z) / ny
+}
+
 export type MoveInput = {
   /** Normalized wish direction on the XZ plane (already camera-relative). */
   wishX: number

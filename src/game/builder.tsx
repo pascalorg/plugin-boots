@@ -925,6 +925,12 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
       root: mesh,
       nodeId: `${PIECE_NODE_PREFIX}${piece.id}`,
       nodeType: 'block',
+      // FEET SEE THE PLANE (climb feel): stairs planks and roof patches are
+      // WALKING surfaces — at the voxelize handover their entry stays
+      // capsule-solid as `walkOnly` instead of disabling, so sprinting up a
+      // placed ramp rides the smooth plane while bullets carve the voxels.
+      // Damage past WALK_ONLY_MAX_DAMAGE demotes it (destruction.ts).
+      walkOnClad: piece.piece === 'stairs' || piece.piece === 'roof',
     }
     world.colliders.push(entry)
     // INSTANT BRICKS, budgeted: single placements voxelize now, not on
