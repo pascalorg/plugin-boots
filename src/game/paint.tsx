@@ -27,6 +27,7 @@ import { playerRig } from './player'
 import { primedCellColor } from './skin-tone'
 import { getSession } from './session'
 import { aimDirection } from './shooting'
+import { rotateByBasis, rotateByBasisInverse, type VoxelBasis } from './voxel'
 import type { GameWorld } from './world'
 
 /**
@@ -63,6 +64,22 @@ import type { GameWorld } from './world'
  * weighted by strength); the explicit sidebar
  * Save button is the only path that patches real nodes. The ledger resets
  * on PaintTool mount — the same session lifetime destruction state has.
+ *
+ * ── Round read (phase 10) ───────────────────────────────────────────────
+ * Cell tint alone is inherently SQUARE — whole 0.15 m voxels flip color
+ * (owner: "it only colors full squares instead of a normal paint circle").
+ * So every spray tick that coats a voxelized target ALSO stamps a round
+ * splat SPRITE: one InstancedMesh pool (SPLAT_SPRITE_CAP ring — the drip
+ * idiom) of textured quads laid flat on the hit face (splatNormalFor: the
+ * dominant grid axis of the reversed shot, biased to the FACE on layered
+ * wall/slab/roof grids), lifted SPLAT_SPRITE_LIFT off the surface, palette
+ * via instanceColor over ONE module-cached irregular-rim splat texture.
+ * Held-trigger economy: a tick lands no new sprite within
+ * SPLAT_COALESCE_FRAC × radius of the node's previous same-color sprite.
+ * Sprites are purely visual — the cell ledger above still owns persistence
+ * and the destroyed-cell look; a node's sprites evict when its target
+ * drops or fully collapses (drainPaintTints spots both), and the pool
+ * lives for the session like the drips (Esc teardown clears it).
  */
 
 export type PaintColor = { name: string; hex: string }
@@ -93,8 +110,10 @@ const PAINT_RANGE = 9
 
 /** Inside this distance (m) the splat stays at its narrowest. */
 export const SPLAT_NEAR_DIST = 1
-/** Narrow-end radius (m) — one 0.15 m wall cell wide: legible strokes. */
-export const SPLAT_NEAR_RADIUS = 0.12
+/** Narrow-end radius (m) — a generous close-range pass (owner call: "I
+ * liked the paint before better, larger area"), still tight enough that
+ * 0.25 m strokes WRITE legibly against 0.15 m wall cells. */
+export const SPLAT_NEAR_RADIUS = 0.25
 /** Beyond this distance (m) the cone is fully open. */
 export const SPLAT_FAR_DIST = 8
 /** Broad-end radius (m) — one splat covers most of a wall face. */
@@ -563,6 +582,399 @@ function DripsLayer() {
   )
 }
 
+// ── Splat sprites (phase 10 — the ROUND paint read on voxel surfaces) ─────
+//
+// The cell-tint ledger colors whole voxels — inherently square. Every spray
+// tick that coats a voxelized target also stamps ONE round textured quad
+// flat on the hit face, so sprayed paint reads as overlapping aerosol
+// circles near AND far. Pool + texture follow the drip idiom exactly: a
+// fixed InstancedMesh ring (DynamicDrawUsage, every slot's color primed
+// before the first draw), one module-cached white splat texture with an
+// irregular rim, palette per instance via instanceColor. Purely visual —
+// persistence stays with the ledger + decal votes.
+
+/** Sprite pool size — one InstancedMesh of face-flat splat quads. */
+export const SPLAT_SPRITE_CAP = 192
+/** Quad lift off the hit surface (m) — clears the voxel skin without
+ * reading as floating (6–8 mm band; polygonOffset does the rest). */
+export const SPLAT_SPRITE_LIFT = 0.007
+/** No new sprite within this × radius of the node's previous same-color
+ * sprite — the held-trigger economy rule the decal lane budgets by. */
+export const SPLAT_COALESCE_FRAC = 0.3
+/** Per-stamp scale jitter band around the true 2 × radius diameter. */
+export const SPLAT_SPRITE_JITTER_MIN = 0.85
+export const SPLAT_SPRITE_JITTER_MAX = 1.15
+/** Layered grids (wall/slab/roof): the FACE (thickness axis) wins the
+ * quad orientation whenever the spray crosses it by at least this much —
+ * a glancing pass down a wall still stamps flat on the drywall. */
+export const SPLAT_FACE_BIAS = 0.2
+
+/** Quad side (m): 2 × splat radius, jittered by `rand` ∈ [0, 1] across the
+ * SPLAT_SPRITE_JITTER band (rand 0.5 = the exact diameter). Pure. */
+export function splatSpriteSize(radius: number, rand: number): number {
+  return 2 * radius * (SPLAT_SPRITE_JITTER_MIN + (SPLAT_SPRITE_JITTER_MAX - SPLAT_SPRITE_JITTER_MIN) * rand)
+}
+
+/** Pure coalescing rule: stamp unless the node's PREVIOUS sprite has the
+ * same color and sits closer than SPLAT_COALESCE_FRAC × radius (3D). */
+export function shouldStampSplat(
+  prev: { x: number; y: number; z: number; color: number } | undefined,
+  x: number,
+  y: number,
+  z: number,
+  color: number,
+  radius: number,
+): boolean {
+  if (!prev || prev.color !== color) return true
+  const dx = x - prev.x
+  const dy = y - prev.y
+  const dz = z - prev.z
+  const min = SPLAT_COALESCE_FRAC * radius
+  return dx * dx + dy * dy + dz * dz >= min * min
+}
+
+/** The grid fields the sprite-normal math reads (VoxelGridData subset). */
+type SplatGridFrame = {
+  q: VoxelBasis
+  nx: number
+  ny: number
+  nz: number
+  cellX: number
+  cellY: number
+  cellZ: number
+}
+
+/** Grid-frame scratch for splatNormalFor (module temp — zero allocs). */
+const _splatAxis = { x: 0, y: 0, z: 0 }
+
+/**
+ * The face normal a sprite lies flat against. raycastVoxelTargets hands
+ * back no face, so derive it: rotate −shotDirection into the GRID frame
+ * (voxel faces are axis-aligned there — yawed walls and pitched roof
+ * planes included), snap to an axis, rotate back out to world. Layered
+ * kinds (wall/slab/roof) bias the pick to the THICKNESS axis — smallest
+ * physical extent, destruction's thicknessAxisOf rule — whenever the spray
+ * crosses it by SPLAT_FACE_BIAS; plain volumes take the raw dominant axis
+ * (the mist-cone idiom). Pure — writes a unit world vector into `out`.
+ */
+export function splatNormalFor(
+  grid: SplatGridFrame,
+  kind: string,
+  dirX: number,
+  dirY: number,
+  dirZ: number,
+  out: { x: number; y: number; z: number },
+): void {
+  rotateByBasis(grid.q, -dirX, -dirY, -dirZ, _splatAxis)
+  const ax = Math.abs(_splatAxis.x)
+  const ay = Math.abs(_splatAxis.y)
+  const az = Math.abs(_splatAxis.z)
+  let axis: 0 | 1 | 2 = ax >= ay && ax >= az ? 0 : ay >= az ? 1 : 2
+  if (kind !== 'volume') {
+    let t: 0 | 1 | 2 = 0
+    let extent = grid.nx * grid.cellX
+    if (grid.ny * grid.cellY < extent) {
+      t = 1
+      extent = grid.ny * grid.cellY
+    }
+    if (grid.nz * grid.cellZ < extent) t = 2
+    const along = t === 0 ? ax : t === 1 ? ay : az
+    if (along >= SPLAT_FACE_BIAS) axis = t
+  }
+  const component = axis === 0 ? _splatAxis.x : axis === 1 ? _splatAxis.y : _splatAxis.z
+  const sign = component >= 0 ? 1 : -1
+  rotateByBasisInverse(grid.q, axis === 0 ? sign : 0, axis === 1 ? sign : 0, axis === 2 ? sign : 0, out)
+}
+
+export type SplatSlot = {
+  alive: boolean
+  /** Slot changed since the frame writer last uploaded it. */
+  dirty: boolean
+  nodeId: string
+  /** Quad center, already lifted off the surface along the normal. */
+  x: number
+  y: number
+  z: number
+  /** Unit face normal (world) — the quad's +Z. */
+  nx: number
+  ny: number
+  nz: number
+  /** Roll around the normal (rad) — stamp variety. */
+  roll: number
+  /** Quad side length (m) — jittered 2 × splat radius. */
+  size: number
+  color: number
+}
+
+const splatSlots: SplatSlot[] = Array.from({ length: SPLAT_SPRITE_CAP }, () => ({
+  alive: false,
+  dirty: false,
+  nodeId: '',
+  x: 0,
+  y: 0,
+  z: 0,
+  nx: 0,
+  ny: 0,
+  nz: 1,
+  roll: 0,
+  size: 0.3,
+  color: 0,
+}))
+let splatCursor = 0
+/** Any slot dirty — the frame writer idles at one boolean. */
+let splatsDirty = false
+/** nodeId → slot indices in stamp order (drop/collapse eviction). */
+const nodeSplats = new Map<string, number[]>()
+/** nodeId → the node's LAST stamped sprite (the coalescing rule).
+ * Records are reused in place — one allocation per node per session. */
+const lastSplatByNode = new Map<string, { x: number; y: number; z: number; color: number }>()
+
+/** Live sprite counts (QA/tests) — total and for one node. */
+export function splatSpriteCensus(nodeId?: string): number {
+  if (nodeId !== undefined) return nodeSplats.get(nodeId)?.length ?? 0
+  let n = 0
+  for (const s of splatSlots) if (s.alive) n++
+  return n
+}
+
+/** The live slots (tests/debug) — read-only by contract. */
+export function splatSpriteSlots(): readonly SplatSlot[] {
+  return splatSlots
+}
+
+function releaseSplatSlot(index: number): void {
+  const s = splatSlots[index]!
+  if (!s.alive) return
+  s.alive = false
+  s.dirty = true
+  splatsDirty = true
+  const list = nodeSplats.get(s.nodeId)
+  if (list) {
+    const at = list.indexOf(index)
+    if (at >= 0) list.splice(at, 1)
+    if (list.length === 0) nodeSplats.delete(s.nodeId)
+  }
+}
+
+/** Evict every sprite on `nodeId` — its target dropped (builder Z-undo) or
+ * fully collapsed; drainPaintTints spots both states each frame (a no-op
+ * once the node's list is gone). Also forgets the coalescing record so a
+ * REBUILT node's first tick stamps again. */
+export function releaseNodeSplats(nodeId: string): void {
+  lastSplatByNode.delete(nodeId)
+  const indices = nodeSplats.get(nodeId)
+  if (!indices || indices.length === 0) return
+  for (const index of [...indices]) releaseSplatSlot(index)
+}
+
+/** Session teardown / SplatsLayer (re)mount — same lifetime as the drips. */
+export function resetPaintSplats(): void {
+  for (const s of splatSlots) {
+    s.alive = false
+    s.dirty = false
+  }
+  splatCursor = 0
+  splatsDirty = false
+  nodeSplats.clear()
+  lastSplatByNode.clear()
+}
+
+/**
+ * Claim the next ring slot for a round splat on a voxel surface (the
+ * 193rd sprite reuses the first). Returns false when the coalescing rule
+ * swallowed the stamp — the CELL ledger still took the coat either way.
+ * `scaleRand`/`roll` default to Math.random draws; tests pin them.
+ */
+export function stampSplat(
+  nodeId: string,
+  x: number,
+  y: number,
+  z: number,
+  nx: number,
+  ny: number,
+  nz: number,
+  radius: number,
+  color: number,
+  scaleRand: number = Math.random(),
+  roll: number = Math.random() * Math.PI * 2,
+): boolean {
+  const prev = lastSplatByNode.get(nodeId)
+  if (!shouldStampSplat(prev, x, y, z, color, radius)) return false
+  const index = splatCursor
+  splatCursor = (splatCursor + 1) % SPLAT_SPRITE_CAP
+  releaseSplatSlot(index)
+  const s = splatSlots[index]!
+  s.alive = true
+  s.dirty = true
+  s.nodeId = nodeId
+  s.x = x + nx * SPLAT_SPRITE_LIFT
+  s.y = y + ny * SPLAT_SPRITE_LIFT
+  s.z = z + nz * SPLAT_SPRITE_LIFT
+  s.nx = nx
+  s.ny = ny
+  s.nz = nz
+  s.roll = roll
+  s.size = splatSpriteSize(radius, scaleRand)
+  s.color = color
+  let list = nodeSplats.get(nodeId)
+  if (!list) {
+    list = []
+    nodeSplats.set(nodeId, list)
+  }
+  list.push(index)
+  if (prev) {
+    prev.x = x
+    prev.y = y
+    prev.z = z
+    prev.color = color
+  } else {
+    lastSplatByNode.set(nodeId, { x, y, z, color })
+  }
+  splatsDirty = true
+  return true
+}
+
+/** ONE cached soft-round splat texture — white (instanceColor carries the
+ * palette), irregular wobbly rim + satellite droplets so stamps read as
+ * aerosol hits, not perfect discs. 128², module lifetime (the dust idiom). */
+let splatTexture: CanvasTexture | null = null
+function getSplatTexture(): CanvasTexture | null {
+  if (splatTexture) return splatTexture
+  if (typeof document === 'undefined') return null
+  const canvas = document.createElement('canvas')
+  canvas.width = 128
+  canvas.height = 128
+  const g = canvas.getContext('2d')
+  if (!g) return null
+  // Dense core feathering toward a WOBBLY rim: the radial gradient fades,
+  // the irregular path clips it — a defined-but-organic circle edge.
+  const fill = g.createRadialGradient(64, 64, 0, 64, 64, 52)
+  fill.addColorStop(0, 'rgba(255,255,255,0.97)')
+  fill.addColorStop(0.55, 'rgba(255,255,255,0.95)')
+  fill.addColorStop(0.82, 'rgba(255,255,255,0.8)')
+  fill.addColorStop(1, 'rgba(255,255,255,0.2)')
+  g.fillStyle = fill
+  g.beginPath()
+  const WOBBLES = 48
+  for (let i = 0; i <= WOBBLES; i++) {
+    const a = (i / WOBBLES) * Math.PI * 2
+    const r = 46 + Math.sin(a * 3 + 1.7) * 4.5 + Math.sin(a * 7 + 0.4) * 2.5
+    const px = 64 + Math.cos(a) * r
+    const py = 64 + Math.sin(a) * r
+    if (i === 0) g.moveTo(px, py)
+    else g.lineTo(px, py)
+  }
+  g.closePath()
+  g.fill()
+  // Satellite droplets just past the rim — overspray character.
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2 + (i % 3) * 0.7
+    const dist = 53 + (i % 3) * 3
+    const bx = 64 + Math.cos(a) * dist
+    const by = 64 + Math.sin(a) * dist
+    const r = 2.5 + (i % 3) * 1.5
+    const blob = g.createRadialGradient(bx, by, 0, bx, by, r)
+    blob.addColorStop(0, 'rgba(255,255,255,0.85)')
+    blob.addColorStop(1, 'rgba(255,255,255,0)')
+    g.fillStyle = blob
+    g.beginPath()
+    g.arc(bx, by, r, 0, Math.PI * 2)
+    g.fill()
+  }
+  splatTexture = new CanvasTexture(canvas)
+  return splatTexture
+}
+
+const SPLAT_ZERO = new Matrix4().makeScale(0, 0, 0)
+const SPLAT_FORWARD = new Vector3(0, 0, 1)
+const _splatNormalV = new Vector3()
+const _splatQuat = new Quaternion()
+const _splatRoll = new Quaternion()
+const _splatPos = new Vector3()
+const _splatScale = new Vector3()
+const _splatMatrix = new Matrix4()
+const _splatWhite = new Color('#ffffff')
+/** sprayPaint's splatNormalFor out — module temp, zero per-tick allocs. */
+const _splatN = { x: 0, y: 0, z: 0 }
+/** Flat palette tints for sprites (working color space, precomputed once —
+ * the DRIP_TINTS rule: never re-parse a hex string in the frame path). */
+const SPLAT_TINTS: readonly Color[] = PAINT_PALETTE.map((p) => new Color(p.hex))
+
+/** Upload changed slots: compose the face-flat quad (align +Z to the
+ * normal, roll around it), zero-scale evicted slots. Idles at one boolean;
+ * dirty frames touch only dirty slots. Zero allocations. */
+function stepSplats(mesh: InstancedMesh): void {
+  if (!splatsDirty) return
+  splatsDirty = false
+  for (let i = 0; i < SPLAT_SPRITE_CAP; i++) {
+    const s = splatSlots[i]!
+    if (!s.dirty) continue
+    s.dirty = false
+    if (!s.alive) {
+      mesh.setMatrixAt(i, SPLAT_ZERO)
+      continue
+    }
+    _splatNormalV.set(s.nx, s.ny, s.nz)
+    _splatQuat.setFromUnitVectors(SPLAT_FORWARD, _splatNormalV)
+    _splatRoll.setFromAxisAngle(SPLAT_FORWARD, s.roll)
+    _splatQuat.multiply(_splatRoll)
+    _splatPos.set(s.x, s.y, s.z)
+    _splatScale.set(s.size, s.size, 1)
+    _splatMatrix.compose(_splatPos, _splatQuat, _splatScale)
+    mesh.setMatrixAt(i, _splatMatrix)
+    mesh.setColorAt(i, SPLAT_TINTS[s.color] ?? SPLAT_TINTS[0]!)
+  }
+  mesh.instanceMatrix.needsUpdate = true
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+}
+
+/**
+ * The sprite pool renderer — mounted by PaintTool next to DripsLayer. One
+ * InstancedMesh of SPLAT_SPRITE_CAP quads over the cached splat texture;
+ * every slot's color is primed before the first draw (the debris idiom — a
+ * WebGPU pipeline compiled without instanceColor would ignore every later
+ * setColorAt). Lit standard material so stamps sit in the wall's light
+ * like the decal splats do; polygonOffset −3 layers them over the voxel
+ * skin (craters −2, decals −4), depthWrite off so overlaps blend.
+ */
+function SplatsLayer() {
+  const meshRef = useRef<InstancedMesh>(null!)
+  const texture = getSplatTexture()
+  useLayoutEffect(() => {
+    const mesh = meshRef.current
+    if (!mesh) return
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage)
+    mesh.frustumCulled = false
+    for (let i = 0; i < SPLAT_SPRITE_CAP; i++) {
+      mesh.setMatrixAt(i, SPLAT_ZERO)
+      mesh.setColorAt(i, _splatWhite)
+    }
+    mesh.instanceMatrix.needsUpdate = true
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    resetPaintSplats()
+    return resetPaintSplats
+  }, [])
+  useFrame(() => {
+    const mesh = meshRef.current
+    if (mesh) stepSplats(mesh)
+  })
+  if (!texture) return null
+  return (
+    <instancedMesh args={[undefined, undefined, SPLAT_SPRITE_CAP]} ref={meshRef} userData={{ __boots: true }}>
+      <planeGeometry />
+      <meshStandardMaterial
+        depthWrite={false}
+        map={texture}
+        polygonOffset
+        polygonOffsetFactor={-3}
+        polygonOffsetUnits={-3}
+        roughness={0.55}
+        transparent
+      />
+    </instancedMesh>
+  )
+}
+
 // ── Decals (P5 — pristine hosts wear splats, painting no longer voxelizes) ─
 //
 // A spray tick that lands on a PRISTINE host surface (a dormant prebuild or
@@ -1021,7 +1433,8 @@ export function sprayPaint(world: GameWorld): boolean {
   if (!target) return false
 
   const serial = nodeSerials.get(nodeId) ?? 0
-  const coats = splatCoat(target.grid, _point.x, _point.y, _point.z, splatRadiusAt(bestDist), serial)
+  const radius = splatRadiusAt(bestDist)
+  const coats = splatCoat(target.grid, _point.x, _point.y, _point.z, radius, serial)
   if (coats.length === 0) return false
   let painted = paintedByNode.get(nodeId)
   if (!painted) {
@@ -1057,6 +1470,12 @@ export function sprayPaint(world: GameWorld): boolean {
     painted.set(cell, paintValue(colorIndex, Math.min(1, before + add)))
   }
   nodeSerials.set(nodeId, serial + 1)
+  // ROUND READ (phase 10): the cell tint above is square by construction —
+  // stamp a round sprite flat on the hit face so the pass reads as a paint
+  // circle. Coalescing may swallow it (held-trigger economy); the ledger
+  // coat already landed either way.
+  splatNormalFor(target.grid, target.kind, _direction.x, _direction.y, _direction.z, _splatN)
+  stampSplat(nodeId, _point.x, _point.y, _point.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
   return true
 }
 
@@ -1151,14 +1570,23 @@ export function drainPaintTints(scene: Object3D): void {
   const targets = useDestruction.getState().targets
   for (const [nodeId, cells] of paintedByNode) {
     const target = targets.get(nodeId)
-    if (!target) continue
+    if (!target) {
+      // Target DROPPED (builder Z-undo unmounted the piece): the surface
+      // its sprites floated on is gone — evict them. Every sprite node has
+      // ledger entries (stampSplat only follows a successful coat), so this
+      // drain sees every drop; a repeat call is a Map-miss no-op.
+      releaseNodeSplats(nodeId)
+      continue
+    }
     // FULLY-dead grid (island crumble / collapse): there is nothing left to
     // tint AND matchesTarget can never fingerprint it (no alive probe), so
     // resolving would full-scene-traverse every drain forever. Skip it —
     // the LEDGER stays (capturePaint's "every painted cell died" full-ledger
-    // vote still counts the node on Save); only the mesh ref drops.
+    // vote still counts the node on Save); only the mesh ref drops, and the
+    // node's splat sprites evict with the collapsed surface.
     if (target.grid.aliveCount === 0) {
       meshCache.delete(nodeId)
+      releaseNodeSplats(nodeId)
       continue
     }
     const serial = nodeSerials.get(nodeId) ?? 0
@@ -1331,6 +1759,7 @@ export function PaintTool({ world }: { world: GameWorld }) {
   useEffect(() => {
     resetPaint()
     resetPaintDecals()
+    resetPaintSplats()
     ;(globalThis as Record<string, unknown>).__bootsPaint = paintDebug
     // Decal → ledger conversion the frame a node's replica goes live
     // (feature-detected until destruction.ts ships the hook).
@@ -1342,9 +1771,11 @@ export function PaintTool({ world }: { world: GameWorld }) {
       spray.current?.stop()
       spray.current = null
       spraying.current = false
-      // Never hold host meshes (or their clipped decals) across sessions.
+      // Never hold host meshes (or their clipped decals/sprites) across
+      // sessions.
       meshCache.clear()
       resetPaintDecals()
+      resetPaintSplats()
     }
   }, [])
 
@@ -1405,11 +1836,12 @@ export function PaintTool({ world }: { world: GameWorld }) {
 
     drainPaintTints(scene)
   })
-  // The drip + decal pools ride the tool's lifetime — reused slots persist,
-  // exit resets the rings with the ledger.
+  // The drip + sprite + decal pools ride the tool's lifetime — reused slots
+  // persist, exit resets the rings with the ledger.
   return (
     <>
       <DripsLayer />
+      <SplatsLayer />
       <PaintDecals />
     </>
   )
