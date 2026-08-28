@@ -1,14 +1,6 @@
-import {
-  Color,
-  Mesh,
-  MeshBasicMaterial,
-  OrthographicCamera,
-  PlaneGeometry,
-  RenderTarget,
-  Scene,
-  type Texture,
-} from 'three'
+import type { Mesh } from 'three'
 import { type RoofPlaneBasis, roofPlaneFrame } from './roof-framing'
+import type { SurfaceMaterialLike } from './skin-tone'
 
 /**
  * Roof PLANE enumeration from the host's merged roof mesh (MULTILEVEL-PLAN
@@ -346,56 +338,19 @@ function fillResidual(
   for (const tri of down) if (!covered(-tri.nx, -tri.ny, -tri.nz)) out.push(...tri.v)
 }
 
-/** Minimal material slice roofSurfaceColor needs (Mesh['material'] items). */
-type MaterialLike = { color?: Color; map?: (Texture & { image?: unknown }) | null }
-
-/**
- * Average color of a material's texture map, sampled through a tiny 2D
- * canvas (browser only — headless test environments simply return null).
- * The host's shingle materials carry their whole look in the MAP with a
- * pure-white base color, so reading `material.color` alone yields white;
- * the 8×8 down-draw average recovers the texture's real tone. Returns null
- * for compressed/undrawable images (callers keep the base color then).
- */
-function averageMapColor(material: MaterialLike): Color | null {
-  const image = material.map?.image
-  if (!image || typeof document === 'undefined') return null
-  try {
-    const size = 8
-    const canvas = document.createElement('canvas')
-    canvas.width = size
-    canvas.height = size
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return null
-    ctx.drawImage(image as CanvasImageSource, 0, 0, size, size)
-    const data = ctx.getImageData(0, 0, size, size).data
-    let r = 0
-    let g = 0
-    let b = 0
-    for (let i = 0; i < data.length; i += 4) {
-      r += data[i]!
-      g += data[i + 1]!
-      b += data[i + 2]!
-    }
-    const n = (data.length / 4) * 255
-    // Canvas bytes are sRGB — convert into three's working color space.
-    return new Color().setRGB(r / n, g / n, b / n, 'srgb')
-  } catch {
-    return null
-  }
-}
-
 /**
  * The material owning the most `accept`ed triangle area (by world face-
  * normal Y) across the shell's material groups (0 Wall/Trim, 1 Deck,
  * 2 Interior, 3 Shingle on host roofs). Null when no accepted face carries
- * a colored material.
+ * a colored material. Exported: destruction.ts feeds the winner into
+ * skin-tone.ts's resolveSurfaceTone chain (walls/slabs pick over ALL faces
+ * with their own accept gates).
  */
-function dominantMaterialBy(
+export function dominantMaterialBy(
   meshes: readonly Mesh[],
   accept: (ny: number) => boolean,
-): MaterialLike | null {
-  const areas = new Map<MaterialLike, number>()
+): SurfaceMaterialLike | null {
+  const areas = new Map<SurfaceMaterialLike, number>()
   const v = [0, 0, 0, 0, 0, 0, 0, 0, 0]
   for (const mesh of meshes) {
     const geometry = mesh.geometry
@@ -417,7 +372,7 @@ function dominantMaterialBy(
     }
     for (const group of groups) {
       const material = materials[Math.min(group.materialIndex ?? 0, materials.length - 1)] as
-        | MaterialLike
+        | SurfaceMaterialLike
         | undefined
       if (!material?.color) continue
       const start = group.start
@@ -445,7 +400,7 @@ function dominantMaterialBy(
       if (area > 0) areas.set(material, (areas.get(material) ?? 0) + area)
     }
   }
-  let best: MaterialLike | null = null
+  let best: SurfaceMaterialLike | null = null
   let bestArea = 0
   for (const [material, area] of areas) {
     if (area > bestArea) {
@@ -457,189 +412,21 @@ function dominantMaterialBy(
 }
 
 /** The roof SURFACE material: dominant over sloped UP-facing area only —
- * the shingle side, never undersides, fascia, or gable-end trim. */
-function dominantSlopedMaterial(meshes: readonly Mesh[]): MaterialLike | null {
+ * the shingle side, never undersides, fascia, or gable-end trim (the fix
+ * for the C2 QA defect where targetBaseColor grabbed the FIRST material
+ * slot — usually the white Wall/Trim tone — so voxelized roofs rendered
+ * white). destruction.ts resolves its tone through skin-tone.ts's chain
+ * (thumbnail → GPU readback for compressed KTX2 → non-white base → dark
+ * shingle fallback). */
+export function dominantSlopedMaterial(meshes: readonly Mesh[]): SurfaceMaterialLike | null {
   return dominantMaterialBy(meshes, (ny) => ny > 0 && slopedPitchOk(ny))
 }
 
-/**
- * Dominant ROOF SURFACE color of the merged shell, resolved SYNCHRONOUSLY —
- * the fix for the C2 QA defect where targetBaseColor grabbed the FIRST
- * material slot (usually the white Wall/Trim tone) so voxelized roofs
- * rendered white. Textured winners (the host shingle slots are white-color
- * + texture) resolve through the map's average tone × base color when the
- * image is canvas-drawable; compressed KTX2 maps can't resolve here — use
- * resolveRoofSkinTone for the async GPU readback that covers them. Returns
- * null when no sloped face carries a colored material — callers keep their
- * existing fallback.
- */
-export function roofSurfaceColor(meshes: readonly Mesh[]): Color | null {
-  const best = dominantSlopedMaterial(meshes)
-  if (!best?.color) return null
-  const mapTone = averageMapColor(best)
-  return mapTone ? mapTone.multiply(best.color) : best.color.clone()
+/** Dominant material of the shell's RESIDUAL faces — the ones the sloped
+ * gate excludes (gable-end triangles, fascia, flat caps). The residual
+ * lane tints its gable-end replica with THIS surface's tone instead of the
+ * shingle skin: gable ends read as siding/trim, not roofing. */
+export function dominantResidualMaterial(meshes: readonly Mesh[]): SurfaceMaterialLike | null {
+  return dominantMaterialBy(meshes, (ny) => !slopedPitchOk(Math.abs(ny)))
 }
 
-/**
- * Dominant color of the shell's RESIDUAL faces — the ones the sloped gate
- * excludes (gable-end triangles, fascia, flat caps) — resolved the
- * roofSurfaceColor way (base color × canvas map average). The residual
- * lane (destruction.ts) tints its gable-end replica with this instead of
- * the shingle tone: gable ends read as siding/trim, not roofing. Null when
- * no residual face carries a colored material.
- */
-export function residualSurfaceColor(meshes: readonly Mesh[]): Color | null {
-  const best = dominantMaterialBy(meshes, (ny) => !slopedPitchOk(Math.abs(ny)))
-  if (!best?.color) return null
-  const mapTone = averageMapColor(best)
-  return mapTone ? mapTone.multiply(best.color) : best.color.clone()
-}
-
-// ── Async skin tone (compressed shingle textures) ───────────────────────────
-// The host's shingle materials ship as KTX2/compressed textures with a pure
-// white base color: material.color says nothing and the image is not
-// canvas-drawable, so the only truthful source of the roof tone is the GPU.
-// voxel-walls.tsx registers the live renderer here (it sits inside the R3F
-// canvas); resolveRoofSkinTone then draws the winning map onto a 4×4 render
-// target through the renderer's own sampler chain and averages the readback
-// — asynchronously, because WebGPU readbacks are promises. destruction.ts
-// retints the freshly built plane targets when the tone lands (a frame or
-// two after first blood — imperceptible).
-
-/** The renderer surface this module needs (WebGLRenderer AND WebGPURenderer
- * both satisfy it — readback prefers the async API when present). */
-export type RoofToneRenderer = {
-  getRenderTarget: () => unknown
-  setRenderTarget: (target: unknown) => void
-  render: (scene: Scene, camera: OrthographicCamera) => unknown
-  readRenderTargetPixels?: (
-    target: unknown,
-    x: number,
-    y: number,
-    width: number,
-    height: number,
-    buffer: Uint8Array,
-  ) => void
-  readRenderTargetPixelsAsync?: (
-    target: unknown,
-    x: number,
-    y: number,
-    width: number,
-    height: number,
-  ) => Promise<ArrayBufferView>
-}
-
-let roofToneRenderer: RoofToneRenderer | null = null
-
-/** voxel-walls.tsx wires the live renderer in on mount (null on unmount). */
-export function setRoofTextureRenderer(renderer: RoofToneRenderer | null): void {
-  roofToneRenderer = renderer
-}
-
-/** Lazy 4×4 readback rig — one tiny scene reused for every roof texture. */
-let toneRig: {
-  target: RenderTarget
-  scene: Scene
-  camera: OrthographicCamera
-  material: MeshBasicMaterial
-} | null = null
-
-const TONE_RT_SIZE = 4
-
-/** GPU average of a texture through the live renderer. Resolves null when
- * no renderer is registered or the readback fails (headless tests, exotic
- * targets) — callers keep the synchronous color then. */
-async function gpuAverageMapColor(map: Texture): Promise<Color | null> {
-  const renderer = roofToneRenderer
-  if (!renderer) return null
-  try {
-    if (!toneRig) {
-      const scene = new Scene()
-      const material = new MeshBasicMaterial()
-      scene.add(new Mesh(new PlaneGeometry(2, 2), material))
-      toneRig = {
-        target: new RenderTarget(TONE_RT_SIZE, TONE_RT_SIZE),
-        scene,
-        camera: new OrthographicCamera(-1, 1, 1, -1, 0, 1),
-        material,
-      }
-    }
-    toneRig.material.map = map
-    toneRig.material.needsUpdate = true
-    const prior = renderer.getRenderTarget()
-    renderer.setRenderTarget(toneRig.target)
-    renderer.render(toneRig.scene, toneRig.camera)
-    let pixels: ArrayBufferView
-    if (renderer.readRenderTargetPixelsAsync) {
-      const read = renderer.readRenderTargetPixelsAsync(
-        toneRig.target,
-        0,
-        0,
-        TONE_RT_SIZE,
-        TONE_RT_SIZE,
-      )
-      renderer.setRenderTarget(prior)
-      pixels = await read
-    } else if (renderer.readRenderTargetPixels) {
-      const buffer = new Uint8Array(TONE_RT_SIZE * TONE_RT_SIZE * 4)
-      renderer.readRenderTargetPixels(toneRig.target, 0, 0, TONE_RT_SIZE, TONE_RT_SIZE, buffer)
-      renderer.setRenderTarget(prior)
-      pixels = buffer
-    } else {
-      renderer.setRenderTarget(prior)
-      return null
-    }
-    toneRig.material.map = null
-    const data = pixels as unknown as { length: number; [i: number]: number }
-    if (!data.length) return null
-    let r = 0
-    let g = 0
-    let b = 0
-    for (let i = 0; i + 2 < data.length; i += 4) {
-      r += data[i]!
-      g += data[i + 1]!
-      b += data[i + 2]!
-    }
-    // Render targets hold WORKING-SPACE (linear) values — the sRGB map was
-    // already decoded by the sampler, so no further conversion here.
-    const n = (data.length / 4) * 255
-    return new Color(r / n, g / n, b / n)
-  } catch {
-    return null
-  }
-}
-
-/** map → resolved average tone (before the base-color multiply). WeakMap:
- * a strong Map would pin every session's shingle Textures (and their CPU
- * image data) for the module lifetime across project jump-ins. */
-const toneCache = new WeakMap<Texture, Color>()
-
-/**
- * Resolve the roof surface tone including compressed textures: the
- * synchronous canvas path first, then the cached / freshly-read GPU
- * average. `onTone` fires AT MOST once — synchronously when the tone is
- * already known, or as soon as the GPU readback lands; never when nothing
- * better than roofSurfaceColor's answer exists.
- */
-export function resolveRoofSkinTone(meshes: readonly Mesh[], onTone: (tone: Color) => void): void {
-  const best = dominantSlopedMaterial(meshes)
-  const baseColor = best?.color
-  if (!best || !baseColor) return
-  const canvasTone = averageMapColor(best)
-  if (canvasTone) {
-    onTone(canvasTone.multiply(baseColor))
-    return
-  }
-  const map = best.map
-  if (!map) return
-  const cached = toneCache.get(map)
-  if (cached) {
-    onTone(cached.clone().multiply(baseColor))
-    return
-  }
-  void gpuAverageMapColor(map).then((tone) => {
-    if (!tone) return
-    toneCache.set(map, tone.clone())
-    onTone(tone.multiply(baseColor))
-  })
-}

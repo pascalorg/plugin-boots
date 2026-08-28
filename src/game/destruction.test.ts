@@ -7,6 +7,7 @@ import {
   damageSegment,
   damageTarget,
   dormantTargetCount,
+  dropTarget,
   ensureVoxelTarget,
   isMetalItemMaterial,
   ITEM_CHUNK_CAP,
@@ -22,6 +23,12 @@ import {
   useDestruction,
   wakeAheadTick,
 } from './destruction'
+import {
+  isUntexturedWhite,
+  pendingToneCount,
+  retryPendingTones,
+  toneAuditReport,
+} from './skin-tone'
 import { settleTasksPending } from './structure'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -646,5 +653,89 @@ describe('isMetalItemMaterial (metal spark flag — QA P9R1 fix 2)', () => {
     crate.mesh.geometry.addGroup(0, total - 6, 0) // wood covers almost everything
     crate.mesh.geometry.addGroup(total - 6, 6, 1) // one metal sliver
     expect(ensureVoxelTarget(world, 'crate-1')?.metal).toBe(false)
+  })
+})
+
+describe('tone resolution at voxelize (no target ever wears untextured white)', () => {
+  test('a default-white wall resolves to the wall fallback and audits white-base', () => {
+    const world = makeWorld() // wall meshes carry three's default white material
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    expect(toneAuditReport()).toContainEqual({
+      nodeId: 'wall-1',
+      kind: 'wall',
+      why: 'white-base',
+    })
+  })
+
+  test('a colored wall keeps its own tone and stays out of the audit', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    ;(wall.mesh.material as MeshStandardMaterial).color.set('#8a4b32')
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.baseColor.getHexString()).toBe('8a4b32')
+    expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
+  })
+
+  test('an item region with an unreadable map over a white base wears the item fallback, not white', () => {
+    const world = makeWorld()
+    const crate = world.colliders.find((c) => c.nodeId === 'crate-1')!
+    const material = crate.mesh.material as MeshStandardMaterial
+    material.color.set('#ffffff')
+    // Compressed-style map: an image no CPU path can read.
+    ;(material as unknown as { map: unknown }).map = { image: { width: 4, height: 4 } }
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    expect(toneAuditReport()).toContainEqual({
+      nodeId: 'crate-1',
+      kind: 'item',
+      why: 'map-unreadable',
+    })
+  })
+
+  test('a plain-white item with NO map keeps its porcelain white (legit, not a fallback)', () => {
+    const world = makeWorld()
+    const target = ensureVoxelTarget(world, 'crate-1')!
+    expect(isUntexturedWhite(target.baseColor)).toBe(true)
+    expect(toneAuditReport().some((e) => e.nodeId === 'crate-1')).toBe(false)
+  })
+
+  test('a pending wall texture retints the live target when it loads (skinRevision bump)', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    const material = wall.mesh.material as MeshStandardMaterial
+    const image: { data?: Uint8Array; width: number; height: number } = { width: 2, height: 2 }
+    ;(material as unknown as { map: unknown }).map = { image }
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    // Still loading: the fallback renders, the retry lane is armed.
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    expect(pendingToneCount()).toBe(1)
+    expect(target.skinRevision ?? 0).toBe(0)
+    // The image "finishes loading" as a flat red — next retry pass lands it.
+    const data = new Uint8Array(2 * 2 * 4)
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = 255
+      data[i + 3] = 255
+    }
+    image.data = data
+    retryPendingTones()
+    expect(target.baseColor.r).toBeGreaterThan(0.9)
+    expect(target.baseColor.g).toBeLessThan(0.1)
+    expect(target.skinRevision).toBe(1)
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
+  })
+
+  test('dropTarget clears the node from the audit and cancels its retry', () => {
+    const world = makeWorld()
+    const wall = world.colliders.find((c) => c.nodeId === 'wall-1')!
+    ;(wall.mesh.material as unknown as { map: unknown }).map = {
+      image: { width: 4, height: 4 },
+    }
+    ensureVoxelTarget(world, 'wall-1')
+    expect(pendingToneCount()).toBe(1)
+    dropTarget('wall-1')
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport().some((e) => e.nodeId === 'wall-1')).toBe(false)
   })
 })

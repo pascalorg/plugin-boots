@@ -15,8 +15,7 @@ import {
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
-import { type RoofToneRenderer, setRoofTextureRenderer } from './roof-planes'
-import { primedCellColor } from './skin-tone'
+import { primedCellColor, setSkinToneRenderer, type SkinToneRenderer } from './skin-tone'
 
 /**
  * Renders every voxelized target as the phase-3 WALL SANDWICH, one
@@ -509,13 +508,14 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
 
 export function VoxelWalls() {
   const version = useDestruction((s) => s.version)
-  // Roof skin tone rig (roof-planes.ts): the async shingle-tone readback
-  // needs the LIVE renderer — register it for the session, clear on unmount.
+  // Skin tone rig (skin-tone.ts): the async compressed-texture readback
+  // (shingles, tiled floors) needs the LIVE renderer — register it for the
+  // session, clear on unmount.
   const gl = useThree((s) => s.gl)
   useEffect(() => {
-    setRoofTextureRenderer(gl as unknown as RoofToneRenderer)
+    setSkinToneRenderer(gl as unknown as SkinToneRenderer)
     return () => {
-      setRoofTextureRenderer(null)
+      setSkinToneRenderer(null)
       // Session exit: every entry is a tombstone by now (mesh unmounts
       // ran first) — drop them so their mesh/grid closures free with the
       // session instead of lingering until next session's first drains.

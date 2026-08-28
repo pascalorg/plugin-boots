@@ -1,6 +1,23 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { Color } from 'three'
-import { primedCellColor, type SkinToneSource } from './skin-tone'
+import {
+  averagePixelTone,
+  clearToneAudit,
+  isUntexturedWhite,
+  kindFallbackTone,
+  pendingToneCount,
+  primedCellColor,
+  resetSkinTones,
+  resolveSurfaceTone,
+  retryPendingTones,
+  setSkinToneRenderer,
+  type SkinToneKind,
+  type SkinToneRenderer,
+  type SkinToneSource,
+  type SurfaceMaterialLike,
+  TONE_RETRY_MAX,
+  toneAuditReport,
+} from './skin-tone'
 
 /**
  * Pins for the extracted primeSkin per-cell color math (skin-tone.ts):
@@ -127,5 +144,187 @@ describe('primedCellColor (shared primeSkin tone math)', () => {
     primedCellColor(new Color(), wall, 0)
     primedCellColor(new Color(), wall, 1)
     expectSame(wall.baseColor, base)
+  })
+})
+
+// ── resolveSurfaceTone: the "no voxel stays white" chain ────────────────────
+
+/** DataTexture-style readable map: every texel one flat RGBA byte color. */
+function readableMap(r: number, g: number, b: number, w = 2, h = 2): SurfaceMaterialLike['map'] {
+  const data = new Uint8Array(w * h * 4)
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = r
+    data[i + 1] = g
+    data[i + 2] = b
+    data[i + 3] = 255
+  }
+  return { image: { data, width: w, height: h } } as unknown as SurfaceMaterialLike['map']
+}
+
+/** A map whose image can never be read on the CPU (compressed / headless). */
+function unreadableMap(): SurfaceMaterialLike['map'] {
+  return { image: { width: 4, height: 4 } } as unknown as SurfaceMaterialLike['map']
+}
+
+const srgbTone = (r: number, g: number, b: number) =>
+  new Color().setRGB(r / 255, g / 255, b / 255, 'srgb')
+
+afterEach(() => {
+  resetSkinTones()
+  setSkinToneRenderer(null)
+})
+
+describe('resolveSurfaceTone (fallback chain)', () => {
+  test('kind fallbacks are plausible materials, never untextured white', () => {
+    for (const kind of ['wall', 'slab', 'volume', 'roof', 'item'] as SkinToneKind[]) {
+      const tone = kindFallbackTone(kind)
+      expect(isUntexturedWhite(tone)).toBe(false)
+    }
+    // And the detector itself: white/near-white trips, real colors don't.
+    expect(isUntexturedWhite(new Color('#ffffff'))).toBe(true)
+    expect(isUntexturedWhite(new Color(0.95, 0.95, 0.95))).toBe(true)
+    expect(isUntexturedWhite(new Color('#d8d2c7'))).toBe(false)
+  })
+
+  test('no material at all → kind fallback + no-material audit', () => {
+    const tone = resolveSurfaceTone('node-a', 'slab', null)
+    expectSame(tone, kindFallbackTone('slab'))
+    expect(toneAuditReport()).toEqual([{ nodeId: 'node-a', kind: 'slab', why: 'no-material' }])
+  })
+
+  test('readable map wins: average tone × base color, audit clean', () => {
+    const material: SurfaceMaterialLike = {
+      color: new Color(0.5, 1, 1),
+      map: readableMap(255, 0, 0),
+    }
+    const tone = resolveSurfaceTone('node-b', 'wall', material)
+    const expected = srgbTone(255, 0, 0).multiply(material.color!)
+    expectSame(tone, expected)
+    expect(toneAuditReport()).toEqual([])
+    expect(pendingToneCount()).toBe(0)
+  })
+
+  test('averagePixelTone decodes sRGB bytes into the working space', () => {
+    const tone = averagePixelTone([128, 64, 32, 255], true)!
+    expectSame(tone, srgbTone(128, 64, 32))
+    // GPU readbacks are already working-space — no decode.
+    const linear = averagePixelTone([128, 64, 32, 255], false)!
+    expectSame(linear, new Color(128 / 255, 64 / 255, 32 / 255))
+  })
+
+  test('white base, no map → kind fallback + white-base audit', () => {
+    const tone = resolveSurfaceTone('node-c', 'roof', { color: new Color('#ffffff') })
+    expectSame(tone, kindFallbackTone('roof'))
+    expect(toneAuditReport()).toEqual([{ nodeId: 'node-c', kind: 'roof', why: 'white-base' }])
+  })
+
+  test('colored base, no map → the base color, audit clean', () => {
+    const base = new Color('#59702c')
+    const tone = resolveSurfaceTone('node-d', 'wall', { color: base.clone() })
+    expectSame(tone, base)
+    expect(toneAuditReport()).toEqual([])
+  })
+
+  test('unreadable map + white base → fallback now, pending retry delivers when the image loads', () => {
+    const material: SurfaceMaterialLike = { color: new Color('#ffffff'), map: unreadableMap() }
+    let delivered: Color | null = null
+    const tone = resolveSurfaceTone('node-e', 'wall', material, (t) => {
+      delivered = t
+    })
+    expectSame(tone, kindFallbackTone('wall'))
+    expect(toneAuditReport()).toEqual([{ nodeId: 'node-e', kind: 'wall', why: 'pending' }])
+    expect(pendingToneCount()).toBe(1)
+    // The texture "finishes loading": its image becomes CPU-readable.
+    const loaded = readableMap(0, 255, 0)!
+    ;(material.map as { image?: unknown }).image = loaded.image
+    retryPendingTones()
+    expect(delivered).not.toBeNull()
+    expectSame(delivered!, srgbTone(0, 255, 0)) // × white base = itself
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport()).toEqual([])
+  })
+
+  test('unreadable map + colored base → base color immediately, still retrying', () => {
+    const base = new Color('#7a3b2e')
+    const tone = resolveSurfaceTone(
+      'node-f',
+      'slab',
+      { color: base.clone(), map: unreadableMap() },
+      () => {},
+    )
+    expectSame(tone, base)
+    expect(pendingToneCount()).toBe(1)
+    expect(toneAuditReport()).toEqual([{ nodeId: 'node-f', kind: 'slab', why: 'pending' }])
+  })
+
+  test('retry exhausts after TONE_RETRY_MAX passes → map-unreadable audit, no delivery', () => {
+    let delivered = 0
+    resolveSurfaceTone('node-g', 'roof', { color: new Color('#fff'), map: unreadableMap() }, () => {
+      delivered++
+    })
+    for (let i = 0; i < TONE_RETRY_MAX; i++) retryPendingTones()
+    expect(pendingToneCount()).toBe(0)
+    expect(delivered).toBe(0)
+    expect(toneAuditReport()).toEqual([{ nodeId: 'node-g', kind: 'roof', why: 'map-unreadable' }])
+    // Further passes are no-ops.
+    retryPendingTones()
+    expect(toneAuditReport()).toHaveLength(1)
+  })
+
+  test('no retint callback → immediate map-unreadable audit (retrying could never deliver)', () => {
+    resolveSurfaceTone('node-h', 'volume', { color: new Color('#fff'), map: unreadableMap() })
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport()).toEqual([{ nodeId: 'node-h', kind: 'volume', why: 'map-unreadable' }])
+  })
+
+  test('a re-resolve replaces the pending entry (no double retries)', () => {
+    resolveSurfaceTone('node-i', 'wall', { map: unreadableMap() }, () => {})
+    resolveSurfaceTone('node-i', 'wall', { map: unreadableMap() }, () => {})
+    expect(pendingToneCount()).toBe(1)
+  })
+
+  test('clearToneAudit forgets the node (dropTarget)', () => {
+    resolveSurfaceTone('node-j', 'wall', { map: unreadableMap() }, () => {})
+    clearToneAudit('node-j')
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport()).toEqual([])
+  })
+
+  test('GPU readback lane: a registered renderer resolves compressed maps async', async () => {
+    // Fake renderer: "samples" every texture as one flat linear color.
+    const renderer: SkinToneRenderer = {
+      getRenderTarget: () => null,
+      setRenderTarget: () => {},
+      render: () => {},
+      readRenderTargetPixels: (_t, _x, _y, w, h, buffer) => {
+        for (let i = 0; i < w * h * 4; i += 4) {
+          buffer[i] = 64
+          buffer[i + 1] = 128
+          buffer[i + 2] = 255
+          buffer[i + 3] = 255
+        }
+      },
+    }
+    setSkinToneRenderer(renderer)
+    const material: SurfaceMaterialLike = { color: new Color(0.5, 0.5, 0.5), map: unreadableMap() }
+    let delivered: Color | null = null
+    const tone = resolveSurfaceTone('node-k', 'roof', material, (t) => {
+      delivered = t
+    })
+    // Sync answer is the chain fallback (gray base is non-white → kept)…
+    expectSame(tone, material.color!)
+    // …and attempt 0 kicked the readback immediately — no 1 s wait.
+    await new Promise((r) => setTimeout(r, 0))
+    expect(delivered).not.toBeNull()
+    const gpu = new Color(64 / 255, 128 / 255, 255 / 255).multiply(material.color!)
+    expectSame(delivered!, gpu)
+    expect(pendingToneCount()).toBe(0)
+    expect(toneAuditReport()).toEqual([])
+    // The tone cached per map: the next resolve answers synchronously.
+    const again = resolveSurfaceTone('node-l', 'roof', {
+      color: new Color(1, 1, 1),
+      map: material.map,
+    })
+    expectSame(again, new Color(64 / 255, 128 / 255, 255 / 255))
   })
 })
