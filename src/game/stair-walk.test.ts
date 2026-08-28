@@ -15,6 +15,9 @@ import { bvhFor, type ColliderEntry } from './world'
  * shrinks the capsule radius or reworks collideCapsule so risers start
  * defeating the slide, this is the tripwire that says "now you need the
  * step-up pass" (raise-and-retry, docs/MULTILEVEL-PLAN.md Phase A4/D).
+ * NOTE: the PLAYER now runs collision.moveCapsule (STEP_OFFSET lift +
+ * ground snap — climb-feel.test.ts covers it), but BOTS and grenades still
+ * move on this plain slide, so the guarantee below still carries them.
  *
  * Movement integration mirrors player.tsx's frame loop: stepVelocity →
  * integrate → collideCapsule, fixed 60 Hz.

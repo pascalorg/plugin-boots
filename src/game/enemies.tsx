@@ -167,7 +167,8 @@ function meleeBlocked(world: GameWorld, bot: Bot): boolean {
   if (raycastVoxelTargets(_chest, _meleeDir, len)) return true
   _probe.copy(_chest).addScaledVector(_meleeDir, len * 0.5)
   for (const collider of world.colliders) {
-    if (collider.disabled) continue
+    // walkOnly planks are capsule-only — their voxel grid answered above.
+    if (collider.disabled || collider.walkOnly) continue
     if (collider.worldBox.containsPoint(_probe)) return true
   }
   return false

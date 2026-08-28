@@ -92,6 +92,9 @@ export type SupportColliderLike = {
     max: { x: number; y: number; z: number }
   }
   disabled?: boolean
+  /** FEET-SEE-THE-PLANE planks (world.ts): support probes treat them like
+   * disabled — their voxel target is the live material. */
+  walkOnly?: boolean
 }
 
 export type SupportProbeCtx = {
@@ -149,7 +152,7 @@ export function probeTargetSupport(target: SupportTargetLike, ctx: SupportProbeC
     if (bottom <= terrainY + SUPPORT_GAP) return true
     // 2) Live collider top inside the support band under this cell.
     for (const collider of ctx.colliders) {
-      if (collider.disabled || collider.nodeId === target.nodeId) continue
+      if (collider.disabled || collider.walkOnly || collider.nodeId === target.nodeId) continue
       const box = collider.worldBox
       if (box.max.y < bottom - SUPPORT_GAP || box.min.y > bottom + 0.02) continue
       if (cx < box.min.x - XZ_MARGIN || cx > box.max.x + XZ_MARGIN) continue

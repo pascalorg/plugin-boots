@@ -222,7 +222,8 @@ export function sprayPaint(world: GameWorld): boolean {
   let solidType: string | null = null
   let needsVoxelize = false
   for (const collider of world.colliders) {
-    if (collider.disabled) continue
+    // walkOnly planks are capsule-only — the spray lands on their voxels.
+    if (collider.disabled || collider.walkOnly) continue
     _inverse.copy(collider.inverse)
     _ray.origin.copy(_origin).applyMatrix4(_inverse)
     _ray.direction.copy(_direction).transformDirection(_inverse)
