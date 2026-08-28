@@ -1941,13 +1941,16 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
       targets.has(nodeId) ||
       prevoxelizeSkip.has(nodeId) ||
       roofGroups.has(nodeId) ||
-      // Placed catalog items run their OWN voxel lifecycle (item-place.tsx
-      // drops the target on every proxy→GLB swap and re-voxelizes on first
-      // hit) — never prebuild them, and never count them against
-      // completeness: warmup.tsx gates its background BVH drain on a
-      // ZERO-budget call of this function, and a target-less placed item
-      // arriving mid-session would wedge that gate false forever.
-      nodeId.startsWith(ITEM_NODE_PREFIX) ||
+      // EVERY game-only '__boots' node manages its own lifecycle — never
+      // prebuild any of them. Placed catalog items (ITEM_NODE_PREFIX)
+      // re-voxelize on proxy→GLB swaps and first hits (and a target-less
+      // placed item arriving mid-session would wedge warmup.tsx's
+      // zero-budget completeness gate false forever). And the SPAWN
+      // FIXTURES (gun/build tables '__boots-table*', the breaker
+      // '__boots-switch') register 'item' colliders too: prebuilding THEM
+      // meant a wake hid the tables themselves — the "everything
+      // disappears when I approach the table" live report.
+      nodeId.startsWith('__boots') ||
       !EXPLODABLE.has(collider.nodeType)
     ) {
       continue
