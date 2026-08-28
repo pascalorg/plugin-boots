@@ -488,6 +488,12 @@ function ActiveGame() {
           // skips (walkOnly planks / dormant prebuilds) vs collides.
           walkOnly: target.walkOnly === true,
           dormant: target.dormant === true,
+          // Metal spark lane (QA P9R1 fix 2): the coarse flag + how many
+          // cells the per-cell mask marks metal (0 = mask-less).
+          metal: target.metal === true,
+          metalCells: target.cellMetal
+            ? target.cellMetal.reduce((n, v) => n + v, 0)
+            : 0,
         })),
       studs: () =>
         Array.from(useDestruction.getState().targets.values()).flatMap((target) =>
