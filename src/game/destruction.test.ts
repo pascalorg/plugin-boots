@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import { clearDebris, debrisCensus } from './debris'
 import {
   collapseWholeTarget,
   damageExplosion,
@@ -7,6 +8,12 @@ import {
   damageTarget,
   dormantTargetCount,
   ensureVoxelTarget,
+  ITEM_CHUNK_CAP,
+  ITEM_CHUNK_PER_CELLS,
+  ITEM_CHUNK_SCALE_MIN,
+  ITEM_CHUNK_SCALE_SPAN,
+  itemChunkCount,
+  itemChunkSize,
   prevoxelizeTick,
   raycastSegments,
   resetDestruction,
@@ -84,7 +91,7 @@ afterEach(() => {
 })
 
 describe('prevoxelizeTick', () => {
-  test('voxelizes every wall (and only walls) without a shot, colliders handed over', () => {
+  test('voxelizes walls AND items awake without a shot, colliders handed over', () => {
     const world = makeWorld()
     let done = false
     for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
@@ -92,15 +99,18 @@ describe('prevoxelizeTick', () => {
     const targets = useDestruction.getState().targets
     expect(targets.get('wall-1')?.kind).toBe('wall')
     expect(targets.get('wall-2')?.kind).toBe('wall')
-    // Walls wake instantly (the bricks-from-the-start look); everything
-    // else a blast can reach is PREBUILT DORMANT — grid ready, host mesh
-    // still rendering and colliding until the first hit wakes it (the
-    // grenade-lag fix: no big grids built inside the blast frame).
+    // Walls wake instantly (the bricks-from-the-start look) — and so do
+    // ITEM-FAMILY nodes (voxel-first, owner 2026-08-28): the crate's host
+    // GLB hides at session start and its silhouette replica renders from
+    // frame one, so an item never morphs into voxels on its first hit —
+    // it just starts losing chunks. Non-item explodables (doors, slabs,
+    // roofs…) still prebuild DORMANT (the grenade-lag economics).
     expect(targets.get('wall-1')?.dormant).toBeFalsy()
-    expect(targets.get('crate-1')?.dormant).toBe(true)
-    // Host handover happened for WALLS only; dormant prebuilds keep theirs.
+    expect(targets.get('crate-1')?.dormant).toBeFalsy()
+    expect(targets.get('crate-1')?.item).toBe(true)
+    // Host handover happened for walls and items alike, in the same ticks.
     for (const collider of world.colliders) {
-      expect(Boolean(collider.disabled)).toBe(collider.nodeType === 'wall')
+      expect(Boolean(collider.disabled)).toBe(true)
     }
     // The anatomy is fully there before any damage.
     const wall = targets.get('wall-1')!
@@ -118,18 +128,23 @@ describe('prevoxelizeTick', () => {
     expect(prevoxelizeTick(world, 8)).toBe(true) // idempotent once done
   })
 
-  test('dormant census tracks prebuilds; wake-ahead idles out at zero', () => {
+  test('dormant census tracks non-item prebuilds; wake-ahead idles out at zero', () => {
     const world = makeWorld()
+    // Items are voxel-first (awake at prevoxelize), so the census needs a
+    // NON-item explodable for coverage: a door still prebuilds dormant.
+    world.colliders.push(boxCollider('door-1', 'door', [0.9, 2.1, 0.1], [2.5, 1.05, 3]))
     expect(dormantTargetCount()).toBe(0)
     let done = false
     for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
     expect(done).toBe(true)
-    // Walls wake instantly; the crate is this layout's one dormant prebuild.
-    expect(dormantTargetCount()).toBe(1)
-    // A cooking stick near the crate wakes it through wakeAheadTick…
-    const center = new Vector3(10, 1.35, 0)
-    expect(wakeAheadTick(world, center, 3.2)).toBe(true)
+    // Walls + the crate wake instantly; the door is the one dormant prebuild.
     expect(useDestruction.getState().targets.get('crate-1')?.dormant).toBeFalsy()
+    expect(useDestruction.getState().targets.get('door-1')?.dormant).toBe(true)
+    expect(dormantTargetCount()).toBe(1)
+    // A cooking stick near the door wakes it through wakeAheadTick…
+    const center = new Vector3(2.5, 1.05, 3)
+    expect(wakeAheadTick(world, center, 3.2)).toBe(true)
+    expect(useDestruction.getState().targets.get('door-1')?.dormant).toBeFalsy()
     expect(dormantTargetCount()).toBe(0)
     // …and once the census is zero the per-frame scan idles out O(1).
     expect(wakeAheadTick(world, center, 3.2)).toBe(false)
@@ -290,6 +305,58 @@ describe('carve splash chips the framing (gunfire chips neighbors)', () => {
     expect(() =>
       damageTarget(world, 'crate-1', new Vector3(10, 1.35, -0.5), 0.4),
     ).not.toThrow()
+  })
+})
+
+describe('voxel-first items break naturally (owner call 2026-08-28)', () => {
+  test('itemChunkCount: ~1 chunk per 2-3 cells, floor 1, cap 14', () => {
+    expect(itemChunkCount(0)).toBe(0)
+    expect(itemChunkCount(1)).toBe(1)
+    expect(itemChunkCount(2)).toBe(1)
+    expect(itemChunkCount(5)).toBe(2)
+    expect(itemChunkCount(12)).toBe(5)
+    expect(itemChunkCount(35)).toBe(ITEM_CHUNK_CAP)
+    expect(itemChunkCount(500)).toBe(ITEM_CHUNK_CAP)
+  })
+
+  test('itemChunkSize: chunks stay in the 1.6-2.6x cell band, 2-3x a same-roll wall crumb', () => {
+    const cell = 0.08 // typical silhouette cell
+    for (const roll of [0, 0.25, 0.5, 0.75, 1]) {
+      const chunk = itemChunkSize(cell, roll)
+      expect(chunk).toBeGreaterThanOrEqual(cell * ITEM_CHUNK_SCALE_MIN)
+      expect(chunk).toBeLessThanOrEqual(cell * (ITEM_CHUNK_SCALE_MIN + ITEM_CHUNK_SCALE_SPAN))
+      // Wall crumbs draw at cell * (0.6 + roll * 0.5) — the same roll's
+      // chunk is 2-3x that: fewer, LARGER pieces, never wall dust.
+      const crumb = cell * (0.6 + roll * 0.5)
+      expect(chunk / crumb).toBeGreaterThanOrEqual(2)
+      expect(chunk / crumb).toBeLessThanOrEqual(3)
+    }
+  })
+
+  test('an item carve spawns exactly the chunk budget — and no paper shards', () => {
+    const world = makeWorld()
+    const crate = ensureVoxelTarget(world, 'crate-1')!
+    expect(crate.item).toBe(true)
+    clearDebris()
+    const removed = damageTarget(world, 'crate-1', new Vector3(10, 1.35, 0), 0.3)
+    expect(removed).toBeGreaterThan(0)
+    const census = debrisCensus()
+    expect(census.live).toBe(itemChunkCount(removed))
+    expect(census.live).toBeLessThanOrEqual(ITEM_CHUNK_CAP)
+    // Porcelain sheds chunks, never drywall paper (flat shards are the
+    // wall/roof sheet read).
+    expect(census.flats).toBe(0)
+    clearDebris()
+  })
+
+  test('a heavy smash caps at ITEM_CHUNK_CAP chunks per carve', () => {
+    const world = makeWorld()
+    ensureVoxelTarget(world, 'crate-1')
+    clearDebris()
+    const removed = damageTarget(world, 'crate-1', new Vector3(10, 1.35, 0), 0.8)
+    expect(removed).toBeGreaterThan(ITEM_CHUNK_CAP * ITEM_CHUNK_PER_CELLS)
+    expect(debrisCensus().live).toBe(ITEM_CHUNK_CAP)
+    clearDebris()
   })
 })
 
