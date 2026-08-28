@@ -31,6 +31,11 @@ See [`docs/RESEARCH.md`](docs/RESEARCH.md) for the open-source three.js groundwo
 
 ## Install (development)
 
+> **Not on npm** — and that's deliberate. Boots only runs inside the
+> Pascal editor: players just enable it from the **Plugins panel** at
+> [editor.pascal.app](https://editor.pascal.app); host apps consume it
+> pinned straight from this repo (`github:pascalorg/plugin-boots#<sha>`).
+
 Boots is a standard Pascal editor plugin — raw TypeScript, peer-deps on `@pascal-app/core|editor|viewer`.
 
 ```bash
