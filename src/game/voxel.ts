@@ -90,6 +90,36 @@ export const rotateByBasisInverse = (
   out.z = z + q.w * tz + (-q.x * ty + q.y * tx)
 }
 
+/**
+ * The grid→world transform of a grid's SHELL frame — the grid frame with
+ * its origin moved to zero, the frame shell.ts packs fragment vertices in
+ * (a shell-frame position p satisfies p = rotateByBasis(q, world) − origin).
+ * Returns a plain { position, quaternion } for an Object3D/group whose
+ * children carry shell-frame geometry:
+ *
+ *   world = quaternion ⊗ p_shell + position
+ *         = q⁻¹ ⊗ (p_shell + origin)
+ *
+ * so quaternion is the basis CONJUGATE (grid.q is WORLD → GRID — see
+ * VoxelBasis; its conjugate maps grid → world, the same rotation
+ * voxel-walls' primeSkin composes for rotated instances) and position is
+ * the origin rotated out to world. Identity-basis grids (plain walls)
+ * reduce to { position: origin, quaternion: identity }. Pure — fresh plain
+ * objects, no three types.
+ */
+export function gridFrameToWorld(grid: {
+  origin: { x: number; y: number; z: number }
+  q: VoxelBasis
+}): {
+  position: { x: number; y: number; z: number }
+  quaternion: { x: number; y: number; z: number; w: number }
+} {
+  const position = { x: 0, y: 0, z: 0 }
+  rotateByBasisInverse(grid.q, grid.origin.x, grid.origin.y, grid.origin.z, position)
+  const { q } = grid
+  return { position, quaternion: { x: -q.x, y: -q.y, z: -q.z, w: q.w } }
+}
+
 export type VoxelGridData = {
   /** Legacy/render size — the LARGEST per-axis cell (length/height cell on
    * anisotropic wall grids). Debris sizing and gap-free collision spheres

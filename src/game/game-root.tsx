@@ -16,6 +16,7 @@ import {
   prevoxelizeTick,
   probeLandingY,
   resetDestruction,
+  setShellFlag,
   useDestruction,
   type VoxelTarget,
 } from './destruction'
@@ -33,6 +34,7 @@ import { PaintTool } from './paint'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
 import { Player, playerDebug, playerRig } from './player'
 import { getSession, hideForGame, getSessionSerial } from './session'
+import { ShellLayer, shellCensus } from './shell-layer'
 import { aimDirection, fire } from './shooting'
 import { pendingToneCount, toneAuditReport } from './skin-tone'
 import { GameSky } from './sky'
@@ -561,6 +563,12 @@ function ActiveGame() {
             ? target.cellMetal.reduce((n, v) => n + v, 0)
             : 0,
         })),
+      // Conforming-shell lane (S0): census (shelled targets / fragments /
+      // fragments killed) + the flag toggle. setShell is SESSION-LATCHED:
+      // destruction reads the flag once at the session's first wall
+      // voxelize, so a flip takes effect on the NEXT Jump in.
+      shell: () => shellCensus(),
+      setShell: (kind: 'wall', v: boolean) => setShellFlag(kind, v),
       // Tone audit (voxel-fidelity QA): every node still wearing a
       // FALLBACK skin tone instead of its surface's real albedo, and why
       // ('pending' entries are still retrying ~1/s). Empty = no voxel
@@ -679,6 +687,7 @@ function ActiveGame() {
       <ForeignOverlayHide />
       <OverlaySweep />
       <VoxelWalls />
+      <ShellLayer world={world} />
       <GlassCracks />
       <Debris />
       <DustSystem />

@@ -28,6 +28,13 @@
  * max(prev, next) and is the only thing the driver feeds the bar.
  *
  * Dependency-free pure math — fully testable headless (loading.test.ts).
+ *
+ * CONFORMING SHELLS (S0) add NO stage weight: shell builds run INSIDE
+ * ensureVoxelTarget's wall path (destruction.ts buildWallShell), on the
+ * same 4 ms prevoxelize budget — the wall stage's fraction (walls with
+ * targets / total walls) already carries their cost, amortized as a few
+ * extra prevoxelize frames (~25–50 ms house-wide, flag ON only). A
+ * separate weight would double-count work the wall counter is measuring.
  */
 
 /** Never hold the veil longer than this, no matter what's pending. */

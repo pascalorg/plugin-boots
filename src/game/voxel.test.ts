@@ -5,6 +5,7 @@ import {
   buildVoxelGrid,
   dropInteriorCells,
   findUnsupportedIslands,
+  gridFrameToWorld,
   raycastObb,
   raycastVoxels,
   raycastYawObb,
@@ -601,5 +602,80 @@ describe('findUnsupportedIslands', () => {
     for (const idx of islands[0]!) {
       expect(grid.coords[idx * 3 + 1]!).toBeGreaterThan(8)
     }
+  })
+})
+
+describe('gridFrameToWorld (shell-frame group transform)', () => {
+  /** Reconstruct voxel i's WORLD center from its SHELL-frame center
+   * ((coords + 0.5) · cell — origin already at zero) through the returned
+   * transform, and compare against grid.centers (world by contract). */
+  function expectRoundTrip(grid: ReturnType<typeof buildVoxelGrid>) {
+    const t = gridFrameToWorld(grid)
+    const quaternion = new Quaternion(
+      t.quaternion.x,
+      t.quaternion.y,
+      t.quaternion.z,
+      t.quaternion.w,
+    )
+    const position = new Vector3(t.position.x, t.position.y, t.position.z)
+    const v = new Vector3()
+    for (let i = 0; i < grid.count; i++) {
+      v.set(
+        (grid.coords[i * 3]! + 0.5) * grid.cellX,
+        (grid.coords[i * 3 + 1]! + 0.5) * grid.cellY,
+        (grid.coords[i * 3 + 2]! + 0.5) * grid.cellZ,
+      )
+        .applyQuaternion(quaternion)
+        .add(position)
+      expect(v.x).toBeCloseTo(grid.centers[i * 3]!, 5)
+      expect(v.y).toBeCloseTo(grid.centers[i * 3 + 1]!, 5)
+      expect(v.z).toBeCloseTo(grid.centers[i * 3 + 2]!, 5)
+    }
+  }
+
+  test('identity-basis grid: position = origin, quaternion = identity', () => {
+    const grid = wallGrid()
+    const t = gridFrameToWorld(grid)
+    expect(t.position).toEqual({ x: grid.origin.x, y: grid.origin.y, z: grid.origin.z })
+    expect(t.quaternion).toEqual({ x: -0, y: -0, z: -0, w: 1 })
+    expectRoundTrip(grid)
+  })
+
+  test('yaw grid: shell-frame centers land on the world centers', () => {
+    const yaw = Math.PI / 4
+    const geometry = new BoxGeometry(2, 1, 0.12)
+    const bvh = new MeshBVH(geometry)
+    const matrixWorld = new Matrix4().makeRotationY(-yaw)
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.06), new Vector3(1, 0.5, 0.06))
+    const grid = buildVoxelGrid([{ bvh, matrixWorld }], bounds, 0.15, false, { z: 0.12 / 3 }, yaw)
+    expect(grid.count).toBeGreaterThan(0)
+    expectRoundTrip(grid)
+  })
+
+  test('full-basis grid (pitched): the quaternion is the basis conjugate', () => {
+    const q = new Quaternion()
+      .setFromAxisAngle(new Vector3(0, 1, 0), Math.PI / 6)
+      .multiply(new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), Math.PI / 5))
+    const basis: VoxelBasis = { x: q.x, y: q.y, z: q.z, w: q.w }
+    const geometry = new BoxGeometry(2, 1, 0.12)
+    const bvh = new MeshBVH(geometry)
+    const matrixWorld = new Matrix4().makeRotationFromQuaternion(q.clone().invert())
+    const bounds = new Box3(new Vector3(-1, -0.5, -0.06), new Vector3(1, 0.5, 0.06))
+    const grid = buildVoxelGrid(
+      [{ bvh, matrixWorld }],
+      bounds,
+      0.15,
+      false,
+      { z: 0.12 / 3 },
+      0,
+      basis,
+    )
+    expect(grid.count).toBeGreaterThan(0)
+    const t = gridFrameToWorld(grid)
+    expect(t.quaternion.x).toBeCloseTo(-basis.x, 10)
+    expect(t.quaternion.y).toBeCloseTo(-basis.y, 10)
+    expect(t.quaternion.z).toBeCloseTo(-basis.z, 10)
+    expect(t.quaternion.w).toBeCloseTo(basis.w, 10)
+    expectRoundTrip(grid)
   })
 })
