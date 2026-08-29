@@ -1,5 +1,6 @@
-import { useScene } from '@pascal-app/core'
+import { sceneRegistry, useScene } from '@pascal-app/core'
 import { useEditor } from '@pascal-app/editor'
+import * as hostViewerExports from '@pascal-app/viewer'
 import { useViewer } from '@pascal-app/viewer'
 import type { Object3D, PerspectiveCamera } from 'three'
 import { useBoots } from '../store'
@@ -173,6 +174,137 @@ export function forceStackedLevelMode(teardown: Array<() => void>): void {
       prev,
     )
   })
+}
+
+/**
+ * FULL-HEIGHT PRESENCE: the game always starts with the whole building at
+ * full wall height, exactly as the editor's "Full height" display mode shows
+ * it. The host's wall display mode (`useViewer.wallMode`: 'up' | 'cutaway' |
+ * 'down' | 'translucent') is a MATERIAL swap on the same full-height wall
+ * meshes — 'down' dresses every wall in the dotted low-stipple film,
+ * 'cutaway' turns camera-facing exterior walls to glass, 'translucent' makes
+ * everything see-through (viewer WallCutout). Jumping in from any of those
+ * would show ghost/stipple walls in first person (dormant conforming-shell
+ * targets keep the HOST look until damaged — including the host's mode
+ * materials). Force 'up' with the exact record/restore pattern
+ * forceStackedLevelMode uses; feature-detected so older hosts no-op.
+ * The owner-reported "indestructible full-height walls" companion bug is
+ * handled separately by sweepWallBatches below — forcing 'up' is what makes
+ * that path the ONLY one destruction ever has to handle.
+ */
+export function forceFullHeightWallMode(teardown: Array<() => void>): void {
+  const viewer = useViewer.getState() as unknown as {
+    wallMode?: string
+    setWallMode?: (mode: string) => void
+  }
+  const prev = viewer.wallMode
+  if (!viewer.setWallMode || !prev || prev === 'up') return
+  viewer.setWallMode('up')
+  teardown.push(() => {
+    ;(useViewer.getState() as unknown as { setWallMode?: (m: string) => void }).setWallMode?.(prev)
+  })
+}
+
+// ── Host wall-batch neutralization ──────────────────────────────────────────
+// In 'up' (Full height) wall mode — and ONLY there — the host merges a
+// level's walls into one presentation mesh (`wall-batch`, a direct child of
+// the level root; nodes wall-batch-system) and takes each member wall's own
+// mesh off the scene layer (its layers keep the BATCHED bit; the mesh stays
+// `visible = true` so collectWorld/voxelize still read the true full-height
+// geometry). Destruction's host→voxel swap hides the wall's OWN mesh, which
+// under a batch isn't the one drawing — the merged copy keeps rendering the
+// pristine full-height wall over the carved voxel replica: the owner's
+// "walls are forever up / indestructible in Full height" bug (2026-08-29).
+// The batch is presentation-only (raycast no-op), so the game neutralizes
+// it: hide every live `wall-batch` mesh (session ledger) and put the member
+// walls back on the scene layer so the per-wall hide/swap works again.
+
+/** Host layer indices, read off the viewer package when it exports them
+ * (SCENE_LAYER since 0.9.x; BATCHED_LAYER arrived with wall batching) —
+ * falling back to the host's stable values so a dist that predates the
+ * export still sweeps correctly. */
+const viewerLayerExports = hostViewerExports as unknown as {
+  SCENE_LAYER?: number
+  BATCHED_LAYER?: number
+}
+const SCENE_LAYER_BIT = 1 << (viewerLayerExports.SCENE_LAYER ?? 0)
+const BATCHED_LAYER_BIT = 1 << (viewerLayerExports.BATCHED_LAYER ?? 5)
+
+/** The host's merged-walls presentation mesh name (nodes wall-batch-system). */
+const WALL_BATCH_NAME = 'wall-batch'
+
+/**
+ * Pure planner behind sweepWallBatches (exported for unit tests): which
+ * level-child batch meshes to hide, and which member wall meshes to put
+ * back on the scene layer. A wall is revealed only when the sweep actually
+ * found a live batch AND the wall is provably batch-held: still visible
+ * (a `visible = false` wall was game-hidden by destruction — its voxel
+ * replica draws now), mask non-zero (mask 0 is maskForGame's game-hide —
+ * same story), scene bit OFF, batched bit ON (scene-off WITHOUT the batched
+ * bit is the host's solo/isolation hold — not ours to undo).
+ */
+export function planWallBatchSweep(
+  levelRoots: Iterable<Object3D>,
+  wallMeshes: Iterable<Object3D>,
+  sceneBit: number = SCENE_LAYER_BIT,
+  batchedBit: number = BATCHED_LAYER_BIT,
+): { batches: Object3D[]; reveals: Array<{ mesh: Object3D; from: number; to: number }> } {
+  const batches: Object3D[] = []
+  for (const root of levelRoots) {
+    for (const child of root.children) {
+      if (child.name === WALL_BATCH_NAME && child.visible) batches.push(child)
+    }
+  }
+  const reveals: Array<{ mesh: Object3D; from: number; to: number }> = []
+  if (batches.length > 0) {
+    for (const mesh of wallMeshes) {
+      if (!mesh.visible) continue
+      const mask = mesh.layers.mask
+      if (mask === 0 || (mask & sceneBit) !== 0 || (mask & batchedBit) === 0) continue
+      reveals.push({ mesh, from: mask, to: mask | sceneBit })
+    }
+  }
+  return { batches, reveals }
+}
+
+/**
+ * Neutralize the host's merged wall batches for the session. Runs at
+ * enterGame (kills batches that already exist when jumping in from 'up')
+ * and again from destruction's hideHostNode on every WALL host→voxel swap
+ * (kills batches the host sews mid-session — forcing 'up' at entry lifts
+ * its stand-down, and it re-merges ~180 ms later; a batch of DORMANT walls
+ * is pixel-identical to the walls drawing themselves, so the swap moment is
+ * exactly when a live batch first matters). Restore is two-part: hidden
+ * batch meshes ride the ordinary hiddenObjects ledger, and each revealed
+ * wall gets a CONDITIONAL teardown entry — if a later owner re-masked the
+ * mesh (a wake's maskForGame, the host disposing the batch when the
+ * restored wall mode suspends batching), that owner's restore wins.
+ * No-op outside a session and on hosts without wall batching.
+ */
+export function sweepWallBatches(): void {
+  const session = current
+  if (!session) return
+  const registry = sceneRegistry as unknown as {
+    byType: Record<string, ReadonlySet<string> | undefined>
+    nodes: Map<string, Object3D>
+  }
+  const levelIds = registry.byType.level
+  if (!levelIds || levelIds.size === 0) return
+  function* resolve(ids: ReadonlySet<string> | undefined): Generator<Object3D> {
+    if (!ids) return
+    for (const id of ids) {
+      const obj = registry.nodes.get(id)
+      if (obj) yield obj
+    }
+  }
+  const plan = planWallBatchSweep(resolve(levelIds), resolve(registry.byType.wall))
+  for (const batch of plan.batches) hideForGame(batch)
+  for (const { mesh, from, to } of plan.reveals) {
+    mesh.layers.mask = to
+    session.teardown.push(() => {
+      if (mesh.layers.mask === to) mesh.layers.mask = from
+    })
+  }
 }
 
 /**
@@ -420,6 +552,10 @@ export function enterGame(): boolean {
   // Whole-building presence: solo/exploded level modes would snapshot a
   // partial or displaced building — force stacked, restore on exit.
   forceStackedLevelMode(teardownList)
+  // Full-height presence: the game always starts at 'up' wall display —
+  // low/cutaway/translucent are material tricks that would dress dormant
+  // walls in ghost stipple in first person. Restore the exact mode on exit.
+  forceFullHeightWallMode(teardownList)
   // No selection during a session: gizmos can't appear in first person.
   // Must run BEFORE setPhase('game') mounts GameRoot, so the pre-session
   // gizmo rig is unmounted before collectWorld snapshots the scene.
@@ -448,6 +584,13 @@ export function enterGame(): boolean {
     loading: true,
   }
   current = session
+
+  // Jumping in FROM 'up' means the host's merged wall batches are already
+  // live — the one case forceFullHeightWallMode above can't dissolve (no
+  // mode flip, so the batch system never stands down). Sweep them now that
+  // the session ledger exists; mid-session re-merges are swept from
+  // destruction's wall wake path (see sweepWallBatches).
+  sweepWallBatches()
 
   // ── Entry loading gate (look/fire only) ────────────────────────────────
   // While the veil is up (session.loading), suppress firing and look

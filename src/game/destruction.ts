@@ -30,7 +30,7 @@ import {
   enumerateRoofPlanes,
   type RoofMemberTris,
 } from './roof-planes'
-import { hideForGameKeepingRoots, maskForGame } from './session'
+import { hideForGameKeepingRoots, maskForGame, sweepWallBatches } from './session'
 import {
   cellToneAt,
   clearToneAudit,
@@ -1530,6 +1530,13 @@ function hideHostNode(
   wallRoot?: Object3D,
   maskOnly?: boolean,
 ): boolean {
+  // WALL swaps first dissolve the host's merged wall-batch presentation
+  // (Full-height mode only): under a batch this wall's own mesh isn't the
+  // one drawing, so hiding it below would leave the pristine merged copy
+  // rendering over the voxel replica — the owner's "walls are forever up
+  // in Full height" bug. No-op when no live batch exists (cheap: one pass
+  // over each level root's direct children). See session.sweepWallBatches.
+  if (wallRoot) sweepWallBatches()
   const keepRoots = new Set(world.solidRoots ?? [])
   if (wallRoot) keepRoots.delete(wallRoot)
   for (const collider of world.colliders) {

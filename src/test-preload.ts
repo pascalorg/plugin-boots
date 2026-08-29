@@ -54,10 +54,15 @@ mock.module('@pascal-app/viewer', () => {
     // round-trip through real state.
     levelMode: 'stacked' as string,
     setLevelMode: (() => {}) as (mode: string) => void,
+    // session.ts forces the wall display mode to 'up' (Full height) on
+    // Jump-in; functional for the same teardown round-trip assertions.
+    wallMode: 'up' as string,
+    setWallMode: (() => {}) as (mode: string) => void,
     // keep.ts reads selection.levelId when converting kept pieces to nodes.
     selection: { levelId: 'level-test' } as { levelId: string | null },
   })
   useViewer.setState({ setLevelMode: (mode: string) => useViewer.setState({ levelMode: mode }) })
+  useViewer.setState({ setWallMode: (mode: string) => useViewer.setState({ wallMode: mode }) })
   return {
     useViewer,
     // renderer.tsx's hook — inert in headless tests.
