@@ -234,7 +234,14 @@ describe('integration: synthetic wall world, flag on/off', () => {
     for (const target of useDestruction.getState().targets.values()) {
       expect(target.shell).toBeUndefined()
     }
-    expect(shellCensus()).toEqual({ enabled: false, targets: 0, fragments: 0, killed: 0 })
+    const empty = { targets: 0, fragments: 0, killed: 0 }
+    expect(shellCensus()).toEqual({
+      enabled: { wall: false, roof: false, slab: false },
+      targets: 0,
+      fragments: 0,
+      killed: 0,
+      byKind: { wall: empty, roof: empty, slab: empty },
+    })
   })
 
   test('census counts shelled targets, fragments, and killed fragments after a carve', () => {
@@ -242,10 +249,18 @@ describe('integration: synthetic wall world, flag on/off', () => {
     const world = makeWorld()
     prevoxelize(world)
     const before = shellCensus()
-    expect(before.enabled).toBe(true)
+    expect(before.enabled.wall).toBe(true)
     expect(before.targets).toBe(2)
     expect(before.fragments).toBeGreaterThan(0)
     expect(before.killed).toBe(0)
+    // Per-kind breakdown: everything here is the wall lane.
+    expect(before.byKind.wall).toEqual({
+      targets: before.targets,
+      fragments: before.fragments,
+      killed: 0,
+    })
+    expect(before.byKind.roof).toEqual({ targets: 0, fragments: 0, killed: 0 })
+    expect(before.byKind.slab).toEqual({ targets: 0, fragments: 0, killed: 0 })
     const removed = damageTarget(world, 'wall-1', new Vector3(0, 1.35, -0.06), 0.25)
     expect(removed).toBeGreaterThan(0)
     const after = shellCensus()

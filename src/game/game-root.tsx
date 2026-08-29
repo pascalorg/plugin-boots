@@ -640,12 +640,13 @@ function ActiveGame() {
       // Prevoxelize scheduler live numbers (perf fix 2 QA): frame-dt EMA,
       // the adaptive time budget it picked, and the queue remainder.
       prevoxelize: () => prevoxelizeSchedulerStats(),
-      // Conforming-shell lane (S0): census (shelled targets / fragments /
-      // fragments killed) + the flag toggle. setShell is SESSION-LATCHED:
-      // destruction reads the flag once at the session's first wall
-      // voxelize, so a flip takes effect on the NEXT Jump in.
+      // Conforming-shell lane (S0 walls + S1 roofs/slabs): census (shelled
+      // targets / fragments / fragments killed, totals + per kind) + the
+      // per-kind flag toggle. setShell is SESSION-LATCHED per kind:
+      // destruction reads each flag once at the session's first voxelize
+      // of that kind, so a flip takes effect on the NEXT Jump in.
       shell: () => shellCensus(),
-      setShell: (kind: 'wall', v: boolean) => setShellFlag(kind, v),
+      setShell: (kind: 'wall' | 'roof' | 'slab', v: boolean) => setShellFlag(kind, v),
       // Tone audit (voxel-fidelity QA): every node still wearing a
       // FALLBACK skin tone instead of its surface's real albedo, and why
       // ('pending' entries are still retrying ~1/s). Empty = no voxel

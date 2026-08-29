@@ -23,10 +23,12 @@ import { perfEvent, perfSection } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, pieceReplicaDead, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
 import {
+  assignRoofTrisToMembers,
   dominantMaterialBy,
   dominantResidualMaterial,
   dominantSlopedMaterial,
   enumerateRoofPlanes,
+  type RoofMemberTris,
 } from './roof-planes'
 import { hideForGameKeepingRoots, maskForGame } from './session'
 import {
@@ -368,8 +370,9 @@ export type VoxelTarget = {
    * baseColor per cell (same value jitter as walls) and debris tint reads
    * it through cellTint. Never touched per frame. */
   cellColors?: Float32Array
-  /** Conforming shell fragments (S0 — walls only, behind the session-
-   * latched shellFlags.wall): the wall's REAL surface clipped into
+  /** Conforming shell fragments (S0 walls, S1 roof plane members + slabs —
+   * each behind its session-latched shellFlags kind): the target's REAL
+   * surface clipped into
    * 1–6-cell fragments (shell.ts). NOTE the indexing contract:
    * fragmentForCell / cellsOfFragment use LATTICE keys
    * (ix + nx·(iy + ny·iz)) — grid.count counts OCCUPIED voxels only, so
@@ -1651,6 +1654,17 @@ function buildRoofPlaneTargets(
   const residualTris: number[] = []
   const planes = enumerateRoofPlanes(meshes, residualTris)
   if (planes.length === 0) return null
+  // CONFORMING SHELL (S1a, session-latched 'roof' flag): every plane member
+  // also carries its OWN slice of the host roof surface — bucketed ONCE per
+  // family (assignRoofTrisToMembers). Bucketing before clipping is load-
+  // bearing: shell.ts's cellOfTriangle clamps out-of-grid centroids, so an
+  // unbucketed ridge/hip triangle would misfile into a border cell AND
+  // duplicate across the sibling members' shells. The residual member stays
+  // voxel-only. Shelled families ALWAYS register dormant below — the
+  // first-damage family wake is the host→shell swap moment.
+  const roofShell: RoofMemberTris | null = shellRoofEnabled()
+    ? assignRoofTrisToMembers(meshes, planes)
+    : null
   // One flat rafter layout over all planes, split per plane (ids re-based
   // 0..n−1 within each group — the SegmentMember contract per target).
   const rafterGroups = splitRaftersByPlane(buildRafters(null, null, planes), planes.length)
@@ -1725,8 +1739,16 @@ function buildRoofPlaneTargets(
     if (grid.count === 0) continue
     const sheetInfo = buildSheets(grid, ROOF_SHEET_TILE, ROOF_SHEET_TILE)
     const segments = rafterGroups[p] ?? []
+    const memberId = `${nodeId}#p${p}`
+    // S1a: this member's shell from ITS OWN world-frame bucket, clipped in
+    // the member grid's shell frame (seed = the member id, so the fragment
+    // pattern is stable per plane). A null/overflow build leaves just this
+    // member voxel-only — never aborts the family.
+    const memberShell = roofShell
+      ? buildRoofMemberShell(memberId, roofShell.buckets[p]!, grid)
+      : undefined
     built.push({
-      nodeId: `${nodeId}#p${p}`,
+      nodeId: memberId,
       kind: 'roof',
       roof: true,
       grid,
@@ -1738,6 +1760,8 @@ function buildRoofPlaneTargets(
       sheetByCell: sheetInfo.sheetByCell,
       removedQueue: [],
       revision: 0,
+      shell: memberShell,
+      shellMaterials: memberShell ? roofShell!.materials : undefined,
     })
   }
   if (built.length === 0) return null
@@ -1755,7 +1779,11 @@ function buildRoofPlaneTargets(
   // Every plane replica is ready — hide the merged host mesh ONCE, in the
   // same tick, and hand the node's colliders over. Dormant prebuilds defer
   // that hide to wakeTarget (group-wide: one map entry per roof node).
-  if (dormant) {
+  // Shelled families (S1a) ALWAYS defer: the first-damage wake IS the
+  // host→shell swap (invisible — the member shells ARE the host surface),
+  // exactly the S0 wall contract.
+  const registerDormant = dormant === true || roofShell !== null
+  if (registerDormant) {
     dormantRoofHide.set(nodeId, meshes)
     for (const target of built) {
       target.dormant = true
@@ -1776,7 +1804,7 @@ function buildRoofPlaneTargets(
   roofGroups.set(nodeId, ids)
   state.bump()
   // Paint decal lane: the plane family is live under the scene node id.
-  if (!dormant) targetLiveListener?.(nodeId)
+  if (!registerDormant) targetLiveListener?.(nodeId)
   return built[0]!
 }
 
@@ -1868,33 +1896,48 @@ export function setTargetLiveListener(cb: ((nodeId: string) => void) | null): vo
   targetLiveListener = cb
 }
 
-// ── Conforming shell lane (S0 — walls only, flag-latched) ───────────────────
-// The wall's REAL surface, clipped into per-cell fragments (shell.ts), so
+// ── Conforming shell lane (S0 walls + S1 roofs/slabs, flag-latched) ─────────
+// The target's REAL surface, clipped into per-cell fragments (shell.ts), so
 // the first hit swaps the host mesh for a pixel-identical partitioned twin
 // instead of the voxel-cube read. Everything here runs at VOXELIZE time
 // only; carves/saves/raycasts keep reading the grid, untouched.
 
-/** Live shell toggles (QA: `__boots.setShell('wall', true)`). Read ONCE per
- * session, at the session's first wall voxelize (prevoxelize reaches every
- * wall before any damage can) — see shellWallEnabled. Default OFF. */
-export const shellFlags = { wall: false }
+/** The shell lane's target kinds — one independent flag + latch each. */
+export type ShellKind = 'wall' | 'roof' | 'slab'
+
+/** Live shell toggles (QA: `__boots.setShell('wall', true)`). Each kind is
+ * read ONCE per session, at the session's first voxelize of that kind
+ * (prevoxelize reaches everything before any damage can) — see
+ * shellEnabled. All default OFF. */
+export const shellFlags: Record<ShellKind, boolean> = {
+  wall: false,
+  roof: false,
+  slab: false,
+}
 
 /** Flip a shell flag — affects the NEXT session only (prevoxelize latch). */
-export function setShellFlag(kind: 'wall', v: boolean): void {
+export function setShellFlag(kind: ShellKind, v: boolean): void {
   shellFlags[kind] = v
 }
 
-/** The session's latched flag value (null = not latched yet). */
-let shellWallLatch: boolean | null = null
-
-/** Latch-on-first-read runtime guard: the first wall voxelize of a session
- * freezes shellFlags.wall for the WHOLE session, so a mid-session flip
- * can never split one house into shelled + unshelled walls — a state no
- * renderer or save lane has to reason about. resetDestruction re-arms it. */
-function shellWallEnabled(): boolean {
-  if (shellWallLatch === null) shellWallLatch = shellFlags.wall
-  return shellWallLatch
+/** The session's latched flag values (null = that kind not latched yet). */
+const shellLatch: Record<ShellKind, boolean | null> = {
+  wall: null,
+  roof: null,
+  slab: null,
 }
+
+/** Latch-on-first-read runtime guard, PER KIND: the first voxelize of a
+ * kind in a session freezes its flag for the WHOLE session, so a
+ * mid-session flip can never split one house into shelled + unshelled
+ * targets of one kind — a state no renderer or save lane has to reason
+ * about. resetDestruction re-arms every latch. */
+function shellEnabled(kind: ShellKind): boolean {
+  return (shellLatch[kind] ??= shellFlags[kind])
+}
+const shellWallEnabled = (): boolean => shellEnabled('wall')
+const shellRoofEnabled = (): boolean => shellEnabled('roof')
+const shellSlabEnabled = (): boolean => shellEnabled('slab')
 
 /** FNV-1a over the node id — the deterministic shell seed (same node id ⇒
  * same fragment pattern, every session). */
@@ -1984,7 +2027,9 @@ function collectShellSourceTris(
 }
 
 /**
- * Build the conforming shell for one WALL target, or undefined on ANY
+ * Build the conforming shell for one SINGLE-GRID target (S0 walls; S1b
+ * slabs — one grid covers top + bottom + rim, so the collect-everything
+ * walk is the correct partition input there too), or undefined on ANY
  * fallback (no readable triangles, SHELL_TRI_CAP exceeded, clipper throw)
  * — the caller keeps today's voxel-only path then, never crashes. The
  * ShellGrid gets the FULL lattice count (nx·ny·nz): fragmentForCell is
@@ -2016,6 +2061,54 @@ function buildWallShell(
     return { shell, materials }
   } catch {
     return undefined // clipper threw — per-target voxel fallback, never crash
+  }
+}
+
+/**
+ * Build one ROOF PLANE MEMBER's conforming shell (S1a) from its
+ * pre-bucketed WORLD-frame triangles (assignRoofTrisToMembers): transform
+ * the bucket into the member grid's SHELL frame — the exact
+ * collectShellSourceTris math, p_shell = rotateByBasis(grid.q, p_world) −
+ * origin, normals rotation-only — then clip/cluster/pack with the member
+ * id as the deterministic seed. Undefined on ANY fallback (empty bucket,
+ * SHELL_TRI_CAP, clipper throw): that member keeps today's voxel-only
+ * path — a single overflowing plane never aborts the family's shells.
+ */
+function buildRoofMemberShell(
+  memberId: string,
+  tris: readonly ShellSourceTri[],
+  grid: VoxelGridData,
+): ShellData | undefined {
+  if (tris.length === 0) return undefined
+  try {
+    const { origin, q } = grid
+    const local: ShellSourceTri[] = tris.map((tri) => {
+      const positions: number[] = []
+      const normals: number[] = []
+      for (let k = 0; k < 9; k += 3) {
+        rotateByBasis(q, tri.positions[k]!, tri.positions[k + 1]!, tri.positions[k + 2]!, _shellFrame)
+        positions.push(_shellFrame.x - origin.x, _shellFrame.y - origin.y, _shellFrame.z - origin.z)
+        rotateByBasis(q, tri.normals[k]!, tri.normals[k + 1]!, tri.normals[k + 2]!, _shellFrame)
+        normals.push(_shellFrame.x, _shellFrame.y, _shellFrame.z)
+      }
+      return { positions, normals, uvs: tri.uvs, materialIndex: tri.materialIndex }
+    })
+    const shell = buildShellData(
+      local,
+      {
+        nx: grid.nx,
+        ny: grid.ny,
+        nz: grid.nz,
+        cellX: grid.cellX,
+        cellY: grid.cellY,
+        cellZ: grid.cellZ,
+        count: grid.nx * grid.ny * grid.nz,
+      },
+      hashString(memberId),
+    )
+    return shell ?? undefined
+  } catch {
+    return undefined // clipper threw — this member voxel-only, never crash
   }
 }
 
@@ -2213,14 +2306,21 @@ export function ensureVoxelTarget(
   const ceilingSlab = kind === 'slab' && nodeType === 'ceiling'
   const toneKind: SkinToneKind = floorSlab ? 'floor' : kind
   const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, toneKind)
-  // CONFORMING SHELL (S0, session-latched flag): walls also carry their
-  // real surface partitioned into per-cell fragments. Shelled walls
-  // register DORMANT below — the host keeps rendering AND colliding until
-  // the first damage wakes them (damageTarget → wakeTarget), and the wake
-  // IS the swap: hideHostNode runs there while the shell + core replicas
-  // flip visible off the same `dormant` drop / store bump. Any build
-  // fallback keeps today's instant-awake voxel path.
+  // CONFORMING SHELL (S0 walls + S1b slabs, session-latched per-kind
+  // flags): the target also carries its real surface partitioned into
+  // per-cell fragments. Slab sandwiches reuse the wall builder unchanged —
+  // ONE grid covers top + bottom + rim, so collecting every non-glass
+  // triangle is the correct partition input (no per-member bucketing like
+  // roofs need). Shelled targets register DORMANT below — the host keeps
+  // rendering AND colliding until the first damage wakes them
+  // (damageTarget → wakeTarget), and the wake IS the swap: hideHostNode
+  // runs there while the shell + core replicas flip visible off the same
+  // `dormant` drop / store bump. Any build fallback keeps today's
+  // instant-awake voxel path.
   const wallShell = wall && shellWallEnabled() ? buildWallShell(nodeId, meshes, grid) : undefined
+  const slabShell =
+    kind === 'slab' && shellSlabEnabled() ? buildWallShell(nodeId, meshes, grid) : undefined
+  const targetShell = wallShell ?? slabShell
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -2264,16 +2364,16 @@ export function ensureVoxelTarget(
     contactOnlySupport,
     floorCore: floorSlab || undefined,
     ceilingTop: ceilingSlab || undefined,
-    shell: wallShell?.shell,
-    shellMaterials: wallShell?.materials,
+    shell: targetShell?.shell,
+    shellMaterials: targetShell?.materials,
   }
 
   // Hide the host meshes + hand the colliders over (keep-aware — see
   // hideHostNode for the hosted-children fencing rules). Dormant prebuilds
   // defer the hide to wakeTarget — the host keeps rendering AND colliding.
-  // Shelled walls ALWAYS register dormant: the first-damage wake is the
+  // Shelled targets ALWAYS register dormant: the first-damage wake is the
   // host→shell swap moment (invisible — the shell IS the host surface).
-  if (opts?.dormant || wallShell) {
+  if (opts?.dormant || targetShell) {
     target.dormant = true
     dormantCount++
     target.hostMeshes = meshes
@@ -2487,11 +2587,16 @@ function scanPrevoxelizePending(
       continue
     }
     ids.push(nodeId)
+    // Voxel-first roofs/slabs prebuild AWAKE — unless their shell lane is
+    // ON (S1): shelled targets must stay dormant so the first-damage wake
+    // is the invisible host→shell swap (the awake lane would hide the host
+    // and show voxels at session start, exactly the morph the shell
+    // exists to avoid).
     awake.set(
       nodeId,
       ITEM_FAMILY_KINDS.has(collider.nodeType) ||
-        ROOF_KINDS.has(collider.nodeType) ||
-        SLAB_KINDS.has(collider.nodeType),
+        (ROOF_KINDS.has(collider.nodeType) && !shellRoofEnabled()) ||
+        (SLAB_KINDS.has(collider.nodeType) && !shellSlabEnabled()),
     )
   }
   return { ids, awake }
@@ -4455,7 +4560,10 @@ export function resetDestruction(): void {
   blastEpoch++
   dormantRoofHide.clear()
   dormantCount = 0
-  shellWallLatch = null // next session re-reads shellFlags (prevoxelize latch)
+  // Next session re-reads shellFlags (per-kind prevoxelize latches).
+  shellLatch.wall = null
+  shellLatch.roof = null
+  shellLatch.slab = null
   if (sceneSupportTimer !== null) {
     clearTimeout(sceneSupportTimer)
     sceneSupportTimer = null

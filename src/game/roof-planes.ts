@@ -1,6 +1,8 @@
-import type { Mesh } from 'three'
+import { type Material, Matrix3, type Mesh, Vector3 } from 'three'
 import { type RoofPlaneBasis, roofPlaneFrame } from './roof-framing'
+import type { ShellSourceTri } from './shell'
 import type { SurfaceMaterialLike } from './skin-tone'
+import { isGlassLikeMesh } from './world'
 
 /**
  * Roof PLANE enumeration from the host's merged roof mesh (MULTILEVEL-PLAN
@@ -411,26 +413,30 @@ function pointNearPoly(a: number, u: number, poly: readonly number[], pad: numbe
 }
 
 /**
- * True when EVERY vertex of the triangle lies inside one kept plane's slab
- * volume: normal offset within [nInner − SLAB_EPS, nOuter + SLAB_EPS] and
- * plane-space (a, u) inside the plane's own footprint polygon dilated by
- * RIM_PAD. Such faces are the assembly's END-CAPS — eave fascia, rake
- * caps, overhang soffits: the roof's RIM. The plane's pinned grid already
- * voxelizes that exact volume (its border cells trace these very faces),
- * so tracing them AGAIN as residual paints a second, trim-toned cube shell
- * OVER the plane's shingle-family border cells — the owner-reported WHITE
- * CUBES along the eaves/rakes of an otherwise dark roof. Gable-end
- * triangles always keep at least one vertex well below the inner surface
- * (they close the attic, not the slab), so they stay residual and keep
- * their siding/trim tone — the vanishing-gable-end fix is untouched.
+ * Index of the first kept plane whose SLAB volume wholly contains the
+ * triangle (−1 = none): every vertex's normal offset within
+ * [nInner − SLAB_EPS, nOuter + SLAB_EPS] and plane-space (a, u) inside the
+ * plane's own footprint polygon dilated by RIM_PAD. Such faces are the
+ * assembly's END-CAPS — eave fascia, rake caps, overhang soffits: the
+ * roof's RIM. The plane's pinned grid already voxelizes that exact volume
+ * (its border cells trace these very faces), so tracing them AGAIN as
+ * residual paints a second, trim-toned cube shell OVER the plane's
+ * shingle-family border cells — the owner-reported WHITE CUBES along the
+ * eaves/rakes of an otherwise dark roof. Gable-end triangles always keep
+ * at least one vertex well below the inner surface (they close the attic,
+ * not the slab), so they stay residual and keep their siding/trim tone —
+ * the vanishing-gable-end fix is untouched. Ties (a tri inside two
+ * overlapping hip slabs) break toward the FIRST plane in enumeration
+ * order — deterministic.
  */
-function triInSlab(tri: Tri, slabs: readonly Slab[]): boolean {
-  for (const s of slabs) {
+function slabIndexOf(v: ArrayLike<number>, slabs: readonly Slab[]): number {
+  for (let si = 0; si < slabs.length; si++) {
+    const s = slabs[si]!
     let inside = true
     for (let k = 0; k < 9; k += 3) {
-      const x = tri.v[k]!
-      const y = tri.v[k + 1]!
-      const z = tri.v[k + 2]!
+      const x = v[k]!
+      const y = v[k + 1]!
+      const z = v[k + 2]!
       const w = x * s.nx + y * s.ny + z * s.nz
       if (w < s.nInner - SLAB_EPS || w > s.nOuter + SLAB_EPS) {
         inside = false
@@ -443,20 +449,59 @@ function triInSlab(tri: Tri, slabs: readonly Slab[]): boolean {
         break
       }
     }
-    if (inside) return true
+    if (inside) return si
   }
-  return false
+  return -1
+}
+
+/**
+ * MEMBER-ASSIGNMENT classifier — the ONE partition rule both the residual
+ * enumeration (fillResidual = its complement) and the S1 shell bucketing
+ * (assignRoofTrisToMembers) follow. Returns the kept-plane index a world
+ * triangle belongs to, or −1 (residual):
+ *
+ *   - sloped faces (the pitch gate) match a kept normal's CLUSTER_DOT cone
+ *     — up tris directly, down tris through their OPPOSITE (an opposing
+ *     underside IS its plane's inner surface). Ridge/hip cone ties break
+ *     toward the HIGHEST dot — deterministic;
+ *   - everything else must lie wholly inside one kept plane's slab volume
+ *     (slabIndexOf — the eave/rake/soffit rim end-caps).
+ *
+ * `nx,ny,nz` is the triangle's unit face normal; `v` its 9 packed world
+ * positions.
+ */
+function planeOfTri(
+  nx: number,
+  ny: number,
+  nz: number,
+  v: ArrayLike<number>,
+  keptNormals: readonly number[],
+  slabs: readonly Slab[],
+): number {
+  if (slopedPitchOk(Math.abs(ny))) {
+    const sign = ny > 0 ? 1 : -1
+    let best = -1
+    let bestDot = CLUSTER_DOT
+    for (let k = 0; k < keptNormals.length; k += 3) {
+      const dot =
+        sign * (nx * keptNormals[k]! + ny * keptNormals[k + 1]! + nz * keptNormals[k + 2]!)
+      if (dot > bestDot) {
+        bestDot = dot
+        best = k / 3
+      }
+    }
+    if (best >= 0) return best
+  }
+  return slabIndexOf(v, slabs)
 }
 
 /**
  * Append every face the kept planes leave uncovered to `out` (packed world
- * triangles): all pitch-gate rejects, up tris outside every kept normal's
- * CLUSTER_DOT cone (the same test that assigns polyTris — exact
- * complement), and down tris whose OPPOSITE misses every kept plane (an
- * opposing underside sits on its plane's inner surface, inside the slab
- * the plane target already voxelizes). Faces that lie INSIDE a kept
- * plane's slab volume (triInSlab — the eave/rake/soffit rim end-caps) are
- * excluded from all three lanes for the same already-voxelized reason.
+ * triangles) — exactly the tris planeOfTri assigns to NO member: pitch-gate
+ * rejects and cone misses that also sit outside every kept plane's slab
+ * volume (rim end-caps are excluded for the already-voxelized reason on
+ * slabIndexOf). Push order (rest, up, down) is load-bearing only for
+ * bit-stable residual grids across sessions.
  */
 function fillResidual(
   out: number[],
@@ -466,17 +511,165 @@ function fillResidual(
   keptNormals: readonly number[],
   slabs: readonly Slab[],
 ): void {
-  const covered = (nx: number, ny: number, nz: number): boolean => {
-    for (let k = 0; k < keptNormals.length; k += 3) {
-      if (nx * keptNormals[k]! + ny * keptNormals[k + 1]! + nz * keptNormals[k + 2]! > CLUSTER_DOT)
-        return true
-    }
-    return false
+  const residual = (tri: Tri) =>
+    planeOfTri(tri.nx, tri.ny, tri.nz, tri.v, keptNormals, slabs) < 0
+  for (const tri of rest) if (residual(tri)) out.push(...tri.v)
+  for (const tri of up) if (residual(tri)) out.push(...tri.v)
+  for (const tri of down) if (residual(tri)) out.push(...tri.v)
+}
+
+/**
+ * Reconstruct a kept plane's Slab volume from its public RoofPlane record.
+ * The enumeration builds these inline and discards them; the S1 member-
+ * assignment lane needs them again AFTER the fact, and every field is
+ * recoverable exactly — eaveCenter was constructed FROM (midA, minU,
+ * nInner) in this very frame, so the projections round-trip to float
+ * precision (≪ SLAB_EPS). A poly-less plane (external callers) yields a
+ * slab that contains nothing — pointNearPoly over an empty polygon is
+ * always false.
+ */
+function slabOfPlane(plane: RoofPlane): Slab {
+  const { across, normal, upSlope } = roofPlaneFrame(plane.yaw, plane.pitch)
+  const [ex, ey, ez] = plane.eaveCenter
+  const nInner = ex * normal[0] + ey * normal[1] + ez * normal[2]
+  return {
+    nx: normal[0],
+    ny: normal[1],
+    nz: normal[2],
+    ax: across[0],
+    ay: across[1],
+    az: across[2],
+    ux: upSlope[0],
+    uy: upSlope[1],
+    uz: upSlope[2],
+    nInner,
+    nOuter: nInner + plane.thickness,
+    midA: ex * across[0] + ey * across[1] + ez * across[2],
+    minU: ex * upSlope[0] + ey * upSlope[1] + ez * upSlope[2],
+    poly: plane.polyTris ?? [],
   }
-  for (const tri of rest) if (!triInSlab(tri, slabs)) out.push(...tri.v)
-  for (const tri of up) if (!covered(tri.nx, tri.ny, tri.nz) && !triInSlab(tri, slabs)) out.push(...tri.v)
-  for (const tri of down)
-    if (!covered(-tri.nx, -tri.ny, -tri.nz) && !triInSlab(tri, slabs)) out.push(...tri.v)
+}
+
+/** One roof family's member surfaces (S1a shell bucketing) — see
+ * assignRoofTrisToMembers. */
+export type RoofMemberTris = {
+  /** buckets[p] = plane p's member surface: WORLD-frame ShellSourceTris
+   * (destruction transforms each bucket into its member grid's own shell
+   * frame before clipping). */
+  buckets: ShellSourceTri[][]
+  /** Faces no plane member claims — the residual member's surface (that
+   * member stays voxel-only in S1; exposed for the partition pins). */
+  residual: ShellSourceTri[]
+  /** Host material instances BY REFERENCE, deduped across meshes and
+   * geometry groups — ONE table for the whole family (materialIndex on
+   * every bucket's tris is family-global). */
+  materials: Material[]
+}
+
+const _assignNormalMat = new Matrix3()
+const _assignV = new Vector3()
+
+/**
+ * Bucket every non-glass host triangle of a roof node into exactly ONE
+ * plane member — planeOfTri: up-cone CLUSTER_DOT test, opposing-underside
+ * test, rim via the slab-volume test — or the residual. An exact, disjoint
+ * partition of the collected surface (degenerate zero-area faces are the
+ * only drops — the clipper discards them anyway).
+ *
+ * This bucketing is REQUIRED before clipping (S1a): shell.ts's
+ * cellOfTriangle CLAMPS out-of-grid centroids, so a ridge/hip triangle
+ * clipped against a sibling plane's grid would misfile into a border cell
+ * AND render twice — once per overlapping member shell.
+ *
+ * Output tris are WORLD-frame (positions + shading normals via the mesh's
+ * normal matrix; a normal-less geometry falls back to the geometric face
+ * normal), uvs verbatim, materialIndex into the returned family table —
+ * the same ShellSourceTri shape destruction's collectShellSourceTris
+ * produces, one frame transform earlier.
+ */
+export function assignRoofTrisToMembers(
+  meshes: readonly Mesh[],
+  planes: readonly RoofPlane[],
+): RoofMemberTris {
+  const keptNormals: number[] = []
+  const slabs: Slab[] = []
+  for (const plane of planes) {
+    const { normal } = roofPlaneFrame(plane.yaw, plane.pitch)
+    keptNormals.push(normal[0], normal[1], normal[2])
+    slabs.push(slabOfPlane(plane))
+  }
+  const buckets: ShellSourceTri[][] = planes.map(() => [])
+  const residual: ShellSourceTri[] = []
+  const materials: Material[] = []
+  for (const mesh of meshes) {
+    if (isGlassLikeMesh(mesh)) continue
+    const geometry = mesh.geometry
+    const position = geometry.getAttribute('position')
+    if (!position) continue
+    const normal = geometry.getAttribute('normal')
+    const uv = geometry.getAttribute('uv')
+    const index = geometry.getIndex()
+    const meshMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    const slotOfMaterial = meshMaterials.map((m) => {
+      let slot = materials.indexOf(m)
+      if (slot < 0) {
+        slot = materials.length
+        materials.push(m)
+      }
+      return slot
+    })
+    _assignNormalMat.getNormalMatrix(mesh.matrixWorld)
+    const vertexCount = index ? index.count : position.count
+    const groups =
+      geometry.groups.length > 0
+        ? geometry.groups
+        : [{ start: 0, count: vertexCount, materialIndex: 0 }]
+    for (const group of groups) {
+      const materialIndex =
+        slotOfMaterial[Math.min(group.materialIndex ?? 0, slotOfMaterial.length - 1)] ?? 0
+      const end = Math.min(group.start + group.count, vertexCount)
+      for (let i = group.start; i + 3 <= end; i += 3) {
+        const positions: number[] = []
+        const normals: number[] = []
+        const uvs: number[] = []
+        for (let k = 0; k < 3; k++) {
+          const vi = index ? index.getX(i + k) : i + k
+          _assignV.fromBufferAttribute(position, vi).applyMatrix4(mesh.matrixWorld)
+          positions.push(_assignV.x, _assignV.y, _assignV.z)
+          if (normal) {
+            _assignV.fromBufferAttribute(normal, vi).applyMatrix3(_assignNormalMat).normalize()
+            normals.push(_assignV.x, _assignV.y, _assignV.z)
+          }
+          if (uv) uvs.push(uv.getX(vi), uv.getY(vi))
+          else uvs.push(0, 0)
+        }
+        // Geometric face normal — the classifier's input (and the shading
+        // fallback when the geometry ships no normal attribute).
+        const ux = positions[3]! - positions[0]!
+        const uy = positions[4]! - positions[1]!
+        const uz = positions[5]! - positions[2]!
+        const wx = positions[6]! - positions[0]!
+        const wy = positions[7]! - positions[1]!
+        const wz = positions[8]! - positions[2]!
+        const cx = uy * wz - uz * wy
+        const cy = uz * wx - ux * wz
+        const cz = ux * wy - uy * wx
+        const len = Math.sqrt(cx * cx + cy * cy + cz * cz)
+        if (len < 1e-8) continue // degenerate — no area, no member
+        const fnx = cx / len
+        const fny = cy / len
+        const fnz = cz / len
+        if (normals.length === 0) {
+          normals.push(fnx, fny, fnz, fnx, fny, fnz, fnx, fny, fnz)
+        }
+        const tri: ShellSourceTri = { positions, normals, uvs, materialIndex }
+        const p = planeOfTri(fnx, fny, fnz, positions, keptNormals, slabs)
+        if (p >= 0) buckets[p]!.push(tri)
+        else residual.push(tri)
+      }
+    }
+  }
+  return { buckets, residual, materials }
 }
 
 /**

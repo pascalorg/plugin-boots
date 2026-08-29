@@ -213,31 +213,56 @@ export function countDeadFragments(shell: ShellData, grid: VoxelGridData): numbe
  * (they carry the voxel-less edge-fragment deaths the fallback can't see). */
 const shellKillRegistry = new Map<string, Uint8Array>()
 
-/** QA census: shelled-target count, total fragments, fragments killed.
- * `enabled` reports the LIVE flag (the session may be latched differently
- * — targets with shells tell the latched truth). Plain data only. */
+/** One kind's slice of the shell census (plain data). */
+export type ShellKindCensus = { targets: number; fragments: number; killed: number }
+
+/** QA census: shelled-target count, total fragments, fragments killed —
+ * totals plus a per-kind breakdown (S1: wall / roof / slab lanes toggle
+ * independently). `enabled` reports the LIVE flags (the session may be
+ * latched differently — targets with shells tell the latched truth).
+ * Shelled targets bucket by their VoxelTarget.kind (roof plane members are
+ * kind 'roof'; the voxel-only residual member never carries a shell).
+ * Plain data only. */
 export function shellCensus(): {
-  enabled: boolean
+  enabled: { wall: boolean; roof: boolean; slab: boolean }
   targets: number
   fragments: number
   killed: number
+  byKind: Record<'wall' | 'roof' | 'slab', ShellKindCensus>
 } {
   let targets = 0
   let fragments = 0
   let killed = 0
+  const byKind: Record<'wall' | 'roof' | 'slab', ShellKindCensus> = {
+    wall: { targets: 0, fragments: 0, killed: 0 },
+    roof: { targets: 0, fragments: 0, killed: 0 },
+    slab: { targets: 0, fragments: 0, killed: 0 },
+  }
   for (const target of useDestruction.getState().targets.values()) {
     const shell = target.shell
     if (!shell) continue
+    const slice = target.kind !== 'volume' ? byKind[target.kind] : null
     targets++
+    if (slice) slice.targets++
     fragments += shell.fragments.length
+    if (slice) slice.fragments += shell.fragments.length
+    let dead = 0
     const flags = shellKillRegistry.get(target.nodeId)
     if (flags) {
-      for (let i = 0; i < flags.length; i++) if (flags[i] !== 0) killed++
+      for (let i = 0; i < flags.length; i++) if (flags[i] !== 0) dead++
     } else {
-      killed += countDeadFragments(shell, target.grid)
+      dead = countDeadFragments(shell, target.grid)
     }
+    killed += dead
+    if (slice) slice.killed += dead
   }
-  return { enabled: shellFlags.wall, targets, fragments, killed }
+  return {
+    enabled: { wall: shellFlags.wall, roof: shellFlags.roof, slab: shellFlags.slab },
+    targets,
+    fragments,
+    killed,
+    byKind,
+  }
 }
 
 // ─── Components ──────────────────────────────────────────────────────────

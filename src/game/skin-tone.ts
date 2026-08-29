@@ -237,21 +237,49 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
  * drywall sandwich reads as compressed gypsum, whatever the facade coat. */
 const CORE_GYPSUM = new Color('#a8a29a')
 
+/** The deck/sheathing brown a roof core pulls toward (S1a) — under the
+ * shingle shell sits plywood decking, never gypsum: a carved roof hole
+ * must read as torn wood sheathing, whatever the shingle tone. */
+export const CORE_DECK_HEX = '#8a6a48'
+const CORE_DECK = new Color(CORE_DECK_HEX)
+
 /**
  * The CORE tone of a shelled target's cell — voxel-walls' core mode primes
  * the skin layer with this instead of the facade pattern tones (the facade
  * lives on the conforming shell mesh now): the base darkened into a
- * structural read (lightness −0.18 plus a slight desaturation), with one
- * kind tweak — 'wall' cores first pull toward the gypsum-gray family,
- * while every other kind (slab/floor cores keep their dirt-toned base)
- * takes only the darkening. Pure — writes into `out` and returns it; no
- * per-cell jitter (the core is a uniform structural fill, and the shell
- * carries all the visual variation).
+ * structural read (lightness −0.18 plus a slight desaturation), with kind
+ * tweaks — 'wall' cores first pull toward the gypsum-gray family, 'roof'
+ * cores (S1a plane members) toward the deck/sheathing brown, while every
+ * other kind (slab/floor cores keep their dirt-toned base) takes only the
+ * darkening. Pure — writes into `out` and returns it; no per-cell jitter
+ * (the core is a uniform structural fill, and the shell carries all the
+ * visual variation).
  */
 export function coreCellColor(base: Color, kind: string, out: Color): Color {
   out.copy(base)
   if (kind === 'wall') out.lerp(CORE_GYPSUM, 0.35)
+  else if (kind === 'roof') out.lerp(CORE_DECK, 0.35)
   return out.offsetHSL(0, -0.08, -0.18)
+}
+
+/**
+ * Per-CELL core tone router for shelled targets (S1b): a FLOOR-family
+ * slab's cells BELOW the top walking layer keep the dirt-subfloor read of
+ * primedCellColor's floorCore branch (clods, dry dirt, tile flecks) —
+ * carving a shelled floor must reveal earth exactly like the unshelled
+ * one, and spawnFloorBreach's under-hole decal expects the same rubble
+ * family. Every other cell takes the flat kind core tone (coreCellColor).
+ * Pure — writes into `out` and returns it.
+ */
+export function shellCoreCellColor(out: Color, wall: SkinToneSource, i: number): Color {
+  if (
+    wall.kind === 'slab' &&
+    wall.floorCore === true &&
+    wall.grid.coords[i * 3 + 1]! < (wall.grid.ny ?? 1) - 1
+  ) {
+    return primedCellColor(out, wall, i)
+  }
+  return coreCellColor(wall.baseColor, wall.kind, out)
 }
 
 // ── Per-cell texture patterns (stage 2: "the same texture", not one tone) ───

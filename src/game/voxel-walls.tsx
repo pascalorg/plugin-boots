@@ -23,9 +23,9 @@ import { perfSection } from './perf-monitor'
 import {
   CEILING_FACE_TINT,
   FLOOR_CORE_HEX,
-  coreCellColor,
   primedCellColor,
   setSkinToneRenderer,
+  shellCoreCellColor,
   type SkinToneRenderer,
 } from './skin-tone'
 
@@ -713,10 +713,12 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
     }
     // Shared per-cell prime tone (skin-tone.ts) — paint.tsx feathers coats
     // up from exactly this color, so the two must never drift. Shelled
-    // targets prime the CORE tone instead (the facade is the shell's).
+    // targets prime the CORE tone instead (the facade is the shell's);
+    // shellCoreCellColor keeps floorCore under-layers on the dirt-subfloor
+    // read so a breached shelled floor still reveals earth (S1b).
     mesh.setColorAt(
       i,
-      core ? coreCellColor(wall.baseColor, wall.kind, _color) : primedCellColor(_color, wall, i),
+      core ? shellCoreCellColor(_color, wall, i) : primedCellColor(_color, wall, i),
     )
   }
   mesh.instanceMatrix.needsUpdate = true
