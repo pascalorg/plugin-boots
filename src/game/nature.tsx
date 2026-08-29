@@ -7,6 +7,7 @@ import {
   CanvasTexture,
   CircleGeometry,
   Color,
+  IcosahedronGeometry,
   type InstancedMesh,
   Matrix4,
   Path,
@@ -129,6 +130,49 @@ function grassClusterGeometry(): BufferGeometry {
   for (let i = 1; i < normals.length; i += 3) normals[i] = 1
   geometry.setAttribute('normal', new BufferAttribute(normals, 3))
   geometry.setIndex(indices)
+  return geometry
+}
+
+/**
+ * Bush cluster — species 4 of the flora pass (low, trunkless). Three
+ * overlapping icosahedron blobs baked into ONE geometry (same trick as
+ * grassClusterGeometry: detail per instance, still a single draw call).
+ * Vertex colors shade each blob a step lighter so the cluster reads as
+ * separate lobes; they multiply with the per-instance green.
+ */
+function bushClusterGeometry(): BufferGeometry {
+  const rand = mulberry32(9)
+  const blobs: Array<{ x: number; y: number; z: number; r: number; shade: number }> = [
+    { x: 0, y: 0.12, z: 0, r: 0.62, shade: 0.92 },
+    { x: 0.42, y: 0.02, z: 0.18, r: 0.45, shade: 1.02 },
+    { x: -0.3, y: 0.05, z: -0.28, r: 0.4, shade: 1.12 },
+  ]
+  const positions: number[] = []
+  const normals: number[] = []
+  const colors: number[] = []
+  const blob = new IcosahedronGeometry(1, 1).toNonIndexed()
+  const pos = blob.getAttribute('position')
+  const nor = blob.getAttribute('normal')
+  for (const { x, y, z, r, shade } of blobs) {
+    // A touch of per-blob squash + yaw so the lobes don't read as copies.
+    const yaw = rand() * Math.PI * 2
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    const squash = 0.72 + rand() * 0.16
+    for (let i = 0; i < pos.count; i++) {
+      const px = pos.getX(i) * r
+      const py = pos.getY(i) * r * squash
+      const pz = pos.getZ(i) * r
+      positions.push(x + px * cos - pz * sin, y + py, z + px * sin + pz * cos)
+      normals.push(nor.getX(i), nor.getY(i), nor.getZ(i))
+      colors.push(shade, shade, shade)
+    }
+  }
+  blob.dispose()
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', new BufferAttribute(new Float32Array(positions), 3))
+  geometry.setAttribute('normal', new BufferAttribute(new Float32Array(normals), 3))
+  geometry.setAttribute('color', new BufferAttribute(new Float32Array(colors), 3))
   return geometry
 }
 
@@ -334,6 +378,8 @@ export function Nature({ world }: { world: GameWorld }) {
 
   const flowerGeometry = useMemo(() => new CircleGeometry(1, 7).rotateX(-Math.PI / 2), [])
 
+  const bushGeometry = useMemo(bushClusterGeometry, [])
+
   const grass = useMemo(
     () =>
       // Bias 0.72 packs clumps denser near the building; the distance term
@@ -435,13 +481,13 @@ export function Nature({ world }: { world: GameWorld }) {
         <meshStandardMaterial roughness={1} />
       </instancedMesh>
 
+      {/* Bushes: baked three-lobe clusters (species 4 — low, trunkless). */}
       <instancedMesh
-        args={[undefined, undefined, bushes.matrices.length]}
+        args={[bushGeometry, undefined, bushes.matrices.length]}
         frustumCulled={false}
         ref={(mesh) => setInstances(mesh, bushes)}
       >
-        <icosahedronGeometry args={[0.6, 1]} />
-        <meshStandardMaterial roughness={1} />
+        <meshStandardMaterial roughness={1} vertexColors />
       </instancedMesh>
 
       <instancedMesh

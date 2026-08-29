@@ -14,9 +14,12 @@ import {
   primedCellColor,
   resetSkinTones,
   resolveSurfaceTone,
+  CEILING_FACE_TINT,
+  CEILING_WHITE_HEX,
   retryPendingTones,
   setSkinToneRenderer,
   SKIN_TILE_M,
+  STRUCTURE_TOP_HEX,
   type SkinToneKind,
   type SkinToneRenderer,
   type SkinToneSource,
@@ -167,6 +170,90 @@ describe('primedCellColor (shared primeSkin tone math)', () => {
     const out = new Color()
     expectSame(primedCellColor(out, wall, 0), reference(wall, 0))
     expectSame(primedCellColor(out, wall, 1), reference(wall, 1))
+  })
+
+  test('ceiling plates never mute per CELL — every layer keeps the legacy slab math bit-exact', () => {
+    // Live host ceilings voxelize as ONE cell layer whose bottom face IS
+    // the room ceiling: any per-cell mute would darken the interior view
+    // (the 2026-08-29 regression). The attic-side mute rides the ceiling
+    // geometry's VERTEX colors instead (CEILING_FACE_TINT) — so the cell
+    // tone must stay the plain slab chain on every layer, top included.
+    const wall: SkinToneSource = {
+      kind: 'slab',
+      baseColor: new Color('#f2efe9'), // interior-white ceiling paint
+      grid: { coords: coords([[0, 0, 0], [0, 1, 0], [0, 2, 0]]), ny: 3 },
+    }
+    const out = new Color()
+    expectSame(primedCellColor(out, wall, 0), reference(wall, 0))
+    expectSame(primedCellColor(out, wall, 1), reference(wall, 1))
+    expectSame(primedCellColor(out, wall, 2), reference(wall, 2))
+  })
+
+  test('CEILING_FACE_TINT lands the interior-white ceiling exactly on STRUCTURE_TOP', () => {
+    // The face keying contract: vertexColor × instanceColor. A default
+    // interior-white ceiling cell wearing the tint on its attic faces must
+    // read STRUCTURE_TOP — muted, never anywhere near untextured white —
+    // and any darker (painted) tone can only get darker still.
+    const white = new Color(CEILING_WHITE_HEX)
+    const structure = new Color(STRUCTURE_TOP_HEX)
+    const tinted = new Color(
+      white.r * CEILING_FACE_TINT[0],
+      white.g * CEILING_FACE_TINT[1],
+      white.b * CEILING_FACE_TINT[2],
+    )
+    expectSame(tinted, structure)
+    expect(isUntexturedWhite(tinted)).toBe(false)
+    for (const c of CEILING_FACE_TINT) {
+      expect(c).toBeGreaterThan(0)
+      expect(c).toBeLessThan(0.5) // a real mute, not a subtle darken
+    }
+  })
+
+  test('wall: the TOP row (the plate) wears muted structure, every other row keeps the wall tone', () => {
+    const wall: SkinToneSource = {
+      kind: 'wall',
+      baseColor: new Color('#e8e2d5'),
+      grid: { coords: coords([[0, 0, 0], [0, 1, 0], [1, 2, 0], [0, 2, 1]]), ny: 3 },
+    }
+    const structureReference = (i: number): Color => {
+      const j1 = ((i * 2654435761) % 97) / 97
+      const j2 = ((i * 1597334677) % 89) / 89
+      return new Color(STRUCTURE_TOP_HEX).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+    }
+    const out = new Color()
+    expectSame(primedCellColor(out, wall, 0), reference(wall, 0))
+    expectSame(primedCellColor(out, wall, 1), reference(wall, 1))
+    // Both top-row cells mute — the rim spans the full thickness.
+    expectSame(primedCellColor(out, wall, 2), structureReference(2))
+    expectSame(primedCellColor(out, wall, 3), structureReference(3))
+  })
+
+  test('top-rim muting never fires without grid.ny, on single-row walls, or on any slab', () => {
+    const out = new Color()
+    // No ny (legacy callers): walls keep the plain math on every row.
+    const noNy: SkinToneSource = {
+      kind: 'wall',
+      baseColor: new Color('#c9c1b2'),
+      grid: { coords: coords([[0, 0, 0], [0, 5, 0]]) },
+    }
+    expectSame(primedCellColor(out, noNy, 0), reference(noNy, 0))
+    expectSame(primedCellColor(out, noNy, 1), reference(noNy, 1))
+    // Single-row wall grid: that one row is the whole visible face.
+    const single: SkinToneSource = {
+      kind: 'wall',
+      baseColor: new Color('#c9c1b2'),
+      grid: { coords: coords([[0, 0, 0]]), ny: 1 },
+    }
+    expectSame(primedCellColor(out, single, 0), reference(single, 0))
+    // Slabs (floors keep their walking surface; ceilings keep the interior
+    // tone — their attic mute is per FACE): the top layer keeps the
+    // resolved tone.
+    const floor: SkinToneSource = {
+      kind: 'slab',
+      baseColor: new Color('#a0784e'),
+      grid: { coords: coords([[0, 2, 0]]), ny: 3 },
+    }
+    expectSame(primedCellColor(out, floor, 0), reference(floor, 0))
   })
 
   test('item cellColors win over every kind branch', () => {

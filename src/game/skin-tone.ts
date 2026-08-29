@@ -28,6 +28,14 @@ import {
  *   - slab sandwiches: bottom skin (grid Y = 0) lightens toward drywall;
  *     FLOOR-family slabs (floorCore) paint every under-layer as dirt
  *     subfloor instead (FLOOR_CORE_HEX)
+ *   - every wall's TOP row (the plate) wears bare structure
+ *     (STRUCTURE_TOP_HEX) — dusty sheathing, never the interior tone:
+ *     through the eave slit those cells read as a light sawtooth ring
+ *     framing the dark roof field (round-5 QA). CEILING plates can't take
+ *     the same per-CELL mute — live host ceilings voxelize as a SINGLE
+ *     cell layer whose bottom face IS the room ceiling — so their attic
+ *     side mutes per FACE instead (CEILING_FACE_TINT, applied as vertex
+ *     colors by voxel-walls' ceiling geometry)
  *   - roof planes: inner skin (grid Z ≠ 0) pales toward bare deck; outer
  *     skin stripes every ~3rd up-slope row darker (shingle courses) and
  *     jitters harder (per-shingle scatter)
@@ -80,6 +88,45 @@ const _pattern = new Color()
 export const FLOOR_CORE_HEX = '#6b4a2f'
 const FLOOR_CORE = new Color(FLOOR_CORE_HEX)
 
+/** Muted bare-structure tone for TOP rims: a wall's top row (the plate)
+ * and a ceiling plate's attic side — dusty sheathing/framing, muted enough
+ * to never read as light teeth against a dark roof through the eave slit.
+ * Absolute by design for the wall plate (the host has no sheathing/plate
+ * material to sample, and a relative darken of an interior-white tone
+ * would still read light). */
+export const STRUCTURE_TOP_HEX = '#7a6f5e'
+const STRUCTURE_TOP = new Color(STRUCTURE_TOP_HEX)
+
+/** The interior-white ceiling reference CEILING_FACE_TINT is derived
+ * against: the tone the host's default ceiling finish resolves to. */
+export const CEILING_WHITE_HEX = '#f2efe9'
+
+/** Per-FACE multiplier for a ceiling plate's structural faces (the attic
+ * TOP + the rim edges): chosen so the default interior-white ceiling tone
+ * lands exactly on STRUCTURE_TOP — kind+face keying, the slab underside
+ * lighten inverted. It rides the ceiling box geometry's VERTEX colors
+ * (voxel-walls CEILING_GEOMETRY; three multiplies vertexColor ×
+ * instanceColor), because live host ceilings voxelize as ONE cell layer:
+ * the same cell's bottom face is the room ceiling a player sees from
+ * below (must stay bit-exact — vertex color 1 there) while its top/rim
+ * faces are the attic floor whose interior white read as a light sawtooth
+ * ring through the eave slit (round-5 QA). Multiplicative, so painted or
+ * patterned ceilings mute proportionally and never flash light. */
+export const CEILING_FACE_TINT: readonly [number, number, number] = (() => {
+  const white = new Color(CEILING_WHITE_HEX)
+  return [STRUCTURE_TOP.r / white.r, STRUCTURE_TOP.g / white.g, STRUCTURE_TOP.b / white.b]
+})()
+
+/** True when cell `i` sits on a WALL's top row — the plate, bare structure
+ * under the eave. Walls are always layered (their interior faces come from
+ * lower rows), so per-cell muting is safe; ceiling plates are NOT (single
+ * cell layer, see CEILING_FACE_TINT) and never mute per cell. */
+function isStructuralTopCell(wall: SkinToneSource, i: number): boolean {
+  const ny = wall.grid.ny
+  if (ny === undefined || ny < 2 || wall.kind !== 'wall') return false
+  return wall.grid.coords[i * 3 + 1] === ny - 1
+}
+
 /**
  * Write cell `i`'s primed skin color into `out` and return it. Mirrors
  * primeSkin exactly: tone pick (cellColors / texture-pattern sample /
@@ -109,6 +156,12 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
     // Item palette (destruction.ts sampleItemCellColors): each voxel wears
     // its sub-mesh region tone; keep the gentle wall jitter below.
     base = _cellTone.setRGB(cellColors[i * 3]!, cellColors[i * 3 + 1]!, cellColors[i * 3 + 2]!)
+  } else if (isStructuralTopCell(wall, i)) {
+    // Wall plate row: muted bare structure. Fixes the light sawtooth teeth
+    // framing the eave line (round-5 QA: rays through the eave slit hit
+    // these cells, not roof). Ceilings handle their attic side per FACE
+    // (CEILING_FACE_TINT) — their per-cell tone stays the interior one.
+    base = STRUCTURE_TOP
   } else if (
     wall.kind === 'slab' &&
     wall.floorCore === true &&

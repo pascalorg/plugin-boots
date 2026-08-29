@@ -41,6 +41,7 @@ import {
   pendingToneCount,
   primedCellColor,
   retryPendingTones,
+  STRUCTURE_TOP_HEX,
   toneAuditReport,
 } from './skin-tone'
 import { settleTasksPending } from './structure'
@@ -263,6 +264,11 @@ describe('floor slab tone lane (owner wave 5: "the floor inside is white")', () 
     expect(targets.get('slab-9')?.floorCore).toBe(true)
     expect(targets.get('floor-9')?.floorCore).toBe(true)
     expect(targets.get('ceil-9')?.floorCore).toBeFalsy()
+    // The mirror flag: ceilings mute their attic-side TOP layer
+    // (skin-tone.ts ceilingTop); floors keep their walking surface.
+    expect(targets.get('ceil-9')?.ceilingTop).toBe(true)
+    expect(targets.get('slab-9')?.ceilingTop).toBeFalsy()
+    expect(targets.get('floor-9')?.ceilingTop).toBeFalsy()
   })
 
   test('a white-material floor slab falls back to the WOOD family tone, never screed gray', () => {
@@ -300,6 +306,81 @@ describe('floor slab tone lane (owner wave 5: "the floor inside is white")', () 
     }
     expect(unders).toBeGreaterThan(0)
     expect(tops).toBeGreaterThan(0)
+  })
+})
+
+describe('eave-teeth tone lane (round-5 QA: light sawtooth through the eave slit)', () => {
+  /** The exact primed-cell reference for the muted structural top tone. */
+  const structureReference = (i: number): Color => {
+    const j1 = ((i * 2654435761) % 97) / 97
+    const j2 = ((i * 1597334677) % 89) / 89
+    return new Color(STRUCTURE_TOP_HEX).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+  }
+
+  test('a ceiling slab flags ceilingTop but primes every CELL with the plain slab chain (mute is per FACE)', () => {
+    // Live host ceilings voxelize as ONE cell layer whose bottom face IS
+    // the room ceiling — a per-cell mute darkened the interior view
+    // (2026-08-29 regression). The attic-side mute rides voxel-walls'
+    // CEILING_GEOMETRY vertex colors (skin-tone.ts CEILING_FACE_TINT);
+    // destruction's job is only the ceilingTop KEY plus untouched cell
+    // tones: top layers keep the flat tone, the bottom skin keeps the
+    // drywall lighten, both bit-identical to a plain slab.
+    const world = makeWorld()
+    world.colliders.push(boxCollider('ceil-9', 'ceiling', [3, 0.1, 3], [0, 2.6, -5]))
+    const target = ensureVoxelTarget(world, 'ceil-9')!
+    expect(target.ceilingTop).toBe(true)
+    const topLayer = target.grid.ny - 1
+    expect(topLayer).toBeGreaterThan(0)
+    const out = new Color()
+    let tops = 0
+    let bottoms = 0
+    for (let i = 0; i < target.grid.count && (tops < 6 || bottoms < 6); i++) {
+      const iy = target.grid.coords[i * 3 + 1]!
+      if (iy !== topLayer && iy !== 0) continue
+      primedCellColor(out, target, i)
+      const j1 = ((i * 2654435761) % 97) / 97
+      const j2 = ((i * 1597334677) % 89) / 89
+      const base =
+        iy === 0
+          ? // Bottom skin: bit-identical to the legacy ceiling lighten.
+            target.baseColor.clone().offsetHSL(0, -0.06, 0.14)
+          : // Top layer: the FLAT tone — never the structural mute.
+            target.baseColor.clone()
+      expectSameColor(out, base.offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1))
+      if (iy === topLayer) tops++
+      else bottoms++
+    }
+    expect(tops).toBeGreaterThan(0)
+    expect(bottoms).toBeGreaterThan(0)
+  })
+
+  test('a wall primes its TOP row (the plate) muted; every row below keeps the wall tone', () => {
+    const world = makeWorld()
+    const target = ensureVoxelTarget(world, 'wall-1')!
+    expect(target.kind).toBe('wall')
+    const topRow = target.grid.ny - 1
+    expect(topRow).toBeGreaterThan(0)
+    const out = new Color()
+    let tops = 0
+    let bodies = 0
+    for (let i = 0; i < target.grid.count && (tops < 6 || bodies < 6); i++) {
+      const iy = target.grid.coords[i * 3 + 1]!
+      primedCellColor(out, target, i)
+      if (iy === topRow) {
+        expectSameColor(out, structureReference(i))
+        tops++
+      } else {
+        const j1 = ((i * 2654435761) % 97) / 97
+        const j2 = ((i * 1597334677) % 89) / 89
+        expectSameColor(
+          out,
+          target.baseColor.clone().offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1),
+        )
+        bodies++
+      }
+    }
+    expect(tops).toBeGreaterThan(0)
+    expect(bodies).toBeGreaterThan(0)
   })
 })
 

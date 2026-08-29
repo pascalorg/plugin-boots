@@ -2,13 +2,24 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
-import { type Group, Vector3 } from 'three'
+import {
+  BoxGeometry,
+  CylinderGeometry,
+  type Group,
+  type Material,
+  type Mesh,
+  MeshBasicMaterial,
+  MeshStandardMaterial,
+  SphereGeometry,
+  Vector3,
+} from 'three'
 import { useBoots } from '../store'
 import { HEARTBEAT_HP, type HeartbeatHandle, heartbeatBpm, lowHpSeverity, sfx } from './audio'
 import { collideCapsule } from './collision'
 import { collideVoxelTargets, raycastVoxelTargets } from './destruction'
 import { doorsDebug } from './doors'
 import {
+  ACCENT_PALETTE,
   accrueDoorStuck,
   ALERT_SECONDS,
   BOT_STATS,
@@ -604,8 +615,70 @@ export function Enemies({ world }: { world: GameWorld }) {
   )
 }
 
+// --- SHARED VISUAL KIT --------------------------------------------------------
+// Every unit is assembled from THREE shared geometries (a unit box, a unit
+// sphere, a unit disc — scaled per mesh) and a small fixed material set, so a
+// spawned bot allocates ZERO geometries/materials (the old per-bot JSX
+// primitives allocated ~7 of each per droid). Stock materials only —
+// WebGPU-safe, no new shader surface. Per-unit looks come from
+// bot.visual (enemies-state.botVisualParams — seeded off the unit id).
+const unitBox = new BoxGeometry(1, 1, 1)
+const unitSphere = new SphereGeometry(1, 10, 8)
+const unitDisc = new CylinderGeometry(1, 1, 1, 12)
+
+function std(color: string, metalness: number, roughness: number): MeshStandardMaterial {
+  return new MeshStandardMaterial({ color, metalness, roughness })
+}
+const CHASSIS = std('#dfe3e8', 0.35, 0.4)
+const CHASSIS_DARK = std('#c7ccd4', 0.35, 0.4)
+const LIMB = std('#9aa1ab', 0.4, 0.45)
+const ARM = std('#b7bdc6', 0.4, 0.45)
+const JOINT = std('#7c828c', 0.5, 0.35)
+const DOG_BODY = std('#e8b23a', 0.3, 0.5)
+const DOG_HEAD = std('#2f3238', 0, 0.5)
+const DOG_DARK = std('#3a3d42', 0, 0.5)
+const DRONE_BODY = std('#2c2f34', 0, 0.5)
+const DRONE_FRAME = std('#4a4e55', 0, 0.5)
+const ROTOR = std('#7d838c', 0, 0.4)
+/** DAMAGE READ (<40% / <20% hp): main panels flip to these scorched sets —
+ * the shared-material analog of an instanceColor darken. */
+const SCORCH_MILD = std('#8a8078', 0.2, 0.7)
+const SCORCH_HEAVY = std('#4c443c', 0.1, 0.85)
+/** Per-wave accents (visor slits, shoulder stripes) — unlit so they read as
+ * glowing without any emissive/shader surface. One material per palette entry. */
+const ACCENTS = ACCENT_PALETTE.map((c) => new MeshBasicMaterial({ color: c }))
+/** Drone sensor eye — bright unlit red, same glow trick. */
+const EYE = new MeshBasicMaterial({ color: '#ff4038' })
+
+/** Rotor disc XZ seats: cross-frame arm ends (4) / bar-frame ends (2). */
+const ROTORS_4 = [
+  [0.184, 0.184],
+  [-0.184, 0.184],
+  [-0.184, -0.184],
+  [0.184, -0.184],
+] as const
+const ROTORS_2 = [
+  [0.25, 0],
+  [-0.25, 0],
+] as const
+
+/** Per-part animation/scorch data stamped into mesh userData at mount. */
+type BotPart = {
+  role?: 'legL' | 'legR' | 'armL' | 'armR' | 'gait' | 'tail' | 'rotor' | 'hull'
+  /** Swing amplitude (droid legs/arms, rad). */
+  amp?: number
+  /** Gait phase offset (dog legs, rad). */
+  off?: number
+  /** Spin per frame (rotors, signed rad). */
+  spin?: number
+  /** Pristine material to restore when the scorch read clears (hull). */
+  base?: Material
+}
+
 function BotModel({ bot }: { bot: Bot }) {
   const ref = useRef<Group>(null)
+  /** Applied scorch stage (0 pristine, 1 <40% hp, 2 <20%) — swap-on-change. */
+  const scorch = useRef(0)
 
   useFrame(() => {
     const group = ref.current
@@ -620,101 +693,225 @@ function BotModel({ bot }: { bot: Bot }) {
       }
       return
     }
-    // Walk cycles.
+    // Walk cycles — roles + per-unit params stamped in the JSX below; the
+    // userData records are created once at mount, so this loop allocates
+    // nothing. Droid arms counter-swing their legs; dog legs each carry a
+    // seeded gait phase; rotors are rotation-only spins.
     const swing = Math.sin(bot.phase)
     for (const child of group.children) {
-      const role = (child.userData as { role?: string }).role
-      if (role === 'legL') child.rotation.x = swing * 0.7
-      else if (role === 'legR') child.rotation.x = -swing * 0.7
-      else if (role === 'rotor') child.rotation.y += 0.9
+      const part = child.userData as BotPart
+      if (part.role === 'legL') child.rotation.x = swing * (part.amp ?? 0.7)
+      else if (part.role === 'legR') child.rotation.x = -swing * (part.amp ?? 0.7)
+      else if (part.role === 'armL') child.rotation.x = -swing * (part.amp ?? 0.5)
+      else if (part.role === 'armR') child.rotation.x = swing * (part.amp ?? 0.5)
+      else if (part.role === 'gait') child.rotation.x = Math.sin(bot.phase + (part.off ?? 0)) * 0.65
+      else if (part.role === 'tail') child.rotation.y = Math.sin(bot.phase * 1.7) * 0.55
+      else if (part.role === 'rotor') child.rotation.y += part.spin ?? 0.9
+    }
+    // DAMAGE READ: below 40% hp the main panels flip to the scorched set
+    // (heavier again under 20%) — shared-material swap, only on stage change.
+    const hp = bot.health / BOT_STATS[bot.kind].health
+    const stage = hp < 0.2 ? 2 : hp < 0.4 ? 1 : 0
+    if (stage !== scorch.current) {
+      scorch.current = stage
+      for (const child of group.children) {
+        const part = child.userData as BotPart
+        if (part.role !== 'hull' || !part.base) continue
+        ;(child as Mesh).material = stage === 2 ? SCORCH_HEAVY : stage === 1 ? SCORCH_MILD : part.base
+      }
     }
   })
 
   if (bot.kind === 'droid') {
+    const v = bot.visual
+    const accent = ACCENTS[v.accent % ACCENTS.length]!
+    const armAmp = v.swingAmp * 0.75
     return (
-      <group ref={ref}>
-        <mesh position={[0, 1.05, 0]}>
-          <boxGeometry args={[0.46, 0.62, 0.26]} />
-          <meshStandardMaterial color="#dfe3e8" metalness={0.35} roughness={0.4} />
-        </mesh>
-        <mesh position={[0, 1.56, 0]}>
-          <boxGeometry args={[0.24, 0.24, 0.24]} />
-          <meshStandardMaterial color="#c7ccd4" metalness={0.35} roughness={0.4} />
-        </mesh>
-        <mesh position={[0, 1.56, 0.125]}>
-          <boxGeometry args={[0.18, 0.06, 0.01]} />
-          <meshStandardMaterial color="#ff3b30" />
-        </mesh>
-        <mesh position={[-0.12, 0.72, 0]} userData={{ role: 'legL' }}>
-          <boxGeometry args={[0.13, 0.72, 0.16]} />
-          <meshStandardMaterial color="#9aa1ab" metalness={0.4} roughness={0.45} />
-        </mesh>
-        <mesh position={[0.12, 0.72, 0]} userData={{ role: 'legR' }}>
-          <boxGeometry args={[0.13, 0.72, 0.16]} />
-          <meshStandardMaterial color="#9aa1ab" metalness={0.4} roughness={0.45} />
-        </mesh>
-        <mesh position={[-0.3, 1.1, 0]} userData={{ role: 'legR' }}>
-          <boxGeometry args={[0.1, 0.5, 0.12]} />
-          <meshStandardMaterial color="#b7bdc6" metalness={0.4} roughness={0.45} />
-        </mesh>
-        <mesh position={[0.3, 1.1, 0]} userData={{ role: 'legL' }}>
-          <boxGeometry args={[0.1, 0.5, 0.12]} />
-          <meshStandardMaterial color="#b7bdc6" metalness={0.4} roughness={0.45} />
-        </mesh>
+      <group ref={ref} scale={v.scale}>
+        {/* torso core + chest plate + pelvis */}
+        <mesh
+          geometry={unitBox}
+          material={CHASSIS}
+          position={[0, 1.08, 0]}
+          scale={[0.4, 0.52, 0.24]}
+          userData={{ role: 'hull', base: CHASSIS }}
+        />
+        <mesh
+          geometry={unitBox}
+          material={CHASSIS_DARK}
+          position={[0, 1.2, 0.13]}
+          scale={[0.46, 0.3, 0.08]}
+          userData={{ role: 'hull', base: CHASSIS_DARK }}
+        />
+        <mesh geometry={unitBox} material={LIMB} position={[0, 0.8, 0]} scale={[0.3, 0.16, 0.2]} />
+        {/* head + visor slit (per-wave accent) */}
+        <mesh
+          geometry={unitBox}
+          material={CHASSIS_DARK}
+          position={[0, 1.56, 0]}
+          scale={[0.22, 0.22, 0.22]}
+          userData={{ role: 'hull', base: CHASSIS_DARK }}
+        />
+        <mesh geometry={unitBox} material={accent} position={[0, 1.57, 0.115]} scale={[0.17, 0.05, 0.02]} />
+        {/* shoulder pads + the left-pad stripe (per-wave accent) */}
+        <mesh geometry={unitBox} material={CHASSIS} position={[-0.29, 1.38, 0]} scale={[0.16, 0.1, 0.2]} />
+        <mesh geometry={unitBox} material={CHASSIS} position={[0.29, 1.38, 0]} scale={[0.16, 0.1, 0.2]} />
+        <mesh geometry={unitBox} material={accent} position={[-0.29, 1.44, 0]} scale={[0.17, 0.024, 0.21]} />
+        {/* thin arms (counter-swing, per-unit amplitude) + shoulder joints */}
+        <mesh
+          geometry={unitBox}
+          material={ARM}
+          position={[-0.32, 1.1, 0]}
+          scale={[0.08, 0.48, 0.1]}
+          userData={{ role: 'armL', amp: armAmp }}
+        />
+        <mesh
+          geometry={unitBox}
+          material={ARM}
+          position={[0.32, 1.1, 0]}
+          scale={[0.08, 0.48, 0.1]}
+          userData={{ role: 'armR', amp: armAmp }}
+        />
+        <mesh geometry={unitSphere} material={JOINT} position={[-0.32, 1.36, 0]} scale={0.07} />
+        <mesh geometry={unitSphere} material={JOINT} position={[0.32, 1.36, 0]} scale={0.07} />
+        {/* thin legs (per-unit swing amplitude) + hip joints */}
+        <mesh
+          geometry={unitBox}
+          material={LIMB}
+          position={[-0.12, 0.42, 0]}
+          scale={[0.11, 0.7, 0.14]}
+          userData={{ role: 'legL', amp: v.swingAmp }}
+        />
+        <mesh
+          geometry={unitBox}
+          material={LIMB}
+          position={[0.12, 0.42, 0]}
+          scale={[0.11, 0.7, 0.14]}
+          userData={{ role: 'legR', amp: v.swingAmp }}
+        />
+        <mesh geometry={unitSphere} material={JOINT} position={[-0.12, 0.76, 0]} scale={0.075} />
+        <mesh geometry={unitSphere} material={JOINT} position={[0.12, 0.76, 0]} scale={0.075} />
       </group>
     )
   }
 
   if (bot.kind === 'dog') {
+    const v = bot.visual
+    const headZ = 0.3 * v.bodyLen + 0.09
     return (
       <group ref={ref}>
-        <mesh position={[0, 0.48, 0]}>
-          <boxGeometry args={[0.3, 0.24, 0.62]} />
-          <meshStandardMaterial color="#e8b23a" metalness={0.3} roughness={0.5} />
-        </mesh>
-        <mesh position={[0, 0.52, 0.36]}>
-          <boxGeometry args={[0.16, 0.14, 0.16]} />
-          <meshStandardMaterial color="#2f3238" roughness={0.5} />
-        </mesh>
+        <mesh
+          geometry={unitBox}
+          material={DOG_BODY}
+          position={[0, 0.48, 0]}
+          scale={[0.3, 0.24, 0.62 * v.bodyLen]}
+          userData={{ role: 'hull', base: DOG_BODY }}
+        />
+        {/* head block + snout + ear nubs */}
+        <mesh geometry={unitBox} material={DOG_HEAD} position={[0, 0.56, headZ]} scale={[0.17, 0.15, 0.17]} />
+        <mesh
+          geometry={unitBox}
+          material={DOG_DARK}
+          position={[0, 0.52, headZ + 0.12]}
+          scale={[0.1, 0.08, 0.12]}
+        />
+        <mesh
+          geometry={unitBox}
+          material={DOG_DARK}
+          position={[-0.05, 0.67, headZ - 0.03]}
+          scale={[0.035, 0.07, 0.035]}
+        />
+        <mesh
+          geometry={unitBox}
+          material={DOG_DARK}
+          position={[0.05, 0.67, headZ - 0.03]}
+          scale={[0.035, 0.07, 0.035]}
+        />
+        {/* tail segment — wags off the run phase while chasing */}
+        <mesh
+          geometry={unitBox}
+          material={DOG_DARK}
+          position={[0, 0.58, -(0.3 * v.bodyLen + 0.1)]}
+          scale={[0.045, 0.045, 0.24]}
+          userData={{ role: 'tail' }}
+        />
+        {/* legs — per-unit gait phase offsets (FL, FR, BL, BR) */}
         {(
           [
-            [-0.12, 0.26],
-            [0.12, 0.26],
-            [-0.12, -0.26],
-            [0.12, -0.26],
+            [-0.12, 0.26, 0],
+            [0.12, 0.26, 1],
+            [-0.12, -0.26, 2],
+            [0.12, -0.26, 3],
           ] as const
-        ).map(([x, z], i) => (
-          <mesh key={i} position={[x, 0.24, z]} userData={{ role: i % 2 ? 'legL' : 'legR' }}>
-            <boxGeometry args={[0.07, 0.46, 0.07]} />
-            <meshStandardMaterial color="#3a3d42" roughness={0.5} />
-          </mesh>
+        ).map(([x, z, i]) => (
+          <mesh
+            key={i}
+            geometry={unitBox}
+            material={DOG_DARK}
+            position={[x, 0.24, z * v.bodyLen]}
+            scale={[0.07, 0.46, 0.07]}
+            userData={{ role: 'gait', off: v.gait[i] }}
+          />
         ))}
       </group>
     )
   }
 
+  const v = bot.visual
+  const four = v.rotors === 4
   return (
     <group ref={ref}>
-      <mesh>
-        <boxGeometry args={[0.2, 0.09, 0.2]} />
-        <meshStandardMaterial color="#2c2f34" roughness={0.5} />
-      </mesh>
-      <mesh position={[0, 0.02, 0]} rotation={[0, Math.PI / 4, 0]}>
-        <boxGeometry args={[0.52, 0.02, 0.05]} />
-        <meshStandardMaterial color="#4a4e55" roughness={0.5} />
-      </mesh>
-      <mesh position={[0, 0.02, 0]} rotation={[0, -Math.PI / 4, 0]}>
-        <boxGeometry args={[0.52, 0.02, 0.05]} />
-        <meshStandardMaterial color="#4a4e55" roughness={0.5} />
-      </mesh>
-      <mesh position={[0, 0.07, 0]} userData={{ role: 'rotor' }}>
-        <boxGeometry args={[0.42, 0.01, 0.03]} />
-        <meshStandardMaterial color="#7d838c" roughness={0.4} />
-      </mesh>
-      <mesh position={[0, -0.04, 0.06]}>
-        <sphereGeometry args={[0.035]} />
-        <meshStandardMaterial color="#ff3b30" />
-      </mesh>
+      {/* body — round vs boxy per unit */}
+      {v.round ? (
+        <mesh
+          geometry={unitSphere}
+          material={DRONE_BODY}
+          scale={[0.13, 0.09, 0.13]}
+          userData={{ role: 'hull', base: DRONE_BODY }}
+        />
+      ) : (
+        <mesh
+          geometry={unitBox}
+          material={DRONE_BODY}
+          scale={[0.2, 0.09, 0.2]}
+          userData={{ role: 'hull', base: DRONE_BODY }}
+        />
+      )}
+      {/* frame: cross arms under 4 rotors, a single bar under 2 */}
+      {four ? (
+        <>
+          <mesh
+            geometry={unitBox}
+            material={DRONE_FRAME}
+            position={[0, 0.02, 0]}
+            rotation={[0, Math.PI / 4, 0]}
+            scale={[0.52, 0.02, 0.05]}
+          />
+          <mesh
+            geometry={unitBox}
+            material={DRONE_FRAME}
+            position={[0, 0.02, 0]}
+            rotation={[0, -Math.PI / 4, 0]}
+            scale={[0.52, 0.02, 0.05]}
+          />
+        </>
+      ) : (
+        <mesh geometry={unitBox} material={DRONE_FRAME} position={[0, 0.02, 0]} scale={[0.56, 0.02, 0.06]} />
+      )}
+      {/* rotor discs — thin elliptical cylinders so the y-spin actually reads;
+          alternating spin direction, rotation only */}
+      {(four ? ROTORS_4 : ROTORS_2).map(([x, z], i) => (
+        <mesh
+          key={i}
+          geometry={unitDisc}
+          material={ROTOR}
+          position={[x, 0.07, z]}
+          scale={[0.115, 0.014, 0.08]}
+          userData={{ role: 'rotor', spin: i % 2 ? -0.9 : 0.9 }}
+        />
+      ))}
+      {/* sensor eye — bright unlit red, reads as a glow */}
+      <mesh geometry={unitSphere} material={EYE} position={[0, -0.03, four ? 0.08 : 0.07]} scale={0.04} />
     </group>
   )
 }

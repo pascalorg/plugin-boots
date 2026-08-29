@@ -4,6 +4,7 @@ import {
   accrueDoorStuck,
   type Bot,
   type BotKind,
+  botVisualParams,
   DOOR_APPROACH_OFFSET,
   DOOR_SCAN_PERIOD,
   DOOR_SCAN_RANGE,
@@ -49,6 +50,7 @@ function makeBot(kind: BotKind, x: number, z: number): Bot {
     doorZ: 0,
     doorFumbleT: 0,
     doorT: 0,
+    visual: botVisualParams(1, kind, 0),
   }
 }
 

@@ -368,6 +368,15 @@ export type VoxelTarget = {
    * paints every under-layer as dirt subfloor (skin-tone.ts
    * FLOOR_CORE_HEX) so a carved floor reveals earth. */
   floorCore?: boolean
+  /** CEILING-family slab (nodeType 'ceiling'): voxel-walls renders it with
+   * the FACE-tinted ceiling geometry (skin-tone.ts CEILING_FACE_TINT) —
+   * the attic-side TOP and rim faces mute toward bare structure while the
+   * bottom face (the room ceiling seen from below) stays bit-exact. Per
+   * FACE, not per cell, because live host ceilings voxelize as a SINGLE
+   * cell layer serving both sides: through the eave slit the interior
+   * white read as a light sawtooth ring framing the dark roof
+   * (round-5 QA). */
+  ceilingTop?: boolean
 }
 
 /** Legacy alias — every voxelized target uses the same shape. */
@@ -2013,6 +2022,11 @@ export function ensureVoxelTarget(
   // gray that read "white") and the under-layers wear the dirt subfloor
   // tone (VoxelTarget.floorCore → skin-tone.ts). Owner wave 5.
   const floorSlab = kind === 'slab' && nodeType !== 'ceiling'
+  // CEILING slabs take the FACE-tinted ceiling geometry in voxel-walls
+  // (VoxelTarget.ceilingTop → skin-tone.ts CEILING_FACE_TINT): their attic
+  // side is only ever seen through the eave slit, where interior white
+  // read as light sawtooth teeth against the dark roof (round-5 QA).
+  const ceilingSlab = kind === 'slab' && nodeType === 'ceiling'
   const toneKind: SkinToneKind = floorSlab ? 'floor' : kind
   const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, toneKind)
   const segments = wall
@@ -2057,6 +2071,7 @@ export function ensureVoxelTarget(
     revision: 0,
     contactOnlySupport,
     floorCore: floorSlab || undefined,
+    ceilingTop: ceilingSlab || undefined,
   }
 
   // Hide the host meshes + hand the colliders over (keep-aware — see

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { ensureVoxelTarget, resetDestruction, useDestruction, wakeTarget } from './destruction'
+import { CEILING_FACE_TINT } from './skin-tone'
 import {
+  CEILING_GEOMETRY,
   DORMANT_PRIME_PER_FRAME,
   type DormantPrimeEntry,
   dormantPrimeQueueSize,
@@ -250,5 +252,45 @@ describe('dirt underlay layout (owner wave 5: broken floor shows earth)', () => 
     const layout = floorUnderlayLayout(target)
     expect(layout).not.toBeNull()
     expect(layout!.y).toBeLessThan(0.01) // under the slab's grid base
+  })
+})
+
+describe('ceiling face tint (round-5 QA eave teeth: attic side mutes per FACE)', () => {
+  test('CEILING_GEOMETRY: bottom-face vertices stay 1, every other face wears CEILING_FACE_TINT', () => {
+    // The one-cell-layer ceiling contract: vertexColor × instanceColor —
+    // the bottom face (the room ceiling, seen from below) must render the
+    // instance tone BIT-EXACT (vertex color 1), while the attic TOP and
+    // the four rim faces carry the structural mute that kills the light
+    // sawtooth through the eave slit.
+    const normal = CEILING_GEOMETRY.getAttribute('normal')
+    const color = CEILING_GEOMETRY.getAttribute('color')
+    expect(color).toBeDefined()
+    expect(color.count).toBe(normal.count)
+    let down = 0
+    let other = 0
+    for (let v = 0; v < normal.count; v++) {
+      if (normal.getY(v) < -0.5) {
+        expect(color.getX(v)).toBe(1)
+        expect(color.getY(v)).toBe(1)
+        expect(color.getZ(v)).toBe(1)
+        down++
+      } else {
+        expect(color.getX(v)).toBeCloseTo(CEILING_FACE_TINT[0], 6) // float32 attribute
+        expect(color.getY(v)).toBeCloseTo(CEILING_FACE_TINT[1], 6)
+        expect(color.getZ(v)).toBeCloseTo(CEILING_FACE_TINT[2], 6)
+        other++
+      }
+    }
+    expect(down).toBe(4) // one box face
+    expect(other).toBe(20) // the five structural faces
+  })
+
+  test('a real ceiling target carries ceilingTop (the geometry pick key); floors and walls never do', () => {
+    const ceil = boxCollider('ceil-g', 'ceiling', [3, 0.1, 3], [0, 2.6, 5])
+    const world = makeWorld([ceil])
+    const target = ensureVoxelTarget(world, 'ceil-g')!
+    expect(target.kind).toBe('slab')
+    expect(target.ceilingTop).toBe(true)
+    expect(target.floorCore).toBeFalsy()
   })
 })

@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { sceneRegistry } from '@pascal-app/core'
 import { BoxGeometry, Group, InstancedMesh, Matrix4, Mesh, type Object3D, Vector3 } from 'three'
+import { treeParamsAt } from './tree-species'
 import {
   BURN_SECONDS,
   buildTreesFrom,
   CHAR_HITS,
   charBurstDir,
-  COMBAT_TREE_APEX,
   type CombatTree,
   CRACKLE_FADE_S,
   damageTree,
@@ -38,12 +38,15 @@ import {
  */
 
 const PLACEMENT: TreePlacement = { x: 10, z: 0, scale: 1, yaw: 0, color: [0.25, 0.43, 0.2] }
+/** The species silhouette standing at the fixture spot (position-derived). */
+const P = treeParamsAt(PLACEMENT.x, PLACEMENT.z)
 
 function tree(overrides: Partial<TreePlacement> = {}): CombatTree {
   return buildTreesFrom([{ ...PLACEMENT, ...overrides }])[0]!
 }
 
-const ORIGIN = new Vector3(0, 1.2, 0)
+/** A level shot at half trunk height — hits the trunk on any species. */
+const TRUNK_ORIGIN = new Vector3(0, P.trunkH * 0.5, 0)
 const PLUS_X = new Vector3(1, 0, 0)
 
 describe('buildTreesFrom', () => {
@@ -57,36 +60,44 @@ describe('buildTreesFrom', () => {
       expect(t.charHits).toBe(CHAR_HITS)
     }
   })
+
+  test('species params come from the position hash unless the placement carries them', () => {
+    const trees = buildTreesFrom([PLACEMENT, { ...PLACEMENT, x: 20 }])
+    expect(trees[0]!.params).toEqual(treeParamsAt(10, 0))
+    expect(trees[1]!.params).toEqual(treeParamsAt(20, 0))
+    // An explicit placement params object wins (host trees pass theirs in).
+    const forced = treeParamsAt(-31, 44)
+    expect(buildTreesFrom([{ ...PLACEMENT, params: forced }])[0]!.params).toBe(forced)
+  })
 })
 
 describe('raycastTrees', () => {
-  test('level shot at the trunk hits part trunk at cylinder range', () => {
-    const hit = raycastTrees([tree()], ORIGIN, PLUS_X, 90)
+  test('level shot at the trunk hits part trunk at the species radius', () => {
+    const hit = raycastTrees([tree()], TRUNK_ORIGIN, PLUS_X, 90)
     expect(hit).not.toBeNull()
     expect(hit!.part).toBe('trunk')
-    // Trunk front face: x = 10 - 0.2 (base radius) from x = 0.
-    expect(hit!.distance).toBeCloseTo(9.8, 5)
-    expect(hit!.point.x).toBeCloseTo(9.8, 5)
+    // Trunk front face: x = 10 - the species' trunk radius, from x = 0.
+    expect(hit!.distance).toBeCloseTo(10 - P.trunkR, 5)
+    expect(hit!.point.x).toBeCloseTo(10 - P.trunkR, 5)
   })
 
   test('high shot hits the canopy sphere, not the trunk', () => {
-    const origin = new Vector3(0, 3.4, 0) // canopy center height (scale 1)
+    const origin = new Vector3(0, P.crownCY, 0) // crown center height (scale 1)
     const hit = raycastTrees([tree()], origin, PLUS_X, 90)
     expect(hit).not.toBeNull()
     expect(hit!.part).toBe('canopy')
-    expect(hit!.distance).toBeCloseTo(10 - 1.55, 5)
+    expect(hit!.distance).toBeCloseTo(10 - P.crownR, 5)
   })
 
-  test('mid-height shot clears the trunk and takes the nearer canopy', () => {
-    // Trunk tops scale with the tree: 2.4 m at scale 1. A shot at y 3.0
-    // sails over the small tree's trunk but clips its crown before ever
-    // reaching the taller tree behind it.
+  test('shot above the trunk top takes the nearer canopy', () => {
+    // Trunk tops scale with the tree. A shot just over the small tree's
+    // trunk clips its crown before ever reaching the tree behind it.
     const small = tree({ scale: 1 })
     const big = { ...tree({ x: 20, scale: 1.5 }), id: 1 }
-    const origin = new Vector3(0, 3.0, 0)
+    const origin = new Vector3(0, P.trunkH + 0.3, 0)
     const hit = raycastTrees([small, big], origin, PLUS_X, 90)
     expect(hit).not.toBeNull()
-    // y 3.0 is inside the SMALL tree's canopy sphere (center 3.4 r 1.55).
+    // Just above the trunk is inside every species' canopy sphere.
     expect(hit!.treeId).toBe(0)
     expect(hit!.part).toBe('canopy')
   })
@@ -94,18 +105,18 @@ describe('raycastTrees', () => {
   test('stumps never block shots; charred trees lose the canopy ball', () => {
     const stump = tree()
     stump.state = 'stump'
-    expect(raycastTrees([stump], ORIGIN, PLUS_X, 90)).toBeNull()
+    expect(raycastTrees([stump], TRUNK_ORIGIN, PLUS_X, 90)).toBeNull()
 
     const charred = tree()
     charred.state = 'charred'
-    const high = raycastTrees([charred], new Vector3(0, 3.4, 0), PLUS_X, 90)
+    const high = raycastTrees([charred], new Vector3(0, P.crownCY, 0), PLUS_X, 90)
     expect(high).toBeNull() // no crown left up there
-    const low = raycastTrees([charred], ORIGIN, PLUS_X, 90)
+    const low = raycastTrees([charred], TRUNK_ORIGIN, PLUS_X, 90)
     expect(low?.part).toBe('trunk') // the black trunk still stands
   })
 
   test('maxDist culls', () => {
-    expect(raycastTrees([tree()], ORIGIN, PLUS_X, 5)).toBeNull()
+    expect(raycastTrees([tree()], TRUNK_ORIGIN, PLUS_X, 5)).toBeNull()
   })
 })
 
@@ -217,14 +228,14 @@ describe('elevated trees (host base y)', () => {
     const deckTree = tree({ y: 4 })
     expect(deckTree.y).toBe(4)
     // Old ground-level trunk shot passes under the lifted tree.
-    expect(raycastTrees([deckTree], ORIGIN, PLUS_X, 90)).toBeNull()
+    expect(raycastTrees([deckTree], TRUNK_ORIGIN, PLUS_X, 90)).toBeNull()
     // Same shot at deck height hits the trunk.
-    const trunk = raycastTrees([deckTree], new Vector3(0, 4 + 1.2, 0), PLUS_X, 90)
+    const trunk = raycastTrees([deckTree], new Vector3(0, 4 + P.trunkH * 0.5, 0), PLUS_X, 90)
     expect(trunk?.part).toBe('trunk')
-    // Canopy sphere rides up with the base (center y + 3.4, r 1.55).
-    const canopy = raycastTrees([deckTree], new Vector3(0, 4 + 3.4, 0), PLUS_X, 90)
+    // Canopy sphere rides up with the base (center y + crownCY, r crownR).
+    const canopy = raycastTrees([deckTree], new Vector3(0, 4 + P.crownCY, 0), PLUS_X, 90)
     expect(canopy?.part).toBe('canopy')
-    expect(canopy!.distance).toBeCloseTo(10 - 1.55, 5)
+    expect(canopy!.distance).toBeCloseTo(10 - P.crownR, 5)
   })
 
   test('placements without y stay ground trees (default 0)', () => {
@@ -386,8 +397,10 @@ describe('isForestInstancedMesh + collectHostForestMeshes', () => {
 
 describe('hostTreePlacements + withoutHostOverlap', () => {
   test('replacement placements keep the host transform; hidden trees skipped', () => {
+    // The species standing at (3, -4) — its apex is the height divisor.
+    const spot = treeParamsAt(3, -4)
     const placements = hostTreePlacements([
-      hostTree({ nodeId: 'a', x: 3, y: 1.5, z: -4, yaw: 0.7, height: COMBAT_TREE_APEX }),
+      hostTree({ nodeId: 'a', x: 3, y: 1.5, z: -4, yaw: 0.7, height: spot.apex }),
       hostTree({ nodeId: 'gone', hidden: true }),
       hostTree({ nodeId: 'big', x: 9, z: 9, height: 100 }),
     ])
@@ -397,8 +410,9 @@ describe('hostTreePlacements + withoutHostOverlap', () => {
     expect(a.y).toBe(1.5)
     expect(a.z).toBe(-4)
     expect(a.yaw).toBeCloseTo(0.7, 6)
-    // height / COMBAT_TREE_APEX → a same-height combat tree.
+    // height / the species apex → a same-height combat tree.
     expect(a.scale).toBeCloseTo(1, 6)
+    expect(a.params).toEqual(spot)
     for (const c of a.color) expect(c).toBeGreaterThan(0)
     // Absurd heights clamp instead of spawning an unraycastable monster.
     expect(placements[1]!.scale).toBeLessThanOrEqual(2.6)

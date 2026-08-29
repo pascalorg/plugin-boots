@@ -7,6 +7,7 @@ import {
   Color,
   ConeGeometry,
   CylinderGeometry,
+  IcosahedronGeometry,
   type InstancedMesh,
   Matrix4,
   Quaternion,
@@ -18,6 +19,7 @@ import { spawnDust } from './dust'
 import { scatter } from './nature'
 import { hideForGame } from './session'
 import { registerTreeRoutes } from './shooting'
+import { MAX_BLOBS, MAX_TIERS, type TreeParams, treeParamsAt } from './tree-species'
 import { collectHostForestMeshes, type GameWorld, type HostTreeNode } from './world'
 
 /**
@@ -34,10 +36,19 @@ import { collectHostForestMeshes, type GameWorld, type HostTreeNode } from './wo
  *            Each further hit snaps a branch (charcoal-stick break); after
  *            CHAR_HITS the trunk itself bursts into voxels → stump.
  *
- * Everything is InstancedMesh (trunks, canopies, branches, stumps — four
- * draw calls for the whole grove); bursts ride the shared debris ring, so
- * a felled tree costs nothing persistent. Raycasts are analytic (vertical
- * trunk cylinder + canopy sphere), CPU-only, ~46 trees per shot.
+ * SPECIES (2026-08-28): every tree derives a species + full silhouette
+ * parameters from its position via tree-species.ts (treeParamsAt — the
+ * pure, position-hash-seeded generator), so the grove mixes tiered
+ * conifers, blob-crowned broadleaves and tall thin birches with seeded
+ * height/crown/lean/bark variation — and a felled birch chars as a birch.
+ * Everything is still InstancedMesh: shared UNIT geometries per PART
+ * (trunk cylinder, cone tier ×MAX_TIERS slots, crown blob ×MAX_BLOBS
+ * slots, branch sticks ×CHAR_HITS+1 — the +1 is the broadleaf bark stub —
+ * and stumps: five draw calls for the whole grove); bursts ride the
+ * shared debris ring, so a felled tree costs nothing persistent. Raycasts
+ * are analytic (vertical trunk cylinder + per-species canopy sphere from
+ * params; the 2–4° visual lean is ignored — at crown height that is
+ * ≤0.35 m, well inside every crown radius), CPU-only, ~46 trees per shot.
  *
  * REAL host-scene trees join the grove (phase 4): world.hostTrees (scene
  * vegetation nodes — see world.ts isTreeKind / collectHostTrees) are
@@ -55,8 +66,8 @@ import { collectHostForestMeshes, type GameWorld, type HostTreeNode } from './wo
  *       ledger, and registers shooting.ts's tree routes on mount (routes
  *       cleared on unmount; visibility restored by exitGame's ledger).
  *   treesDebug.dump()  plain per-tree state for `__boots.trees()`:
- *       { id, nodeId?, x, y, z, scale, state, hp, canopyDamage, burnT,
- *         charHits } — nodeId set exactly on host-tree replacements.
+ *       { id, nodeId?, x, y, z, scale, species, state, hp, canopyDamage,
+ *         burnT, charHits } — nodeId set exactly on host-tree replacements.
  *   Pure helpers exported for tests: buildTreesFrom, raycastTrees,
  *       damageTree, updateBurning, hostTreePlacements, withoutHostOverlap,
  *       charBurstDir (no rendering/sfx inside — the component wraps them
@@ -83,16 +94,20 @@ export type TreePlacement = {
   y?: number
   scale: number
   yaw: number
-  /** Canopy rgb 0..1 (trunks share one bark brown). */
+  /** Canopy rgb 0..1 (bark comes from the species params). */
   color: [number, number, number]
   /** Scene node id when this placement replaces a REAL host tree. */
   nodeId?: string
+  /** Species silhouette; omitted = derived from (x, z) via treeParamsAt. */
+  params?: TreeParams
 }
 
 export type CombatTree = TreePlacement & {
   id: number
   /** Resolved base elevation (placement y, defaulted to 0). */
   y: number
+  /** Resolved species silhouette (placement params or position-derived). */
+  params: TreeParams
   state: TreeState
   hp: number
   canopyDamage: number
@@ -109,19 +124,12 @@ export const BURN_SECONDS = 4.5
 /** Branch snaps a charred tree takes before the trunk bursts to a stump. */
 export const CHAR_HITS = 3
 
-// Shape constants — match nature.tsx's old tree look (scaled per tree).
-const TRUNK_R_TOP = 0.14
-const TRUNK_R_BOT = 0.2
-const TRUNK_H = 2.4
-/** Canopy approximated as a sphere for raycasts (cone spans y 1.9..5.3). */
-const CANOPY_CY = 3.4
-const CANOPY_R = 1.55
-
 export function buildTreesFrom(placements: TreePlacement[]): CombatTree[] {
   return placements.map((p, id) => ({
     ...p,
     id,
     y: p.y ?? 0,
+    params: p.params ?? treeParamsAt(p.x, p.z),
     state: 'healthy' as TreeState,
     hp: TREE_HP,
     canopyDamage: 0,
@@ -132,9 +140,6 @@ export function buildTreesFrom(placements: TreePlacement[]): CombatTree[] {
 
 // --- Host-tree replacement placements --------------------------------------
 
-/** Combat-tree apex height at scale 1 (canopy cone top: 3.6 + 3.4 / 2) —
- * the divisor turning a host tree's node height into a matching scale. */
-export const COMBAT_TREE_APEX = 5.3
 /** Sanity clamp on host-derived scales (a 60 m sequoia node still spawns a
  * shootable tree; a 0.5 m sapling stays raycastable). */
 const HOST_SCALE_MIN = 0.45
@@ -143,31 +148,29 @@ const HOST_SCALE_MAX = 2.6
  * replacement stands exactly there. */
 export const HOST_TREE_CLEARANCE = 1.6
 
-const HOST_CANOPY = new Color('#3f6d33')
-const _hostColor = new Color()
-
 /**
  * Combat placements standing in for the REAL host trees, same world
  * transforms: XZ + base elevation from the node's registered root, yaw from
- * the node, scale from node height (height / COMBAT_TREE_APEX, clamped).
- * Hidden-branch trees get no replacement. Canopy color is the scattered
- * grove's green with a deterministic per-index lightness wobble.
+ * the node, scale from node height (height / the species apex at this
+ * position, clamped — the replacement tops out where the host tree did).
+ * Hidden-branch trees get no replacement. Species + canopy color come from
+ * the position-hash generator, same as the scattered grove.
  */
 export function hostTreePlacements(hostTrees: readonly HostTreeNode[]): TreePlacement[] {
   const placements: TreePlacement[] = []
-  for (let i = 0; i < hostTrees.length; i++) {
-    const tree = hostTrees[i]!
+  for (const tree of hostTrees) {
     if (tree.hidden) continue
-    const scale = Math.min(HOST_SCALE_MAX, Math.max(HOST_SCALE_MIN, tree.height / COMBAT_TREE_APEX))
-    _hostColor.copy(HOST_CANOPY).offsetHSL(0, 0, (((i * 7919) % 13) / 13 - 0.5) * 0.08)
+    const params = treeParamsAt(tree.x, tree.z)
+    const scale = Math.min(HOST_SCALE_MAX, Math.max(HOST_SCALE_MIN, tree.height / params.apex))
     placements.push({
       x: tree.x,
       z: tree.z,
       y: tree.y,
       scale,
       yaw: tree.yaw,
-      color: [_hostColor.r, _hostColor.g, _hostColor.b],
+      color: params.color,
       nodeId: tree.nodeId,
+      params,
     })
   }
   return placements
@@ -219,9 +222,10 @@ export function raycastTrees(
   for (const tree of trees) {
     if (tree.state === 'stump') continue
     const s = tree.scale
+    const p = tree.params
     // Trunk: infinite cylinder about (x, z), then clamp hit height.
     {
-      const r = TRUNK_R_BOT * s
+      const r = p.trunkR * s
       const ox = origin.x - tree.x
       const oz = origin.z - tree.z
       const dx = direction.x
@@ -235,7 +239,7 @@ export function raycastTrees(
           const t = (-b - Math.sqrt(disc)) / a
           if (t > 0 && t < bestDist) {
             const y = origin.y + direction.y * t - tree.y
-            if (y >= 0 && y <= TRUNK_H * s) {
+            if (y >= 0 && y <= p.trunkH * s) {
               bestDist = t
               bestTree = tree.id
               bestPart = 'trunk'
@@ -247,9 +251,9 @@ export function raycastTrees(
     // Canopy sphere — only while the crown exists (burned crowns are gone).
     if (tree.state !== 'charred') {
       const cx = origin.x - tree.x
-      const cy = origin.y - (tree.y + CANOPY_CY * s)
+      const cy = origin.y - (tree.y + p.crownCY * s)
       const cz = origin.z - tree.z
-      const r = CANOPY_R * s
+      const r = p.crownR * s
       const b = cx * direction.x + cy * direction.y + cz * direction.z
       const c = cx * cx + cy * cy + cz * cz - r * r
       const disc = b * b - c
@@ -344,6 +348,7 @@ export const treesDebug = {
       y: t.y,
       z: t.z,
       scale: t.scale,
+      species: t.params.species,
       state: t.state,
       hp: t.hp,
       canopyDamage: t.canopyDamage,
@@ -354,7 +359,6 @@ export const treesDebug = {
 
 // --- Effects (voxel bursts, dust, sfx) — component/route side -------------
 
-const BARK = new Color('#6b4f35')
 const CHARCOAL = new Color('#2b2724')
 const EMBER = new Color('#e8703a')
 const _burstColor = new Color()
@@ -406,14 +410,14 @@ function burstCanopyChar(tree: CombatTree): void {
         .setRGB(tree.color[0], tree.color[1], tree.color[2])
         .lerp(CHARCOAL, 0.2 + Math.random() * 0.3)
     }
-    const r = CANOPY_R * s * Math.cbrt(Math.random())
+    const r = tree.params.crownR * s * Math.cbrt(Math.random())
     const theta = Math.random() * Math.PI * 2
     const u = Math.random() * 2 - 1
     const h = Math.sqrt(1 - u * u)
     charBurstDir(theta, Math.random(), _charDir)
     spawnDebris(
       tree.x + Math.cos(theta) * h * r,
-      tree.y + CANOPY_CY * s + u * r,
+      tree.y + tree.params.crownCY * s + u * r,
       tree.z + Math.sin(theta) * h * r,
       (0.1 + Math.random() * 0.07) * s,
       _burstColor,
@@ -431,13 +435,13 @@ function burstCanopy(tree: CombatTree, charcoal: boolean): void {
   for (let i = 0; i < n; i++) {
     if (charcoal) _burstColor.copy(CHARCOAL)
     else _burstColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
-    const r = CANOPY_R * s * Math.cbrt(Math.random())
+    const r = tree.params.crownR * s * Math.cbrt(Math.random())
     const theta = Math.random() * Math.PI * 2
     const u = Math.random() * 2 - 1
     const h = Math.sqrt(1 - u * u)
     spawnDebris(
       tree.x + Math.cos(theta) * h * r,
-      tree.y + CANOPY_CY * s + u * r,
+      tree.y + tree.params.crownCY * s + u * r,
       tree.z + Math.sin(theta) * h * r,
       (0.11 + Math.random() * 0.08) * s,
       _burstColor,
@@ -452,8 +456,9 @@ function burstTrunk(tree: CombatTree, charcoal: boolean): void {
   const s = tree.scale
   const n = 12
   for (let i = 0; i < n; i++) {
-    _burstColor.copy(charcoal ? CHARCOAL : BARK)
-    const y = tree.y + (0.35 + ((TRUNK_H - 0.35) * i) / n) * s
+    if (charcoal) _burstColor.copy(CHARCOAL)
+    else _burstColor.setRGB(tree.params.bark[0], tree.params.bark[1], tree.params.bark[2])
+    const y = tree.y + (0.35 + ((tree.params.trunkH - 0.35) * i) / n) * s
     spawnDebris(
       tree.x + (Math.random() - 0.5) * 0.3 * s,
       y,
@@ -477,9 +482,11 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
   const event = damageTree(tree, hit.part, damage)
   switch (event) {
     case 'chip': {
-      // Splinters/leaf voxels at the impact, in the part's color.
+      // Splinters/leaf voxels at the impact, in the part's color (a birch
+      // trunk chips pale, a pine chips brown — bark rides the species).
       if (hit.part === 'canopy') _burstColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
-      else _burstColor.copy(wasBurning ? CHARCOAL : BARK)
+      else if (wasBurning) _burstColor.copy(CHARCOAL)
+      else _burstColor.setRGB(tree.params.bark[0], tree.params.bark[1], tree.params.bark[2])
       for (let i = 0; i < 3; i++) {
         spawnDebris(hit.point.x, hit.point.y, hit.point.z, 0.06, _burstColor, 1.3, 1.4)
       }
@@ -487,7 +494,7 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
       break
     }
     case 'ignite': {
-      _dustPos.set(tree.x, tree.y + CANOPY_CY * tree.scale, tree.z)
+      _dustPos.set(tree.x, tree.y + tree.params.crownCY * tree.scale, tree.z)
       spawnDust(_dustPos, 0.7, PUFF)
       sfx.voxelCrunch(0.35)
       revision++
@@ -531,85 +538,150 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
 // --- Rendering -------------------------------------------------------------
 
 const _matrix = new Matrix4()
+const _treeMatrix = new Matrix4()
+const _local = new Matrix4()
 const _pos = new Vector3()
 const _quat = new Quaternion()
+const _leanQuat = new Quaternion()
+const _quatIdentity = new Quaternion()
 const _scaleV = new Vector3()
 const _yAxis = new Vector3(0, 1, 0)
+const _leanAxis = new Vector3()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
 /** Branch stick orientations for charred crowns (tilt out + around). */
 const BRANCH_YAWS = [0.3, 2.4, 4.5]
+/** Branch-mesh slots per tree: CHAR_HITS charcoal sticks + 1 bark stub. */
+export const BRANCH_SLOTS = CHAR_HITS + 1
 
-function setTreeMatrix(mesh: InstancedMesh, i: number, tree: CombatTree): void {
+/** Whole-tree world matrix: position × (yaw ∘ 2–4° lean) × uniform scale.
+ * Every part multiplies its LOCAL offset/dims against this, so crowns and
+ * stubs lean with their trunk. */
+function composeTreeMatrix(tree: CombatTree): Matrix4 {
+  const p = tree.params
   _pos.set(tree.x, tree.y, tree.z)
   _quat.setFromAxisAngle(_yAxis, tree.yaw)
+  _leanAxis.set(Math.cos(p.leanDir), 0, Math.sin(p.leanDir))
+  _leanQuat.setFromAxisAngle(_leanAxis, p.lean)
+  _quat.multiply(_leanQuat)
   _scaleV.setScalar(tree.scale)
-  _matrix.compose(_pos, _quat, _scaleV)
-  mesh.setMatrixAt(i, _matrix)
+  return _treeMatrix.compose(_pos, _quat, _scaleV)
+}
+
+/** Part matrix: tree matrix × local(translate, optional yaw, dims). */
+function setPartMatrix(
+  mesh: InstancedMesh,
+  slot: number,
+  tree: Matrix4,
+  x: number,
+  y: number,
+  z: number,
+  sx: number,
+  sy: number,
+  sz: number,
+  yaw = 0,
+): void {
+  _pos.set(x, y, z)
+  if (yaw !== 0) _leanQuat.setFromAxisAngle(_yAxis, yaw)
+  _scaleV.set(sx, sy, sz)
+  _matrix.multiplyMatrices(tree, _local.compose(_pos, yaw !== 0 ? _leanQuat : _quatIdentity, _scaleV))
+  mesh.setMatrixAt(slot, _matrix)
+}
+
+type TreeMeshes = {
+  trunks: InstancedMesh | null
+  cones: InstancedMesh | null
+  blobs: InstancedMesh | null
+  branches: InstancedMesh | null
+  stumps: InstancedMesh | null
 }
 
 /** Rebuild every instance matrix/color from tree states (runs on revision
  * bumps only — burning color animation is the frame loop's job). */
-function syncInstances(
-  trees: CombatTree[],
-  trunks: InstancedMesh | null,
-  canopies: InstancedMesh | null,
-  branches: InstancedMesh | null,
-  stumps: InstancedMesh | null,
-): void {
-  if (!trunks || !canopies || !branches || !stumps) return
+function syncInstances(trees: CombatTree[], meshes: TreeMeshes): void {
+  const { trunks, cones, blobs, branches, stumps } = meshes
+  if (!trunks || !cones || !blobs || !branches || !stumps) return
   for (let i = 0; i < trees.length; i++) {
     const tree = trees[i]!
+    const p = tree.params
     const s = tree.scale
+    const crownUp = tree.state === 'healthy' || tree.state === 'burning'
+    const world = composeTreeMatrix(tree)
     // Trunk stands until the tree is a stump; charred trunks go black.
     if (tree.state === 'stump') trunks.setMatrixAt(i, ZERO)
-    else setTreeMatrix(trunks, i, tree)
-    trunks.setColorAt(i, tree.state === 'charred' ? CHARCOAL : BARK)
-    // Crown exists while healthy/burning (burning tint animates per frame).
-    if (tree.state === 'healthy' || tree.state === 'burning') {
-      setTreeMatrix(canopies, i, tree)
-      _canopyColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
-      canopies.setColorAt(i, _canopyColor)
-    } else canopies.setMatrixAt(i, ZERO)
-    // Bare branches only on charred trees, one hidden per snap taken.
-    for (let b = 0; b < CHAR_HITS; b++) {
-      const j = i * CHAR_HITS + b
-      if (tree.state === 'charred' && b < tree.charHits) {
-        _pos.set(tree.x, tree.y + (TRUNK_H - 0.25) * s, tree.z)
-        _quat.setFromAxisAngle(_yAxis, tree.yaw + BRANCH_YAWS[b]!)
-        _scaleV.setScalar(s)
-        _matrix.compose(_pos, _quat, _scaleV)
-        branches.setMatrixAt(j, _matrix)
-      } else branches.setMatrixAt(j, ZERO)
-      // Color EVERY slot, not just charred ones: the mount-time sync must
+    else setPartMatrix(trunks, i, world, 0, 0, 0, p.trunkR, p.trunkH, p.trunkR)
+    if (tree.state === 'charred') trunks.setColorAt(i, CHARCOAL)
+    else trunks.setColorAt(i, _canopyColor.setRGB(p.bark[0], p.bark[1], p.bark[2]))
+    // Conifer cone tiers — radii shrink up the stack, tint lightens a touch.
+    for (let k = 0; k < MAX_TIERS; k++) {
+      const j = i * MAX_TIERS + k
+      const tier = p.tiers[k]
+      if (crownUp && tier) setPartMatrix(cones, j, world, 0, tier.y, 0, tier.r, tier.h, tier.r)
+      else cones.setMatrixAt(j, ZERO)
+      // Color EVERY slot, not just live ones: the mount-time sync must
       // create instanceColor before the WebGPU pipeline first compiles, or
-      // branches that appear mid-session render white (wiring, 2026-08-25).
-      // Trunks/canopies/stumps already color unconditionally — same reason.
+      // parts that appear mid-session render white (wiring, 2026-08-25).
+      _canopyColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
+      cones.setColorAt(j, _canopyColor.multiplyScalar(1 + 0.05 * k))
+    }
+    // Broadleaf/birch crown blobs (slightly squashed spheres).
+    for (let k = 0; k < MAX_BLOBS; k++) {
+      const j = i * MAX_BLOBS + k
+      const blob = p.blobs[k]
+      if (crownUp && blob) {
+        setPartMatrix(blobs, j, world, blob.x, blob.y, blob.z, blob.r, blob.r * 0.85, blob.r)
+      } else blobs.setMatrixAt(j, ZERO)
+      _canopyColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
+      blobs.setColorAt(j, _canopyColor.multiplyScalar(k === 0 ? 1 : 0.95 + 0.09 * k))
+    }
+    // Branch sticks: CHAR_HITS bare charcoal branches on charred trees
+    // (one hides per snap taken) + the broadleaf bark stub while standing.
+    for (let b = 0; b < CHAR_HITS; b++) {
+      const j = i * BRANCH_SLOTS + b
+      if (tree.state === 'charred' && b < tree.charHits) {
+        setPartMatrix(branches, j, world, 0, p.trunkH - 0.25, 0, 1, 1, 1, BRANCH_YAWS[b]!)
+      } else branches.setMatrixAt(j, ZERO)
       branches.setColorAt(j, CHARCOAL)
     }
-    // Stump appears the moment the tree above it is gone.
-    if (tree.state === 'stump') setTreeMatrix(stumps, i, tree)
-    else stumps.setMatrixAt(i, ZERO)
-    stumps.setColorAt(i, BARK)
+    {
+      const j = i * BRANCH_SLOTS + CHAR_HITS
+      if (p.stub && tree.state !== 'stump') {
+        setPartMatrix(branches, j, world, 0, p.stub.y, 0, 1.9, 0.62, 1.9, p.stub.yaw)
+      } else branches.setMatrixAt(j, ZERO)
+      if (tree.state === 'charred') branches.setColorAt(j, CHARCOAL)
+      else branches.setColorAt(j, _canopyColor.setRGB(p.bark[0], p.bark[1], p.bark[2]))
+    }
+    // Stump appears the moment the tree above it is gone (kept upright —
+    // it reads as the cut base, so the lean stays with the felled tree).
+    if (tree.state === 'stump') {
+      _pos.set(tree.x, tree.y, tree.z)
+      _leanQuat.setFromAxisAngle(_yAxis, tree.yaw)
+      _scaleV.set(p.trunkR * 1.25 * s, 0.35 * s, p.trunkR * 1.25 * s)
+      stumps.setMatrixAt(i, _matrix.compose(_pos, _leanQuat, _scaleV))
+    } else stumps.setMatrixAt(i, ZERO)
+    stumps.setColorAt(i, _canopyColor.setRGB(p.bark[0], p.bark[1], p.bark[2]))
   }
   trunks.instanceMatrix.needsUpdate = true
-  canopies.instanceMatrix.needsUpdate = true
+  cones.instanceMatrix.needsUpdate = true
+  blobs.instanceMatrix.needsUpdate = true
   branches.instanceMatrix.needsUpdate = true
   stumps.instanceMatrix.needsUpdate = true
   if (trunks.instanceColor) trunks.instanceColor.needsUpdate = true
-  if (canopies.instanceColor) canopies.instanceColor.needsUpdate = true
+  if (cones.instanceColor) cones.instanceColor.needsUpdate = true
+  if (blobs.instanceColor) blobs.instanceColor.needsUpdate = true
   if (branches.instanceColor) branches.instanceColor.needsUpdate = true
   if (stumps.instanceColor) stumps.instanceColor.needsUpdate = true
 }
 
-/** Same grove layout nature.tsx rendered (seed 23, 46 trees, ring 12–60 m). */
+/** Same grove layout as ever (seed 23, 46 trees, ring 12–60 m) — species
+ * and color now come from the position-hash generator at each spot. */
 function treePlacements(world: GameWorld): TreePlacement[] {
   const placements: TreePlacement[] = []
   scatter(world, 23, 46, 12, 60, (rand, position) => {
     const yaw = rand() * Math.PI * 2
     const scale = 0.8 + rand() * 0.9
-    const color = new Color('#3f6d33').offsetHSL(0, 0, (rand() - 0.5) * 0.08)
-    placements.push({ x: position.x, z: position.z, scale, yaw, color: [color.r, color.g, color.b] })
-    return color
+    const params = treeParamsAt(position.x, position.z)
+    placements.push({ x: position.x, z: position.z, scale, yaw, color: params.color, params })
+    return _canopyColor.setRGB(params.color[0], params.color[1], params.color[2]).clone()
   })
   return placements
 }
@@ -627,22 +699,27 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
     ])
   }, [world])
 
+  // UNIT geometries — every dimension lives in the instance matrices, so
+  // one geometry per PART serves all species (5 draw calls total).
   const trunkGeometry = useMemo(
-    () => new CylinderGeometry(TRUNK_R_TOP, TRUNK_R_BOT, TRUNK_H).translate(0, TRUNK_H / 2, 0),
+    () => new CylinderGeometry(0.72, 1, 1, 7).translate(0, 0.5, 0),
     [],
   )
-  const canopyGeometry = useMemo(() => new ConeGeometry(1.5, 3.4, 8).translate(0, 3.6, 0), [])
-  // A bare branch: thin charcoal stick leaning out from the trunk top.
+  const coneGeometry = useMemo(() => new ConeGeometry(1, 1, 8).translate(0, 0.5, 0), [])
+  const blobGeometry = useMemo(() => new IcosahedronGeometry(1, 1), [])
+  // A branch: thin stick leaning out from its local origin (charcoal snaps
+  // at unit scale; the broadleaf bark stub reuses it fattened + shortened).
   const branchGeometry = useMemo(() => {
     const g = new BoxGeometry(0.055, 1.15, 0.055)
     g.translate(0, 0.5, 0)
     g.rotateZ(0.55)
     return g
   }, [])
-  const stumpGeometry = useMemo(() => new CylinderGeometry(0.18, 0.22, 0.35).translate(0, 0.175, 0), [])
+  const stumpGeometry = useMemo(() => new CylinderGeometry(0.9, 1.1, 1, 7).translate(0, 0.5, 0), [])
 
   const trunksRef = useRef<InstancedMesh>(null)
-  const canopiesRef = useRef<InstancedMesh>(null)
+  const conesRef = useRef<InstancedMesh>(null)
+  const blobsRef = useRef<InstancedMesh>(null)
   const branchesRef = useRef<InstancedMesh>(null)
   const stumpsRef = useRef<InstancedMesh>(null)
   const seenRevision = useRef(-1)
@@ -691,7 +768,7 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
       // The crown SHEDS: outward-down leaf shower with ember chunks, one
       // brief kind-guarded dust puff, and soft ember pops under the snap.
       burstCanopyChar(tree)
-      _dustPos.set(tree.x, tree.y + CANOPY_CY * tree.scale, tree.z)
+      _dustPos.set(tree.x, tree.y + tree.params.crownCY * tree.scale, tree.z)
       spawnDust(_dustPos, 0.55, PUFF)
       sfx.charSnap()
       sfx.emberCrackle()
@@ -719,39 +796,59 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
     // Structural sync only when something changed.
     if (seenRevision.current !== revision) {
       seenRevision.current = revision
-      syncInstances(trees, trunksRef.current, canopiesRef.current, branchesRef.current, stumpsRef.current)
+      syncInstances(trees, {
+        trunks: trunksRef.current,
+        cones: conesRef.current,
+        blobs: blobsRef.current,
+        branches: branchesRef.current,
+        stumps: stumpsRef.current,
+      })
     }
 
     if (burningCount === 0) return
 
     // Burning crowns: color chars green → ember → charcoal, and every
-    // ~0.35s each fire sheds one smoke puff + the odd ember chunk.
-    const canopies = canopiesRef.current
+    // ~0.35s each fire sheds one smoke puff + the odd ember chunk. The
+    // flicker paints whichever part set the species' crown wears — cone
+    // tier slots for conifers, blob slots for broadleaf/birch.
+    const cones = conesRef.current
+    const blobs = blobsRef.current
     smokeClock.current += dt
     const smoke = smokeClock.current >= 0.35
     if (smoke) smokeClock.current = 0
+    let conesDirty = false
+    let blobsDirty = false
     for (const tree of trees) {
       if (tree.state !== 'burning') continue
+      const p = tree.params
       const t = tree.burnT / BURN_SECONDS
       _flickerColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
       if (t < 0.35) _flickerColor.lerp(EMBER, t / 0.35)
       else _flickerColor.copy(EMBER).lerp(CHARCOAL, (t - 0.35) / 0.65)
       // Fire flicker on top of the char ramp.
       _flickerColor.lerp(EMBER, Math.random() * 0.25)
-      canopies?.setColorAt(tree.id, _flickerColor)
+      if (p.tiers.length > 0) {
+        for (let k = 0; k < p.tiers.length; k++) cones?.setColorAt(tree.id * MAX_TIERS + k, _flickerColor)
+        conesDirty = true
+      }
+      if (p.blobs.length > 0) {
+        for (let k = 0; k < p.blobs.length; k++) blobs?.setColorAt(tree.id * MAX_BLOBS + k, _flickerColor)
+        blobsDirty = true
+      }
       if (smoke) {
         _dustPos.set(
           tree.x + (Math.random() - 0.5) * tree.scale,
-          tree.y + (CANOPY_CY + 1) * tree.scale,
+          tree.y + (p.crownCY + 1) * tree.scale,
           tree.z + (Math.random() - 0.5) * tree.scale,
         )
         spawnDust(_dustPos, 0.35 + t * 0.3, PUFF)
         if (Math.random() < 0.4) {
-          spawnDebris(tree.x, tree.y + (CANOPY_CY + 0.5) * tree.scale, tree.z, 0.05, EMBER, 1.2, 1.1)
+          spawnDebris(tree.x, tree.y + (p.crownCY + 0.5) * tree.scale, tree.z, 0.05, EMBER, 1.2, 1.1)
         }
       }
     }
-    if (canopies?.instanceColor) canopies.instanceColor.needsUpdate = true
+    if (conesDirty && cones?.instanceColor) cones.instanceColor.needsUpdate = true
+    if (blobsDirty && blobs?.instanceColor) blobs.instanceColor.needsUpdate = true
   })
 
   return (
@@ -764,14 +861,21 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
         <meshStandardMaterial roughness={0.95} />
       </instancedMesh>
       <instancedMesh
-        args={[canopyGeometry, undefined, trees.length]}
+        args={[coneGeometry, undefined, trees.length * MAX_TIERS]}
         frustumCulled={false}
-        ref={canopiesRef}
+        ref={conesRef}
       >
         <meshStandardMaterial roughness={0.95} />
       </instancedMesh>
       <instancedMesh
-        args={[branchGeometry, undefined, trees.length * CHAR_HITS]}
+        args={[blobGeometry, undefined, trees.length * MAX_BLOBS]}
+        frustumCulled={false}
+        ref={blobsRef}
+      >
+        <meshStandardMaterial roughness={0.95} />
+      </instancedMesh>
+      <instancedMesh
+        args={[branchGeometry, undefined, trees.length * BRANCH_SLOTS]}
         frustumCulled={false}
         ref={branchesRef}
       >

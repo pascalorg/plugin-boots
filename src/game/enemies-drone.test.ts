@@ -10,6 +10,7 @@ import { meleeBlocked } from './enemies'
 import {
   type Bot,
   type BotKind,
+  botVisualParams,
   DRONE_CAPSULE,
   droneDescentBlocked,
   dronePathBlocked,
@@ -116,6 +117,7 @@ function makeBot(kind: BotKind, x: number, y: number, z: number): Bot {
     doorZ: 0,
     doorFumbleT: 0,
     doorT: 0,
+    visual: botVisualParams(1, kind, 0),
   }
 }
 

@@ -82,6 +82,79 @@ export type Bot = {
   doorFumbleT: number
   /** Ground bots: seconds on the current door mission (TTL abort). */
   doorT: number
+  /** Render-only per-unit variation (botVisualParams, stamped at spawn) —
+   * pathing/collision/waves logic never reads it. */
+  visual: BotVisual
+}
+
+// --- PER-UNIT VISUAL VARIATION (render-only) ---------------------------------
+// Every unit rolls a deterministic look off its id (mulberry32) so the horde
+// stops reading as clones: droids vary in size and stride, dogs in gait and
+// body length, drones in rotor layout and body shape. The accent color
+// (visor slit / shoulder stripe / eye ring) is PER WAVE — a whole wave shares
+// one palette entry, so "the green wave" reads at a glance. enemies.tsx is
+// the only consumer; nothing here feeds steering, damage or collision.
+
+/** Per-wave accent palette (visor slits, shoulder stripes) — 4 entries. */
+export const ACCENT_PALETTE = ['#ff5c47', '#3edb84', '#4aa8ff', '#ffc23d'] as const
+
+export type BotVisual = {
+  /** Whole-body scale (droid size jitter 0.9–1.15×; dogs/drones stay 1). */
+  scale: number
+  /** Droid walk cycle: arm/leg swing amplitude (rad), per unit. */
+  swingAmp: number
+  /** Dog gait: per-leg phase offsets (rad, [0, 2π)) — FL, FR, BL, BR. */
+  gait: [number, number, number, number]
+  /** Dog silhouette: body length factor — short (1) or long (1.3). */
+  bodyLen: number
+  /** Drone rotor discs: 2 (bar frame) or 4 (cross frame). */
+  rotors: 2 | 4
+  /** Drone body variant: round (sphere) vs boxy (box). */
+  round: boolean
+  /** ACCENT_PALETTE index for the unit's wave. */
+  accent: number
+}
+
+/** Tiny deterministic PRNG (same recipe as dust/nature) — a unit looks the
+ * same every session and every remount. */
+function mulberry32(seed: number): () => number {
+  let t = seed >>> 0
+  return () => {
+    t = (t + 0x6d2b79f5) | 0
+    let r = Math.imul(t ^ (t >>> 15), 1 | t)
+    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/**
+ * Roll a unit's look: pure over (id, kind, wave) — same inputs, same params,
+ * pinned by enemies-visual.test.ts. Every field is drawn for every kind (a
+ * fixed draw order keeps the stream stable); the renderer just ignores the
+ * ones its kind doesn't use. Called once per spawn — never in a hot loop.
+ */
+export function botVisualParams(id: number, kind: BotKind, wave: number): BotVisual {
+  const rand = mulberry32(Math.imul(id, 0x9e3779b1) ^ 0x85ebca6b)
+  const scale = 0.9 + rand() * 0.25
+  const swingAmp = 0.5 + rand() * 0.45
+  const gait: [number, number, number, number] = [
+    rand() * Math.PI * 2,
+    rand() * Math.PI * 2,
+    rand() * Math.PI * 2,
+    rand() * Math.PI * 2,
+  ]
+  const bodyLen = rand() < 0.5 ? 1 : 1.3
+  const rotors = rand() < 0.5 ? 2 : 4
+  const round = rand() < 0.5
+  return {
+    scale: kind === 'droid' ? scale : 1,
+    swingAmp,
+    gait,
+    bodyLen,
+    rotors,
+    round,
+    accent: ((wave % ACCENT_PALETTE.length) + ACCENT_PALETTE.length) % ACCENT_PALETTE.length,
+  }
 }
 
 /** Ground-bot (droid/dog) capsule for wall push-out — see BOT WALL RULE in
@@ -213,8 +286,9 @@ export function resetBots(): void {
 
 export function spawnBot(kind: BotKind, x: number, z: number): void {
   const y = kind === 'drone' ? 2.4 + Math.random() * 1.2 : 0
+  const id = botId++
   bots.push({
-    id: botId++,
+    id,
     kind,
     position: new Vector3(x, y, z),
     yaw: 0,
@@ -239,6 +313,7 @@ export function spawnBot(kind: BotKind, x: number, z: number): void {
     doorZ: 0,
     doorFumbleT: 0,
     doorT: 0,
+    visual: botVisualParams(id, kind, waveState.wave),
   })
 }
 

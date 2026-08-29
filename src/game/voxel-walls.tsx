@@ -4,6 +4,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
   BoxGeometry,
+  BufferAttribute,
   Color,
   DynamicDrawUsage,
   type Group,
@@ -17,6 +18,7 @@ import {
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
 import {
+  CEILING_FACE_TINT,
   FLOOR_CORE_HEX,
   primedCellColor,
   setSkinToneRenderer,
@@ -244,6 +246,29 @@ export function floorUnderlayLayout(wall: {
 // for the module (the dust-texture idiom).
 const VOXEL_GEOMETRY = new BoxGeometry()
 const SKIN_MATERIAL = new MeshStandardMaterial({ roughness: 0.92 })
+/** Ceiling-plate skin: the SAME unit box, with the attic-side mute baked
+ * into VERTEX colors (three multiplies vertexColor × instanceColor). Live
+ * host ceilings voxelize as ONE cell layer, so the cell tone can't carry
+ * the split: the bottom face (the room ceiling, seen from below) keeps
+ * vertex color 1 — bit-exact interior read — while the TOP and the four
+ * rim faces wear CEILING_FACE_TINT, the structural mute that kills the
+ * light sawtooth the eave slit used to frame (round-5 QA; skin-tone.ts).
+ * Module-lifetime constants like every other layer resource — one extra
+ * material variant total, zero per-frame work. */
+export const CEILING_GEOMETRY = (() => {
+  const geometry = new BoxGeometry()
+  const normal = geometry.getAttribute('normal')
+  const colors = new Float32Array(normal.count * 3)
+  for (let v = 0; v < normal.count; v++) {
+    const down = normal.getY(v) < -0.5
+    colors[v * 3] = down ? 1 : CEILING_FACE_TINT[0]
+    colors[v * 3 + 1] = down ? 1 : CEILING_FACE_TINT[1]
+    colors[v * 3 + 2] = down ? 1 : CEILING_FACE_TINT[2]
+  }
+  geometry.setAttribute('color', new BufferAttribute(colors, 3))
+  return geometry
+})()
+const CEILING_SKIN_MATERIAL = new MeshStandardMaterial({ roughness: 0.92, vertexColors: true })
 const BOARD_MATERIAL = new MeshStandardMaterial({ roughness: 0.95 })
 const WOOD_MATERIAL = new MeshStandardMaterial({ roughness: 0.85 })
 /** Dirt underlay resources — one unit plane scaled per slab, one matte
@@ -550,7 +575,17 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
 
   return (
     <group ref={groupRef} userData={{ __boots: true }} visible={!wall.dormant}>
-      <instancedMesh args={[VOXEL_GEOMETRY, SKIN_MATERIAL, wall.grid.count]} ref={meshRef} />
+      <instancedMesh
+        args={
+          // Ceiling plates swap in the face-tinted box + vertex-color
+          // material (see CEILING_GEOMETRY); ceilingTop is fixed for a
+          // target's lifetime, so the args never change post-mount.
+          wall.ceilingTop === true
+            ? [CEILING_GEOMETRY, CEILING_SKIN_MATERIAL, wall.grid.count]
+            : [VOXEL_GEOMETRY, SKIN_MATERIAL, wall.grid.count]
+        }
+        ref={meshRef}
+      />
       {underlay && (
         <mesh
           args={[UNDERLAY_GEOMETRY, UNDERLAY_MATERIAL]}
