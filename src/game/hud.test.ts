@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { builderKeybarText, Hud, KEYBAR_DEFAULT } from './hud'
+import { builderKeybarText, Hud, KEYBAR_DEFAULT, presenceChipText } from './hud'
 
 /**
  * Keybind-bar discoverability contract (owner QA 2026-08-27: "no ramp, no
@@ -101,5 +101,29 @@ describe('entry loading veil (headless contract)', () => {
     hud.unmount()
     expect(revealed).toBe(0)
     expect(hud.onReveal).toBeNull()
+  })
+})
+
+/**
+ * Co-presence chrome (headless contract): the chip copy + pluralization
+ * are pure (presenceChipText); the chip/toast methods must be safe with no
+ * DOM (remote-players drives them feature-detected from the frame loop —
+ * a torn-down HUD getting one more call is a no-op, never a crash).
+ */
+describe('co-presence chip + toasts', () => {
+  test('presenceChipText: hidden at 0, singular at 1, plural above', () => {
+    expect(presenceChipText(0)).toBeNull()
+    expect(presenceChipText(-2)).toBeNull()
+    expect(presenceChipText(1)).toBe('1 builder here')
+    expect(presenceChipText(3)).toBe('3 builders here')
+  })
+
+  test('presenceChip and presenceToast are safe no-ops without a DOM', () => {
+    const hud = new Hud()
+    expect(() => hud.presenceChip(2)).not.toThrow()
+    expect(() => hud.presenceChip(2)).not.toThrow() // change-gated repeat
+    expect(() => hud.presenceChip(0)).not.toThrow()
+    expect(() => hud.presenceToast('Alice joined')).not.toThrow()
+    expect(() => hud.unmount()).not.toThrow()
   })
 })

@@ -31,8 +31,17 @@ import { GameItems } from './item-place'
 import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
+import { MOVE } from './movement'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
 import { Player, playerDebug, playerRig } from './player'
+import {
+  type LocalPose,
+  onPresenceEvent,
+  presenceDebug,
+  startPresence,
+  stopPresence,
+} from './presence'
+import { RemotePlayers } from './remote-players'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { ShellLayer, shellCensus } from './shell-layer'
 import { aimDirection, fire } from './shooting'
@@ -374,6 +383,41 @@ const _idRay = new Raycaster()
 const _idOrigin = new Vector3()
 const _idDir = new Vector3()
 
+/**
+ * Co-presence local pose sampler — what the 12 Hz publisher reads. One
+ * reused object (the adapter quantizes it into its own wire scratch), all
+ * plain reads: playerRig (eye position, yaw/pitch, speed, grounded) + the
+ * boots store (phase, weapon, staggered). Speed normalizes against the
+ * run speed so peers animate gait without knowing our tuning.
+ */
+const _localPose: LocalPose = {
+  ph: 'editor',
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  pitch: 0,
+  w: 'knife',
+  s: 0,
+  g: true,
+  st: false,
+}
+
+function sampleLocalPose(): LocalPose {
+  const s = useBoots.getState()
+  _localPose.ph = s.phase === 'game' ? 'game' : 'editor'
+  _localPose.x = playerRig.position.x
+  _localPose.y = playerRig.position.y
+  _localPose.z = playerRig.position.z
+  _localPose.yaw = playerRig.yaw
+  _localPose.pitch = playerRig.pitch
+  _localPose.w = s.weapon
+  _localPose.s = Math.min(1, playerRig.speed / MOVE.runSpeed)
+  _localPose.g = playerRig.grounded
+  _localPose.st = s.staggered
+  return _localPose
+}
+
 /** One entry of the identifyAim() hit chain — plain data, never live refs. */
 type IdentifiedHit = {
   name: string
@@ -499,6 +543,30 @@ function ActiveGame() {
     const fresh = collectWorld()
     if (fresh.walls.size > 0) setWorld(fresh)
   }, [world])
+
+  // Co-presence adapter lifecycle — keyed on the session serial (ActiveGame
+  // itself remounts fresh per session via GameBoundary's key, and startPresence
+  // is idempotent, so a dev-time Fast Refresh remount mid-session only swaps
+  // the pose sampler — never despawns the registry or re-announces us).
+  // exitGame owns the REAL stop (final ph:'editor' goodbye before teardown);
+  // the cleanup below only covers the crash path where ActiveGame unmounts
+  // with the session already over. Join/leave events feed muted HUD toasts.
+  useEffect(() => {
+    const serial = getSessionSerial()
+    startPresence(sampleLocalPose) // feature-detected: no bus → no-op
+    const offEvents = onPresenceEvent((event) => {
+      const hud = getSession()?.hud as unknown as
+        | { presenceToast?: (text: string) => void }
+        | undefined
+      hud?.presenceToast?.(`${event.name} ${event.type === 'join' ? 'joined' : 'left'}`)
+    })
+    return () => {
+      offEvents()
+      // Same-session remounts keep the adapter alive; a stale unmount
+      // (session ended or a new one started) must not stop the new one.
+      if (useBoots.getState().phase !== 'game' && getSessionSerial() === serial) stopPresence()
+    }
+  }, [])
 
   useEffect(() => {
     // Bones engineering overlays (X-ray framing/CMU, lumber, service runs,
@@ -665,6 +733,10 @@ function ActiveGame() {
       // counters, so QA can assert the blast-frame drain bound directly.
       dormantPrimeQueueSize,
       settleTasksPending: (prefix?: string) => settleTasksPending(prefix),
+      // Co-presence QA dump (presence.ts): live remotes as plain copies
+      // ({sessionId, name, p, w, ageMs}) + the {published, received}
+      // counters. Empty remotes + zero counters on a bus-less host.
+      presence: () => presenceDebug(),
     }
     return () => {
       delete (globalThis as Record<string, unknown>).__boots
@@ -681,6 +753,7 @@ function ActiveGame() {
   return (
     <>
       <Player world={world} />
+      <RemotePlayers />
       <Viewmodel world={world} />
       <PaintTool world={world} />
       <Prevoxelize world={world} />

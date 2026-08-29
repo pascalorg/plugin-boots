@@ -217,6 +217,12 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
 
 ## In flight
 
+- CO-PRESENCE v1 (2026-08-29, feat/copresence): other builders in the
+  project appear as live avatars in-session — pose frames only over the
+  host collab bus (feature-detected; solo untouched), snapshot-interp
+  rendering, weapon silhouettes, name tags, HUD chip/toasts, sentinel
+  remote-op-lease discriminator. See docs/MULTIPLAYER.md; host bus ships
+  separately, two-browser e2e on :3001 post-merge. 979 tests green.
 - Phase 4 round 2 (fleet): QA-driven refinements — builder/keep/hud/
   game-root/trees under active edit. Manager integrates, tests, deploys
   :3002, pushes per round.
