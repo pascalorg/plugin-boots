@@ -14,6 +14,7 @@ import {
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { armWaves, waveState } from './enemies-state'
+import { clearScatterInRadius } from './nature'
 import { playerRig } from './player'
 import { getSession } from './session'
 import * as weaponModels from './weapon-models'
@@ -237,6 +238,25 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   const solid = (i: number) => (mesh: Mesh | null) => {
     solidRefs.current[i] = mesh
   }
+
+  // Grass must not grow through the deck: zero-scale the nature scatter
+  // under the footprint (three circles tile the 6 × 2.5 box). Nature
+  // mounts in parallel with the depot, so sweep twice — frame 10 catches
+  // the common case, frame 120 any straggler fields. Idempotent and
+  // O(instances) per sweep (the crater budget), then the frame check is a
+  // single compare forever.
+  const sweepFrame = useRef(0)
+  useFrame(() => {
+    const frame = sweepFrame.current
+    if (frame > 120) return
+    sweepFrame.current = frame + 1
+    if (frame !== 10 && frame !== 120) return
+    const fwdX = -Math.sin(world.spawnYaw)
+    const fwdZ = -Math.cos(world.spawnYaw)
+    for (const lat of [-2, 0, 2]) {
+      clearScatterInRadius(center.x - fwdZ * lat, center.z + fwdX * lat, 1.75)
+    }
+  })
 
   return (
     <group
