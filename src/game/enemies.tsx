@@ -49,7 +49,7 @@ import {
 import { perfEvent } from './perf-monitor'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
-import type { GameWorld } from './world'
+import { type GameWorld, spawnGroundY } from './world'
 
 /**
  * Wave-based horde: humanoid droids, robot dogs, FPV drones — they beeline
@@ -161,11 +161,11 @@ function spawnWave(world: GameWorld): void {
   for (let i = 0; i < count; i++) {
     const angle = Math.random() * Math.PI * 2
     const radius = 22 + Math.random() * 12
-    spawnBot(
-      KIND_CYCLE[i % KIND_CYCLE.length]!,
-      center.x + Math.cos(angle) * radius,
-      center.z + Math.sin(angle) * radius,
-    )
+    const x = center.x + Math.cos(angle) * radius
+    const z = center.z + Math.sin(angle) * radius
+    // Ring points on site-terrain hills spawn ON the hill, not inside it —
+    // spawnGroundY probes the (now solid) terrain and clamps ≥ 0.
+    spawnBot(KIND_CYCLE[i % KIND_CYCLE.length]!, x, z, spawnGroundY(world.colliders, x, z))
   }
 }
 

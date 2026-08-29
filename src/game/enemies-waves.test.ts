@@ -144,6 +144,22 @@ describe('wave director — switch-armed grace/alert', () => {
     expect(due).toBe(0)
   })
 
+  test('spawnBot takes the probed terrain height — hills never bury a bot', () => {
+    // Ground kinds stand ON the given ground; drones hover above it. The
+    // settle probe only ever looks DOWNWARD, so a wrong 0 here was
+    // unrecoverable on +y site-terrain hills.
+    spawnBot('droid', 5, 5, 1.6)
+    spawnBot('drone', 7, 5, 1.6)
+    const droid = bots.find((b) => b.kind === 'droid')!
+    const drone = bots.find((b) => b.kind === 'drone')!
+    expect(droid.position.y).toBe(1.6)
+    expect(droid.groundY).toBe(1.6)
+    expect(drone.position.y).toBeGreaterThan(1.6 + 2.0)
+    // The default keeps the legacy flat-lot behavior.
+    spawnBot('dog', 9, 5)
+    expect(bots.find((b) => b.kind === 'dog')!.position.y).toBe(0)
+  })
+
   test('disarm from grace is a safe no-op (idempotent)', () => {
     disarmWaves()
     disarmWaves()

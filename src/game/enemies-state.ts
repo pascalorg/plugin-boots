@@ -313,8 +313,11 @@ export function resetBots(): void {
   debugFlags.botsFrozen = false
 }
 
-export function spawnBot(kind: BotKind, x: number, z: number): void {
-  const y = kind === 'drone' ? 2.4 + Math.random() * 1.2 : 0
+export function spawnBot(kind: BotKind, x: number, z: number, groundY = 0): void {
+  // groundY: the probed terrain height at (x,z) — site hills lift the ring
+  // point (settleGroundBot only ever probes DOWNWARD, so a bot born at 0
+  // under a +1.6 m hill stayed buried until the first probe never freed it).
+  const y = kind === 'drone' ? groundY + 2.4 + Math.random() * 1.2 : groundY
   const id = botId++
   bots.push({
     id,
@@ -331,7 +334,7 @@ export function spawnBot(kind: BotKind, x: number, z: number): void {
     followT: 0,
     followSign: 1,
     climb: 0,
-    groundY: 0,
+    groundY,
     // Stagger the probe cadence so a whole wave never re-probes on the
     // same frame (settleGroundBot probes as soon as this hits 0).
     groundT: Math.random() * GROUND_PROBE_PERIOD,
