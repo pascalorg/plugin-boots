@@ -278,29 +278,101 @@ export function guardSelectionForGame(teardown: Array<() => void>): void {
  * This sentinel watches the store for the whole session and screams if any
  * code path violates that — a canary, not a fixer.
  *
- * CO-PRESENCE DISCRIMINATOR: with collaboration live, a PEER's edit can
- * land in our scene store mid-session — the host applies remote ops under
- * its remote-op lease, during which `useScene.getState().readOnly === true`.
- * That write is NOT ours and NOT a violation: our game code still never
- * wrote the store, and the session's world snapshot (collectWorld ran at
- * entry) stays frozen — the peer's change appears after Esc, exactly like
- * every host-side restore. Those writes log a calm console.info instead of
- * the INVARIANT VIOLATION scream, so QA keeps a clean signal: any ERROR
- * from this sentinel is still, always, a local bug. Exported for tests.
+ * TWO tolerated writer classes, both HOST-side; the game still never writes:
+ *
+ * CO-PRESENCE: with collaboration live, a PEER's edit can land in our scene
+ * store mid-session — the host applies remote ops under its remote-op lease,
+ * during which `useScene.getState().readOnly === true`. That write is NOT
+ * ours and NOT a violation: our game code still never wrote the store, and
+ * the session's world snapshot (collectWorld ran at entry) stays frozen —
+ * the peer's change appears after Esc, exactly like every host-side restore.
+ *
+ * HOST SCENE REHYDRATION: the host can replace the WHOLE graph mid-session
+ * with no lease at all. Captured live on the 670-node warner-2 perf testbed
+ * (2026-08-29, /tmp/boots-bigscene/console.log): a dev-host Fast Refresh
+ * lands mid-game, the Editor's load effect re-runs (its `onLoad` identity
+ * changed under HMR), and it calls `unloadScene()` then
+ * `applySceneGraphToEditor` → `setScene(...)` — two full-store swaps per
+ * refresh, which the old sentinel screamed at twice each (the reported
+ * "4 violations" = 2 refreshes × 2). The scene-loader's remote SSE scene
+ * events (MCP live-sync from another session) apply through the same
+ * `setScene` path. All of these REHYDRATE the same document; nothing
+ * in-game wrote anything, and the world snapshot stays frozen.
+ *
+ * The rehydration signature is exact, and only the host lifecycle APIs
+ * produce it: `unloadScene`/`setScene` swap in a FRESH `dirtyNodes` Set in
+ * the very write that replaces `nodes`, and the incoming graph (parsed from
+ * server JSON) shares no node object identity with the store it replaces.
+ * Every incremental writer — the four Save bridges and any rogue in-game
+ * code path (`createNode`/`updateNodes`/`deleteNodes`) — spreads the
+ * previous map (untouched nodes keep their identity) and never touches
+ * `dirtyNodes` inside its `set()`, so it can never match. (The host's
+ * `setInstalledPlugins` also swaps `dirtyNodes` — with a copy — but leaves
+ * `nodes` alone, so the identity checks exclude it.) Tolerated writes log a
+ * calm console.info and roll the sentinel's baseline forward; any ERROR
+ * from this sentinel is still, always, a local bug.
+ * Exported for tests (armSceneWriteSentinel + the pure classifySceneWrite).
  */
+export type SceneWriteClass = 'remote-collab-op' | 'host-rehydration' | 'violation'
+
+/** Structural view of the scene store, defensive against older hosts. */
+type SentinelSceneState = {
+  nodes: Record<string, unknown>
+  dirtyNodes?: unknown
+  readOnly?: boolean
+}
+
+/** Pure discriminator for one store transition observed during play. */
+export function classifySceneWrite(
+  prev: SentinelSceneState,
+  next: SentinelSceneState,
+): SceneWriteClass {
+  // The host's remote-op lease: a peer's collaboration edit.
+  if (next.readOnly === true) return 'remote-collab-op'
+  // Host rehydration: nodes swapped wholesale AND dirtyNodes replaced by a
+  // fresh Set in the same write (only unloadScene/setScene do that) AND no
+  // node object survived by identity (incremental writers always share the
+  // untouched ones). Deliberately NO `size === 0` check on the fresh set:
+  // zustand notifies listeners in registration order, and host systems
+  // subscribed before this sentinel (the fence-lift tracker, live on the
+  // warner-2 repro) call `markDirty` — an in-place `.add()` on the very
+  // Set this write installed — before the sentinel's listener runs.
+  const dirty = next.dirtyNodes
+  const swappedDirty = dirty instanceof Set && dirty !== prev.dirtyNodes
+  if (swappedDirty && next.nodes !== prev.nodes) {
+    for (const id of Object.keys(next.nodes)) {
+      if (prev.nodes[id] === next.nodes[id]) return 'violation'
+    }
+    return 'host-rehydration'
+  }
+  return 'violation'
+}
+
 export function armSceneWriteSentinel(teardown: Array<() => void>): void {
-  const nodesAtEnter = useScene.getState().nodes
-  const unsub = useScene.subscribe((state) => {
-    if (state.nodes !== nodesAtEnter && useBoots.getState().phase === 'game') {
-      if ((state as { readOnly?: boolean }).readOnly === true) {
-        console.info(
-          '[boots] remote collaboration op during play (world snapshot stays frozen)',
-        )
-      } else {
-        console.error(
-          '[boots] INVARIANT VIOLATION: the scene store changed during play — nothing in-game may write it. Investigate immediately.',
-        )
-      }
+  // The baseline rolls FORWARD on every tolerated host write, so one
+  // rehydration doesn't turn every later benign store write (a readOnly
+  // flip, an installedPlugins sync) into a scream. A violation deliberately
+  // does NOT roll it: while the invariant is broken, every subsequent store
+  // write keeps screaming — same repeated-visibility behavior as before.
+  let baseline = useScene.getState().nodes
+  const unsub = useScene.subscribe((state, prevState) => {
+    if (state.nodes === baseline || useBoots.getState().phase !== 'game') return
+    const verdict = classifySceneWrite(
+      prevState as unknown as SentinelSceneState,
+      state as unknown as SentinelSceneState,
+    )
+    if (verdict === 'remote-collab-op') {
+      baseline = state.nodes
+      console.info('[boots] remote collaboration op during play (world snapshot stays frozen)')
+    } else if (verdict === 'host-rehydration') {
+      baseline = state.nodes
+      console.info(
+        '[boots] host scene rehydration during play (dev hot-reload or remote scene sync — world snapshot stays frozen)',
+      )
+    } else {
+      console.error(
+        '[boots] INVARIANT VIOLATION: the scene store changed during play — nothing in-game may write it. Investigate immediately.',
+      )
     }
   })
   teardown.push(unsub)
