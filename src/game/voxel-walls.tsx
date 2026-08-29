@@ -10,12 +10,18 @@ import {
   type InstancedMesh,
   Matrix4,
   MeshStandardMaterial,
+  PlaneGeometry,
   Quaternion,
   Vector3,
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
-import { primedCellColor, setSkinToneRenderer, type SkinToneRenderer } from './skin-tone'
+import {
+  FLOOR_CORE_HEX,
+  primedCellColor,
+  setSkinToneRenderer,
+  type SkinToneRenderer,
+} from './skin-tone'
 
 /**
  * Renders every voxelized target as the phase-3 WALL SANDWICH, one
@@ -181,6 +187,55 @@ const BOARD_DAMAGED = new Color('#d8d1c2')
 const WOOD_BASE = new Color('#b08d57')
 const WOOD_DAMAGED = new Color('#8f6f45')
 
+// ── Dirt underlay (owner wave 5: "dirt when broken, not white/grass") ───────
+// A hole carved THROUGH a ground-floor slab used to reveal the host's ground
+// pad (near-white) or lawn — inside a house the reveal must read as EARTH.
+// Terrain-borne floor slabs (floorCore + base near grade) mount one flat
+// dirt-toned plane just under the sandwich: fully occluded while the floor
+// is intact, and whatever hole opens shows soil. Game-layer visual only
+// (unmounts with the session, never a scene write); plain BufferGeometry +
+// standard material (WebGPU-safe), one extra draw call per ground slab.
+
+/** A floor slab whose grid base sits at/below this height is terrain-borne
+ * — upper-storey floors never get an underlay (their holes must show the
+ * room below). Generous vs destruction's SLAB_GROUND_Y so raised ground
+ * slabs still read dirt. */
+export const UNDERLAY_MAX_BASE_Y = 0.35
+
+/** How far below the slab's grid base the underlay plane sits — under the
+ * bottom skin, above the host pad (which hugs the slab within ~0.15 m). */
+export const UNDERLAY_DROP = 0.004
+
+/** Pure: the dirt underlay's placement for a floor slab grid, or null when
+ * the target must not carry one (not a floor sandwich / not terrain-borne).
+ * Slab grids are world-aligned AABB grids (no yaw/basis), so the layout is
+ * a centered XZ rectangle over the grid's full footprint. */
+export function floorUnderlayLayout(wall: {
+  floorCore?: boolean
+  kind: VoxelTarget['kind']
+  grid: {
+    origin: { x: number; y: number; z: number }
+    nx: number
+    nz: number
+    cellX: number
+    cellZ: number
+  }
+}): { x: number; y: number; z: number; width: number; depth: number } | null {
+  if (wall.floorCore !== true || wall.kind !== 'slab') return null
+  const { origin, nx, nz, cellX, cellZ } = wall.grid
+  if (origin.y > UNDERLAY_MAX_BASE_Y) return null
+  const width = nx * cellX
+  const depth = nz * cellZ
+  if (width <= 0 || depth <= 0) return null
+  return {
+    x: origin.x + width / 2,
+    y: origin.y - UNDERLAY_DROP,
+    z: origin.z + depth / 2,
+    width,
+    depth,
+  }
+}
+
 // Shared render resources — every layer of every replica is configuration-
 // identical per layer type (all per-instance variation rides instanceMatrix
 // + instanceColor; paint gates ride mesh.userData), so one geometry and one
@@ -191,6 +246,15 @@ const VOXEL_GEOMETRY = new BoxGeometry()
 const SKIN_MATERIAL = new MeshStandardMaterial({ roughness: 0.92 })
 const BOARD_MATERIAL = new MeshStandardMaterial({ roughness: 0.95 })
 const WOOD_MATERIAL = new MeshStandardMaterial({ roughness: 0.85 })
+/** Dirt underlay resources — one unit plane scaled per slab, one matte
+ * earth material in the FLOOR_CORE family (the under-layer voxels above it
+ * jitter around the same tone, so hole walls and hole floor read as one
+ * material). */
+const UNDERLAY_GEOMETRY = new PlaneGeometry(1, 1)
+const UNDERLAY_MATERIAL = new MeshStandardMaterial({
+  color: new Color(FLOOR_CORE_HEX).offsetHSL(0, 0, -0.012),
+  roughness: 1,
+})
 
 function isGone(m: SandwichMember): boolean {
   return m.broken === true || m.torn === true
@@ -384,6 +448,9 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
   // layer — same member shape, same single-draw-call path.
   const segments =
     sandwich.segments && sandwich.segments.length > 0 ? sandwich.segments : wall.studs
+  // Dirt underlay for terrain-borne floor slabs (see header above): a hole
+  // carved through the floor reveals earth, not the host's white pad/lawn.
+  const underlay = useMemo(() => floorUnderlayLayout(wall), [wall])
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
@@ -484,6 +551,14 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
   return (
     <group ref={groupRef} userData={{ __boots: true }} visible={!wall.dormant}>
       <instancedMesh args={[VOXEL_GEOMETRY, SKIN_MATERIAL, wall.grid.count]} ref={meshRef} />
+      {underlay && (
+        <mesh
+          args={[UNDERLAY_GEOMETRY, UNDERLAY_MATERIAL]}
+          position={[underlay.x, underlay.y, underlay.z]}
+          rotation={[-Math.PI / 2, 0, 0]}
+          scale={[underlay.width, underlay.depth, 1]}
+        />
+      )}
       {boards && boards.length > 0 && (
         <MemberLayer
           base={BOARD_BASE}

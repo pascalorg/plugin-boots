@@ -25,7 +25,9 @@ import {
  * primedCellColor must stay bit-identical to what primeSkin writes:
  *
  *   - item targets (cellColors): the sampled per-voxel sub-mesh tone
- *   - slab sandwiches: bottom skin (grid Y = 0) lightens toward drywall
+ *   - slab sandwiches: bottom skin (grid Y = 0) lightens toward drywall;
+ *     FLOOR-family slabs (floorCore) paint every under-layer as dirt
+ *     subfloor instead (FLOOR_CORE_HEX)
  *   - roof planes: inner skin (grid Z ≠ 0) pales toward bare deck; outer
  *     skin stripes every ~3rd up-slope row darker (shingle courses) and
  *     jitters harder (per-shingle scatter)
@@ -44,6 +46,12 @@ import {
 export type SkinToneSource = {
   kind: 'wall' | 'slab' | 'volume' | 'roof'
   baseColor: Color
+  /** FLOOR-family slab (nodeType slab/floor, never ceiling): every layer
+   * under the walking surface — the bottom skin and the rim middles — reads
+   * as DIRT SUBFLOOR (FLOOR_CORE_HEX) instead of lightened drywall, so a
+   * carved floor shows earth, never white (owner wave 5). Needs grid.ny to
+   * tell the top layer apart. */
+  floorCore?: boolean
   /** Per-voxel RGB, 3 floats per index (item silhouette lane). */
   cellColors?: Float32Array
   /** The surface texture's CPU color grid (mapPatternGrid) — when present,
@@ -56,6 +64,7 @@ export type SkinToneSource = {
     cellY?: number
     cellZ?: number
     nx?: number
+    ny?: number
     nz?: number
   }
 }
@@ -63,6 +72,13 @@ export type SkinToneSource = {
 const _cellTone = new Color()
 const _derived = new Color()
 const _pattern = new Color()
+
+/** Dirt-subfloor core tone for FLOOR-family slabs: what a carved floor
+ * reveals (bottom skin + rim middles) — warm earth brown, kind-based by
+ * design (the host has no "subfloor" material to sample). Owner wave 5:
+ * "should be wood floor, or dirt when broken — not white". */
+export const FLOOR_CORE_HEX = '#6b4a2f'
+const FLOOR_CORE = new Color(FLOOR_CORE_HEX)
 
 /**
  * Write cell `i`'s primed skin color into `out` and return it. Mirrors
@@ -93,6 +109,15 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
     // Item palette (destruction.ts sampleItemCellColors): each voxel wears
     // its sub-mesh region tone; keep the gentle wall jitter below.
     base = _cellTone.setRGB(cellColors[i * 3]!, cellColors[i * 3 + 1]!, cellColors[i * 3 + 2]!)
+  } else if (
+    wall.kind === 'slab' &&
+    wall.floorCore === true &&
+    wall.grid.coords[i * 3 + 1]! < (wall.grid.ny ?? 1) - 1
+  ) {
+    // FLOOR slab under-layers (bottom skin + rim middles, everything below
+    // the top walking layer): dirt subfloor — carving the floor reveals
+    // earth, never drywall white. Kind-based constant (owner wave 5).
+    base = FLOOR_CORE
   } else if (wall.kind === 'slab' && wall.grid.coords[i * 3 + 1] === 0) {
     // Bottom skin — the ceiling face a player looks up at — renders as
     // slightly lighter, desaturated drywall.
@@ -360,8 +385,11 @@ export type SurfaceMaterialLike = {
 }
 
 /** The target kinds the tone chain distinguishes ('item' = the silhouette
- * lane's per-region palette — VoxelTarget.kind stays 'volume' there). */
-export type SkinToneKind = 'wall' | 'slab' | 'volume' | 'roof' | 'item'
+ * lane's per-region palette — VoxelTarget.kind stays 'volume' there;
+ * 'floor' = FLOOR-family slabs — nodeType slab/floor, never ceiling —
+ * whose fallback must read as a wood floor, not screed gray: the owner
+ * wave-5 "floor inside the house is white" complaint). */
+export type SkinToneKind = 'wall' | 'slab' | 'volume' | 'roof' | 'item' | 'floor'
 
 /** Kind palette — the LAST link of the chain. Deliberately un-white: a
  * surface that lost every better source should read as a plausible
@@ -369,7 +397,8 @@ export type SkinToneKind = 'wall' | 'slab' | 'volume' | 'roof' | 'item'
  * default. */
 const KIND_FALLBACK_HEX: Record<SkinToneKind, string> = {
   wall: '#d8d2c7', // drywall greige (the classic inner-skin tone)
-  slab: '#b8afa2', // warm screed gray
+  slab: '#b8afa2', // warm screed gray (ceiling-family slabs)
+  floor: '#a0784e', // mid oak — a floor that lost its finish still reads wood
   volume: '#c8c1b6', // warm neutral
   roof: '#5a524a', // dark weathered shingle
   item: '#d8d2c7', // porcelain-adjacent greige (matches the old item default)

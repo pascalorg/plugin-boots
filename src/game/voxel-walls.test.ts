@@ -6,9 +6,12 @@ import {
   type DormantPrimeEntry,
   dormantPrimeQueueSize,
   drainDormantPrimes,
+  floorUnderlayLayout,
   primeDormantNow,
   queueDormantPrime,
   syncDormantWallFrame,
+  UNDERLAY_DROP,
+  UNDERLAY_MAX_BASE_Y,
 } from './voxel-walls'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -206,5 +209,46 @@ describe('dormant target ↔ replica contract (real destruction store)', () => {
     expect(crate.disabled).toBe(true) // colliders handed over on wake
     // (the host MESH hide rides the session ledger — live-QA territory,
     // hideForGame is a no-op without an active session)
+  })
+})
+
+describe('dirt underlay layout (owner wave 5: broken floor shows earth)', () => {
+  const grid = (originY: number) => ({
+    origin: { x: -4, y: originY, z: 1 },
+    nx: 10,
+    nz: 20,
+    cellX: 0.3,
+    cellZ: 0.3,
+  })
+
+  test('a terrain-borne floor slab gets a full-footprint plane just under the sandwich', () => {
+    const layout = floorUnderlayLayout({ floorCore: true, kind: 'slab', grid: grid(-0.04) })!
+    expect(layout).not.toBeNull()
+    expect(layout.width).toBeCloseTo(3, 10)
+    expect(layout.depth).toBeCloseTo(6, 10)
+    expect(layout.x).toBeCloseTo(-4 + 1.5, 10)
+    expect(layout.z).toBeCloseTo(1 + 3, 10)
+    expect(layout.y).toBeCloseTo(-0.04 - UNDERLAY_DROP, 10)
+  })
+
+  test('upper-storey floors, ceilings and non-slabs never get one', () => {
+    // Upper storey: a hole must show the room below, never a dirt plane.
+    expect(
+      floorUnderlayLayout({ floorCore: true, kind: 'slab', grid: grid(UNDERLAY_MAX_BASE_Y + 0.01) }),
+    ).toBeNull()
+    // Ceiling-family slab (no floorCore) and non-slab kinds.
+    expect(floorUnderlayLayout({ kind: 'slab', grid: grid(0) })).toBeNull()
+    expect(floorUnderlayLayout({ floorCore: true, kind: 'volume', grid: grid(0) })).toBeNull()
+  })
+
+  test('a real ground slab target carries floorCore and yields a layout', () => {
+    const slab = boxCollider('slab-u', 'slab', [3, 0.2, 3], [0, 0.1, 5])
+    const world = makeWorld([slab])
+    const target = ensureVoxelTarget(world, 'slab-u')!
+    expect(target.kind).toBe('slab')
+    expect(target.floorCore).toBe(true)
+    const layout = floorUnderlayLayout(target)
+    expect(layout).not.toBeNull()
+    expect(layout!.y).toBeLessThan(0.01) // under the slab's grid base
   })
 })

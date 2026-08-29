@@ -5,6 +5,7 @@ import {
   cellPatternTone,
   cellToneAt,
   clearToneAudit,
+  FLOOR_CORE_HEX,
   isUntexturedWhite,
   kindFallbackTone,
   mapPatternGrid,
@@ -128,6 +129,46 @@ describe('primedCellColor (shared primeSkin tone math)', () => {
     }
   })
 
+  test('floor-family slab (floorCore): under-layers wear the dirt subfloor, top keeps the floor tone', () => {
+    // ny = 3: iy 0 (bottom skin) + iy 1 (rim middle) are UNDER-layers →
+    // dirt; iy 2 is the walking surface → the resolved floor tone,
+    // bit-identical to a plain slab top (owner wave 5: a carved floor
+    // reveals earth, never drywall white).
+    const wall: SkinToneSource = {
+      kind: 'slab',
+      floorCore: true,
+      baseColor: new Color('#a0784e'),
+      grid: { coords: coords([[0, 0, 0], [0, 1, 0], [0, 2, 0]]), ny: 3 },
+    }
+    const dirtReference = (i: number): Color => {
+      const j1 = ((i * 2654435761) % 97) / 97
+      const j2 = ((i * 1597334677) % 89) / 89
+      return new Color(FLOOR_CORE_HEX).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+    }
+    const out = new Color()
+    expectSame(primedCellColor(out, wall, 0), dirtReference(0))
+    expectSame(primedCellColor(out, wall, 1), dirtReference(1))
+    // Top layer: exactly the plain-slab top math (no ceiling lighten, no dirt).
+    expectSame(primedCellColor(out, wall, 2), reference({ ...wall, floorCore: false }, 2))
+    // The dirt really reads warm brown, not white.
+    const dirt = primedCellColor(new Color(), wall, 0)
+    expect(isUntexturedWhite(dirt)).toBe(false)
+    expect(dirt.r).toBeGreaterThan(dirt.g)
+    expect(dirt.g).toBeGreaterThan(dirt.b)
+  })
+
+  test('floorCore without grid.ny falls back to the legacy slab math (defensive)', () => {
+    const wall: SkinToneSource = {
+      kind: 'slab',
+      floorCore: true,
+      baseColor: new Color('#8f8577'),
+      grid: { coords: coords([[0, 0, 0], [0, 1, 0]]) },
+    }
+    const out = new Color()
+    expectSame(primedCellColor(out, wall, 0), reference(wall, 0))
+    expectSame(primedCellColor(out, wall, 1), reference(wall, 1))
+  })
+
   test('item cellColors win over every kind branch', () => {
     const wall: SkinToneSource = {
       kind: 'slab',
@@ -182,7 +223,7 @@ afterEach(() => {
 
 describe('resolveSurfaceTone (fallback chain)', () => {
   test('kind fallbacks are plausible materials, never untextured white', () => {
-    for (const kind of ['wall', 'slab', 'volume', 'roof', 'item'] as SkinToneKind[]) {
+    for (const kind of ['wall', 'slab', 'volume', 'roof', 'item', 'floor'] as SkinToneKind[]) {
       const tone = kindFallbackTone(kind)
       expect(isUntexturedWhite(tone)).toBe(false)
     }
@@ -190,6 +231,15 @@ describe('resolveSurfaceTone (fallback chain)', () => {
     expect(isUntexturedWhite(new Color('#ffffff'))).toBe(true)
     expect(isUntexturedWhite(new Color(0.95, 0.95, 0.95))).toBe(true)
     expect(isUntexturedWhite(new Color('#d8d2c7'))).toBe(false)
+  })
+
+  test("the 'floor' fallback is wood-family: warm brown, darker than the slab greige", () => {
+    const floor = kindFallbackTone('floor')
+    expect(floor.r).toBeGreaterThan(floor.g)
+    expect(floor.g).toBeGreaterThan(floor.b)
+    const slab = kindFallbackTone('slab')
+    const l = (c: Color) => (c.r + c.g + c.b) / 3
+    expect(l(floor)).toBeLessThan(l(slab))
   })
 
   test('no material at all → kind fallback + no-material audit', () => {

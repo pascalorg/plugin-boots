@@ -362,6 +362,12 @@ export type VoxelTarget = {
    * 7 cm above (QA round 2 follow-up: the plate must not prop a wall whose
    * real slab was carved out from under it). */
   contactOnlySupport?: boolean
+  /** FLOOR-family slab (nodeType slab/floor — never ceiling): the tone
+   * chain runs through the 'floor' kind (wood-family fallback, never the
+   * screed gray that read "white" — owner wave 5) and primedCellColor
+   * paints every under-layer as dirt subfloor (skin-tone.ts
+   * FLOOR_CORE_HEX) so a carved floor reveals earth. */
+  floorCore?: boolean
 }
 
 /** Legacy alias — every voxelized target uses the same shape. */
@@ -1376,16 +1382,21 @@ function buildSheets(
  * The material a target's tone chain should read: the one owning the most
  * FACE AREA (the old first-material grab returned white cap/trim slots on
  * textured hosts — the "voxels are still the default untextured white"
- * live complaint). Slabs prefer their upward-facing area (the floor
- * finish) and fall back to all faces; everything else reads all faces.
+ * live complaint). Slab-family targets (floors included) prefer their
+ * upward-facing area (the floor finish), then NON-downward faces — the
+ * white ceiling underside must never win a floor's tone by area (owner
+ * wave 5: "the floor inside the house is white") — and only then all
+ * faces; everything else reads all faces. Exported for tests.
  */
-function dominantTargetMaterial(
+export function dominantTargetMaterial(
   meshes: readonly Mesh[],
   kind: SkinToneKind,
 ): Parameters<typeof resolveSurfaceTone>[2] {
-  if (kind === 'slab') {
+  if (kind === 'slab' || kind === 'floor') {
     const top = dominantMaterialBy(meshes, (ny) => ny > 0.7)
     if (top) return top
+    const nonDown = dominantMaterialBy(meshes, (ny) => ny > -0.7)
+    if (nonDown) return nonDown
   }
   return dominantMaterialBy(meshes, () => true)
 }
@@ -1997,7 +2008,13 @@ export function ensureVoxelTarget(
   // chain and the pattern lane both stand down); the dominant surface
   // material feeds both otherwise.
   const coatColor = wall ? nodeCoatColor(nodeId) : null
-  const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, kind)
+  // FLOOR-family slabs (everything but explicit ceilings) resolve through
+  // the 'floor' tone lane: the fallback is wood-family (never the screed
+  // gray that read "white") and the under-layers wear the dirt subfloor
+  // tone (VoxelTarget.floorCore → skin-tone.ts). Owner wave 5.
+  const floorSlab = kind === 'slab' && nodeType !== 'ceiling'
+  const toneKind: SkinToneKind = floorSlab ? 'floor' : kind
+  const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, toneKind)
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -2021,7 +2038,7 @@ export function ensureVoxelTarget(
     // pending textures retint later via skinRevision (retintTarget).
     baseColor: itemPalette?.average ?? coatColor ?? resolveSurfaceTone(
       nodeId,
-      kind,
+      toneKind,
       surfaceMaterial,
       retintTarget(nodeId),
     ),
@@ -2039,6 +2056,7 @@ export function ensureVoxelTarget(
     removedQueue: [],
     revision: 0,
     contactOnlySupport,
+    floorCore: floorSlab || undefined,
   }
 
   // Hide the host meshes + hand the colliders over (keep-aware — see

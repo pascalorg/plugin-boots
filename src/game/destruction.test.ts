@@ -15,6 +15,7 @@ import {
   damageExplosion,
   damageSegment,
   damageTarget,
+  dominantTargetMaterial,
   dormantTargetCount,
   dropTarget,
   ensureVoxelTarget,
@@ -34,7 +35,9 @@ import {
   wakeAheadTick,
 } from './destruction'
 import {
+  FLOOR_CORE_HEX,
   isUntexturedWhite,
+  kindFallbackTone,
   pendingToneCount,
   primedCellColor,
   retryPendingTones,
@@ -108,6 +111,12 @@ function makeWorld(): GameWorld {
 afterEach(() => {
   resetDestruction()
 })
+
+const expectSameColor = (a: Color, b: Color) => {
+  expect(a.r).toBeCloseTo(b.r, 10)
+  expect(a.g).toBeCloseTo(b.g, 10)
+  expect(a.b).toBeCloseTo(b.b, 10)
+}
 
 describe('prevoxelizeTick', () => {
   test('voxelizes walls AND items awake without a shot, colliders handed over', () => {
@@ -210,6 +219,87 @@ describe('prevoxelizeTick', () => {
     expect(prevoxelizeTick(world, 0)).toBe(true)
     expect(prevoxelizeTick(world, 8)).toBe(true)
     expect(useDestruction.getState().targets.has('__boots-item-7')).toBe(false)
+  })
+})
+
+describe('floor slab tone lane (owner wave 5: "the floor inside is white")', () => {
+  /** The two-material host floor: a WOOD walking surface over a WHITE
+   * ceiling underside + white rim (BoxGeometry's 6 material groups —
+   * index 2 is +Y). White owns MORE area (bottom 9 m² + sides 2.4 m² vs
+   * top 9 m²), so an all-faces area pick would come back white. */
+  function twoMaterialFloorMesh(): Mesh {
+    const white = new MeshStandardMaterial({ color: '#ffffff' })
+    const wood = new MeshStandardMaterial({ color: '#8b5a2b' })
+    const mesh = new Mesh(new BoxGeometry(3, 0.2, 3), [
+      white, // +x
+      white, // -x
+      wood, // +y — the floor finish
+      white, // -y — the white ceiling underside
+      white, // +z
+      white, // -z
+    ])
+    mesh.position.set(0, 0.1, 5)
+    mesh.updateMatrixWorld(true)
+    return mesh
+  }
+
+  test('dominant material for floors is the TOP face — the white underside never wins by area', () => {
+    const mesh = twoMaterialFloorMesh()
+    const picked = dominantTargetMaterial([mesh], 'floor')
+    expect(picked?.color?.getHexString()).toBe('8b5a2b')
+    // Same protection on the legacy 'slab' tone kind (ceiling-family).
+    expect(dominantTargetMaterial([mesh], 'slab')?.color?.getHexString()).toBe('8b5a2b')
+  })
+
+  test('slab/floor nodes voxelize with floorCore; ceilings do not', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('slab-9', 'slab', [3, 0.2, 3], [0, 3, 5]))
+    world.colliders.push(boxCollider('floor-9', 'floor', [3, 0.2, 3], [8, 3, 5]))
+    world.colliders.push(boxCollider('ceil-9', 'ceiling', [3, 0.1, 3], [0, 2.6, -5]))
+    const targets = useDestruction.getState().targets
+    for (const nodeId of ['slab-9', 'floor-9', 'ceil-9']) {
+      expect(ensureVoxelTarget(world, nodeId)?.kind).toBe('slab')
+    }
+    expect(targets.get('slab-9')?.floorCore).toBe(true)
+    expect(targets.get('floor-9')?.floorCore).toBe(true)
+    expect(targets.get('ceil-9')?.floorCore).toBeFalsy()
+  })
+
+  test('a white-material floor slab falls back to the WOOD family tone, never screed gray', () => {
+    const world = makeWorld()
+    // boxCollider meshes wear three's default white MeshBasicMaterial —
+    // exactly the untextured-white lie the chain must not honor.
+    world.colliders.push(boxCollider('slab-9', 'slab', [3, 0.2, 3], [0, 3, 5]))
+    const target = ensureVoxelTarget(world, 'slab-9')!
+    expectSameColor(target.baseColor, kindFallbackTone('floor'))
+    expect(isUntexturedWhite(target.baseColor)).toBe(false)
+    // The audit names the floor lane.
+    expect(toneAuditReport()).toEqual([{ nodeId: 'slab-9', kind: 'floor', why: 'white-base' }])
+  })
+
+  test('under-layer cells of a floor slab prime as dirt subfloor; the top layer keeps the floor tone', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('slab-9', 'slab', [3, 0.2, 3], [0, 3, 5]))
+    const target = ensureVoxelTarget(world, 'slab-9')!
+    const topLayer = target.grid.ny - 1
+    let unders = 0
+    let tops = 0
+    const out = new Color()
+    for (let i = 0; i < target.grid.count && (unders < 6 || tops < 6); i++) {
+      const iy = target.grid.coords[i * 3 + 1]!
+      primedCellColor(out, target, i)
+      // Pin against the exact primeSkin math: dirt for every layer under
+      // the walking surface, the resolved (wood-fallback) tone on top.
+      const j1 = ((i * 2654435761) % 97) / 97
+      const j2 = ((i * 1597334677) % 89) / 89
+      const expected = (iy < topLayer ? new Color(FLOOR_CORE_HEX) : target.baseColor.clone())
+        .offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+      expectSameColor(out, expected)
+      if (iy < topLayer) unders++
+      else tops++
+    }
+    expect(unders).toBeGreaterThan(0)
+    expect(tops).toBeGreaterThan(0)
   })
 })
 

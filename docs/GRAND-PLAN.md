@@ -175,6 +175,18 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   resetGlass clears it); crack-decal two-stage kept. New perf sections:
   boom-carve-sync/bots/sfx/dust, skin-drain, skin-reprime. 897 tests /
   23.9k assertions green.
+- Owner wave-5 follow-up (2026-08-29): INTERIOR FLOOR "white — should be
+  wood, dirt when broken". Floor-family slabs (nodeType slab/floor, never
+  ceiling) now resolve through a new 'floor' tone kind — wood-family
+  fallback #a0784e instead of the screed gray that read white when the
+  finish map never resolves — and the dominant-material pick refuses the
+  white ceiling underside (top faces, then non-down, then all).
+  VoxelTarget.floorCore paints every under-layer (bottom skin + rim
+  middles) as dirt subfloor (skin-tone.ts FLOOR_CORE_HEX #6b4a2f), and
+  terrain-borne floor slabs mount one dirt underlay plane under the
+  sandwich (voxel-walls floorUnderlayLayout, base ≤ 0.35 m) so a
+  carved-through hole shows EARTH, not the host's white pad or lawn.
+  Verified live on :3002 (wood floor intact, dirt hole carved). 915 tests.
 
 ## In flight
 
