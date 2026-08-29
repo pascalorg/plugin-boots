@@ -10,7 +10,7 @@ import { collideVoxelWalls } from './destruction'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
 import { getSession } from './session'
-import type { GameWorld } from './world'
+import { type GameWorld, settleSpawnFeet } from './world'
 
 /**
  * DAMAGE / STAGGER API (for enemies & pacing — the "you can't die" dynamic)
@@ -318,6 +318,13 @@ export function Player({ world }: { world: GameWorld }) {
       }
     }
     feet.current.copy(world.spawn)
+    // SPAWN SETTLE (big-project jump-in): world.spawn.y was probed at
+    // snapshot time, but the LIVE collider set can differ by mount time —
+    // stand on the topmost walkable surface at the spawn XZ and lift free
+    // if the capsule starts interpenetrated. Starting buried is the one
+    // shape push-out can't fix (triangles deeper than the capsule radius
+    // are invisible to it), and it read as "spawns half into the ground".
+    settleSpawnFeet(world.colliders, feet.current, PLAYER_CAPSULE)
     vel.current.set(0, 0, 0)
     groundNormal.current.set(0, 1, 0)
     playerRig.yaw = world.spawnYaw
@@ -597,9 +604,11 @@ export function Player({ world }: { world: GameWorld }) {
       swayRoll,
     )
 
-    // Fall off the world guard.
+    // Fall off the world guard. Re-settle: the ground at the spawn XZ may
+    // have changed since the snapshot (voxelized away, pieces placed).
     if (feet.current.y < -30) {
       feet.current.copy(world.spawn)
+      settleSpawnFeet(world.colliders, feet.current, PLAYER_CAPSULE)
       vel.current.set(0, 0, 0)
     }
   })

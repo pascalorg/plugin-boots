@@ -19,7 +19,7 @@ import { playerRig } from './player'
 import { getSession } from './session'
 import * as weaponModels from './weapon-models'
 import { HammerModel, MinigunModel, PistolModel, RifleModel } from './weapon-models'
-import { bvhFor, type ColliderEntry, type GameWorld } from './world'
+import { bvhFor, type ColliderEntry, type GameWorld, spawnGroundY } from './world'
 
 /**
  * THE ARMORED SPAWN DEPOT (owner vision): the spawn gear is a PERMANENT,
@@ -300,6 +300,15 @@ const RUST_PATCHES: Array<{
  */
 function SpawnDepot({ world }: { world: GameWorld }) {
   const center = useMemo(() => depotPosition(world), [world])
+  // Seat the container on whatever actually stands at its center — the
+  // same probe that settles the player (spawnGroundY skips '__boots'
+  // colliders, so the depot never stands on itself). On lots whose yard
+  // is a raised site slab (warner-2: top at y≈0.69) a hardcoded y=0 left
+  // the container embedded waist-deep in the terrain.
+  const groundY = useMemo(
+    () => spawnGroundY(world.colliders ?? [], center.x, center.z),
+    [world, center],
+  )
   const buildAt = useMemo(() => buildStationPosition(world), [world])
   const armoryAt = useMemo(() => armoryStationPosition(world), [world])
   const hasBuilder = useBoots((s) => s.owned.includes('builder'))
@@ -330,7 +339,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
 
   return (
     <group
-      position={[center.x, 0, center.z]}
+      position={[center.x, groundY, center.z]}
       rotation={[0, depotWorldYaw(world), 0]}
       userData={{ __boots: true }}
     >

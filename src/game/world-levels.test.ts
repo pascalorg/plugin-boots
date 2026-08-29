@@ -14,11 +14,13 @@ import { collectWorld } from './world'
  * fixtures prove the ordering: a level left hidden at a wrong Y would be
  * skipped by the walk or baked with wrong collider matrices.
  *
- * Also pins the Phase-A spawn rule: the ring stays OUTSIDE the full-building
- * AABB on XZ, but its Y is the LOWEST level's ground (clamped to the terrain
- * plane at 0 — basements must not sink the spawn underground), and the dead
- * `useScene.selectedLevelId` read is gone: levelId now mirrors the viewer's
- * selection (the preload stub pins it to 'level-test').
+ * Also pins the spawn rule: the ring stays OUTSIDE the full-building AABB on
+ * XZ, and its Y SETTLES on what actually stands at that XZ (spawnGroundY —
+ * the topmost walkable collider surface, else the lot's terrain plane at 0:
+ * basements must not sink the spawn underground, elevated buildings must not
+ * float it mid-air). The dead `useScene.selectedLevelId` read is gone:
+ * levelId now mirrors the viewer's selection (the preload stub pins it to
+ * 'level-test').
  */
 
 type Registered = { id: string; kind: string }
@@ -133,10 +135,13 @@ describe('collectWorld across stacked levels', () => {
     expect(Math.abs(world.spawn.x)).toBeGreaterThan(size.x / 2)
   })
 
-  test('elevated building: spawn ground follows the lowest level up', () => {
+  test('elevated building: spawn settles on the terrain ring, not the raised level', () => {
+    // The ring is OUTSIDE the building — nothing stands at its XZ, so the
+    // feet belong on the lot plane at 0. The old lowest-level-elevation
+    // guess started the player 1.2 m up in mid-air and dropped them.
     buildTwoStoreys(1.2, 4.0)
     const world = collectWorld()
-    expect(world.spawn.y).toBeCloseTo(1.2, 5)
+    expect(world.spawn.y).toBe(0)
   })
 
   test('basement building: spawn ground clamps to the terrain plane at 0', () => {

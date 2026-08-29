@@ -5,13 +5,16 @@ import {
   BufferAttribute,
   BufferGeometry,
   type InstancedMesh,
+  Line3,
   Matrix4,
   type Mesh,
   type Object3D,
+  Ray,
   Vector3,
 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
 import { CELL, type GridAnchor, STOREY } from './grid'
+import { WALKABLE_NORMAL_Y } from './movement'
 import { perfEvent } from './perf-monitor'
 
 /**
@@ -992,23 +995,209 @@ export function snapLevelsForSnapshot(): void {
   }
 }
 
-/** Lowest storey ground: min world-Y over all registered level groups
- * (post-snap that IS each level's baseY), clamped to the terrain plane at 0
- * — spawn/respawn live on the terrain ring outside the building, so a
- * basement's negative baseY must not sink the spawn underground. */
-function lowestLevelGroundY(): number {
-  let lowest = Number.POSITIVE_INFINITY
-  const levelIds = sceneRegistry.byType.level
-  if (levelIds) {
-    for (const id of levelIds) {
-      const obj = sceneRegistry.nodes.get(id)
-      if (!obj) continue
-      obj.updateWorldMatrix(true, false)
-      const y = _levelWorldPos.setFromMatrixPosition(obj.matrixWorld).y
-      if (y < lowest) lowest = y
+// ---------------------------------------------------------------------------
+// Spawn ground settle — the player must START ON the surface, never in it
+// ---------------------------------------------------------------------------
+
+/** Session-fixture colliders (the spawn depot cluster guntable.tsx registers
+ * under '__boots-depot', plus any future '__boots*' fixture) are placed
+ * RELATIVE to the spawn — letting them answer a spawn ground probe would be
+ * circular, and the depot container sits only ~3 m behind the spawn point:
+ * a probe must never stand the player ON it. They are also mount-order racy
+ * (guntable pushes its entries into world.colliders around the same time
+ * the player settles), so skipping them keeps the settle deterministic. */
+const SESSION_FIXTURE_PREFIX = '__boots'
+
+/** Feet rest this far above a probed surface so the capsule never starts
+ * its first frame a hair interpenetrated; the first ground resolve snaps
+ * it flush. */
+export const SPAWN_SETTLE_EPS = 0.02
+
+/** The unstick pass gives up after lifting this far — a spawn buried deeper
+ * than 3 m is a data pathology better left to the lot plane + fall guard
+ * than silently teleported to a rooftop. */
+export const SPAWN_UNSTICK_MAX_LIFT = 3
+/** Unstick lift granularity (m). */
+const SPAWN_UNSTICK_STEP = 0.25
+/** Overlap slack for the unstick test: a graze shallower than this is
+ * exactly what collideCapsule's push-out resolves on frame one — lifting
+ * for it would pop the player over fences the capsule merely touches. */
+const SPAWN_UNSTICK_SLACK = 0.05
+
+function spawnProbeEligible(collider: ColliderEntry): boolean {
+  return !collider.disabled && !collider.nodeId.startsWith(SESSION_FIXTURE_PREFIX)
+}
+
+const _spawnRay = new Ray()
+const _spawnNormal = new Vector3()
+const _spawnHitPoint = new Vector3()
+
+/**
+ * Topmost WALKABLE surface at (x, z) over the collider set: a downward BVH
+ * raycast per XZ-covering collider, cast from above the HIGHEST candidate
+ * top — starting above every top means a probe point INSIDE a volume still
+ * resolves to that volume's top face ("lift out"), the one shape a capsule
+ * cannot save itself from (triangles deeper than its radius are invisible
+ * to push-out, so a buried start used to stay buried). Faces steeper than
+ * the walkable limit are not spawn ground (a 60° roof plane must not catch
+ * the probe). Returns null when no eligible collider covers the XZ at all —
+ * callers fall back to the lot's terrain plane. Pure over its inputs;
+ * exported for the spawn-settle tests.
+ */
+export function probeSpawnSurfaceY(
+  colliders: readonly ColliderEntry[],
+  x: number,
+  z: number,
+): number | null {
+  let ceiling = Number.NEGATIVE_INFINITY
+  for (const collider of colliders) {
+    if (!spawnProbeEligible(collider)) continue
+    const box = collider.worldBox
+    if (x < box.min.x || x > box.max.x || z < box.min.z || z > box.max.z) continue
+    if (box.max.y > ceiling) ceiling = box.max.y
+  }
+  if (!Number.isFinite(ceiling)) return null
+
+  const fromY = ceiling + 1
+  let best: number | null = null
+  for (const collider of colliders) {
+    if (!spawnProbeEligible(collider)) continue
+    const box = collider.worldBox
+    if (x < box.min.x || x > box.max.x || z < box.min.z || z > box.max.z) continue
+    // Box top at or below the current best can't improve on it.
+    if (best !== null && box.max.y <= best) continue
+    _spawnRay.origin.set(x, fromY, z)
+    _spawnRay.direction.set(0, -1, 0)
+    _spawnRay.applyMatrix4(collider.inverse)
+    const hit = collider.bvh.raycastFirst(_spawnRay, 2)
+    if (!hit?.face) continue
+    // Walkability in WORLD space; |n.y| because a double-sided first hit
+    // from above may report the back-face normal.
+    _spawnNormal.copy(hit.face.normal).transformDirection(collider.mesh.matrixWorld)
+    if (Math.abs(_spawnNormal.y) < WALKABLE_NORMAL_Y) continue
+    const worldY = _spawnHitPoint.copy(hit.point).applyMatrix4(collider.mesh.matrixWorld).y
+    if (best === null || worldY > best) best = worldY
+  }
+  return best
+}
+
+/**
+ * The Y the spawn's FEET start at for a chosen XZ: the topmost walkable
+ * collider surface there (+ SPAWN_SETTLE_EPS), else the lot's terrain plane
+ * at 0. Surfaces BELOW the lot plane (recessed patios) clamp up to 0 too —
+ * collision.ts's infinite ground plane would fight anything lower. This
+ * replaces the old lowest-LEVEL-elevation guess, which knew nothing about
+ * what actually stands at the spawn XZ: a raised site slab / terrace under
+ * the ring spawn left the player waist-deep in it on large real projects
+ * ("spawns half into the ground"), and an elevated building floated the
+ * spawn in mid-air over flat ground.
+ */
+export function spawnGroundY(colliders: readonly ColliderEntry[], x: number, z: number): number {
+  const surface = probeSpawnSurfaceY(colliders, x, z)
+  if (surface === null) return 0
+  return Math.max(0, surface + SPAWN_SETTLE_EPS)
+}
+
+const _usBox = new Box3()
+const _usSegment = new Line3()
+const _usLocalSegment = new Line3()
+const _usLocalBox = new Box3()
+const _usTriPoint = new Vector3()
+const _usCapsulePoint = new Vector3()
+
+/**
+ * Does a capsule standing at feet (x, y, z) intersect any eligible collider
+ * surface? The same segment-vs-triangle proximity test collideCapsule
+ * resolves with, read-only. Shares the deep-burial blind spot (a segment
+ * farther than `radius` from every surface triangle reads free) — which is
+ * why the spawn settle probes the surface FIRST and only unsticks after.
+ * Exported for the spawn-settle tests.
+ */
+export function capsuleOverlapsColliders(
+  colliders: readonly ColliderEntry[],
+  x: number,
+  y: number,
+  z: number,
+  radius: number,
+  height: number,
+): boolean {
+  _usBox.min.set(x - radius, y, z - radius)
+  _usBox.max.set(x + radius, y + height, z + radius)
+  for (const collider of colliders) {
+    if (!spawnProbeEligible(collider)) continue
+    if (!collider.worldBox.intersectsBox(_usBox)) continue
+    _usSegment.start.set(x, y + radius, z)
+    _usSegment.end.set(x, y + height - radius, z)
+    _usLocalSegment.copy(_usSegment).applyMatrix4(collider.inverse)
+    _usLocalBox.makeEmpty()
+    _usLocalBox.expandByPoint(_usLocalSegment.start)
+    _usLocalBox.expandByPoint(_usLocalSegment.end)
+    _usLocalBox.min.addScalar(-radius)
+    _usLocalBox.max.addScalar(radius)
+    let overlapped = false
+    collider.bvh.shapecast({
+      intersectsBounds: (box) => box.intersectsBox(_usLocalBox),
+      intersectsTriangle: (tri) => {
+        if (tri.closestPointToSegment(_usLocalSegment, _usTriPoint, _usCapsulePoint) < radius) {
+          overlapped = true
+          return true // one contact answers the question — abort traversal
+        }
+        return false
+      },
+    })
+    if (overlapped) return true
+  }
+  return false
+}
+
+/**
+ * UNSTICK: a capsule that STARTS intersecting a collider is the one state
+ * the mover can't fix (push-out needs a surface within its radius; the slide
+ * then wedges on whatever it's embedded in) — lift in SPAWN_UNSTICK_STEP
+ * slices, cap SPAWN_UNSTICK_MAX_LIFT, until free. The test radius is shrunk
+ * by SPAWN_UNSTICK_SLACK so shallow grazes stay with the regular push-out.
+ * Returns the lift applied; 0 means already free OR nothing free within the
+ * cap (feet left untouched then — the lot plane and push-out do what they
+ * can). Exported for the spawn-settle tests.
+ */
+export function unstickSpawn(
+  colliders: readonly ColliderEntry[],
+  feet: Vector3,
+  capsule: { radius: number; height: number },
+): number {
+  const radius = Math.max(0.05, capsule.radius - SPAWN_UNSTICK_SLACK)
+  if (!capsuleOverlapsColliders(colliders, feet.x, feet.y, feet.z, radius, capsule.height)) {
+    return 0
+  }
+  for (
+    let lift = SPAWN_UNSTICK_STEP;
+    lift <= SPAWN_UNSTICK_MAX_LIFT + 1e-9;
+    lift += SPAWN_UNSTICK_STEP
+  ) {
+    if (
+      !capsuleOverlapsColliders(colliders, feet.x, feet.y + lift, feet.z, radius, capsule.height)
+    ) {
+      feet.y += lift
+      return lift
     }
   }
-  return Number.isFinite(lowest) ? Math.max(0, lowest) : 0
+  return 0
+}
+
+/**
+ * Session-start feet settle (player.tsx mount + its fall-off-world respawn):
+ * stand exactly on the topmost walkable surface at the spawn XZ (the LIVE
+ * collider set — it can differ from the snapshot-time probe), then lift free
+ * if the capsule still interpenetrates something the point probe couldn't
+ * see (an overhang lip, a beam crossing the capsule body off-center).
+ */
+export function settleSpawnFeet(
+  colliders: readonly ColliderEntry[],
+  feet: Vector3,
+  capsule: { radius: number; height: number },
+): void {
+  feet.y = spawnGroundY(colliders, feet.x, feet.z)
+  unstickSpawn(colliders, feet, capsule)
 }
 
 const _levelWorldPos = new Vector3()
@@ -1240,22 +1429,27 @@ export function collectWorld(): GameWorld {
   const storeyLadder = deriveStoreyLadder(collectStackedLevels(), nodes) ?? undefined
 
   // Spawn: outside the building along +X of its center, eye toward it.
-  // Y is the LOWEST level's ground (usually 0) — with the whole stacked
-  // building collected, buildingAabb spans every storey, but the ring stays
-  // on the ground the building rises from.
+  // XZ first; Y then SETTLES onto whatever actually stands there —
+  // spawnGroundY probes the collected colliders straight down at the spawn
+  // XZ (raised lot slabs, terraces, foundation plinths that reach the ring)
+  // and falls back to the lot's terrain plane at 0. The old Y guess (the
+  // lowest LEVEL's elevation) knew nothing about the ground at the ring:
+  // a raised site slab under the spawn buried the player waist-deep on big
+  // real projects, and an elevated building floated the spawn mid-air.
   const spawn = new Vector3(6, 0, 6)
   let spawnYaw = Math.PI * 0.75
   if (!buildingAabb.isEmpty()) {
     const center = buildingAabb.getCenter(new Vector3())
     const size = buildingAabb.getSize(new Vector3())
     const dist = Math.max(size.x, size.z) / 2 + 5
-    spawn.set(center.x + dist, lowestLevelGroundY(), center.z + dist * 0.4)
+    spawn.set(center.x + dist, 0, center.z + dist * 0.4)
     spawnYaw = Math.atan2(spawn.x - center.x, spawn.z - center.z) + Math.PI
     // Camera yaw convention: 0 looks down -Z; face the building center.
     const dx = center.x - spawn.x
     const dz = center.z - spawn.z
     spawnYaw = Math.atan2(-dx, -dz)
   }
+  spawn.y = spawnGroundY(colliders, spawn.x, spawn.z)
 
   // Telemetry only (the game is whole-building; nothing gameplay-side keys
   // on this). The editor's active level lives on the VIEWER's selection —
