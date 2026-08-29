@@ -9,6 +9,7 @@ import { GameInput } from './input'
 import { closeItemMenu, isItemMenuOpen } from './inventory'
 import { placedItemCount } from './item-keep'
 import { capturePaint } from './paint-keep'
+import { stopPresence } from './presence'
 import { captureDemolition } from './save-demolition'
 
 /**
@@ -269,6 +270,42 @@ export function guardSelectionForGame(teardown: Array<() => void>): void {
   })
 }
 
+/**
+ * ── Scene-write sentinel ────────────────────────────────────────────────────
+ * THE promise: nothing you do in the game is saved. The host autosaves its
+ * draft from the live scene store, so the guarantee holds iff the store is
+ * NEVER written during play (Keep runs after exit, behind its own button).
+ * This sentinel watches the store for the whole session and screams if any
+ * code path violates that — a canary, not a fixer.
+ *
+ * CO-PRESENCE DISCRIMINATOR: with collaboration live, a PEER's edit can
+ * land in our scene store mid-session — the host applies remote ops under
+ * its remote-op lease, during which `useScene.getState().readOnly === true`.
+ * That write is NOT ours and NOT a violation: our game code still never
+ * wrote the store, and the session's world snapshot (collectWorld ran at
+ * entry) stays frozen — the peer's change appears after Esc, exactly like
+ * every host-side restore. Those writes log a calm console.info instead of
+ * the INVARIANT VIOLATION scream, so QA keeps a clean signal: any ERROR
+ * from this sentinel is still, always, a local bug. Exported for tests.
+ */
+export function armSceneWriteSentinel(teardown: Array<() => void>): void {
+  const nodesAtEnter = useScene.getState().nodes
+  const unsub = useScene.subscribe((state) => {
+    if (state.nodes !== nodesAtEnter && useBoots.getState().phase === 'game') {
+      if ((state as { readOnly?: boolean }).readOnly === true) {
+        console.info(
+          '[boots] remote collaboration op during play (world snapshot stays frozen)',
+        )
+      } else {
+        console.error(
+          '[boots] INVARIANT VIOLATION: the scene store changed during play — nothing in-game may write it. Investigate immediately.',
+        )
+      }
+    }
+  })
+  teardown.push(unsub)
+}
+
 export function enterGame(): boolean {
   if (current || useBoots.getState().phase === 'game') return false
   if (typeof document === 'undefined') return false
@@ -434,23 +471,8 @@ export function enterGame(): boolean {
     document.removeEventListener('fullscreenchange', onFullscreenChange)
   })
 
-  // ── Scene-write sentinel ────────────────────────────────────────────────
-  // THE promise: nothing you do in the game is saved. The host autosaves its
-  // draft from the live scene store, so the guarantee holds iff the store is
-  // NEVER written during play (Keep runs after exit, behind its own button).
-  // This sentinel watches the store for the whole session and screams if any
-  // code path violates that — a canary, not a fixer.
-  {
-    const nodesAtEnter = useScene.getState().nodes
-    const unsub = useScene.subscribe((state) => {
-      if (state.nodes !== nodesAtEnter && useBoots.getState().phase === 'game') {
-        console.error(
-          '[boots] INVARIANT VIOLATION: the scene store changed during play — nothing in-game may write it. Investigate immediately.',
-        )
-      }
-    })
-    session.teardown.push(unsub)
-  }
+  // Scene-write sentinel — see armSceneWriteSentinel below.
+  armSceneWriteSentinel(session.teardown)
 
   useBoots.getState().resetSession()
   useBoots.getState().setPhase('game')
@@ -463,6 +485,12 @@ export function exitGame(): void {
   const session = current
   if (!session) return
   current = null
+
+  // Co-presence goodbye FIRST — one final explicit ph:'editor' frame so
+  // peers despawn our avatar instantly, then the adapter tears down. Runs
+  // before the session teardown/restore below (feature-detected inside:
+  // without a collab bus this is a no-op).
+  stopPresence()
 
   useBoots.getState().setPhase('editor')
 

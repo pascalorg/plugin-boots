@@ -74,6 +74,10 @@ import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
  * - waveCleared() — one-shot "WAVE CLEARED" center banner (fade in, hold
  *   ~1.8s, fade out). Driven by enemies.tsx when the last live bot of a
  *   wave dies; feature-detected there, so integration order can't crash.
+ * - presenceChip(count) — co-presence "N builders here" chip, top-left,
+ *   muted, change-gated, hidden at 0 (remote-players.tsx drives it on
+ *   roster edges). presenceToast(text) — one queued muted join/leave line
+ *   under it; unlike hint() there is NO once-gate (peers come and go).
  * - loadingProgress(p, pending?) — the entry veil's REAL progress feed
  *   (game-root's LoadingDriver, weights in loading.ts). The veil mounts
  *   opaque with a thin bottom bar + one quip line and holds until p ≥ 1
@@ -143,6 +147,20 @@ export function builderKeybarText(
 
 /** Hitmarker flavors — see hitmarker() in the header. */
 export type HitmarkerKind = 'hit' | 'kill' | 'carve'
+
+/**
+ * Co-presence chip text — pure so the copy + pluralization are pinnable
+ * headless. null = no chip (solo). The count is REMOTE players only (the
+ * local player is not a ghost to themselves).
+ */
+export function presenceChipText(count: number): string | null {
+  if (count <= 0) return null
+  return count === 1 ? '1 builder here' : `${count} builders here`
+}
+
+/** Presence toast pacing — join/leave lines, muted, short-lived. */
+const PRESENCE_TOAST_HOLD_MS = 2400
+const PRESENCE_TOAST_GAP_MS = 300
 
 /** How long a kill flare owns the marker against trailing hit writes. */
 const KILL_HOLD_MS = 160
@@ -244,6 +262,16 @@ export class Hud {
    * drops its loading input gate here. Cleared on unmount, never called by
    * teardown (an Esc mid-load exits without a reveal). */
   onReveal: (() => void) | null = null
+  /** Co-presence chip ("N builders here") — see presenceChip(). */
+  private presenceChipEl: HTMLDivElement | null = null
+  /** Last presenceChip() count written (change gate; -1 = never). */
+  private presenceCount = -1
+  /** Presence toast line + its queue (join/leave events can burst). */
+  private presenceToastEl: HTMLDivElement | null = null
+  private presenceToastQueue: string[] = []
+  private presenceToastActive = false
+  private presenceToastTimer: ReturnType<typeof setTimeout> | null = null
+  private presenceToastGapTimer: ReturnType<typeof setTimeout> | null = null
 
   mount(container: HTMLElement): void {
     const root = document.createElement('div')
@@ -438,6 +466,17 @@ export class Hud {
     // keybar (its top edge sits near 59px). No box, no border: text only.
     this.hintEl = el(
       `position:absolute;left:50%;bottom:66px;transform:translateX(-50%);color:rgba(255,255,255,0.6);font:${FONT};font-size:11px;letter-spacing:0.08em;text-shadow:0 1px 3px rgba(0,0,0,0.7);white-space:nowrap;opacity:0;transition:opacity 0.3s`,
+    )
+    // Co-presence chip — top-left, MUTED on purpose (other builders in the
+    // lot are ambient information, never combat chrome). presenceChip()
+    // drives it change-gated; hidden while the count is 0.
+    this.presenceChipEl = el(
+      `position:absolute;left:28px;top:20px;color:rgba(255,255,255,0.55);font:${FONT};font-size:11px;letter-spacing:0.1em;text-shadow:0 1px 3px rgba(0,0,0,0.7);white-space:nowrap;opacity:0;transition:opacity 0.25s`,
+    )
+    // Presence join/leave toast — one muted line under the chip; queued so
+    // a burst of joins reads one at a time.
+    this.presenceToastEl = el(
+      `position:absolute;left:28px;top:40px;color:rgba(255,255,255,0.45);font:${FONT};font-size:11px;letter-spacing:0.08em;text-shadow:0 1px 3px rgba(0,0,0,0.7);white-space:nowrap;opacity:0;transition:opacity 0.3s`,
     )
     // WAVE CLEARED banner — center card, opacity-only (waveCleared()).
     this.waveClearEl = el(
@@ -846,6 +885,57 @@ export class Hud {
   }
 
   /**
+   * Co-presence chip: "N builders here" while remote players share the
+   * session's project (remote-players.tsx drives it on roster edges, and
+   * defensively per frame — the change gate makes repeats free). 0 hides
+   * the chip. Muted styling on purpose: ambient info, not combat chrome.
+   */
+  presenceChip(count: number): void {
+    if (count === this.presenceCount) return
+    this.presenceCount = count
+    const el = this.presenceChipEl
+    if (!el) return
+    const text = presenceChipText(count)
+    el.textContent = text ?? ''
+    el.style.opacity = text ? '1' : '0'
+  }
+
+  /**
+   * Presence join/leave toast — one short muted line ("Alice joined").
+   * Queued (a burst of joins reads one at a time), fade in 300ms, hold
+   * ~2.4s, fade out, small gap, next. Unlike hint(), toasts have no
+   * once-gate: the same player can join and leave repeatedly.
+   */
+  presenceToast(text: string): void {
+    if (!this.presenceToastEl) return
+    this.presenceToastQueue.push(text)
+    if (!this.presenceToastActive) this.showNextPresenceToast()
+  }
+
+  /** Dequeue-and-show loop for presenceToast() — mirrors showNextHint. */
+  private showNextPresenceToast = (): void => {
+    this.presenceToastGapTimer = null
+    const el = this.presenceToastEl
+    if (!el) return
+    const text = this.presenceToastQueue.shift()
+    if (text === undefined) {
+      this.presenceToastActive = false
+      return
+    }
+    this.presenceToastActive = true
+    el.textContent = text
+    el.style.transition = 'opacity 0.3s'
+    el.style.opacity = '1'
+    this.presenceToastTimer = setTimeout(() => {
+      this.presenceToastTimer = null
+      if (!this.presenceToastEl) return
+      this.presenceToastEl.style.transition = 'opacity 0.5s'
+      this.presenceToastEl.style.opacity = '0'
+      this.presenceToastGapTimer = setTimeout(this.showNextPresenceToast, PRESENCE_TOAST_GAP_MS)
+    }, PRESENCE_TOAST_HOLD_MS)
+  }
+
+  /**
    * Directional damage flash. `angle` is screen-relative radians (0 = hit
    * from ahead, positive clockwise): the edge(s) facing the hit light up
    * strongly with a cosine falloff, so diagonal hits split across two edges.
@@ -900,6 +990,14 @@ export class Hud {
     this.hintActive = false
     this.hintEl = null
     this.waveClearEl = null
+    if (this.presenceToastTimer) clearTimeout(this.presenceToastTimer)
+    if (this.presenceToastGapTimer) clearTimeout(this.presenceToastGapTimer)
+    this.presenceToastTimer = this.presenceToastGapTimer = null
+    this.presenceToastQueue.length = 0
+    this.presenceToastActive = false
+    this.presenceToastEl = null
+    this.presenceChipEl = null
+    this.presenceCount = -1
     // Veil teardown — Esc during loading exits cleanly: the veil rides the
     // root removal below; onReveal is deliberately NOT fired (the session
     // is over, there is nothing to un-gate).
