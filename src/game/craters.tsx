@@ -24,6 +24,15 @@ import { type GameWorld, pointOnRoad } from './world'
  *       terrain 0, not on world.roadFootprints, not under the building
  *       AABB), so callers never pre-filter. Returns true when a crater
  *       actually spawned.
+ *   spawnFloorBreach(x, z, slabBaseY, carveRadius)
+ *       The FLOOR-BREACH variant (owner "broken floor looks broken"): a
+ *       carve that opens a ground slab clean THROUGH stamps a modest
+ *       soil-toned decal at the hole so whatever sits below (the lawn
+ *       plane, or nothing) reads as broken earth. Deliberately BYPASSES
+ *       craterEligible — the hole is under the building/driveway by
+ *       definition — and shares this ring buffer's CRATER_CAP budget.
+ *       destruction.ts calls it from the slab carve path; upper storeys
+ *       no-op (their holes must show the room below).
  *   <Craters />  renders the live ring buffer. Mounted by <Nature/> (the
  *       lawn owner), so craters persist for the session and unmount —
  *       geometries disposed — with the rest of the green on exit. No host
@@ -77,6 +86,24 @@ const CHAR_B = 0.1
 const SOIL_R = 0.42
 const SOIL_G = 0.3
 const SOIL_B = 0.19
+/** Floor-breach center: dark packed earth, NOT explosion char — the decal
+ * reads as broken ground, its rim easing up to the same soil brown. */
+const EARTH_R = SOIL_R * 0.55
+const EARTH_G = SOIL_G * 0.55
+const EARTH_B = SOIL_B * 0.55
+
+// ── Floor-breach policy ─────────────────────────────────────────────────
+/** A slab whose grid base sits above this is an upper storey — its breach
+ * shows the room below, never a ground decal. Mirrors voxel-walls'
+ * UNDERLAY_MAX_BASE_Y (an import would cycle: voxel-walls → destruction →
+ * craters). */
+export const BREACH_MAX_BASE_Y = 0.35
+/** Breach decal base height floor: just above the lawn plane (y = 0.05),
+ * in the 0.06–0.07 band the crater base also lives in. */
+export const BREACH_MIN_Y = 0.062
+/** Lift over the slab's grid base — clears the dirt underlay plane at
+ * base − 0.004 (voxel-walls UNDERLAY_DROP) without z-fighting it. */
+export const BREACH_LIFT = 0.006
 
 // --- Pure math (exported for tests) ------------------------------------------
 
@@ -150,21 +177,26 @@ function mulberry32(seed: number) {
  * The displaced patch: center vertex + CRATER_RINGS rings of
  * CRATER_SEGMENTS, y from craterProfile with per-vertex jitter that fades
  * to ZERO at the outer ring (the edge must meet the lawn flush — tests
- * assert exact 0 there). Vertex colors run char → soil along the radius.
+ * assert exact 0 there). Vertex colors run char → soil along the radius;
+ * the `breach` variant runs dark-earth → soil instead (a broken floor is
+ * torn ground, not a scorch site).
  */
-export function buildCraterGeometry(radius: number, seed: number): BufferGeometry {
+export function buildCraterGeometry(radius: number, seed: number, breach = false): BufferGeometry {
   const rand = mulberry32(seed)
   const positions: number[] = []
   const colors: number[] = []
   const indices: number[] = []
+  const r0 = breach ? EARTH_R : CHAR_R
+  const g0 = breach ? EARTH_G : CHAR_G
+  const b0 = breach ? EARTH_B : CHAR_B
   const pushColor = (t: number) => {
     const u = Math.min(1, t / CRATER_RIM_T)
     const mix = u * u * (3 - 2 * u)
     const shade = 0.92 + rand() * 0.16
     colors.push(
-      (CHAR_R + (SOIL_R - CHAR_R) * mix) * shade,
-      (CHAR_G + (SOIL_G - CHAR_G) * mix) * shade,
-      (CHAR_B + (SOIL_B - CHAR_B) * mix) * shade,
+      (r0 + (SOIL_R - r0) * mix) * shade,
+      (g0 + (SOIL_G - g0) * mix) * shade,
+      (b0 + (SOIL_B - b0) * mix) * shade,
     )
   }
   positions.push(0, craterProfile(0), 0)
@@ -206,10 +238,12 @@ export function buildCraterGeometry(radius: number, seed: number): BufferGeometr
  * at the center, soil at the crater edge, alpha 0 at 1.55× the radius.
  * Rendered unlit, NormalBlending, no depth write: it darkens the lawn it
  * floats over and carries the depth read where the real bowl is occluded.
+ * The `breach` variant centers on dark earth instead of char — same
+ * machinery, dirt read.
  */
-export function buildScorchGeometry(radius: number): BufferGeometry {
+export function buildScorchGeometry(radius: number, breach = false): BufferGeometry {
   const positions: number[] = [0, 0, 0]
-  const colors: number[] = [0.09, 0.075, 0.06, 0.85]
+  const colors: number[] = breach ? [0.14, 0.1, 0.062, 0.8] : [0.09, 0.075, 0.06, 0.85]
   const indices: number[] = []
   const rings: Array<[number, number, number, number, number]> = [
     [radius * 1.02, 0.33, 0.24, 0.155, 0.5],
@@ -247,8 +281,13 @@ export type CraterSlot = {
   gen: number
   x: number
   z: number
+  /** Patch base height — CRATER_BASE_Y for lawn craters; floor breaches
+   * ride their slab's height (see spawnFloorBreach). */
+  y: number
   radius: number
   seed: number
+  /** Floor-breach decal (soil palette, no char) vs blast crater. */
+  breach: boolean
 }
 
 const slots: CraterSlot[] = Array.from({ length: CRATER_CAP }, () => ({
@@ -256,8 +295,10 @@ const slots: CraterSlot[] = Array.from({ length: CRATER_CAP }, () => ({
   gen: 0,
   x: 0,
   z: 0,
+  y: CRATER_BASE_Y,
   radius: 1,
   seed: 1,
+  breach: false,
 }))
 let cursor = 0
 let version = 0
@@ -317,6 +358,8 @@ export function spawnCrater(
   slot.gen++
   slot.x = center.x
   slot.z = center.z
+  slot.y = CRATER_BASE_Y
+  slot.breach = false
   slot.radius = craterRadiusFor(blastRadius)
   slot.seed = (Math.random() * 0xffffffff) >>> 0
   // Nothing grows on scorched dirt — clear the blades to just past the rim.
@@ -339,16 +382,75 @@ export function spawnCrater(
   return true
 }
 
+/**
+ * Floor-breach decal (destruction.ts calls this when a carve opens a
+ * floor slab clean through): stamp broken earth at the hole so the ground
+ * under the breach never reads as pristine lawn or bare void. BYPASSES
+ * craterEligible by design — the road/AABB veto exists to keep BLAST scars
+ * off hard surfaces, and a breach is by definition under one. Policy:
+ *   - upper storeys (slabBaseY > BREACH_MAX_BASE_Y) no-op — the hole must
+ *     show the room below;
+ *   - base height rides the slab: max(BREACH_MIN_Y, slabBaseY +
+ *     BREACH_LIFT) — above the lawn plane AND the slab's dirt underlay;
+ *   - modest size: ≈ the carve radius, 1.2× at most (never the blast
+ *     clamps — a bullet-drilled breach stays a small scar);
+ *   - repeat carves widening one hole GROW the existing decal in place
+ *     instead of stacking slots (shared CRATER_CAP budget).
+ * No dust/debris burst here — the carve that opened the hole already
+ * voiced. Returns true when a new slot spawned.
+ */
+export function spawnFloorBreach(
+  x: number,
+  z: number,
+  slabBaseY: number,
+  carveRadius: number,
+): boolean {
+  if (slabBaseY > BREACH_MAX_BASE_Y) return false
+  const radius = Math.min(carveRadius * 1.2, CRATER_MAX_DIAMETER / 2)
+  if (radius <= 0.05) return false
+  const y = Math.max(BREACH_MIN_Y, slabBaseY + BREACH_LIFT)
+  for (const slot of slots) {
+    if (!slot.alive || !slot.breach) continue
+    const dx = slot.x - x
+    const dz = slot.z - z
+    const reach = Math.max(slot.radius, radius)
+    if (dx * dx + dz * dz < reach * reach) {
+      if (radius > slot.radius) {
+        // The same hole, widened — grow in place (gen bump remounts).
+        slot.radius = radius
+        slot.gen++
+        emit()
+      }
+      return false
+    }
+  }
+  const slot = slots[cursor]!
+  cursor = (cursor + 1) % CRATER_CAP
+  slot.alive = true
+  slot.gen++
+  slot.x = x
+  slot.z = z
+  slot.y = y
+  slot.breach = true
+  slot.radius = radius
+  slot.seed = (Math.random() * 0xffffffff) >>> 0
+  emit()
+  return true
+}
+
 // --- Rendering ----------------------------------------------------------------
 
 function CraterMesh({ crater }: { crater: CraterSlot }) {
   // Keyed by gen in <Craters/>, so a reused slot remounts and rebuilds —
   // deps here only guard against in-place slot mutation.
   const geometry = useMemo(
-    () => buildCraterGeometry(crater.radius, crater.seed),
-    [crater.radius, crater.seed],
+    () => buildCraterGeometry(crater.radius, crater.seed, crater.breach),
+    [crater.radius, crater.seed, crater.breach],
   )
-  const scorch = useMemo(() => buildScorchGeometry(crater.radius), [crater.radius])
+  const scorch = useMemo(
+    () => buildScorchGeometry(crater.radius, crater.breach),
+    [crater.radius, crater.breach],
+  )
   useEffect(
     () => () => {
       geometry.dispose()
@@ -357,7 +459,7 @@ function CraterMesh({ crater }: { crater: CraterSlot }) {
     [geometry, scorch],
   )
   return (
-    <group position={[crater.x, CRATER_BASE_Y, crater.z]}>
+    <group position={[crater.x, crater.y, crater.z]}>
       <mesh geometry={geometry}>
         <meshStandardMaterial
           polygonOffset

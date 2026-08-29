@@ -5,6 +5,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
   BoxGeometry,
   BufferAttribute,
+  CanvasTexture,
   Color,
   DynamicDrawUsage,
   type Group,
@@ -13,6 +14,7 @@ import {
   MeshStandardMaterial,
   PlaneGeometry,
   Quaternion,
+  RepeatWrapping,
   Vector3,
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
@@ -272,13 +274,80 @@ export const CEILING_GEOMETRY = (() => {
 const CEILING_SKIN_MATERIAL = new MeshStandardMaterial({ roughness: 0.92, vertexColors: true })
 const BOARD_MATERIAL = new MeshStandardMaterial({ roughness: 0.95 })
 const WOOD_MATERIAL = new MeshStandardMaterial({ roughness: 0.85 })
+/** Deterministic RNG for the dirt canvas (nature.tsx's generator). */
+function mulberry32(seed: number) {
+  let a = seed
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/** Procedural dirt for the underlay: the FLOOR_CORE brown speckled with
+ * darker clods, lighter dry patches, and a few desaturated pebble flecks —
+ * the nature.tsx groundTexture idiom (2D canvas → CanvasTexture,
+ * RepeatWrapping). ONE module-level canvas + texture for every slab (the
+ * shared-resource contract above); null headless (bun tests import this
+ * module with no DOM), where the material's flat FLOOR_CORE color stands
+ * in. The underlay plane's UVs span the whole slab and slab sizes vary per
+ * node, so a SHARED texture can't hit an exact world repeat — the fixed
+ * UNDERLAY_REPEAT lands ~1 repeat / 1.2 m on a typical ~10 m ground slab
+ * (grain size, not alignment, is what reads through a hole). */
+const UNDERLAY_REPEAT = 8
+function dirtTexture(): CanvasTexture | null {
+  if (typeof document === 'undefined') return null
+  const size = 256
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const g = canvas.getContext('2d')!
+  g.fillStyle = FLOOR_CORE_HEX // #6b4a2f — rgb(107, 74, 47)
+  g.fillRect(0, 0, size, size)
+  const rand = mulberry32(13)
+  g.globalAlpha = 0.32
+  for (let i = 0; i < 2200; i++) {
+    // Clods run darker, dry dirt lighter — the same ±spread the voxel
+    // cells wear (skin-tone.ts FLOOR_CLOD_SPREAD), so hole walls and hole
+    // floor keep reading as one material.
+    const shade = 0.72 + rand() * 0.6
+    g.fillStyle = `rgb(${Math.round(107 * shade)}, ${Math.round(74 * shade)}, ${Math.round(47 * shade)})`
+    const r = 1 + rand() * 3.5
+    g.beginPath()
+    g.arc(rand() * size, rand() * size, r, 0, Math.PI * 2)
+    g.fill()
+  }
+  // Sparse gray pebbles — rubble bits, not a pattern.
+  g.globalAlpha = 0.4
+  for (let i = 0; i < 90; i++) {
+    const v = Math.round(96 + rand() * 60)
+    g.fillStyle = `rgb(${v}, ${v - 6}, ${v - 12})`
+    const r = 0.8 + rand() * 1.6
+    g.beginPath()
+    g.arc(rand() * size, rand() * size, r, 0, Math.PI * 2)
+    g.fill()
+  }
+  g.globalAlpha = 1
+  const texture = new CanvasTexture(canvas)
+  texture.wrapS = RepeatWrapping
+  texture.wrapT = RepeatWrapping
+  texture.repeat.set(UNDERLAY_REPEAT, UNDERLAY_REPEAT)
+  return texture
+}
+
 /** Dirt underlay resources — one unit plane scaled per slab, one matte
  * earth material in the FLOOR_CORE family (the under-layer voxels above it
  * jitter around the same tone, so hole walls and hole floor read as one
- * material). */
+ * material). Textured (dirtTexture) so a breached floor shows GROUND, not
+ * a flat untextured brown; the map multiplies against white — the tones
+ * live in the canvas — while headless keeps the legacy flat color. */
 const UNDERLAY_GEOMETRY = new PlaneGeometry(1, 1)
+const UNDERLAY_TEXTURE = dirtTexture()
 const UNDERLAY_MATERIAL = new MeshStandardMaterial({
-  color: new Color(FLOOR_CORE_HEX).offsetHSL(0, 0, -0.012),
+  color: UNDERLAY_TEXTURE ? '#ffffff' : new Color(FLOOR_CORE_HEX).offsetHSL(0, 0, -0.012),
+  map: UNDERLAY_TEXTURE,
   roughness: 1,
 })
 

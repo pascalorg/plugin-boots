@@ -15,6 +15,7 @@ import {
 import { create } from 'zustand'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { spawnFloorBreach } from './craters'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { blastDebrisActive, queueDebris } from './grenade'
@@ -35,6 +36,7 @@ import {
   kindFallbackTone,
   mapAverageTone,
   mapPatternGrid,
+  primedCellColor,
   reportToneFallback,
   resetSkinTones,
   resolveSurfaceTone,
@@ -1168,11 +1170,17 @@ const _cellPattern = new Color()
 const _cellTint = new Color()
 
 /** Debris/shard tone for one removed cell: the sampled item palette when
- * the target carries one (scratch — spawnDebris/spawnFlatDebris copy the
- * color immediately), the target's flat baseColor otherwise. */
-function cellTint(target: VoxelTarget, idx: number): Color {
+ * the target carries one, else the cell's PRIMED skin tone (skin-tone.ts
+ * primedCellColor — the very color the voxel wore on the wall). Debris
+ * always matches the surface it came off: a floor slab's under-layer cells
+ * shed dirt-brown clods and its top cells shed tile/asphalt-pattern chips
+ * — never the flat averaged baseColor lie (owner: "broken floor looks
+ * broken"). Scratch — spawnDebris/spawnFlatDebris copy the color
+ * immediately; primedCellColor is pure module-scratch math, so this stays
+ * allocation-free in the carve hot path. Exported for tests. */
+export function cellTint(target: VoxelTarget, idx: number): Color {
   const colors = target.cellColors
-  if (!colors) return target.baseColor
+  if (!colors) return primedCellColor(_cellTint, target, idx)
   return _cellTint.setRGB(colors[idx * 3]!, colors[idx * 3 + 1]!, colors[idx * 3 + 2]!)
 }
 
@@ -3160,6 +3168,34 @@ export function damageTarget(
   return total
 }
 
+/** True when this carve opened a slab THROUGH: some removed cell's plan
+ * column (ix,iz) holds no live cell anymore, top skin to bottom skin —
+ * daylight through the floor. Lattice keys per the grid contract
+ * (ix + nx·(iy + ny·iz)); slabs keep ny ≤ ~4 layers so the scan is
+ * O(removed × ny) Map lookups, paid only on floorCore slab carves.
+ * Pure — exported for tests. */
+export function floorBreachOpened(
+  grid: Pick<VoxelGridData, 'coords' | 'index' | 'alive' | 'nx' | 'ny'>,
+  removed: number[],
+): boolean {
+  const { coords, index, alive, nx, ny } = grid
+  for (let n = 0; n < removed.length; n++) {
+    const c = removed[n]! * 3
+    const ix = coords[c]!
+    const iz = coords[c + 2]!
+    let open = true
+    for (let iy = 0; iy < ny; iy++) {
+      const j = index.get(ix + nx * (iy + ny * iz))
+      if (j !== undefined && alive[j]) {
+        open = false
+        break
+      }
+    }
+    if (open) return true
+  }
+  return false
+}
+
 /** The single-target carve body damageTarget dispatches to (roof groups
  * call it once per plane). */
 function damageTargetOne(
@@ -3199,6 +3235,20 @@ function damageTargetOne(
   for (let i = 0; i < removed.length; i++) target.removedQueue.push(removed[i]!)
   target.revision++
   useDestruction.getState().bump()
+  // FLOOR BREACH (owner "broken floor looks broken"): a ground-slab carve
+  // that opened a plan column clean through stamps broken-earth under the
+  // hole — the lawn plane (or the void) below must never read pristine.
+  // Slab grids are identity-basis, so grid.origin.y is the world base
+  // height; upper storeys no-op inside spawnFloorBreach (their holes show
+  // the room below). Gated to floorCore slabs — the only targets whose
+  // underside is terrain.
+  if (
+    target.floorCore === true &&
+    target.kind === 'slab' &&
+    floorBreachOpened(target.grid, removed)
+  ) {
+    spawnFloorBreach(point.x, point.z, target.grid.origin.y, radius)
+  }
   if (target.item) {
     // NATURAL BREAKAGE: chunky, material-true pieces — one per ~2–3 removed
     // cells (capped), sampled EVENLY across the exact cells this carve took
@@ -3246,7 +3296,9 @@ function damageTargetOne(
       direction: direction ? _plumeDir.copy(direction) : undefined,
     })
     // A few small torn-edge paper shards flutter off the hole's rim —
-    // drywall reads as tearing plates, not popping cubes.
+    // drywall reads as tearing plates, not popping cubes. Tinted per CELL
+    // (cellTint) so a floor's dirt core sheds brown flakes and a patterned
+    // face sheds pattern-toned ones, matching the cubes above.
     const shards = Math.min(3, 1 + (removed.length >> 3))
     for (let n = 0; n < shards; n++) {
       const idx = removed[Math.floor(Math.random() * removed.length)]!
@@ -3256,7 +3308,7 @@ function damageTargetOne(
         target.grid.centers[idx * 3 + 2]!,
         0.1 + Math.random() * 0.16,
         0.12 + Math.random() * 0.2,
-        target.baseColor,
+        cellTint(target, idx),
         undefined,
         target.roof ? 'shingle' : 'drywall',
       )

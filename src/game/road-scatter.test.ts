@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { sceneRegistry } from '@pascal-app/core'
 import { Box3, BoxGeometry, Color, Group, Matrix4, Mesh, PlaneGeometry, Vector3 } from 'three'
-import { scatter } from './nature'
+import { GROUND_HOLE_LIMIT, GROUND_RADIUS, groundGeometry, groundHoleRect, scatter } from './nature'
 import {
   bvhFor,
   type ColliderEntry,
@@ -221,5 +221,60 @@ describe('scatter road rejection', () => {
       // 0.29 < the 0.3 rejection margin — nothing may sit even at the rim.
       expect(pointOnRoad([strip], x, z, 0.29)).toBe(false)
     }
+  })
+})
+
+describe('lawn disc footprint hole (grass never under the building)', () => {
+  test('normal footprints cut exactly the AABB + 1 m pad, centered in shape space', () => {
+    // Shape space: x = world x − center.x, y = center.z − world z.
+    const rect = groundHoleRect(new Box3(new Vector3(-5, 0, -4), new Vector3(5, 3, 6)))!
+    expect(rect.x0).toBeCloseTo(-6, 10)
+    expect(rect.x1).toBeCloseTo(6, 10)
+    expect(rect.y0).toBeCloseTo(-6, 10)
+    expect(rect.y1).toBeCloseTo(6, 10)
+    expect(groundHoleRect(new Box3())).toBeNull() // no building, no hole
+  })
+
+  test('oversized footprints CLAMP to the disc instead of forfeiting the hole', () => {
+    // Pre-2026-08-29 the hole was SKIPPED whenever the rect overflowed
+    // 0.95 × GROUND_RADIUS — grass then rendered under the WHOLE house and
+    // every floor breach showed pristine lawn. The clamp keeps the largest
+    // safe hole: corners on the inscribed square, strictly inside the disc.
+    const rect = groundHoleRect(
+      new Box3(new Vector3(-200, 0, -200), new Vector3(200, 3, 200)),
+    )!
+    expect(rect.x0).toBeCloseTo(-GROUND_HOLE_LIMIT, 10)
+    expect(rect.x1).toBeCloseTo(GROUND_HOLE_LIMIT, 10)
+    expect(rect.y0).toBeCloseTo(-GROUND_HOLE_LIMIT, 10)
+    expect(rect.y1).toBeCloseTo(GROUND_HOLE_LIMIT, 10)
+    // The clamp really is triangulation-safe: worst corner inside 0.95 R.
+    expect(Math.hypot(GROUND_HOLE_LIMIT, GROUND_HOLE_LIMIT)).toBeLessThanOrEqual(
+      GROUND_RADIUS * 0.95 + 1e-9,
+    )
+  })
+
+  test('groundGeometry carries the clamped hole: no lawn vertex strictly inside it', () => {
+    const world = { buildingAabb: new Box3(new Vector3(-200, 0, -200), new Vector3(200, 3, 200)) }
+    const geometry = groundGeometry(world)
+    const position = geometry.getAttribute('position')
+    expect(position.count).toBeGreaterThan(0)
+    let onHoleBoundary = 0
+    for (let i = 0; i < position.count; i++) {
+      const x = position.getX(i)
+      const y = position.getY(i)
+      // Nothing strictly inside the hole (that would be grass under the
+      // house), everything within the disc contour.
+      const inside =
+        Math.abs(x) < GROUND_HOLE_LIMIT - 1e-6 && Math.abs(y) < GROUND_HOLE_LIMIT - 1e-6
+      expect(inside).toBe(false)
+      expect(Math.hypot(x, y)).toBeLessThanOrEqual(GROUND_RADIUS + 1e-4)
+      const onEdge =
+        Math.abs(Math.abs(x) - GROUND_HOLE_LIMIT) < 1e-6 ||
+        Math.abs(Math.abs(y) - GROUND_HOLE_LIMIT) < 1e-6
+      if (onEdge) onHoleBoundary++
+    }
+    // The hole ring actually exists in the triangulation.
+    expect(onHoleBoundary).toBeGreaterThanOrEqual(4)
+    geometry.dispose()
   })
 })

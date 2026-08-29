@@ -9,8 +9,10 @@ import {
   MeshStandardMaterial,
   Vector3,
 } from 'three'
+import { craterSlots, resetCraters } from './craters'
 import { clearDebris, debrisCensus } from './debris'
 import {
+  cellTint,
   collapseWholeTarget,
   damageExplosion,
   damageSegment,
@@ -19,6 +21,7 @@ import {
   dormantTargetCount,
   dropTarget,
   ensureVoxelTarget,
+  floorBreachOpened,
   EXPLOSION_CORE_NODES,
   isMetalItemMaterial,
   ITEM_CHUNK_CAP,
@@ -35,7 +38,9 @@ import {
   wakeAheadTick,
 } from './destruction'
 import {
-  FLOOR_CORE_HEX,
+  FLOOR_CLOD_DARK_HEX,
+  FLOOR_DIRT_LIGHT_HEX,
+  floorColumnHash,
   isUntexturedWhite,
   kindFallbackTone,
   pendingToneCount,
@@ -295,17 +300,118 @@ describe('floor slab tone lane (owner wave 5: "the floor inside is white")', () 
       const iy = target.grid.coords[i * 3 + 1]!
       primedCellColor(out, target, i)
       // Pin against the exact primeSkin math: dirt for every layer under
-      // the walking surface, the resolved (wood-fallback) tone on top.
+      // the walking surface — the per-column clod blend (skin-tone.ts
+      // FLOOR_CLOD anchors; no toneGrid here, so no flecks) — and the
+      // resolved (wood-fallback) tone on top.
       const j1 = ((i * 2654435761) % 97) / 97
       const j2 = ((i * 1597334677) % 89) / 89
-      const expected = (iy < topLayer ? new Color(FLOOR_CORE_HEX) : target.baseColor.clone())
-        .offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+      const clod = floorColumnHash(target.grid.coords[i * 3]!, target.grid.coords[i * 3 + 2]!)
+      const expected = (
+        iy < topLayer
+          ? new Color(FLOOR_CLOD_DARK_HEX).lerp(
+              new Color(FLOOR_DIRT_LIGHT_HEX),
+              (clod % 1024) / 1024,
+            )
+          : target.baseColor.clone()
+      ).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
       expectSameColor(out, expected)
       if (iy < topLayer) unders++
       else tops++
     }
     expect(unders).toBeGreaterThan(0)
     expect(tops).toBeGreaterThan(0)
+  })
+})
+
+describe('debris tint + floor breach (owner: "broken floor looks broken")', () => {
+  test('cellTint funnels through primedCellColor — debris wears the cell skin tone, not baseColor', () => {
+    const world = makeWorld()
+    world.colliders.push(boxCollider('slab-9', 'slab', [3, 0.2, 3], [0, 3, 5]))
+    const target = ensureVoxelTarget(world, 'slab-9')!
+    const out = new Color()
+    let checkedUnder = false
+    for (let i = 0; i < target.grid.count; i++) {
+      // Scratch contract: copy the tint before the next call.
+      const tint = cellTint(target, i).clone()
+      expectSameColor(tint, primedCellColor(out, target, i))
+      if (!checkedUnder && target.grid.coords[i * 3 + 1] === 0) {
+        // A bottom-skin cell of a floor slab sheds DIRT-brown debris.
+        expect(isUntexturedWhite(tint)).toBe(false)
+        expect(tint.r).toBeGreaterThan(tint.b)
+        checkedUnder = true
+      }
+    }
+    expect(checkedUnder).toBe(true)
+    // Item palette still wins over the primed chain (fake target).
+    const fake = {
+      kind: 'volume',
+      baseColor: new Color('#ff0000'),
+      cellColors: new Float32Array([0.2, 0.4, 0.6]),
+      grid: { coords: new Int16Array([0, 0, 0]) },
+    } as unknown as Parameters<typeof cellTint>[0]
+    const item = cellTint(fake, 0)
+    // Float32Array palette — f32 precision.
+    expect(item.r).toBeCloseTo(0.2, 6)
+    expect(item.g).toBeCloseTo(0.4, 6)
+    expect(item.b).toBeCloseTo(0.6, 6)
+  })
+
+  test('floorBreachOpened: true only when a removed column holds no live cell top-to-bottom', () => {
+    // A 2×1×2 plan sandwich (ny 2): lattice keys ix + nx·(iy + ny·iz).
+    const nx = 2
+    const ny = 2
+    const triples: [number, number, number][] = []
+    for (let iz = 0; iz < 2; iz++)
+      for (let iy = 0; iy < ny; iy++) for (let ix = 0; ix < nx; ix++) triples.push([ix, iy, iz])
+    const coords = new Int16Array(triples.length * 3)
+    const index = new Map<number, number>()
+    triples.forEach(([ix, iy, iz], i) => {
+      coords[i * 3] = ix
+      coords[i * 3 + 1] = iy
+      coords[i * 3 + 2] = iz
+      index.set(ix + nx * (iy + ny * iz), i)
+    })
+    const alive = new Uint8Array(triples.length).fill(1)
+    const grid = { coords, index, alive, nx, ny }
+    const at = (ix: number, iy: number, iz: number) => index.get(ix + nx * (iy + ny * iz))!
+    // Top-only removal (the pierce gate's skin carve): no breach.
+    const topOnly = at(0, 1, 0)
+    alive[topOnly] = 0
+    expect(floorBreachOpened(grid, [topOnly])).toBe(false)
+    // Bottom goes too — the column is daylight now.
+    const bottom = at(0, 0, 0)
+    alive[bottom] = 0
+    expect(floorBreachOpened(grid, [bottom])).toBe(true)
+    // A removal elsewhere doesn't read the (0,0) hole as its own breach.
+    const other = at(1, 1, 1)
+    alive[other] = 0
+    expect(floorBreachOpened(grid, [other])).toBe(false)
+  })
+
+  test('a THROUGH carve on a GROUND slab stamps ONE soil breach decal; upper storeys never do', () => {
+    resetCraters()
+    const world = makeWorld()
+    world.colliders.push(boxCollider('pad-g', 'slab', [3, 0.2, 3], [10, 0.1, 10])) // base y = 0
+    world.colliders.push(boxCollider('slab-up', 'slab', [3, 0.2, 3], [0, 3, 5])) // storey 2
+    // Full-depth carve (radius ≥ the pierce gate) straight through the pad.
+    expect(damageTarget(world, 'pad-g', new Vector3(10, 0.1, 10), 0.7)).toBeGreaterThan(0)
+    let breaches = craterSlots().filter((s) => s.alive && s.breach)
+    expect(breaches.length).toBe(1)
+    expect(breaches[0]!.x).toBe(10)
+    expect(breaches[0]!.z).toBe(10)
+    // Just above the lawn plane (0.05), modest size: carve radius × 1.2.
+    expect(breaches[0]!.y).toBeGreaterThan(0.05)
+    expect(breaches[0]!.y).toBeLessThan(0.12)
+    expect(breaches[0]!.radius).toBeCloseTo(0.7 * 1.2, 5)
+    // Widening the same hole reuses the decal instead of stacking slots.
+    damageTarget(world, 'pad-g', new Vector3(10.4, 0.1, 10), 0.7)
+    breaches = craterSlots().filter((s) => s.alive && s.breach)
+    expect(breaches.length).toBe(1)
+    // The upper-storey slab breaches THROUGH too — but its hole must show
+    // the room below, never a ground decal.
+    expect(damageTarget(world, 'slab-up', new Vector3(0, 3, 5), 0.7)).toBeGreaterThan(0)
+    expect(craterSlots().filter((s) => s.alive && s.breach).length).toBe(1)
+    resetCraters()
   })
 })
 

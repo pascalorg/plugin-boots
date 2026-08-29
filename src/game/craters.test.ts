@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, InstancedMesh, Matrix4, Vector3 } from 'three'
 import {
+  BREACH_LIFT,
+  BREACH_MAX_BASE_Y,
+  BREACH_MIN_Y,
   buildCraterGeometry,
   buildScorchGeometry,
   CRATER_CAP,
@@ -16,6 +19,7 @@ import {
   liveCraters,
   resetCraters,
   spawnCrater,
+  spawnFloorBreach,
 } from './craters'
 import { clearScatterInRadius, registerScatterField, scatterFieldCount } from './nature'
 import { footprintFromTriangles, type RoadFootprint } from './world'
@@ -173,6 +177,10 @@ describe('buildScorchGeometry', () => {
 describe('ring buffer', () => {
   test('caps at CRATER_CAP and reuses the oldest slot with a gen bump', () => {
     const world = greenWorld()
+    // Gens are CUMULATIVE module state (React keys must never repeat), so
+    // other suites' spawns in the same process count too — assert deltas.
+    const gen0 = craterSlots()[0]!.gen
+    const gen3 = craterSlots()[3]!.gen
     for (let i = 0; i < CRATER_CAP + 3; i++) {
       expect(spawnCrater(world, new Vector3(30 + i, 0.1, 0), 3.2)).toBe(true)
     }
@@ -181,10 +189,10 @@ describe('ring buffer', () => {
     // Slots 0–2 were reclaimed by booms 17–19…
     expect(slots[0]!.x).toBe(30 + CRATER_CAP)
     expect(slots[2]!.x).toBe(32 + CRATER_CAP)
-    expect(slots[0]!.gen).toBe(2)
+    expect(slots[0]!.gen).toBe(gen0 + 2)
     // …slot 3 still holds boom 4.
     expect(slots[3]!.x).toBe(33)
-    expect(slots[3]!.gen).toBe(1)
+    expect(slots[3]!.gen).toBe(gen3 + 1)
   })
 
   test('ineligible blasts spawn nothing and consume no slot', () => {
@@ -203,6 +211,80 @@ describe('ring buffer', () => {
     expect(liveCraters()).toBe(0)
     spawnCrater(world, new Vector3(40, 0.1, 0), 3.2)
     expect(craterSlots()[0]!.x).toBe(40)
+  })
+})
+
+describe('floor breach decals (owner: "broken floor looks broken")', () => {
+  test('bypasses the green veto: stamps where craterEligible says no', () => {
+    // Under the building AABB and on a road footprint — both blast-crater
+    // vetoes, both by definition where a breached slab sits.
+    const building = new Box3(new Vector3(5, 0, -6), new Vector3(15, 3, 6))
+    const world = greenWorld({ road: [roadRect()], building })
+    expect(craterEligible(world, 10, 0.1, 0)).toBe(false)
+    expect(spawnFloorBreach(10, 0, 0, 0.7)).toBe(true)
+    const slot = craterSlots().find((s) => s.alive && s.breach)!
+    expect(slot.x).toBe(10)
+    // Ground slab (base 0): the decal floats in the lawn-plane band —
+    // above the grass disc at 0.05, below the crater profile's rim reach.
+    expect(slot.y).toBeCloseTo(BREACH_MIN_Y, 10)
+    // Modest: carve radius × 1.2, never the blast-crater diameter clamps.
+    expect(slot.radius).toBeCloseTo(0.7 * 1.2, 5)
+  })
+
+  test('upper storeys never stamp; raised ground slabs lift the decal over their underlay', () => {
+    expect(spawnFloorBreach(0, 0, BREACH_MAX_BASE_Y + 0.01, 0.7)).toBe(false)
+    expect(liveCraters()).toBe(0)
+    // A slab based at 0.3 m: decal rides the slab, not the lawn plane.
+    expect(spawnFloorBreach(0, 0, 0.3, 0.7)).toBe(true)
+    const slot = craterSlots().find((s) => s.alive && s.breach)!
+    expect(slot.y).toBeCloseTo(0.3 + BREACH_LIFT, 10)
+  })
+
+  test('same-hole carves grow the decal in place; distinct holes claim distinct slots', () => {
+    expect(spawnFloorBreach(0, 0, 0, 0.5)).toBe(true)
+    const gen = craterSlots()[0]!.gen
+    // Overlapping follow-up (0.4 m off, within reach): no new slot…
+    expect(spawnFloorBreach(0.4, 0, 0, 0.5)).toBe(false)
+    expect(liveCraters()).toBe(1)
+    // …a WIDER overlap grows the existing decal (gen bump = remount)…
+    expect(spawnFloorBreach(0.2, 0, 0, 0.9)).toBe(false)
+    expect(liveCraters()).toBe(1)
+    expect(craterSlots()[0]!.radius).toBeCloseTo(0.9 * 1.2, 5)
+    expect(craterSlots()[0]!.gen).toBe(gen + 1)
+    // …and a hole across the room is its own scar.
+    expect(spawnFloorBreach(5, 5, 0, 0.5)).toBe(true)
+    expect(liveCraters()).toBe(2)
+  })
+
+  test('size caps at the crater max; blast craters keep their own slot fields', () => {
+    expect(spawnFloorBreach(20, 20, 0, 3)).toBe(true)
+    const breach = craterSlots().find((s) => s.alive && s.breach)!
+    expect(breach.radius).toBeCloseTo(CRATER_MAX_DIAMETER / 2, 5)
+    // A lawn crater spawned after a breach stays a lawn crater (base y,
+    // no breach flag) — the shared ring buffer never leaks variant state.
+    expect(spawnCrater(greenWorld(), new Vector3(40, 0.1, 0), 3.2)).toBe(true)
+    const crater = craterSlots().find((s) => s.alive && !s.breach)!
+    expect(crater.y).toBeCloseTo(0.058, 10)
+  })
+
+  test('breach geometry wears the soil palette, not explosion char', () => {
+    const char = buildCraterGeometry(1, 5)
+    const soil = buildCraterGeometry(1, 5, true)
+    // Same seed → same shade jitter; the breach center is earth (lighter,
+    // warmer) while the rim converges on the same soil family.
+    expect(soil.getAttribute('color').getX(0)).toBeGreaterThan(char.getAttribute('color').getX(0))
+    const last = soil.getAttribute('color').count - 1
+    expect(soil.getAttribute('color').getX(last)).toBeCloseTo(
+      char.getAttribute('color').getX(last),
+      10,
+    )
+    // The breach scorch centers on dark earth (still translucent, still
+    // fading to zero at the outer ring).
+    const scorch = buildScorchGeometry(1, true)
+    const color = scorch.getAttribute('color')
+    expect(color.getX(0)).toBeGreaterThan(buildScorchGeometry(1).getAttribute('color').getX(0))
+    expect(color.getW(0)).toBeLessThan(1)
+    expect(color.getW(color.count - 1)).toBe(0)
   })
 })
 

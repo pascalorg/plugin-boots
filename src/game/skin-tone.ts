@@ -80,13 +80,41 @@ export type SkinToneSource = {
 const _cellTone = new Color()
 const _derived = new Color()
 const _pattern = new Color()
+const _fleck = new Color()
 
 /** Dirt-subfloor core tone for FLOOR-family slabs: what a carved floor
  * reveals (bottom skin + rim middles) — warm earth brown, kind-based by
  * design (the host has no "subfloor" material to sample). Owner wave 5:
  * "should be wood floor, or dirt when broken — not white". */
 export const FLOOR_CORE_HEX = '#6b4a2f'
-const FLOOR_CORE = new Color(FLOOR_CORE_HEX)
+
+/** Dirt-variation anchors for the floor core (owner "broken floor looks
+ * broken" round: the carved fill must read as RUBBLE — clods, dry patches,
+ * cracked-tile flecks — never one flat brown). Each plan COLUMN (ix,iz)
+ * hashes to a blend between darker clods and lighter dry dirt, both in the
+ * FLOOR_CORE_HEX family (the dirt underlay speckles around the same
+ * browns). Anchor LERP, not an HSL offset — the working space is linear,
+ * where FLOOR_CORE's lightness is only ~0.09: a symmetric ±0.11 offset
+ * would clip clods to pure black, so the spread leans on the DRY side and
+ * the dark anchor keeps headroom for the ±0.05 per-cell jitter on top. */
+export const FLOOR_CLOD_DARK_HEX = '#5a3d26'
+export const FLOOR_DIRT_LIGHT_HEX = '#93693f'
+const FLOOR_CLOD_DARK = new Color(FLOOR_CLOD_DARK_HEX)
+const FLOOR_DIRT_LIGHT = new Color(FLOOR_DIRT_LIGHT_HEX)
+/** Fraction of plan columns that fold a surface-pattern fleck into the
+ * dirt (broken tile bits in the rubble) — dirt first, flecks second. */
+export const FLOOR_FLECK_RATE = 0.22
+/** How much of the (desaturated) surface tone a fleck column mixes in. */
+export const FLOOR_FLECK_MIX = 0.25
+
+/** Deterministic 32-bit mix of a floor slab's plan-column indices — the
+ * dirt-variation seed (exported so tests pin the exact math). Low 10 bits
+ * drive the clod blend, the next 10 the fleck pick. Pure integer math. */
+export function floorColumnHash(ix: number, iz: number): number {
+  let h = Math.imul(ix + 1, 0x9e3779b1) ^ Math.imul(iz + 1, 0x85ebca6b)
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35)
+  return (h ^ (h >>> 16)) >>> 0
+}
 
 /** Muted bare-structure tone for TOP rims: a wall's top row (the plate)
  * and a ceiling plate's attic side — dusty sheathing/framing, muted enough
@@ -169,8 +197,21 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
   ) {
     // FLOOR slab under-layers (bottom skin + rim middles, everything below
     // the top walking layer): dirt subfloor — carving the floor reveals
-    // earth, never drywall white. Kind-based constant (owner wave 5).
-    base = FLOOR_CORE
+    // earth, never drywall white. Kind-based (owner wave 5), broken up per
+    // plan COLUMN (owner "broken floor looks broken"): one deterministic
+    // (ix,iz) hash blends darker clods against lighter dry dirt (the
+    // FLOOR_CLOD anchors — well past the generic ±0.05 cell jitter, so the
+    // fill reads as rubble, not one flat brown), and ~FLOOR_FLECK_RATE of
+    // columns fold FLOOR_FLECK_MIX of the floor's own DESATURATED surface
+    // tone into the dirt — the cracked-tile flecks (`tone` holds the
+    // cell's toneGrid sample from the pattern lane above, or the flat
+    // baseColor when the grid can't sample). Pure math, so re-primes and
+    // paint coats derive identically.
+    const h = floorColumnHash(wall.grid.coords[i * 3]!, wall.grid.coords[i * 3 + 2]!)
+    base = _derived.copy(FLOOR_CLOD_DARK).lerp(FLOOR_DIRT_LIGHT, (h % 1024) / 1024)
+    if (wall.toneGrid && ((h >>> 10) & 1023) / 1024 < FLOOR_FLECK_RATE) {
+      base.lerp(_fleck.copy(tone).offsetHSL(0, -0.3, 0), FLOOR_FLECK_MIX)
+    }
   } else if (wall.kind === 'slab' && wall.grid.coords[i * 3 + 1] === 0) {
     // Bottom skin — the ceiling face a player looks up at — renders as
     // slightly lighter, desaturated drywall.

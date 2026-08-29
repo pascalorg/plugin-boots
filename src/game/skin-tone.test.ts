@@ -5,7 +5,11 @@ import {
   cellPatternTone,
   cellToneAt,
   clearToneAudit,
-  FLOOR_CORE_HEX,
+  FLOOR_CLOD_DARK_HEX,
+  FLOOR_DIRT_LIGHT_HEX,
+  FLOOR_FLECK_MIX,
+  FLOOR_FLECK_RATE,
+  floorColumnHash,
   coreCellColor,
   isUntexturedWhite,
   kindFallbackTone,
@@ -137,7 +141,9 @@ describe('primedCellColor (shared primeSkin tone math)', () => {
     // ny = 3: iy 0 (bottom skin) + iy 1 (rim middle) are UNDER-layers →
     // dirt; iy 2 is the walking surface → the resolved floor tone,
     // bit-identical to a plain slab top (owner wave 5: a carved floor
-    // reveals earth, never drywall white).
+    // reveals earth, never drywall white). The dirt wears the per-COLUMN
+    // clod blend (owner "broken floor looks broken"): the (ix,iz) hash
+    // lerps the FLOOR_CLOD anchors, then the generic per-cell jitter.
     const wall: SkinToneSource = {
       kind: 'slab',
       floorCore: true,
@@ -147,7 +153,9 @@ describe('primedCellColor (shared primeSkin tone math)', () => {
     const dirtReference = (i: number): Color => {
       const j1 = ((i * 2654435761) % 97) / 97
       const j2 = ((i * 1597334677) % 89) / 89
-      return new Color(FLOOR_CORE_HEX).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
+      return new Color(FLOOR_CLOD_DARK_HEX)
+        .lerp(new Color(FLOOR_DIRT_LIGHT_HEX), (floorColumnHash(0, 0) % 1024) / 1024)
+        .offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
     }
     const out = new Color()
     expectSame(primedCellColor(out, wall, 0), dirtReference(0))
@@ -159,6 +167,74 @@ describe('primedCellColor (shared primeSkin tone math)', () => {
     expect(isUntexturedWhite(dirt)).toBe(false)
     expect(dirt.r).toBeGreaterThan(dirt.g)
     expect(dirt.g).toBeGreaterThan(dirt.b)
+  })
+
+  test('floor-core dirt varies per plan column: deterministic, ~±0.11 lightness spread, always earth', () => {
+    // A 10×10 plan of bottom-skin cells (iy 0, ny 3): the clod hash must
+    // spread the columns well past the old flat ±0.05 jitter — rubble, not
+    // one brown sheet — while staying deterministic and never white.
+    const plan: [number, number, number][] = []
+    for (let x = 0; x < 10; x++) for (let z = 0; z < 10; z++) plan.push([x, 0, z])
+    const wall: SkinToneSource = {
+      kind: 'slab',
+      floorCore: true,
+      baseColor: new Color('#a0784e'),
+      grid: { coords: coords(plan), ny: 3 },
+    }
+    const hsl = { h: 0, s: 0, l: 0 }
+    let minL = Infinity
+    let maxL = -Infinity
+    const out = new Color()
+    for (let i = 0; i < plan.length; i++) {
+      primedCellColor(out, wall, i)
+      expect(isUntexturedWhite(out)).toBe(false)
+      expect(out.r).toBeGreaterThan(out.b) // warm, always
+      out.getHSL(hsl)
+      if (hsl.l < minL) minL = hsl.l
+      if (hsl.l > maxL) maxL = hsl.l
+      // Deterministic: the same cell re-primes to the same tone.
+      expectSame(primedCellColor(new Color(), wall, i), out)
+    }
+    // Clod anchors (~±0.06 linear lightness) + cell jitter (±0.05): the
+    // total spread must clearly beat the old ±0.05-only band, and stay
+    // bounded (subtle rubble, not noise).
+    expect(maxL - minL).toBeGreaterThan(0.12)
+    expect(maxL - minL).toBeLessThan(0.3)
+  })
+
+  test('floor-core flecks: ~1 in 5 columns folds a desaturated pattern sample into the dirt', () => {
+    // A blue-tile floor (striped map — the blue half is unmistakable in
+    // brown dirt): with the toneGrid present, FLOOR_FLECK_RATE of columns
+    // lerp FLOOR_FLECK_MIX of the desaturated sample in; the rest stay
+    // bit-identical to the grid-less dirt. Dirt first, flecks second.
+    const grid = mapPatternGrid(stripedMap())!
+    const plan: [number, number, number][] = []
+    for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) plan.push([x, 0, z])
+    const flecked: SkinToneSource = {
+      kind: 'slab',
+      floorCore: true,
+      baseColor: new Color('#a0784e'),
+      toneGrid: grid,
+      grid: { coords: coords(plan), ny: 3, cellX: 0.15, cellY: 0.05, cellZ: 0.15 },
+    }
+    const plain: SkinToneSource = { ...flecked, toneGrid: undefined }
+    let flecks = 0
+    const a = new Color()
+    const b = new Color()
+    for (let i = 0; i < plan.length; i++) {
+      primedCellColor(a, flecked, i)
+      primedCellColor(b, plain, i)
+      if (a.equals(b)) continue
+      flecks++
+      // A fleck is a MIX into the dirt, not a replacement — the shift stays
+      // well under the lerp fraction's reach (the HSL jitter riding on top
+      // keeps it approximate, so bound loosely).
+      expect(Math.abs(a.r - b.r)).toBeLessThan(FLOOR_FLECK_MIX + 0.15)
+      expect(isUntexturedWhite(a)).toBe(false)
+    }
+    const rate = flecks / plan.length
+    expect(rate).toBeGreaterThan(FLOOR_FLECK_RATE - 0.12)
+    expect(rate).toBeLessThan(FLOOR_FLECK_RATE + 0.12)
   })
 
   test('floorCore without grid.ny falls back to the legacy slab math (defensive)', () => {

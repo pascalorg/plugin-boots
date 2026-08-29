@@ -2,6 +2,7 @@
 
 import { useMemo } from 'react'
 import {
+  type Box3,
   BufferAttribute,
   BufferGeometry,
   CanvasTexture,
@@ -176,39 +177,62 @@ function bushClusterGeometry(): BufferGeometry {
   return geometry
 }
 
-const GROUND_RADIUS = 95
+export const GROUND_RADIUS = 95
+
+/** The lawn hole may reach this far from the disc center per axis: the
+ * disc's inscribed square at a 0.95 safety — a rect whose CORNERS stay
+ * within 0.95 × GROUND_RADIUS can never cross the outer contour (which
+ * would break ShapeGeometry triangulation). */
+export const GROUND_HOLE_LIMIT = (GROUND_RADIUS * 0.95) / Math.SQRT2
+
+/**
+ * The lawn hole rect in the disc's local shape space (x = world x, y =
+ * −world z, both about the building center), or null with no building.
+ * CLAMPED per axis to GROUND_HOLE_LIMIT — never skipped: the pre-2026-08-29
+ * code dropped the hole entirely whenever the rect overflowed the disc, so
+ * a big building rendered GRASS under its whole footprint and every floor
+ * breach showed lawn instead of earth. The rect always straddles the local
+ * origin (it surrounds the building center), so clamping keeps a valid,
+ * strictly-inside hole. Pure; exported for tests.
+ */
+export function groundHoleRect(
+  aabb: Box3,
+): { x0: number; x1: number; y0: number; y1: number } | null {
+  if (aabb.isEmpty()) return null
+  const center = aabb.getCenter(new Vector3())
+  const pad = 1
+  const clamp = (v: number) => Math.min(GROUND_HOLE_LIMIT, Math.max(-GROUND_HOLE_LIMIT, v))
+  return {
+    x0: clamp(aabb.min.x - pad - center.x),
+    x1: clamp(aabb.max.x + pad - center.x),
+    y0: clamp(center.z - (aabb.max.z + pad)),
+    y1: clamp(center.z - (aabb.min.z - pad)),
+  }
+}
 
 /**
  * The lawn disc with the building footprint CUT OUT of it (AABB + 1 m
  * margin): host slabs sit on the same ground plane, and any lawn surface
  * running under them z-fights their bottom faces from grazing angles. A
  * hole in the geometry kills that coplanar pair by construction — no
- * offset tuning, nothing rendered where the building stands.
+ * offset tuning, nothing rendered where the building stands. Oversized
+ * footprints clamp to the disc (groundHoleRect) instead of forfeiting the
+ * hole. Exported for tests.
  */
-function groundGeometry(world: GameWorld): BufferGeometry {
+export function groundGeometry(world: Pick<GameWorld, 'buildingAabb'>): BufferGeometry {
   const shape = new Shape()
   shape.absarc(0, 0, GROUND_RADIUS, 0, Math.PI * 2, false)
-  const aabb = world.buildingAabb
-  if (!aabb.isEmpty()) {
-    const center = aabb.getCenter(new Vector3())
-    const pad = 1
+  const rect = groundHoleRect(world.buildingAabb)
+  if (rect) {
     // Shape space is the disc's local XY; the mesh rotates -PI/2 about X,
     // so local (x, y) lands at world (x, -z) around the building center.
-    const x0 = aabb.min.x - pad - center.x
-    const x1 = aabb.max.x + pad - center.x
-    const y0 = center.z - (aabb.max.z + pad)
-    const y1 = center.z - (aabb.min.z - pad)
-    // Only cut when the rectangle sits fully inside the disc — a hole
-    // crossing the outer contour would break triangulation.
-    if (Math.max(Math.abs(x0), Math.abs(x1), Math.abs(y0), Math.abs(y1)) < GROUND_RADIUS * 0.95) {
-      const hole = new Path()
-      hole.moveTo(x0, y0)
-      hole.lineTo(x1, y0)
-      hole.lineTo(x1, y1)
-      hole.lineTo(x0, y1)
-      hole.closePath()
-      shape.holes.push(hole)
-    }
+    const hole = new Path()
+    hole.moveTo(rect.x0, rect.y0)
+    hole.lineTo(rect.x1, rect.y0)
+    hole.lineTo(rect.x1, rect.y1)
+    hole.lineTo(rect.x0, rect.y1)
+    hole.closePath()
+    shape.holes.push(hole)
   }
   const geometry = new ShapeGeometry(shape, 48)
   // ShapeGeometry UVs are raw meters — normalize to [0, 1] across the disc
