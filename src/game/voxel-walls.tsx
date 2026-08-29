@@ -15,7 +15,12 @@ import {
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
-import { primedCellColor, setSkinToneRenderer, type SkinToneRenderer } from './skin-tone'
+import {
+  coreCellColor,
+  primedCellColor,
+  setSkinToneRenderer,
+  type SkinToneRenderer,
+} from './skin-tone'
 
 /**
  * Renders every voxelized target as the phase-3 WALL SANDWICH, one
@@ -317,6 +322,35 @@ function MemberLayer({
   return <instancedMesh args={[VOXEL_GEOMETRY, material, members.length]} ref={meshRef} />
 }
 
+/** CORE MODE inset: the fraction of the thickness-axis cell size shaved
+ * off EACH side of a shelled target's skin voxels (×2 for both directions),
+ * so the core column sits strictly INSIDE the conforming shell surface —
+ * no coplanar fighting between core faces and shell triangles. */
+export const CORE_INSET_FRAC = 0.2
+
+/** The grid axis with the smallest PHYSICAL extent (span·cell) — the
+ * thickness axis of a layered wall/slab grid, resolved exactly the way
+ * dropInteriorCells (voxel.ts) picks its skin axis: raw spans can't be
+ * trusted on anisotropic grids (the thin axis gets as many cells as the
+ * others), so compare metres. Pure; exported for tests. */
+export function coreThicknessAxis(grid: {
+  nx: number
+  ny: number
+  nz: number
+  cellX: number
+  cellY: number
+  cellZ: number
+}): 0 | 1 | 2 {
+  let axis: 0 | 1 | 2 = 0
+  let extent = grid.nx * grid.cellX
+  if (grid.ny * grid.cellY < extent) {
+    axis = 1
+    extent = grid.ny * grid.cellY
+  }
+  if (grid.nz * grid.cellZ < extent) axis = 2
+  return axis
+}
+
 /** Prime (or re-prime) the skin layer's matrices + colors from the grid.
  * Runs on mount and again whenever `skinRevision` bumps (async roof tone).
  * Clears the mesh's paint gates afterwards so drainPaintTints re-applies
@@ -329,6 +363,20 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
   // merging with its neighbors — the clean "block" read walls now wear
   // from session start.
   _scale.set(grid.cellX * 0.985, grid.cellY * 0.985, grid.cellZ * 0.985)
+  // CORE MODE (conforming-shell targets): the skin voxels are the wall's
+  // structural CORE now — the shell mesh carries the facade. Inset the
+  // thickness axis by CORE_INSET_FRAC of its cell on BOTH sides (a pure
+  // symmetric scale-down, so positions stay put) and prime with the
+  // darkened structural tone instead of the facade pattern colors.
+  // Zero effect without target.shell.
+  const core = wall.shell !== undefined
+  if (core) {
+    const axis = coreThicknessAxis(grid)
+    const inset = 1 - 2 * CORE_INSET_FRAC
+    if (axis === 0) _scale.x *= inset
+    else if (axis === 1) _scale.y *= inset
+    else _scale.z *= inset
+  }
   // Rotated grids: cells are axis-aligned in the grid's own frame —
   // rotate each instance out to world. Yaw-local grids (diagonal walls)
   // keep the legacy Y axis-angle; FULL-basis grids (pitched roof planes,
@@ -349,8 +397,12 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
       mesh.setMatrixAt(i, ZERO)
     }
     // Shared per-cell prime tone (skin-tone.ts) — paint.tsx feathers coats
-    // up from exactly this color, so the two must never drift.
-    mesh.setColorAt(i, primedCellColor(_color, wall, i))
+    // up from exactly this color, so the two must never drift. Shelled
+    // targets prime the CORE tone instead (the facade is the shell's).
+    mesh.setColorAt(
+      i,
+      core ? coreCellColor(wall.baseColor, wall.kind, _color) : primedCellColor(_color, wall, i),
+    )
   }
   mesh.instanceMatrix.needsUpdate = true
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
