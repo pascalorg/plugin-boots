@@ -157,6 +157,15 @@ export class GameInput {
       this.state.lookY += e.movementY
       syncButtons(e.buttons)
     })
+    // pointermove is a SEPARATE event from mousemove and it is what R3F's
+    // canvas listeners raycast on — un-swallowed, the host kept hovering
+    // (and hover-outlining) nodes under the locked cursor all session.
+    // Swallowing it doesn't affect DOM pointerenter/leave (the item-catalog
+    // cards' hover), which dispatch regardless of pointermove propagation.
+    on('pointermove', (e) => {
+      if (this.menuOpen) return
+      e.stopImmediatePropagation()
+    })
     on('pointerdown', (e) => {
       if (this.menuOpen) {
         menuGate(e)

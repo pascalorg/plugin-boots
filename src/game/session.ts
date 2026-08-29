@@ -174,6 +174,101 @@ export function forceStackedLevelMode(teardown: Array<() => void>): void {
   })
 }
 
+/**
+ * NO SELECTION DURING A SESSION. The host's manipulation gizmos — the
+ * purple move/resize arrow rig (editor NodeArrowHandles), the dashed group
+ * selection box, and the selection outline pass — are React components
+ * mounted INSIDE the same R3F canvas the game renders through, driven
+ * entirely by the viewer store's `selection` (they carry no scene-graph
+ * names or registry kinds, so no hide-sweep predicate can catch them; the
+ * store is their only switch). A selection alive during play therefore
+ * puts uninteractable purple arrows and corner grips in first person (owner
+ * screenshot, 2026-08-28) — and worse, a live sole selection ARMS host
+ * manipulation paths our capture-phase input interception cannot block,
+ * because they were registered on window CAPTURE before our attach and
+ * same-phase listeners run in registration order (the editor
+ * selection-manager's Cmd+right-drag direct-rotate writes the SCENE store
+ * on release). R3F hover raycasts also flow all session: they ride
+ * `pointermove`, which input.ts swallows separately.
+ *
+ * So: record the pre-session selection, clear it, and keep it clear for
+ * the whole session with a store subscription (the ForeignOverlayHide
+ * philosophy — the host re-asserts, we re-clear; event-driven, no polling).
+ * Teardown unsubscribes and restores the EXACT pre-session selection —
+ * exitGame runs teardown before the Keep panel appears, so the post-exit
+ * Keep flows (keep.ts / item-keep.ts read selection.levelId) see the
+ * restored value. collectWorld's mid-game selection.levelId read is
+ * telemetry-only (documented there), so the cleared value is fine.
+ *
+ * The viewer selection is UI state — a zustand store separate from the
+ * useScene document, with no temporal/undo middleware and `selection`
+ * excluded from its persist partialize — so clearing it writes nothing
+ * undoable and never trips the scene-write sentinel below.
+ * Exported for unit tests.
+ */
+export function guardSelectionForGame(teardown: Array<() => void>): void {
+  type SelectionPath = {
+    buildingId?: string | null
+    levelId?: string | null
+    zoneId?: string | null
+    selectedIds?: readonly string[]
+  }
+  type SelectionState = {
+    selection?: SelectionPath
+    hoveredId?: unknown
+    setSelection?: (updates: SelectionPath) => void
+  }
+  const viewer = useViewer as unknown as {
+    getState: () => SelectionState
+    setState: (partial: Record<string, unknown>) => void
+    subscribe: (listener: (state: SelectionState) => void) => () => void
+  }
+  const state = viewer.getState()
+  // Older hosts without the selection API: nothing mounts gizmos, no-op.
+  if (!state.setSelection || !state.selection) return
+  const prev: SelectionPath = {
+    buildingId: state.selection.buildingId ?? null,
+    levelId: state.selection.levelId ?? null,
+    zoneId: state.selection.zoneId ?? null,
+    selectedIds: [...(state.selection.selectedIds ?? [])],
+  }
+  const hasSelection = (selection?: SelectionPath): boolean =>
+    selection != null &&
+    (selection.buildingId != null ||
+      selection.levelId != null ||
+      selection.zoneId != null ||
+      (selection.selectedIds?.length ?? 0) > 0)
+  // Re-entrancy latch: zustand notifies subscribers SYNCHRONOUSLY, so the
+  // guard listener below runs inside clear()'s own setSelection — at which
+  // point hoveredId is still set and an unlatched listener would call
+  // clear() again, forever (stack overflow, caught by the unit tests).
+  let clearing = false
+  const clear = () => {
+    if (clearing) return
+    clearing = true
+    try {
+      // All four fields explicit — setSelection's hierarchy guard then
+      // merges exactly this, no cascade surprises. Also drop any hover
+      // ghost: the hover outline is the same in-canvas selection chrome.
+      viewer
+        .getState()
+        .setSelection?.({ buildingId: null, levelId: null, zoneId: null, selectedIds: [] })
+      if (viewer.getState().hoveredId != null) viewer.setState({ hoveredId: null })
+    } finally {
+      clearing = false
+    }
+  }
+  clear()
+  const unsub = viewer.subscribe((s) => {
+    if (useBoots.getState().phase !== 'game') return
+    if (hasSelection(s.selection) || s.hoveredId != null) clear()
+  })
+  teardown.push(() => {
+    unsub()
+    viewer.getState().setSelection?.(prev)
+  })
+}
+
 export function enterGame(): boolean {
   if (current || useBoots.getState().phase === 'game') return false
   if (typeof document === 'undefined') return false
@@ -216,6 +311,10 @@ export function enterGame(): boolean {
   // Whole-building presence: solo/exploded level modes would snapshot a
   // partial or displaced building — force stacked, restore on exit.
   forceStackedLevelMode(teardownList)
+  // No selection during a session: gizmos can't appear in first person.
+  // Must run BEFORE setPhase('game') mounts GameRoot, so the pre-session
+  // gizmo rig is unmounted before collectWorld snapshots the scene.
+  guardSelectionForGame(teardownList)
 
   // Position context for the HUD overlay.
   if (getComputedStyle(container).position === 'static') {
