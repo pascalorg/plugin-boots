@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test'
-import { builderKeybarText, Hud, KEYBAR_DEFAULT, presenceChipText } from './hud'
+import {
+  builderKeybarText,
+  hotbarModel,
+  hotbarSignature,
+  Hud,
+  KEYBAR_DEFAULT,
+  presenceChipText,
+} from './hud'
 
 /**
  * Keybind-bar discoverability contract (owner QA 2026-08-27: "no ramp, no
@@ -36,6 +43,76 @@ describe('builder keybind bar', () => {
 
   test('the default bar is untouched (holstered contract)', () => {
     expect(KEYBAR_DEFAULT).toBe('Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog')
+  })
+})
+
+/**
+ * Weapon hotbar (owner ask: a discreet slot reminder so players stop
+ * guessing the number keys): hotbarModel is the pure half — a chip is
+ * 'available' iff pressing its key RIGHT NOW would switch to it, which is
+ * viewmodel.tsx switchWeapon's exact gate (builder and paint are always
+ * reachable regardless of `owned`; the G grenade is infinite; every gun
+ * must be picked up first). hotbarSignature is the render loop's change
+ * gate — chip styles rebuild only when it moves.
+ */
+describe('weapon hotbar model', () => {
+  test('lists every slot chip in key order, G last', () => {
+    const chips = hotbarModel({ weapon: 'knife', owned: ['knife'] })
+    expect(chips.map((c) => `${c.key} ${c.label}`)).toEqual([
+      '1 KNIFE',
+      '2 PISTOL',
+      '3 RIFLE',
+      '4 BUILD',
+      '5 MINIGUN',
+      '6 HAMMER',
+      '7 PAINT',
+      'G GRENADE',
+    ])
+  })
+
+  test('spawn loadout: knife active, tools + grenade reachable, guns locked', () => {
+    const byId = Object.fromEntries(
+      hotbarModel({ weapon: 'knife', owned: ['knife'] }).map((c) => [c.id, c.state]),
+    )
+    expect(byId.knife).toBe('active')
+    // Digit4/Digit7 switch without an `owned` check (switchWeapon's gate).
+    expect(byId.builder).toBe('available')
+    expect(byId.paint).toBe('available')
+    // G never checks anything — grenades are infinite.
+    expect(byId.grenade).toBe('available')
+    expect(byId.pistol).toBe('locked')
+    expect(byId.rifle).toBe('locked')
+    expect(byId.minigun).toBe('locked')
+    expect(byId.hammer).toBe('locked')
+  })
+
+  test('picking a gun up unlocks its chip; holding it marks it active', () => {
+    const owned = ['knife', 'rifle']
+    const holdingKnife = hotbarModel({ weapon: 'knife', owned })
+    expect(holdingKnife.find((c) => c.id === 'rifle')?.state).toBe('available')
+    const holdingRifle = hotbarModel({ weapon: 'rifle', owned })
+    expect(holdingRifle.find((c) => c.id === 'rifle')?.state).toBe('active')
+    expect(holdingRifle.find((c) => c.id === 'knife')?.state).toBe('available')
+  })
+
+  test('holding a tool marks its chip active; G never reads active', () => {
+    const holdingBuilder = hotbarModel({ weapon: 'builder', owned: ['knife'] })
+    expect(holdingBuilder.find((c) => c.id === 'builder')?.state).toBe('active')
+    // The grenade is a throw, not a hold — its chip can't go active.
+    const all = hotbarModel({ weapon: 'knife', owned: ['knife'] })
+    expect(all.find((c) => c.id === 'grenade')?.state).toBe('available')
+  })
+
+  test('signature moves exactly with (weapon, owned) reality', () => {
+    const base = hotbarSignature(hotbarModel({ weapon: 'knife', owned: ['knife'] }))
+    const repeat = hotbarSignature(hotbarModel({ weapon: 'knife', owned: ['knife'] }))
+    expect(repeat).toBe(base) // unchanged state → no chip restyle
+    const switched = hotbarSignature(hotbarModel({ weapon: 'builder', owned: ['knife'] }))
+    expect(switched).not.toBe(base) // active chip moved
+    const pickedUp = hotbarSignature(hotbarModel({ weapon: 'knife', owned: ['knife', 'pistol'] }))
+    expect(pickedUp).not.toBe(base) // a chip unlocked
+    // 'active' and 'available' must never collide in the signature alphabet.
+    expect(switched.length).toBe(base.length)
   })
 })
 

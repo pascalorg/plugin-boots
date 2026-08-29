@@ -1,14 +1,15 @@
 'use client'
 
 import { useFrame, useThree } from '@react-three/fiber'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Group, Mesh, Object3D } from 'three'
 import type { WeaponId } from '../store'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { builderDebug } from './builder'
 import { throwGrenade } from './grenade'
-import { itemGhostActive } from './item-place'
+import { isItemMenuOpen } from './inventory'
+import { itemGhostActive, useItems } from './item-place'
 import { MOVE } from './movement'
 import { cyclePaintColor, paintDebug, SprayerModel } from './paint'
 import { perfEvent } from './perf-monitor'
@@ -162,6 +163,19 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
   const weapon = useBoots((s) => s.weapon) as ToolId
 
+  // DISPLAY-ONLY override (owner ask): while a catalog-item ghost is armed
+  // and the menu is closed, the hand SHOWS the builder's little claw hammer
+  // — you're placing furniture, not shooting the rifle. Everything logical
+  // stays on the real weapon: trigger/fire gating, ammo, spin, the hammer
+  // swing machine, item-place's switch-auto-stow and store.weapon are all
+  // untouched — only the rendered mesh + its carry pose (and the draw-in
+  // restart) follow the override. `armed` subscribes reactively; the menu
+  // flag lives on GameInput (no store), so the frame loop below mirrors it
+  // into state change-gated (an unchanged setState is a React no-op).
+  const ghostArmed = useItems((s) => s.armed !== null)
+  const [itemMenuOpen, setItemMenuOpen] = useState(false)
+  const displayed: ToolId = ghostArmed && !itemMenuOpen ? 'builder' : weapon
+
   // Animation state.
   const prevWeapon = useRef(weapon)
   const drawT = useRef(0)
@@ -306,6 +320,13 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const firing = session.input.state.firing
     const current = useBoots.getState().weapon as ToolId
     const staggered = useBoots.getState().staggered
+    // Armed-ghost display override, frame-loop half: `shown` picks the pose
+    // (+ draw-in edge) the same frame the ghost arms/stows — the React
+    // `displayed` above swaps the mesh on its own commit. Keep the GameInput
+    // menu flag mirrored so the two halves agree across menu open/close.
+    const menuOpenNow = isItemMenuOpen()
+    if (menuOpenNow !== itemMenuOpen) setItemMenuOpen(menuOpenNow)
+    const shown: ToolId = itemGhostActive() ? 'builder' : current
     // Weapon droop while staggered — slow lerp both ways so the arm sags
     // and recovers smoothly instead of snapping.
     droop.current += ((staggered ? 1 : 0) - droop.current) * Math.min(1, dt * 6)
@@ -332,12 +353,14 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // change-gates the write, so the per-frame call is free once settled.
     session.hud.setAds?.(ads)
 
-    // Any switch (slots, wheel, gear-table pickup) restarts the draw-in.
-    if (current !== prevWeapon.current) {
-      prevWeapon.current = current
+    // Any switch (slots, wheel, gear-table pickup) restarts the draw-in —
+    // tracked on `shown`, so arming/stowing the item ghost draws the
+    // builder hammer in/out like a real swap.
+    if (shown !== prevWeapon.current) {
+      prevWeapon.current = shown
       drawT.current = 0
       // Drawing the sprayer shakes the can awake — same rattle as R.
-      if (current === 'paint') {
+      if (shown === 'paint') {
         paintShakeT.current = 1
         playPaintRattle()
       }
@@ -464,7 +487,10 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     }
 
     // --- Procedural weapon pose ------------------------------------------
-    const pose = POSES[current]
+    // Pose follows `shown` (the DISPLAYED tool) — while the item ghost is
+    // armed the builder's carry pose frames the claw hammer, whatever gun
+    // logic still holds underneath.
+    const pose = POSES[shown]
     const invDt = dt > 1e-5 ? 1 / dt : 0
 
     // Draw-in: rise from below with a muzzle-down tilt, ease-out cubic.
@@ -526,7 +552,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // knocking around the can — and holding the trigger leans the can in
     // as the thumb presses the nozzle. Both exactly zero at rest.
     paintShakeT.current = Math.max(0, paintShakeT.current - dt * PAINT_SHAKE_DECAY)
-    const canShake = current === 'paint' ? paintShakeT.current : 0
+    const canShake = shown === 'paint' ? paintShakeT.current : 0
     const shakeX = canShake > 0 ? Math.sin(breathT.current * 26) * 0.02 * canShake : 0
     const shakeY = canShake > 0 ? Math.sin(breathT.current * 33 + 0.9) * 0.012 * canShake : 0
     const shakeRoll = canShake > 0 ? Math.sin(breathT.current * 22 + 0.4) * 0.14 * canShake : 0
@@ -537,12 +563,12 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       !itemGhostActive()
     paintPressT.current +=
       ((sprayHeld ? 1 : 0) - paintPressT.current) * Math.min(1, dt * PAINT_PRESS_RATE)
-    const press = current === 'paint' ? paintPressT.current : 0
+    const press = shown === 'paint' ? paintPressT.current : 0
 
     // ADS pose blend: lerp the carry pose toward the centered aim pose and
     // steady the procedural motion (bob/breath/look-lag) toward ADS_STEADY
     // at full aim — planted sights, not a bouncing scope.
-    const adsPose = ADS_POSES[current]
+    const adsPose = ADS_POSES[shown]
     const aim = adsPose ? ads : 0
     const steady = 1 - (1 - ADS_STEADY) * aim
     const baseX = adsPose ? pose.pos[0] + (adsPose.pos[0] - pose.pos[0]) * aim : pose.pos[0]
@@ -555,10 +581,12 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // Warhammer swing offsets — zero for every other weapon and at rest.
     // Wind-up eases OUT (heave the mass up), the slam eases IN (t² — gravity
     // takes it), recover releases through a smoothstep back to carry.
+    // Gated on `shown` (display half): an armed item ghost never inherits a
+    // stray swing pose — the machine's STATE keeps running on `current`.
     let hamPitch = 0
     let hamY = 0
     let hamZ = 0
-    if (current === 'hammer' && hammerPhase.current !== 'idle') {
+    if (shown === 'hammer' && hammerPhase.current !== 'idle') {
       if (hammerPhase.current === 'windup') {
         const k = 1 - (1 - Math.min(1, hammerT.current / HAMMER_WINDUP)) ** 2
         hamPitch = HAMMER_RAISE.pitch * k
@@ -595,13 +623,15 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     }
   })
 
-  const showKnife = weapon === 'knife'
-  const showPistol = weapon === 'pistol'
-  const showRifle = weapon === 'rifle'
-  const showMinigun = weapon === 'minigun'
-  const showHammer = weapon === 'hammer'
-  const showBuilder = weapon === 'builder'
-  const showPaint = weapon === 'paint'
+  // Mesh pick follows `displayed`, not the store weapon — the armed-ghost
+  // override swaps the visual to the builder's claw hammer, nothing else.
+  const showKnife = displayed === 'knife'
+  const showPistol = displayed === 'pistol'
+  const showRifle = displayed === 'rifle'
+  const showMinigun = displayed === 'minigun'
+  const showHammer = displayed === 'hammer'
+  const showBuilder = displayed === 'builder'
+  const showPaint = displayed === 'paint'
 
   return (
     <group ref={rigRef} userData={{ __boots: true }}>

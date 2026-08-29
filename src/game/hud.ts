@@ -55,6 +55,18 @@ import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
  * - Keybind bar: automatic. Follows store.weapon — while the BUILDER is
  *   held it lists the piece hotkeys (builderKeybarText: Z/X/C/V/Q, with
  *   layout-map caps on non-QWERTY), otherwise KEYBAR_DEFAULT.
+ * - Weapon hotbar: automatic. A persistent low-opacity strip of slot chips
+ *   above the keybar block ('1 KNIFE' … 'G GRENADE') so players stop
+ *   guessing the number keys (owner ask). Chip availability mirrors
+ *   viewmodel.tsx's switchWeapon gate — builder and paint are ALWAYS
+ *   reachable, the grenade is infinite on G, guns only once owned — and
+ *   the held weapon's chip gets the highlight. Driven from the store
+ *   subscription, change-gated on hotbarSignature(hotbarModel(state)) so
+ *   per-render calls are free while reality holds. The WHOLE BAR brightens
+ *   to HOTBAR_BRIGHT_OPACITY on a weapon switch, then eases back to the
+ *   discreet HOTBAR_IDLE_OPACITY after HOTBAR_BRIGHT_MS (the CS-style
+ *   flash married to the Minecraft-style persistence). hotbarModel /
+ *   hotbarSignature are the pure, pinnable halves.
  * - hint(id, text) — contextual micro-hints (owner: "it needs to be
  *   discreet"): a tiny low-contrast line just above the keybar, fade-in
  *   300ms, gone after ~4s, each id shown ONCE per session (per Hud
@@ -148,6 +160,78 @@ export function builderKeybarText(
 /** Hitmarker flavors — see hitmarker() in the header. */
 export type HitmarkerKind = 'hit' | 'kill' | 'carve'
 
+/** One weapon-hotbar chip's render state — see the header's hotbar bullet. */
+export type HotbarChipState = 'active' | 'available' | 'locked'
+export type HotbarChip = {
+  /** Printed key cap ('1'…'7', 'G'). */
+  key: string
+  /** Store weapon id ('grenade' for the G chip — not a held weapon). */
+  id: string
+  label: string
+  state: HotbarChipState
+}
+
+/** Slot order mirrors viewmodel.tsx's Digit1-7 handlers plus the always-on
+ * G grenade (duplicated as display data — hud must not import the React
+ * viewmodel: viewmodel → session → hud would cycle). */
+const HOTBAR_SLOTS: ReadonlyArray<readonly [key: string, id: string, label: string]> = [
+  ['1', 'knife', 'KNIFE'],
+  ['2', 'pistol', 'PISTOL'],
+  ['3', 'rifle', 'RIFLE'],
+  ['4', 'builder', 'BUILD'],
+  ['5', 'minigun', 'MINIGUN'],
+  ['6', 'hammer', 'HAMMER'],
+  ['7', 'paint', 'PAINT'],
+  ['G', 'grenade', 'GRENADE'],
+] as const
+
+/**
+ * Weapon-hotbar chip descriptors — pure, pinnable headless. A chip is
+ * 'available' iff pressing its key RIGHT NOW would switch to it, which is
+ * exactly viewmodel.tsx switchWeapon's gate: builder (Digit4/KeyB) and
+ * paint (Digit7) are always reachable regardless of `owned`, everything
+ * else must have been picked up; the G grenade is infinite (its handler
+ * never checks anything). 'active' = the held weapon's chip (G never —
+ * the grenade is a throw, not a hold).
+ */
+export function hotbarModel(state: {
+  weapon: string
+  owned: readonly string[]
+}): HotbarChip[] {
+  return HOTBAR_SLOTS.map(([key, id, label]) => {
+    const available =
+      id === 'builder' || id === 'paint' || id === 'grenade' || state.owned.includes(id)
+    const chipState: HotbarChipState =
+      id === state.weapon ? 'active' : available ? 'available' : 'locked'
+    return { key, id, label, state: chipState }
+  })
+}
+
+/** Compact change signature for a hotbar model — one char per chip
+ * (A/a/. = active/available/locked). The render loop rebuilds chip styles
+ * only when this moves, so per-render calls are DOM-free while (weapon,
+ * owned) hold. */
+export function hotbarSignature(chips: readonly HotbarChip[]): string {
+  let sig = ''
+  for (const chip of chips) {
+    sig += chip.state === 'active' ? 'A' : chip.state === 'available' ? 'a' : '.'
+  }
+  return sig
+}
+
+/** Per-chip opacity by state — locked chips stay legible ghosts. */
+const HOTBAR_CHIP_OPACITY: Record<HotbarChipState, string> = {
+  active: '1',
+  available: '0.8',
+  locked: '0.25',
+}
+
+/** Whole-bar opacity: bright right after a weapon switch, easing back to a
+ * discreet idle once the moment passes. */
+const HOTBAR_IDLE_OPACITY = '0.4'
+const HOTBAR_BRIGHT_OPACITY = '0.9'
+const HOTBAR_BRIGHT_MS = 2500
+
 /**
  * Co-presence chip text — pure so the copy + pluralization are pinnable
  * headless. null = no chip (solo). The count is REMOTE players only (the
@@ -223,6 +307,14 @@ export class Hud {
   private crossTicksEl: HTMLDivElement | null = null
   private crossDotEl: HTMLDivElement | null = null
   private keybarEl: HTMLDivElement | null = null
+  /** Weapon hotbar — the bar element, its chips (HOTBAR_SLOTS order), the
+   * last signature written (change gate; '' = never), the last weapon seen
+   * (brighten-on-switch edge detect) and the ease-back-to-idle timer. */
+  private hotbarEl: HTMLDivElement | null = null
+  private hotbarChips: HTMLDivElement[] = []
+  private hotbarSig = ''
+  private hotbarWeapon = ''
+  private hotbarTimer: ReturnType<typeof setTimeout> | null = null
   /** Builder-mode keybar text — QWERTY caps until the layout map resolves. */
   private builderBar = builderKeybarText()
   private unsub: (() => void) | null = null
@@ -465,6 +557,26 @@ export class Hud {
       `position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.55);color:#fff;font:${FONT};letter-spacing:0.04em;white-space:nowrap`,
       KEYBAR_DEFAULT,
     )
+    // Weapon hotbar — persistent low-opacity slot chips centered ABOVE the
+    // keybar block (keybar tops out near 60px, the hint line near 79px;
+    // this band at 106px stays clear of both and of the editHint at 132px
+    // down to 1280×720). Chip text never changes — render() only restyles
+    // on a signature move and brightens the whole bar on a weapon switch.
+    this.hotbarEl = el(
+      `position:absolute;left:50%;bottom:106px;transform:translateX(-50%);display:flex;gap:6px;white-space:nowrap;opacity:${HOTBAR_IDLE_OPACITY};transition:opacity 0.6s ease`,
+    )
+    this.hotbarChips = []
+    for (const [key, , label] of HOTBAR_SLOTS) {
+      const chip = document.createElement('div')
+      chip.textContent = `${key} ${label}`
+      chip.style.cssText = `padding:3px 7px;border-radius:4px;background:rgba(0,0,0,0.35);color:#fff;font:${FONT};font-size:10px;letter-spacing:0.06em;text-shadow:0 1px 2px rgba(0,0,0,0.8)`
+      this.hotbarEl.appendChild(chip)
+      this.hotbarChips.push(chip)
+    }
+    this.hotbarSig = ''
+    // Seed the switch edge-detect with the CURRENT weapon so mounting never
+    // reads as a switch — the bar spawns at idle, discreet.
+    this.hotbarWeapon = useBoots.getState().weapon
     // Contextual micro-hint — one small low-contrast line just above the
     // keybar (its top edge sits near 59px). No box, no border: text only.
     this.hintEl = el(
@@ -534,6 +646,34 @@ export class Hud {
       if (this.keybarEl) {
         const bar = s.weapon === 'builder' ? this.builderBar : KEYBAR_DEFAULT
         if (this.keybarEl.textContent !== bar) this.keybarEl.textContent = bar
+      }
+      // Weapon hotbar — chip styles rebuild ONLY when the (weapon, owned)
+      // signature moves; the whole bar brightens on a weapon switch and a
+      // timer eases it back to idle (re-armed on every switch).
+      if (this.hotbarEl) {
+        const chips = hotbarModel(s)
+        const sig = hotbarSignature(chips)
+        if (sig !== this.hotbarSig) {
+          this.hotbarSig = sig
+          for (let i = 0; i < chips.length; i++) {
+            const chipEl = this.hotbarChips[i]
+            const chip = chips[i]
+            if (!chipEl || !chip) continue
+            chipEl.style.opacity = HOTBAR_CHIP_OPACITY[chip.state]
+            chipEl.style.background =
+              chip.state === 'active' ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.35)'
+            chipEl.style.fontWeight = chip.state === 'active' ? '700' : '600'
+          }
+        }
+        if (s.weapon !== this.hotbarWeapon) {
+          this.hotbarWeapon = s.weapon
+          this.hotbarEl.style.opacity = HOTBAR_BRIGHT_OPACITY
+          if (this.hotbarTimer) clearTimeout(this.hotbarTimer)
+          this.hotbarTimer = setTimeout(() => {
+            this.hotbarTimer = null
+            if (this.hotbarEl) this.hotbarEl.style.opacity = HOTBAR_IDLE_OPACITY
+          }, HOTBAR_BRIGHT_MS)
+        }
       }
       if (this.healthEl) this.healthEl.textContent = `♥ ${Math.max(0, Math.round(s.health))}`
       this.health = s.health
@@ -1033,6 +1173,12 @@ export class Hud {
     this.crossTicksEl = null
     this.crossDotEl = null
     this.keybarEl = null
+    if (this.hotbarTimer) clearTimeout(this.hotbarTimer)
+    this.hotbarTimer = null
+    this.hotbarEl = null
+    this.hotbarChips.length = 0
+    this.hotbarSig = ''
+    this.hotbarWeapon = ''
     this.pipF = -1
     this.lastAds = -1
   }
