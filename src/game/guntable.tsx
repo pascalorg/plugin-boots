@@ -13,7 +13,7 @@ import {
 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { armWaves, waveState } from './enemies-state'
+import { armWaves, disarmWaves, waveState } from './enemies-state'
 import { clearScatterInRadius } from './nature'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -44,8 +44,10 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  *   industrial knife-switch + twin roof sirens + PUT YOUR BOOTS ON
  *   stencil, hazard stripes below. E throws the handle DOWN — the ONLY
  *   thing that wakes the horde (enemies-state.armWaves → the alert
- *   countdown theatre → waves); the handle mirrors waveState.armed every
- *   frame, back UP when resetBots() restores the grace.
+ *   countdown theatre → waves) — and E again throws it back UP
+ *   (disarmWaves: units power down, grace restored). Working it requires
+ *   standing OUTSIDE the container facing the panel (breakerEngageable);
+ *   the handle mirrors waveState.armed every frame.
  *
  * INDESTRUCTIBLE, mechanically: every depot mesh registers as a collider
  * with nodeType 'fixture' — outside shooting.ts's DESTRUCTIBLE set and the
@@ -141,6 +143,42 @@ export function armoryStationPosition(world: GameWorld): Vector3 {
 /** The industrial breaker on the right end wall: the ONLY combat trigger. */
 export function breakerPosition(world: GameWorld): Vector3 {
   return offsetFromSpawn(world, BREAKER_OFFSET[0], BREAKER_OFFSET[1])
+}
+
+/** How square-on the player must look at the breaker to work it (cos):
+ * within ~57° of dead-on — walking past sideways never throws it. */
+export const BREAKER_FACING_DOT = 0.55
+
+/**
+ * The outside-and-facing gate on the breaker — pure, exported for tests.
+ * The panel hangs on the end wall's OUTSIDE face, but grab arbitration is
+ * a plain XZ disc: standing INSIDE the container you are within reach of
+ * it straight through the steel, and one absent-minded E in there started
+ * (or now, worse, CANCELLED) the war. Two checks, both required: the
+ * player's spawn-frame lateral coordinate clears the end-wall plane (truly
+ * outside, on the panel's side of the wall), and the look direction points
+ * at the panel (facing it, not backing into it). `at` is the caller's
+ * breakerPosition — passed in so the per-frame path allocates nothing.
+ */
+export function breakerEngageable(
+  world: GameWorld,
+  at: Vector3,
+  px: number,
+  pz: number,
+  lookX: number,
+  lookZ: number,
+): boolean {
+  const fwdX = -Math.sin(world.spawnYaw)
+  const fwdZ = -Math.cos(world.spawnYaw)
+  // Spawn-frame lateral coordinate (the lat axis of offsetFromSpawn).
+  const lat = (px - world.spawn.x) * -fwdZ + (pz - world.spawn.z) * fwdX
+  if (lat <= DEPOT_OFFSET[0] + DEPOT_SIZE[0] / 2) return false
+  const tx = at.x - px
+  const tz = at.z - pz
+  const tLen = Math.hypot(tx, tz)
+  const lLen = Math.hypot(lookX, lookZ)
+  if (tLen < 1e-6 || lLen < 1e-6) return false
+  return (tx * lookX + tz * lookZ) / (tLen * lLen) > BREAKER_FACING_DOT
 }
 
 /** Live fixtures' grab candidacy, keyed by nodeId — each WeaponTable (and
@@ -466,14 +504,19 @@ const LEVER_DOWN = 2.7
 /** The full throw sweeps in ~0.4 s (rad/s) — same lerp both directions. */
 const LEVER_RATE = (LEVER_DOWN - LEVER_UP) / 0.4
 
+/** Scratch for the camera's world direction in BreakerPanel's frame loop. */
+const _look = new Vector3()
+
 /**
  * The breaker panel — the industrial zombie switch, now PART OF the depot:
  * mounted on the container's right end wall (outside face), a massive
- * two-hand knife-lever on a steel backplate, handle UP at rest, thrown
- * DOWN on E. That throw (armWaves) is the ONLY way combat starts; the
- * handle chases waveState.armed every frame so it stays down for the whole
- * assault and swings back up when resetBots() restores the grace — exactly
- * the switch wall's contract, on armored steel instead of a concrete stub.
+ * two-hand knife-lever on a steel backplate. A real TOGGLE: E throws the
+ * handle DOWN (armWaves — the ONLY way combat starts) and E again throws
+ * it back UP (disarmWaves — units power down, grace restored). Both
+ * directions demand standing OUTSIDE the container facing the panel
+ * (breakerEngageable), so nobody flips the war on or off through the end
+ * wall while browsing the armory. The handle chases waveState.armed every
+ * frame — down for the whole assault, back up on shutdown or resetBots().
  * The end wall itself is the depot's collider; the panel joins the same
  * nearest-grabbable arbitration under the legacy '__boots-switch' key.
  * Rendered inside the depot's root group: local +z here faces OUTWARD
@@ -484,21 +527,21 @@ function BreakerPanel({ world }: { world: GameWorld }) {
   const leverRef = useRef<Group>(null)
   const leverAngle = useRef(LEVER_UP)
   const prevE = useRef(false)
-  const promptShown = useRef(false)
+  const promptText = useRef<string | null>(null)
 
   // Grab arbitration entry: the breaker competes with the stations so one
-  // E press serves exactly one fixture. `taken` mirrors waveState.armed —
-  // refreshed per frame below (the flag lives outside React), so a thrown
-  // switch stops prompting and a reset re-arms it without a remount.
+  // E press serves exactly one fixture. Never `taken` — a toggle stays
+  // claimable for as long as the session runs; the engageable gate (not
+  // arbitration) is what keeps stray presses out.
   useEffect(() => {
-    grabTables.set(BREAKER_NODE_ID, { x: at.x, z: at.z, taken: waveState.armed })
+    grabTables.set(BREAKER_NODE_ID, { x: at.x, z: at.z, taken: false })
     return () => {
       grabTables.delete(BREAKER_NODE_ID)
     }
   }, [at])
 
-  useFrame((_, dt) => {
-    // The throw (and the reset): chase armed's target pose at the 0.4 s
+  useFrame(({ camera }, dt) => {
+    // The throw (both directions): chase armed's target pose at the 0.4 s
     // sweep rate — a real handle motion, not a snap.
     const target = waveState.armed ? LEVER_DOWN : LEVER_UP
     if (leverAngle.current !== target) {
@@ -509,21 +552,27 @@ function BreakerPanel({ world }: { world: GameWorld }) {
 
     const session = getSession()
     if (!session) return
-    const entry = grabTables.get(BREAKER_NODE_ID)
-    if (entry) entry.taken = waveState.armed
+    camera.getWorldDirection(_look)
     const near =
-      !waveState.armed &&
-      nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) === BREAKER_NODE_ID
-    if (near !== promptShown.current) {
-      promptShown.current = near
-      session.hud.prompt(near ? 'Press E — throw the switch' : null, 'switchwall')
+      nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) ===
+        BREAKER_NODE_ID &&
+      breakerEngageable(world, at, playerRig.position.x, playerRig.position.z, _look.x, _look.z)
+    // The verb tracks the handle: the prompt itself says which way the
+    // next throw goes (and flips in place right after a toggle).
+    const want = near
+      ? waveState.armed
+        ? 'Press E — shut it down'
+        : 'Press E — throw the switch'
+      : null
+    if (want !== promptText.current) {
+      promptText.current = want
+      session.hud.prompt(want, 'switchwall')
     }
     const ePressed = session.input.state.keys.has('KeyE')
     if (near && ePressed && !prevE.current) {
-      armWaves() // the ONLY combat trigger — the wave director takes over
-      sfx.breakerThrow() // heavy knife-switch clunk — the assault is armed
-      session.hud.prompt(null, 'switchwall')
-      promptShown.current = false
+      if (waveState.armed) disarmWaves() // stand down — the lot powers off
+      else armWaves() // the ONLY combat trigger — the wave director takes over
+      sfx.breakerThrow() // heavy knife-switch clunk, both directions
     }
     prevE.current = ePressed
   })

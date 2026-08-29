@@ -4,7 +4,9 @@ import {
   ALERT_SECONDS,
   armWaves,
   bots,
+  disarmWaves,
   resetBots,
+  spawnBot,
   tickWaveDirector,
   waveState,
 } from './enemies-state'
@@ -91,6 +93,62 @@ describe('wave director — switch-armed grace/alert', () => {
       }
     }
     expect(due).toBe(1)
+  })
+
+  /**
+   * THE TOGGLE: the breaker throws back UP too (owner ask — players can
+   * turn the machines off). disarmWaves is the mirror of armWaves: grace
+   * fully restored, a later throw starts the whole theatre over.
+   */
+  test('shutdown mid-countdown restores grace; a re-throw starts over', () => {
+    armWaves()
+    tickWaveDirector(DT, 0)
+    for (let t = 0; t < 2; t += DT) tickWaveDirector(DT, 0)
+    disarmWaves()
+    expect(waveState.armed).toBe(false)
+    expect(waveState.alerted).toBe(false)
+    expect(waveState.countdownActive).toBe(false)
+    let events = 0
+    for (let t = 0; t < 10; t += DT) {
+      const step = tickWaveDirector(DT, 0)
+      if (step.alertStarted || step.assaultStarted || step.waveDue) events++
+    }
+    expect(events).toBe(0)
+    // The next throw is a fresh war: full countdown, not a resume.
+    armWaves()
+    const step = tickWaveDirector(DT, 0)
+    expect(step.alertStarted).toBe(true)
+    expect(waveState.countdown).toBe(ALERT_SECONDS)
+  })
+
+  test('shutdown mid-assault powers down every unit through the dying theatre', () => {
+    armWaves()
+    tickWaveDirector(DT, 0)
+    while (waveState.countdown > 0) tickWaveDirector(DT, 0)
+    spawnBot('droid', 10, 10)
+    spawnBot('dog', 12, 10)
+    spawnBot('drone', 14, 10)
+    waveState.wave = 3
+    disarmWaves()
+    // Units stay on the lot in the dying state — the integrator's normal
+    // cleanup reaps them (a shutdown never snaps bots out of existence).
+    expect(bots.length).toBe(3)
+    for (const bot of bots) expect(bot.state).toBe('dying')
+    // Wave progress resets: a later throw restarts the assault at WAVE 1.
+    expect(waveState.wave).toBe(0)
+    // And the disarmed director never runs the intermission clock down.
+    let due = 0
+    for (let t = 0; t < 8; t += DT) {
+      if (tickWaveDirector(DT, 0).waveDue) due++
+    }
+    expect(due).toBe(0)
+  })
+
+  test('disarm from grace is a safe no-op (idempotent)', () => {
+    disarmWaves()
+    disarmWaves()
+    expect(waveState.armed).toBe(false)
+    expect(tickWaveDirector(DT, 0).alertStarted).toBe(false)
   })
 
   test('resetBots resets the switch — the handle comes back UP, grace restored', () => {

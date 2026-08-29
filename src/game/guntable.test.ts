@@ -5,6 +5,7 @@ import {
   ARMORY_STATION_OFFSET,
   armoryStationPosition,
   BREAKER_OFFSET,
+  breakerEngageable,
   breakerPosition,
   BUILD_STATION_OFFSET,
   buildStationPosition,
@@ -41,6 +42,17 @@ function spawnFrame(world: GameWorld, pos: Vector3): [number, number] {
   const dx = pos.x - world.spawn.x
   const dz = pos.z - world.spawn.z
   return [dx * -fwdZ + dz * fwdX, dx * fwdX + dz * fwdZ]
+}
+
+/** spawnFrame's inverse: a world point from [lateral, forward] offsets. */
+function fromFrame(world: GameWorld, lateral: number, forward: number): Vector3 {
+  const fwdX = -Math.sin(world.spawnYaw)
+  const fwdZ = -Math.cos(world.spawnYaw)
+  return new Vector3(
+    world.spawn.x + fwdX * forward - fwdZ * lateral,
+    0,
+    world.spawn.z + fwdZ * forward + fwdX * lateral,
+  )
 }
 
 /**
@@ -135,21 +147,55 @@ describe('spawn depot layout', () => {
     }
   })
 
-  test('E at the breaker serves the switch alone; thrown falls through', () => {
+  test('E at the breaker serves the switch alone — armed or not (toggle)', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)
       const at = breakerPosition(world)
-      const stations = (thrown: boolean) =>
-        new Map([
-          ['build', { x: buildStationPosition(world).x, z: buildStationPosition(world).z, taken: false }],
-          ['armory', { x: armoryStationPosition(world).x, z: armoryStationPosition(world).z, taken: false }],
-          ['switch', { x: at.x, z: at.z, taken: thrown }],
-        ])
-      expect(nearestGrabbable(at.x, at.z, stations(false))).toBe('switch')
-      // Once thrown (taken mirrors waveState.armed) the same spot never
-      // re-throws — it falls through to whatever else is in range (here:
-      // nothing, the pickup stations are across the container).
-      expect(nearestGrabbable(at.x, at.z, stations(true))).not.toBe('switch')
+      // The switch is a TOGGLE now: its arbitration entry never flips to
+      // taken (a thrown handle must stay claimable for the shutdown), so
+      // at the panel it wins the disc for the whole session.
+      const stations = new Map([
+        ['build', { x: buildStationPosition(world).x, z: buildStationPosition(world).z, taken: false }],
+        ['armory', { x: armoryStationPosition(world).x, z: armoryStationPosition(world).z, taken: false }],
+        ['switch', { x: at.x, z: at.z, taken: false }],
+      ])
+      expect(nearestGrabbable(at.x, at.z, stations)).toBe('switch')
+    }
+  })
+
+  /**
+   * THE OUTSIDE-AND-FACING GATE: the panel hangs on the end wall's OUTSIDE
+   * face, but grab arbitration is a plain XZ disc — from INSIDE the
+   * container the panel is within reach straight through the steel. With
+   * the switch now toggling the war OFF too, an accidental through-wall E
+   * got worse, not better; breakerEngageable is the pin that a throw takes
+   * standing outside the end wall AND looking at the panel.
+   */
+  test('inside the container the breaker never engages — even facing it', () => {
+    for (const yaw of YAWS) {
+      const world = fakeWorld(new Vector3(3, 0, -2), yaw)
+      const at = breakerPosition(world)
+      // Against the end wall's INSIDE face, staring at the panel through it.
+      const inside = fromFrame(world, DEPOT_OFFSET[0] + DEPOT_SIZE[0] / 2 - 0.3, BREAKER_OFFSET[1])
+      expect(at.distanceTo(inside)).toBeLessThan(GRAB_RANGE) // in reach — the trap
+      expect(
+        breakerEngageable(world, at, inside.x, inside.z, at.x - inside.x, at.z - inside.z),
+      ).toBe(false)
+    }
+  })
+
+  test('outside the end wall: facing the panel engages, looking away never does', () => {
+    for (const yaw of YAWS) {
+      const world = fakeWorld(new Vector3(3, 0, -2), yaw)
+      const at = breakerPosition(world)
+      const outside = fromFrame(world, DEPOT_OFFSET[0] + DEPOT_SIZE[0] / 2 + 1.2, BREAKER_OFFSET[1])
+      expect(at.distanceTo(outside)).toBeLessThan(GRAB_RANGE)
+      const toX = at.x - outside.x
+      const toZ = at.z - outside.z
+      expect(breakerEngageable(world, at, outside.x, outside.z, toX, toZ)).toBe(true)
+      // Back turned (or sidling past shoulder-first): no throw.
+      expect(breakerEngageable(world, at, outside.x, outside.z, -toX, -toZ)).toBe(false)
+      expect(breakerEngageable(world, at, outside.x, outside.z, -toZ, toX)).toBe(false)
     }
   })
 

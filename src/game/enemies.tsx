@@ -286,6 +286,13 @@ export function Enemies({ world }: { world: GameWorld }) {
       // the whole countdown (the voice caps its own level — no scaling here).
       spinup.current?.setProgress(1 - waveState.countdown / ALERT_SECONDS)
     }
+    // The breaker is a toggle: a shutdown (disarmWaves) drops `armed` from
+    // OUTSIDE the director, with no step event — reclaim the spin-up voice
+    // here or a mid-countdown shutdown leaves it rising forever.
+    if (!waveState.armed && spinup.current) {
+      spinup.current.stop()
+      spinup.current = null
+    }
     if (step.assaultStarted) {
       // siren winds down with the spin-up (countdownActive already false)
       spinup.current?.stop()

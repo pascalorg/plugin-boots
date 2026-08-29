@@ -178,8 +178,9 @@ export default function BootsPanel() {
         <p>WASD move · Space jump · Shift walk</p>
         <p>Mouse shoot · E gear up at the depot</p>
         <p>
-          Peaceful for as long as you like — grab guns, build, nothing comes. Throw the breaker on
-          the depot's end wall (E) and the countdown starts: the machines come in waves.
+          Peaceful for as long as you like — grab guns, build, nothing comes. Face the breaker on
+          the depot's end wall from outside and press E: the countdown starts and the machines come
+          in waves. E again throws it back up and calls the whole thing off.
         </p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer · 7 paint</p>
         <p>RMB aim (pistol/rifle) · Q or Z/X/C/V pick piece · R cycles paint color · Esc exit</p>

@@ -228,6 +228,30 @@ export function armWaves(): void {
   waveState.armed = true
 }
 
+/**
+ * Throw the breaker back UP: stand down. The switch is a TOGGLE — players
+ * asked to be able to turn the machines off again. Mirrors resetBots' wave
+ * fields (grace fully restored: a later throw starts over with the whole
+ * alert countdown, then WAVE 1) and powers down every unit still on the
+ * lot through the normal dying theatre — the integrator's own cleanup
+ * path, so nothing snaps out of existence. Deliberately NOT damageBot:
+ * a shutdown is not a kill (no hit sparks, no per-kind death voice).
+ */
+export function disarmWaves(): void {
+  waveState.armed = false
+  waveState.alerted = false
+  waveState.countdown = ALERT_SECONDS
+  waveState.countdownActive = false
+  waveState.intermission = 4
+  waveState.wave = 0
+  for (const bot of bots) {
+    if (bot.state === 'alive') {
+      bot.state = 'dying'
+      bot.deadT = 0
+    }
+  }
+}
+
 /** What one director tick decided — the theatre layer (enemies.tsx) turns
  * these into sfx/labels/spawns; state transitions all happen here. */
 export type DirectorStep = {
