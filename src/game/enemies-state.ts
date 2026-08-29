@@ -275,6 +275,11 @@ export function tickWaveDirector(dt: number, botsAlive: number): DirectorStep {
 
 export function resetBots(): void {
   bots.length = 0
+  // Re-arm the id counter too: botVisualParams seeds a unit's look from its
+  // id alone, so a counter that survives reset re-rolls every silhouette on
+  // the next session in the same page — breaking the "a unit looks the same
+  // every session and every remount" contract pinned above mulberry32.
+  botId = 1
   waveState.wave = 0
   waveState.intermission = 4
   waveState.armed = false
@@ -637,20 +642,67 @@ export type BotRayHit = { bot: Bot; distance: number; point: Vector3 }
 const _toCenter = new Vector3()
 const _closest = new Vector3()
 
-/** Analytic ray-vs-sphere per bot body. Cheap at horde sizes. */
+/**
+ * Dog hitbox half-length: the axis segment of the dog's capsule, along its
+ * yaw. The long-body dog (visual.bodyLen 1.3, half the spawns) puts its
+ * snout at local z ≈ 0.66 and tail at ≈ −0.61 — way outside the old fixed
+ * r = 0.42 sphere at body center, so side shots through the visible head or
+ * tail whiffed entirely (even the short dog's snout at z ≈ 0.57 missed).
+ * Segment ± this at bodyY, radius BOT_STATS.dog.radius, matches the
+ * silhouette for both lengths; droids and drones keep the sphere.
+ */
+export function dogHalfLen(bodyLen: number): number {
+  return 0.31 * bodyLen + 0.15
+}
+
+/** Analytic ray-vs-body per bot: sphere for droids/drones, capsule along
+ * the yaw axis for dogs (see dogHalfLen). Cheap at horde sizes; both paths
+ * use the closest-approach parameter as the hit distance. */
 export function raycastBots(origin: Vector3, direction: Vector3, maxDist: number): BotRayHit | null {
   let best: BotRayHit | null = null
   for (const bot of bots) {
     if (bot.state !== 'alive') continue
     const stats = BOT_STATS[bot.kind]
-    _toCenter.copy(bot.position)
-    _toCenter.y += stats.bodyY
-    _toCenter.sub(origin)
-    const t = _toCenter.dot(direction)
-    if (t < 0 || t > maxDist) continue
-    _closest.copy(origin).addScaledVector(direction, t)
-    _closest.sub(_toCenter.add(origin))
-    if (_closest.length() > stats.radius) continue
+    let t: number
+    if (bot.kind === 'dog') {
+      // Closest approach between the ray and the capsule's axis segment
+      // A→B (horizontal, so the segment direction u has uy = 0).
+      const hl = dogHalfLen(bot.visual.bodyLen)
+      const fx = Math.sin(bot.yaw)
+      const fz = Math.cos(bot.yaw)
+      const ax = bot.position.x - fx * hl
+      const ay = bot.position.y + stats.bodyY
+      const az = bot.position.z - fz * hl
+      const ux = fx * 2 * hl
+      const uz = fz * 2 * hl
+      const wx = ax - origin.x
+      const wy = ay - origin.y
+      const wz = az - origin.z
+      const a = ux * ux + uz * uz
+      const b = ux * direction.x + uz * direction.z
+      const d0 = ux * wx + uz * wz
+      const e = direction.x * wx + direction.y * wy + direction.z * wz
+      const denom = a - b * b
+      // denom → 0 only when the ray runs parallel to the axis; the endpoint
+      // A is then as close as any segment point.
+      let sSeg = denom > 1e-8 ? (b * e - d0) / denom : 0
+      sSeg = sSeg < 0 ? 0 : sSeg > 1 ? 1 : sSeg
+      t = e + sSeg * b
+      if (t < 0 || t > maxDist) continue
+      const px = ax + sSeg * ux - (origin.x + direction.x * t)
+      const py = ay - (origin.y + direction.y * t)
+      const pz = az + sSeg * uz - (origin.z + direction.z * t)
+      if (px * px + py * py + pz * pz > stats.radius * stats.radius) continue
+    } else {
+      _toCenter.copy(bot.position)
+      _toCenter.y += stats.bodyY
+      _toCenter.sub(origin)
+      t = _toCenter.dot(direction)
+      if (t < 0 || t > maxDist) continue
+      _closest.copy(origin).addScaledVector(direction, t)
+      _closest.sub(_toCenter.add(origin))
+      if (_closest.length() > stats.radius) continue
+    }
     if (!best || t < best.distance) {
       best = { bot, distance: t, point: origin.clone().addScaledVector(direction, t) }
     }

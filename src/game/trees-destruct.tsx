@@ -206,9 +206,12 @@ export type TreeHit = {
 const _hitPoint = new Vector3()
 
 /**
- * Nearest live tree part along the ray. Trunk = finite vertical cylinder,
- * canopy = sphere; stumps don't block shots. Allocation-free except the
- * returned hit (one small object per SUCCESSFUL shot, not per tree).
+ * Nearest live tree part along the ray. Trunk = finite vertical cylinder;
+ * canopy = sphere for blob species, vertical capped cylinder (skirt→apex,
+ * widest tier as radius) for conifers — see the crownCY/crownR doc in
+ * tree-species.ts for why the old conifer bounding sphere ate shots beside
+ * the crown. Stumps don't block shots. Allocation-free except the returned
+ * hit (one small object per SUCCESSFUL shot, not per tree).
  */
 export function raycastTrees(
   trees: CombatTree[],
@@ -248,21 +251,65 @@ export function raycastTrees(
         }
       }
     }
-    // Canopy sphere — only while the crown exists (burned crowns are gone).
+    // Canopy — only while the crown exists (burned crowns are gone).
     if (tree.state !== 'charred') {
-      const cx = origin.x - tree.x
-      const cy = origin.y - (tree.y + p.crownCY * s)
-      const cz = origin.z - tree.z
       const r = p.crownR * s
-      const b = cx * direction.x + cy * direction.y + cz * direction.z
-      const c = cx * cx + cy * cy + cz * cz - r * r
-      const disc = b * b - c
-      if (disc >= 0) {
-        const t = -b - Math.sqrt(disc)
+      if (p.tiers.length > 0) {
+        // Conifer capped cylinder on the trunk axis, skirt→apex: wall hits
+        // clamp to the y-range, the ends are FLAT discs — the stack sits on
+        // a flat skirt (a sphere cap would bulge a whole tier radius below
+        // it and eat trunk shots) and the apex tapers to a point. First
+        // boundary from outside is the wall inside the range or a disc, so
+        // testing all three and keeping the smallest t is exact for
+        // entering rays.
+        const y0 = tree.y + p.tiers[0]!.y * s
+        const y1 = tree.y + p.apex * s
+        const ox = origin.x - tree.x
+        const oz = origin.z - tree.z
+        let t = -1
+        const a = direction.x * direction.x + direction.z * direction.z
+        if (a > 1e-8) {
+          const b = ox * direction.x + oz * direction.z
+          const c = ox * ox + oz * oz - r * r
+          const disc = b * b - a * c
+          if (disc >= 0) {
+            const tc = (-b - Math.sqrt(disc)) / a
+            if (tc > 0) {
+              const y = origin.y + direction.y * tc
+              if (y >= y0 && y <= y1) t = tc
+            }
+          }
+        }
+        if (Math.abs(direction.y) > 1e-8) {
+          const invDy = 1 / direction.y
+          for (let cap = 0; cap < 2; cap++) {
+            const ts = ((cap === 0 ? y0 : y1) - origin.y) * invDy
+            if (ts > 0 && (t < 0 || ts < t)) {
+              const hx = ox + direction.x * ts
+              const hz = oz + direction.z * ts
+              if (hx * hx + hz * hz <= r * r) t = ts
+            }
+          }
+        }
         if (t > 0 && t < bestDist) {
           bestDist = t
           bestTree = tree.id
           bestPart = 'canopy'
+        }
+      } else {
+        const cx = origin.x - tree.x
+        const cy = origin.y - (tree.y + p.crownCY * s)
+        const cz = origin.z - tree.z
+        const b = cx * direction.x + cy * direction.y + cz * direction.z
+        const c = cx * cx + cy * cy + cz * cz - r * r
+        const disc = b * b - c
+        if (disc >= 0) {
+          const t = -b - Math.sqrt(disc)
+          if (t > 0 && t < bestDist) {
+            bestDist = t
+            bestTree = tree.id
+            bestPart = 'canopy'
+          }
         }
       }
     }
@@ -391,6 +438,40 @@ export function charBurstDir(
 
 const _charDir = { x: 0, y: 0, z: 0 }
 
+const _canopyPoint = { x: 0, y: 0, z: 0 }
+
+/**
+ * Random point inside the tree's canopy volume for burst voxels — matches
+ * the raycast shapes so debris never spawns in air the crown doesn't fill:
+ * blob species sample the crown sphere, conifers pick a cone tier and
+ * sample its disc band (the old crownR sphere put voxels a metre outside
+ * tall pines). theta is passed in so char bursts can reuse the bearing for
+ * their radial launch direction.
+ */
+function canopyBurstPoint(
+  tree: CombatTree,
+  theta: number,
+  out: { x: number; y: number; z: number },
+): { x: number; y: number; z: number } {
+  const s = tree.scale
+  const p = tree.params
+  if (p.tiers.length > 0) {
+    const tier = p.tiers[Math.floor(Math.random() * p.tiers.length)]!
+    const radial = tier.r * s * Math.sqrt(Math.random())
+    out.x = tree.x + Math.cos(theta) * radial
+    out.y = tree.y + (tier.y + Math.random() * tier.h) * s
+    out.z = tree.z + Math.sin(theta) * radial
+    return out
+  }
+  const r = p.crownR * s * Math.cbrt(Math.random())
+  const u = Math.random() * 2 - 1
+  const h = Math.sqrt(1 - u * u)
+  out.x = tree.x + Math.cos(theta) * h * r
+  out.y = tree.y + p.crownCY * s + u * r
+  out.z = tree.z + Math.sin(theta) * h * r
+  return out
+}
+
 /**
  * Char-collapse shower — the burnt crown lets go. Unlike burstCanopy's
  * omni fell burst, every voxel launches outward-down along its own radial
@@ -410,15 +491,13 @@ function burstCanopyChar(tree: CombatTree): void {
         .setRGB(tree.color[0], tree.color[1], tree.color[2])
         .lerp(CHARCOAL, 0.2 + Math.random() * 0.3)
     }
-    const r = tree.params.crownR * s * Math.cbrt(Math.random())
     const theta = Math.random() * Math.PI * 2
-    const u = Math.random() * 2 - 1
-    const h = Math.sqrt(1 - u * u)
     charBurstDir(theta, Math.random(), _charDir)
+    canopyBurstPoint(tree, theta, _canopyPoint)
     spawnDebris(
-      tree.x + Math.cos(theta) * h * r,
-      tree.y + tree.params.crownCY * s + u * r,
-      tree.z + Math.sin(theta) * h * r,
+      _canopyPoint.x,
+      _canopyPoint.y,
+      _canopyPoint.z,
       (0.1 + Math.random() * 0.07) * s,
       _burstColor,
       1.6,
@@ -428,21 +507,18 @@ function burstCanopyChar(tree: CombatTree): void {
   }
 }
 
-/** Voxel burst filling the canopy sphere — the "becomes voxels" collapse. */
+/** Voxel burst filling the canopy volume — the "becomes voxels" collapse. */
 function burstCanopy(tree: CombatTree, charcoal: boolean): void {
   const s = tree.scale
   const n = 26
   for (let i = 0; i < n; i++) {
     if (charcoal) _burstColor.copy(CHARCOAL)
     else _burstColor.setRGB(tree.color[0], tree.color[1], tree.color[2])
-    const r = tree.params.crownR * s * Math.cbrt(Math.random())
-    const theta = Math.random() * Math.PI * 2
-    const u = Math.random() * 2 - 1
-    const h = Math.sqrt(1 - u * u)
+    canopyBurstPoint(tree, Math.random() * Math.PI * 2, _canopyPoint)
     spawnDebris(
-      tree.x + Math.cos(theta) * h * r,
-      tree.y + tree.params.crownCY * s + u * r,
-      tree.z + Math.sin(theta) * h * r,
+      _canopyPoint.x,
+      _canopyPoint.y,
+      _canopyPoint.z,
       (0.11 + Math.random() * 0.08) * s,
       _burstColor,
       1.1,

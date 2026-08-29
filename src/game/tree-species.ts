@@ -60,7 +60,16 @@ export type TreeParams = {
   blobs: BlobSpec[]
   /** Broadleaf branch stub (null on other species). */
   stub: { yaw: number; y: number } | null
-  /** Analytic canopy sphere for raycasts (center height / radius). */
+  /**
+   * Analytic canopy volume for raycasts. Blob species (broadleaf/birch) are
+   * a SPHERE at crownCY with radius crownR. Conifers are a vertical CAPPED
+   * CYLINDER on the trunk axis (flat ends at tiers[0].y and apex) with
+   * radius crownR = the widest tier — the old bounding sphere took Math.max
+   * of the lateral tier radius and the cone stack's HALF-HEIGHT, so tall
+   * pines ate shots (and spawned burst voxels) through a metre-plus of
+   * empty air beside the crown. crownCY stays the stack's mid height for
+   * dust/ember anchor points.
+   */
   crownCY: number
   crownR: number
   /** Total unit-tree height — host trees scale to match node height. */
@@ -172,7 +181,8 @@ export function treeParamsAt(x: number, z: number, seed: number = SPECIES_SEED):
       blobs: [],
       stub: null,
       crownCY: (skirtY + apex) / 2,
-      crownR: Math.max(1.55 * crown, (apex - skirtY) / 2) * 0.95,
+      // Cylinder radius = tier 0, the widest cone (see the crownCY/crownR doc).
+      crownR: 1.55 * crown,
       apex,
     }
   }

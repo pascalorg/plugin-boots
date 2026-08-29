@@ -81,11 +81,13 @@ describe('raycastTrees', () => {
     expect(hit!.point.x).toBeCloseTo(10 - P.trunkR, 5)
   })
 
-  test('high shot hits the canopy sphere, not the trunk', () => {
+  test('high shot hits the canopy, not the trunk', () => {
     const origin = new Vector3(0, P.crownCY, 0) // crown center height (scale 1)
     const hit = raycastTrees([tree()], origin, PLUS_X, 90)
     expect(hit).not.toBeNull()
     expect(hit!.part).toBe('canopy')
+    // Crown front at x = 10 - crownR: the sphere front for blob species,
+    // the capsule wall (widest tier) for the conifer standing here.
     expect(hit!.distance).toBeCloseTo(10 - P.crownR, 5)
   })
 
@@ -117,6 +119,59 @@ describe('raycastTrees', () => {
 
   test('maxDist culls', () => {
     expect(raycastTrees([tree()], TRUNK_ORIGIN, PLUS_X, 5)).toBeNull()
+  })
+})
+
+describe('conifer canopy cylinder (regression: bounding-sphere phantom hits)', () => {
+  // The conifer at (6, 5): the old crownR took Math.max of the widest tier
+  // (1.51) and the cone stack's half-height (2.14), so on tall pines the
+  // vertical term inflated the raycast sphere far past the leaves — rays
+  // through empty air BESIDE the crown reported canopy hits and (via the
+  // bestDist + TIE cap in shooting.ts) ate shots aimed at bots behind them.
+  const CONIFER = treeParamsAt(6, 5)
+  const conifer = () => tree({ x: 6, z: 5 })
+
+  test('fixture is a conifer and crownR is the widest tier, not half-height', () => {
+    expect(CONIFER.tiers.length).toBeGreaterThan(0)
+    expect(CONIFER.crownR).toBeCloseTo(CONIFER.tiers[0]!.r, 5)
+    expect(CONIFER.crownR).toBeLessThan((CONIFER.apex - CONIFER.tiers[0]!.y) / 2)
+  })
+
+  test('side shot through the air beside the crown misses', () => {
+    // 1.8 m off the trunk axis at crown-center height: outside every tier,
+    // but well inside the old bounding sphere (radius ≈ 2.04).
+    const origin = new Vector3(-4, CONIFER.crownCY, 5 + 1.8)
+    expect(raycastTrees([conifer()], origin, PLUS_X, 90)).toBeNull()
+  })
+
+  test('through-axis shot hits the cylinder wall at the widest tier radius', () => {
+    const origin = new Vector3(-4, CONIFER.crownCY, 5)
+    const hit = raycastTrees([conifer()], origin, PLUS_X, 90)
+    expect(hit?.part).toBe('canopy')
+    expect(hit!.distance).toBeCloseTo(10 - CONIFER.crownR, 5)
+  })
+
+  test('vertical shot down onto the crown hits the flat apex disc', () => {
+    const origin = new Vector3(6, CONIFER.apex + 2, 5)
+    const hit = raycastTrees([conifer()], origin, new Vector3(0, -1, 0), 90)
+    expect(hit?.part).toBe('canopy')
+    expect(hit!.distance).toBeCloseTo(2, 5)
+  })
+
+  test('level shot under the skirt is NOT eaten by the canopy volume', () => {
+    // Just below the lowest tier: the crown has a flat base, so only the
+    // trunk stands here (a sphere end-cap would have bulged into this shot).
+    const origin = new Vector3(-4, CONIFER.tiers[0]!.y - 0.1, 5)
+    const hit = raycastTrees([conifer()], origin, PLUS_X, 90)
+    expect(hit?.part).toBe('trunk')
+    expect(hit!.distance).toBeCloseTo(10 - CONIFER.trunkR, 5)
+  })
+
+  test('shot over the skirt but under the crown center still hits the wall', () => {
+    const origin = new Vector3(-4, CONIFER.tiers[0]!.y + 0.1, 5)
+    const hit = raycastTrees([conifer()], origin, PLUS_X, 90)
+    expect(hit?.part).toBe('canopy')
+    expect(hit!.distance).toBeCloseTo(10 - CONIFER.crownR, 5)
   })
 })
 

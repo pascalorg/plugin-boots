@@ -109,4 +109,20 @@ describe('botVisualParams', () => {
       expect(bot.visual.accent).toBe(5 % ACCENT_PALETTE.length)
     }
   })
+
+  test('resetBots re-arms the id counter: session 2 looks like session 1', () => {
+    // Regression: the module-level id counter survived resetBots(), so
+    // re-entering play in the same page continued the sequence and
+    // re-rolled every unit's look — breaking the "same every session"
+    // contract this file pins.
+    spawnBot('dog', 0, 0)
+    spawnBot('droid', 1, 0)
+    spawnBot('drone', 2, 0)
+    const firstSession = bots.map((bot) => ({ id: bot.id, ...bot.visual }))
+    resetBots()
+    spawnBot('dog', 0, 0)
+    spawnBot('droid', 1, 0)
+    spawnBot('drone', 2, 0)
+    expect(bots.map((bot) => ({ id: bot.id, ...bot.visual }))).toEqual(firstSession)
+  })
 })
