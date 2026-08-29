@@ -1,12 +1,20 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { type ComponentType, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
-import { CanvasTexture, type Group, Matrix4, type Mesh, type Object3D, Vector3 } from 'three'
+import { type ComponentType, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  CanvasTexture,
+  type Group,
+  type InstancedMesh,
+  Matrix4,
+  type Mesh,
+  Object3D,
+  Vector3,
+} from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { useDestruction } from './destruction'
 import { armWaves, waveState } from './enemies-state'
+import { clearScatterInRadius } from './nature'
 import { playerRig } from './player'
 import { getSession } from './session'
 import * as weaponModels from './weapon-models'
@@ -14,33 +22,44 @@ import { HammerModel, MinigunModel, PistolModel, RifleModel } from './weapon-mod
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
- * The gun tables: the small BUILD table dead ahead of the player (nearest —
- * E there equips ONLY the builder tool, no alert, no waves), the small-arms
- * table a few steps ahead of the player, and the heavy table a bit farther
- * BEHIND the spawn — turn around to find the big rotary gun. Walk up, press
- * E, gear up. Each table is a real collider so it blocks movement and eats
- * bullets like any other prop — the RENDERED meshes double as the colliders,
- * so when a table voxelizes the destruction manager hides the very top +
- * legs the player sees and the voxel replica takes over ("everything should
- * be able to break apart").
+ * THE ARMORED SPAWN DEPOT (owner vision): the spawn gear is a PERMANENT,
+ * INDESTRUCTIBLE structure — a weathered steel cargo container with one
+ * open long side facing spawn, "all guns lined up, stuff unlimited", the
+ * industrial zombie switch part of it — so that in future multiplayer
+ * OTHER players walk up to the same depot and collect their gear too.
+ * It replaces the three loose tables + the switch-wall stub while keeping
+ * their exact interaction contracts:
  *
- * Set dressing (phase 4):
- * - First table: a pair of work boots beside the guns. Picking up here
- *   grants the gear and NOTHING else — combat is strictly opt-in (see the
- *   switch wall below); the table's own sign flips GEAR UP → YOU ARE COOKED.
- * - Rear table: the warhammer lies next to the rotary gun; picking up there
- *   grants BOTH — the big one and the hammer join the loadout together.
+ * - BUILD STATION (left bay): a workbench at the shop front with the tiny
+ *   hammer on display and a START BUILDING stencil. E gives ONLY the
+ *   builder tool — no alert, no waves, the peaceful entry. Its prompt is
+ *   the one up at spawn ("Press E — start building").
+ * - ARMORY RACK (center bay): pistol, rifle, the big rotary gun and the
+ *   warhammer lined up vertically on a wall rack, the work boots on a
+ *   floor mat below, GEAR UP stencil above. One E gives the FULL loadout
+ *   (the old gear + heavy tables merged: pistol/rifle/minigun/hammer).
+ *   The displays are PERMANENT — unlimited stock, they never flip to
+ *   "taken"; only the small sign flips to the YOU ARE COOKED taunt.
+ * - BREAKER PANEL (right end wall, outside): the massive two-hand
+ *   industrial knife-switch + twin roof sirens + PUT YOUR BOOTS ON
+ *   stencil, hazard stripes below. E throws the handle DOWN — the ONLY
+ *   thing that wakes the horde (enemies-state.armWaves → the alert
+ *   countdown theatre → waves); the handle mirrors waveState.armed every
+ *   frame, back UP when resetBots() restores the grace.
  *
- * THE SWITCH WALL (combat opt-in): a short concrete stub of wall beside the
- * spawn tables carrying a MASSIVE two-hand industrial breaker switch — the
- * big metal handle sits UP and throws DOWN on E (retro-lab vibes), and
- * that throw is the ONLY thing that wakes the horde (enemies-state.armWaves
- * → the alert countdown theatre → waves). The siren beacons live up here
- * now (they moved off the gear table with the trigger), the placard reads
- * PUT YOUR BOOTS ON, and the handle mirrors waveState.armed every frame —
- * down for the whole assault, back up when resetBots() re-arms the grace.
- * The stub joins the same grab arbitration as the tables, so one E press
- * still serves exactly one fixture.
+ * INDESTRUCTIBLE, mechanically: every depot mesh registers as a collider
+ * with nodeType 'fixture' — outside shooting.ts's DESTRUCTIBLE set and the
+ * grenade EXPLODABLE sets, so bullets spark and blasts wash over it (the
+ * QA P6R1 'fixture' lane), and the '__boots-depot' nodeId is covered by
+ * destruction.ts's '__boots' prevoxelize guard. The shell still blocks
+ * movement, bots and bullets like any prop.
+ *
+ * WebGPU-safe by construction: box/cylinder primitive assembly with
+ * CanvasTexture stencil signage, corrugation via ONE instanced rib
+ * geometry, no GLB loads, and the single siren pointLight stays
+ * always-mounted (only intensity animates — never a conditional light).
+ * One grab arbitration map spans all three stations, so one E press
+ * serves exactly one fixture.
  */
 
 /**
@@ -53,12 +72,76 @@ const ExternalWarhammer = externalModels.WarhammerModel
 const BootsPair: ComponentType = externalModels.BootsPairModel ?? FallbackBootsPair
 const SirenModel: ComponentType = externalModels.SirenBeaconModel ?? FallbackSirenBeacon
 
-export const TABLE_SIZE: [number, number, number] = [1.7, 0.06, 0.8]
-/** The build table is deliberately small — a side stand, not an armory. */
-export const BUILD_TABLE_SIZE: [number, number, number] = [1.0, 0.06, 0.55]
-const TABLE_HEIGHT = 0.82
-const TABLE_TOP = TABLE_HEIGHT + 0.03
 export const GRAB_RANGE = 2.4
+
+// ---------------------------------------------------------------------------
+// THE ARMORED SPAWN DEPOT — layout math (owner vision: one PERMANENT,
+// INDESTRUCTIBLE cargo container replaces the loose tables; "all guns lined
+// up, stuff unlimited", the industrial zombie switch part of it, so future
+// multiplayer players collect their gear at the same structure).
+//
+// Everything is expressed in the SPAWN FRAME the tests use: [lateral,
+// forward] offsets from world.spawn, lateral positive = the player's right.
+// The container's long axis lies lateral, its one OPEN long side (the shop
+// front) faces spawn, and the three stations sit in the opening:
+//
+//        left end                                    right end (breaker)
+//   x  ┌──────────────────────────────────────────────┐  ← back wall
+//      │   BUILD bench      ARMORY rack + boots mat   ▐▌ breaker on the
+//      └────═══════─────────────═══════───────────────┘  end wall OUTSIDE
+//                     open side (faces spawn)
+//                          · spawn
+//
+// Grab-range contract (unchanged from the tables): the BUILD station is the
+// only prompt inside GRAB_RANGE at spawn; the armory and the breaker are
+// walked to on purpose. The overlap probe 0.4 m ahead of spawn still sits
+// inside BOTH the build and armory discs, so nearest-untaken arbitration
+// stays load-bearing.
+// ---------------------------------------------------------------------------
+
+/** Container footprint: [length (lateral), height, depth (spawn-ward)]. */
+export const DEPOT_SIZE: [number, number, number] = [6, 2.6, 2.5]
+/** Depot center in the spawn frame: [lateral, forward]. */
+export const DEPOT_OFFSET: [number, number] = [0.8, 3.2]
+/** BUILD station grab point — 2.29 m from spawn: nearest, inside range. */
+export const BUILD_STATION_OFFSET: [number, number] = [-0.9, 2.1]
+/** ARMORY grab point — 2.67 m from spawn: outside range on the peaceful
+ * entry, inside the 0.4 m approach probe's disc. */
+export const ARMORY_STATION_OFFSET: [number, number] = [0.8, 2.55]
+/** Breaker grab point — proud of the right end wall (lat 0.8 + 3.05). */
+export const BREAKER_OFFSET: [number, number] = [3.85, 3.2]
+
+/** Spawn-frame → world: lateral positive is the player's right. Matches the
+ * legacy table math (x += fwdX·fwd − fwdZ·lat, z += fwdZ·fwd + fwdX·lat). */
+function offsetFromSpawn(world: GameWorld, lateral: number, forward: number): Vector3 {
+  const fwdX = -Math.sin(world.spawnYaw)
+  const fwdZ = -Math.cos(world.spawnYaw)
+  return new Vector3(
+    world.spawn.x + fwdX * forward - fwdZ * lateral,
+    0,
+    world.spawn.z + fwdZ * forward + fwdX * lateral,
+  )
+}
+
+/** The container's center on the ground plane, rotated to face spawn. */
+export function depotPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, DEPOT_OFFSET[0], DEPOT_OFFSET[1])
+}
+
+/** BUILD station (left bay): E gives the builder only — the peaceful entry. */
+export function buildStationPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, BUILD_STATION_OFFSET[0], BUILD_STATION_OFFSET[1])
+}
+
+/** ARMORY rack (center bay): E gives the full loadout. */
+export function armoryStationPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, ARMORY_STATION_OFFSET[0], ARMORY_STATION_OFFSET[1])
+}
+
+/** The industrial breaker on the right end wall: the ONLY combat trigger. */
+export function breakerPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, BREAKER_OFFSET[0], BREAKER_OFFSET[1])
+}
 
 /** Live fixtures' grab candidacy, keyed by nodeId — each WeaponTable (and
  * the switch wall) registers on mount and mirrors `taken`. The build and
@@ -89,76 +172,187 @@ export function nearestGrabbable(
   return best
 }
 
-export function tablePosition(world: GameWorld): Vector3 {
-  const fwdX = -Math.sin(world.spawnYaw)
-  const fwdZ = -Math.cos(world.spawnYaw)
-  return new Vector3(
-    world.spawn.x + fwdX * 2.6 - fwdZ * 0.9,
-    0,
-    world.spawn.z + fwdZ * 2.6 + fwdX * 0.9,
-  )
-}
+/** Every solid depot mesh registers under this single destruction key —
+ * '__boots'-prefixed (the prevoxelize guard skips it) AND nodeType
+ * 'fixture' (shooting sparks, grenades skip): armored twice over. */
+export const DEPOT_NODE_ID = '__boots-depot'
+/** Outside shooting's DESTRUCTIBLE set and the grenade EXPLODABLE sets —
+ * the QA P6R1 lane where hits only spark. Exported for the armor pin. */
+export const DEPOT_NODE_TYPE = 'fixture'
 
-/** The build table: nearest of the three, almost dead ahead — side-stepped
- * OPPOSITE the gear table so the two footprints keep clear air between
- * them, and inside GRAB_RANGE so the prompt is up the moment you spawn. */
-export function buildTablePosition(world: GameWorld): Vector3 {
-  const fwdX = -Math.sin(world.spawnYaw)
-  const fwdZ = -Math.cos(world.spawnYaw)
-  return new Vector3(
-    world.spawn.x + fwdX * 2.3 + fwdZ * 0.55,
-    0,
-    world.spawn.z + fwdZ * 2.3 - fwdX * 0.55,
-  )
-}
-
-/** The switch wall's stub footprint (w, h, d) — chest-high and a bit more. */
-export const SWITCH_WALL_SIZE: [number, number, number] = [1.2, 1.35, 0.18]
-
-/** The switch wall: past the gear table on its side of the lot, outside
- * grab range at spawn (the peaceful entry keeps a single BUILD prompt) and
- * clear of the gear table's footprint — you walk to the breaker on purpose. */
-export function switchWallPosition(world: GameWorld): Vector3 {
-  const fwdX = -Math.sin(world.spawnYaw)
-  const fwdZ = -Math.cos(world.spawnYaw)
-  return new Vector3(
-    world.spawn.x + fwdX * 3.4 - fwdZ * 2.2,
-    0,
-    world.spawn.z + fwdZ * 3.4 + fwdX * 2.2,
-  )
-}
-
-/** The heavy table: mirrored behind the spawn with the opposite side-step. */
-export function minigunTablePosition(world: GameWorld): Vector3 {
-  const fwdX = -Math.sin(world.spawnYaw)
-  const fwdZ = -Math.cos(world.spawnYaw)
-  return new Vector3(
-    world.spawn.x - fwdX * 4.5 + fwdZ * 0.6,
-    0,
-    world.spawn.z - fwdZ * 4.5 - fwdX * 0.6,
-  )
-}
-
+/** Kept export name — game-root mounts <GunTable/>; it now builds the
+ * armored spawn depot in place of the loose tables. */
 export function GunTable({ world }: { world: GameWorld }) {
-  const frontPos = useMemo(() => tablePosition(world), [world])
-  const rearPos = useMemo(() => minigunTablePosition(world), [world])
-  const buildPos = useMemo(() => buildTablePosition(world), [world])
-  const switchPos = useMemo(() => switchWallPosition(world), [world])
-  const geared = useBoots((s) => s.owned.includes('rifle'))
-  const hasMinigun = useBoots((s) => s.owned.includes('minigun'))
+  return <SpawnDepot world={world} />
+}
+
+// Depot paint: weathered two-tone steel (per-mesh colors, no textures).
+const BODY = '#4e5d68' // steel blue-gray walls
+const BODY_DARK = '#41505a' // roof + header lip
+const DECK = '#4b5157' // interior floor plate
+const STEEL = '#3a3d42' // rails, struts, hangers
+const CASTING = '#2b3036' // corner castings / skid feet
+const RIB = '#46525c' // corrugation ribs
+
+/** Corner castings (the container's skid feet + top blocks), local frame. */
+const CASTINGS: Array<[number, number, number]> = [
+  [-2.92, 0.13, -1.22],
+  [2.92, 0.13, -1.22],
+  [-2.92, 0.13, 1.22],
+  [2.92, 0.13, 1.22],
+  [-2.92, 2.47, -1.22],
+  [2.92, 2.47, -1.22],
+  [-2.92, 2.47, 1.22],
+  [2.92, 2.47, 1.22],
+]
+
+/** Rust accents — thin proud patches over the two-tone paint. */
+const RUST_PATCHES: Array<{
+  pos: [number, number, number]
+  size: [number, number, number]
+  color: string
+}> = [
+  { pos: [-1.6, 0.55, -1.257], size: [0.8, 0.5, 0.012], color: '#7c4a2d' },
+  { pos: [2.1, 1.9, -1.257], size: [0.5, 0.3, 0.012], color: '#8a5636' },
+  { pos: [-3.007, 0.5, 0.4], size: [0.012, 0.6, 0.7], color: '#7c4a2d' },
+  { pos: [3.007, 1.8, -0.6], size: [0.012, 0.4, 0.5], color: '#8a5636' },
+  { pos: [-2.4, 2.28, 1.256], size: [0.6, 0.18, 0.012], color: '#8a5636' },
+  { pos: [0.5, 0.09, 1.256], size: [1.2, 0.06, 0.012], color: '#7c4a2d' },
+]
+
+/**
+ * The depot itself: one root group at depotPosition, rotated so the open
+ * long side faces spawn (local +z = spawn-ward, +x = the player's right —
+ * the same frame the tables used). Solid meshes collect into solidRefs and
+ * register as '__boots-depot' / 'fixture' colliders: they block movement,
+ * bots and bullets, but never voxelize — bullets spark, grenades wash over.
+ */
+function SpawnDepot({ world }: { world: GameWorld }) {
+  const center = useMemo(() => depotPosition(world), [world])
+  const buildAt = useMemo(() => buildStationPosition(world), [world])
+  const armoryAt = useMemo(() => armoryStationPosition(world), [world])
   const hasBuilder = useBoots((s) => s.owned.includes('builder'))
+  const geared = useBoots((s) => s.owned.includes('rifle'))
+  const solidRefs = useRef<(Mesh | null)[]>([])
+  useFixtureColliders(world, solidRefs)
+  const solid = (i: number) => (mesh: Mesh | null) => {
+    solidRefs.current[i] = mesh
+  }
+
+  // Grass must not grow through the deck: zero-scale the nature scatter
+  // under the footprint (three circles tile the 6 × 2.5 box). Nature
+  // mounts in parallel with the depot, so sweep twice — frame 10 catches
+  // the common case, frame 120 any straggler fields. Idempotent and
+  // O(instances) per sweep (the crater budget), then the frame check is a
+  // single compare forever.
+  const sweepFrame = useRef(0)
+  useFrame(() => {
+    const frame = sweepFrame.current
+    if (frame > 120) return
+    sweepFrame.current = frame + 1
+    if (frame !== 10 && frame !== 120) return
+    const fwdX = -Math.sin(world.spawnYaw)
+    const fwdZ = -Math.cos(world.spawnYaw)
+    for (const lat of [-2, 0, 2]) {
+      clearScatterInRadius(center.x - fwdZ * lat, center.z + fwdX * lat, 1.75)
+    }
+  })
 
   return (
-    <>
-      {/* BUILD table: the peaceful entry. Grants ONLY the builder tool —
-       * and since the wave director keys off the breaker switch alone, no
-       * pickup anywhere wakes the horde. */}
-      <WeaponTable
-        world={world}
-        position={buildPos}
-        yaw={world.spawnYaw}
-        nodeId="__boots-table-3"
-        size={BUILD_TABLE_SIZE}
+    <group
+      position={[center.x, 0, center.z]}
+      rotation={[0, world.spawnYaw, 0]}
+      userData={{ __boots: true }}
+    >
+      {/* ── the armored shell (all colliders) ─────────────────────────── */}
+      {/* floor plate — the interior deck the player steps onto */}
+      <mesh castShadow receiveShadow position={[0, 0.06, 0]} ref={solid(0)}>
+        <boxGeometry args={[6, 0.12, 2.5]} />
+        <meshStandardMaterial color={DECK} roughness={0.9} />
+      </mesh>
+      {/* back wall */}
+      <mesh castShadow position={[0, 1.36, -1.2]} ref={solid(1)}>
+        <boxGeometry args={[6, 2.48, 0.1]} />
+        <meshStandardMaterial color={BODY} metalness={0.25} roughness={0.7} />
+      </mesh>
+      {/* end walls */}
+      <mesh castShadow position={[-2.95, 1.36, 0]} ref={solid(2)}>
+        <boxGeometry args={[0.1, 2.48, 2.5]} />
+        <meshStandardMaterial color={BODY} metalness={0.25} roughness={0.7} />
+      </mesh>
+      <mesh castShadow position={[2.95, 1.36, 0]} ref={solid(3)}>
+        <boxGeometry args={[0.1, 2.48, 2.5]} />
+        <meshStandardMaterial color={BODY} metalness={0.25} roughness={0.7} />
+      </mesh>
+      {/* roof */}
+      <mesh castShadow position={[0, 2.55, 0]} ref={solid(4)}>
+        <boxGeometry args={[6, 0.1, 2.5]} />
+        <meshStandardMaterial color={BODY_DARK} metalness={0.25} roughness={0.7} />
+      </mesh>
+      {/* front header lip over the opening (clear height ~2.0 m) */}
+      <mesh castShadow position={[0, 2.325, 1.2]} ref={solid(5)}>
+        <boxGeometry args={[6, 0.35, 0.1]} />
+        <meshStandardMaterial color={BODY_DARK} metalness={0.25} roughness={0.7} />
+      </mesh>
+      {/* fold-down awning panel, propped open over the shop front */}
+      <group position={[0, 2.42, 1.25]} rotation={[-0.5, 0, 0]}>
+        <mesh castShadow position={[0, 0, 0.575]} ref={solid(6)}>
+          <boxGeometry args={[5.7, 0.05, 1.15]} />
+          <meshStandardMaterial color="#5a6a76" metalness={0.25} roughness={0.65} />
+        </mesh>
+      </group>
+      {/* awning prop struts (visual) */}
+      {[-2.7, 2.7].map((x) => (
+        <mesh key={x} position={[x, 2.625, 1.75]} rotation={[0.985, 0, 0]}>
+          <cylinderGeometry args={[0.018, 0.018, 1.18, 8]} />
+          <meshStandardMaterial color={STEEL} metalness={0.5} roughness={0.5} />
+        </mesh>
+      ))}
+
+      {/* ── set dressing (visual only) ─────────────────────────────────── */}
+      <CorrugationRibs />
+      {CASTINGS.map((pos, i) => (
+        <mesh key={i} position={pos} castShadow>
+          <boxGeometry args={[0.32, 0.26, 0.32]} />
+          <meshStandardMaterial color={CASTING} metalness={0.4} roughness={0.6} />
+        </mesh>
+      ))}
+      {/* roof lip rim */}
+      {[-1.22, 1.22].map((z) => (
+        <mesh key={z} position={[0, 2.63, z]}>
+          <boxGeometry args={[6.04, 0.07, 0.07]} />
+          <meshStandardMaterial color={CASTING} metalness={0.4} roughness={0.6} />
+        </mesh>
+      ))}
+      {[-2.98, 2.98].map((x) => (
+        <mesh key={x} position={[x, 2.63, 0]}>
+          <boxGeometry args={[0.07, 0.07, 2.54]} />
+          <meshStandardMaterial color={CASTING} metalness={0.4} roughness={0.6} />
+        </mesh>
+      ))}
+      {RUST_PATCHES.map((patch, i) => (
+        <mesh key={i} position={patch.pos}>
+          <boxGeometry args={patch.size} />
+          <meshStandardMaterial color={patch.color} roughness={0.95} />
+        </mesh>
+      ))}
+
+      {/* ── signage ────────────────────────────────────────────────────── */}
+      {/* the big painted DEPOT marquee, hanging off the awning edge */}
+      {[-1.0, 1.0].map((x) => (
+        <mesh key={x} position={[x, 2.93, 2.24]}>
+          <boxGeometry args={[0.04, 0.14, 0.04]} />
+          <meshStandardMaterial color={STEEL} metalness={0.5} roughness={0.5} />
+        </mesh>
+      ))}
+      <StencilSign position={[0, 2.82, 2.25]} text="DEPOT" width={2.4} height={0.36} />
+      {/* hazard stripes on the header, flagging the breaker end */}
+      <HazardStripes position={[2.5, 2.325, 1.256]} size={[0.9, 0.28]} />
+
+      {/* ── BUILD STATION (left bay): the peaceful entry ───────────────── */}
+      <StationLogic
+        at={buildAt}
+        nodeId="__boots-depot-build"
         taken={hasBuilder}
         prompt="Press E — start building"
         promptOwner="guntable3"
@@ -167,130 +361,103 @@ export function GunTable({ world }: { world: GameWorld }) {
           s.giveWeapon('builder')
           s.setWeapon('builder')
         }}
-        fixtures={
-          <TableSign
-            position={[0, TABLE_TOP, -0.19]}
-            rotation={[0, 0, 0]}
-            scale={0.7}
-            text={hasBuilder ? 'BUILD AWAY' : 'START BUILDING'}
-          />
-        }
-      >
-        {/* tiny construction hammer on display — flat like the small arms
-         * (haft along the tabletop, head raked up a touch). */}
-        <group position={[0.08, TABLE_TOP + 0.035, 0.08]} rotation={[0, 0.5, 0]}>
-          <group rotation={[-Math.PI / 2 + 0.06, Math.PI / 2, 0]} scale={0.9}>
-            <HammerModel />
-          </group>
+      />
+      {/* workbench at the shop front */}
+      <mesh castShadow position={[-1.7, 0.945, 0.93]} ref={solid(7)}>
+        <boxGeometry args={[1.15, 0.07, 0.6]} />
+        <meshStandardMaterial color="#6e5137" roughness={0.8} />
+      </mesh>
+      {[-2.16, -1.24].map((x, i) => (
+        <mesh key={x} castShadow position={[x, 0.515, 0.93]} ref={solid(8 + i)}>
+          <boxGeometry args={[0.08, 0.79, 0.54]} />
+          <meshStandardMaterial color="#54402c" roughness={0.85} />
+        </mesh>
+      ))}
+      {/* under-shelf */}
+      <mesh position={[-1.7, 0.42, 0.93]}>
+        <boxGeometry args={[0.9, 0.04, 0.48]} />
+        <meshStandardMaterial color="#54402c" roughness={0.85} />
+      </mesh>
+      {/* the tiny display hammer — PERMANENT (unlimited stock) */}
+      <group position={[-1.62, 1.015, 1.01]} rotation={[0, 0.5, 0]}>
+        <group rotation={[-Math.PI / 2 + 0.06, Math.PI / 2, 0]} scale={0.9}>
+          <HammerModel />
         </group>
-      </WeaponTable>
-      <WeaponTable
-        world={world}
-        position={frontPos}
-        yaw={world.spawnYaw}
-        nodeId="__boots-table"
+      </group>
+      <StencilSign
+        position={[-1.7, 2.325, 1.256]}
+        text={hasBuilder ? 'BUILD AWAY' : 'START BUILDING'}
+        width={1.0}
+        height={0.2}
+      />
+
+      {/* ── ARMORY RACK (center bay): the full loadout ─────────────────── */}
+      <StationLogic
+        at={armoryAt}
+        nodeId="__boots-depot-armory"
         taken={geared}
         prompt="Press E — gear up"
         promptOwner="guntable"
         onPickup={() => {
+          // The full loadout in one stop (old gear + heavy tables merged).
           // Gear ONLY — the wave director never reads ownership; combat
-          // waits for the breaker switch (SwitchWall below).
+          // waits for the breaker panel on the end wall.
           const s = useBoots.getState()
           s.giveWeapon('pistol')
           s.giveWeapon('rifle')
-          s.setWeapon('rifle')
-        }}
-        fixtures={
-          /* The placard is a FIXTURE: it outlives the pickup (and flips
-           * to the taunt once you're geared). */
-          <TableSign
-            position={[0, TABLE_TOP, -0.28]}
-            rotation={[0, 0, 0]}
-            text={geared ? 'YOU ARE COOKED' : 'GEAR UP'}
-          />
-        }
-      >
-        {/* pistol on display — lying flat on the tabletop (owner call) */}
-        <group position={[-0.4, TABLE_TOP + 0.03, 0.05]} rotation={[0, 0.45, 0]}>
-          <group rotation={[-Math.PI / 2 + 0.08, Math.PI / 2, 0]} scale={1.3}>
-            <PistolModel />
-          </group>
-        </group>
-        {/* rifle on display — lying flat along the table (owner call) */}
-        <group position={[0.35, TABLE_TOP + 0.04, -0.08]} rotation={[0, -0.12, 0]}>
-          <group rotation={[-Math.PI / 2 + 0.06, Math.PI / 2, 0]} scale={1.15}>
-            <RifleModel />
-          </group>
-        </group>
-        {/* work boots, sitting beside the guns — toes toward the player
-         * walking up (owner call: you should recognize the boots at a
-         * glance), with a small placard behind them. */}
-        <group position={[-0.68, TABLE_TOP, 0.12]} rotation={[0, Math.PI + 0.35, 0]}>
-          <BootsPair />
-        </group>
-      </WeaponTable>
-      <WeaponTable
-        world={world}
-        position={rearPos}
-        yaw={world.spawnYaw}
-        nodeId="__boots-table-2"
-        taken={hasMinigun}
-        prompt="Press E — the big one"
-        promptOwner="guntable2"
-        onPickup={() => {
-          const s = useBoots.getState()
           s.giveWeapon('minigun')
           s.giveWeapon('hammer')
-          s.setWeapon('minigun')
+          s.setWeapon('rifle')
         }}
-      >
-        {/* the big one on display: the real model, laid along the table */}
-        <Spin position={[0, TABLE_HEIGHT + 0.26, 0]}>
-          <group scale={1.5} rotation={[0, Math.PI / 2, 0]}>
-            <group position={[0, 0, 0.35]}>
-              <MinigunModel />
-            </group>
-          </group>
-        </Spin>
-        {/* the warhammer, LEANING against the table's right end — flat on
-            the tabletop it vanished behind the minigun from the spawn side
-            (QA p4r1). Pommel on the floor just past the top's +x edge, the
-            haft rests on the table-edge corner (z-roll 0.25 leans it toward
-            -x; the pommel sits 0.18·cos(0.25) below the group origin), and
-            the big steel head crowns ~4 cm above the tabletop where the
-            approach sightline can't miss it. Pickup grants both weapons. */}
-        <group position={[1.03, 0.18, 0.18]} rotation={[0, 0.15, 0.25]}>
-          {ExternalWarhammer ? (
-            <group scale={0.8}>
-              <ExternalWarhammer />
-            </group>
-          ) : (
-            <group scale={0.8}>
-              <HammerModel />
-            </group>
-          )}
-        </group>
-      </WeaponTable>
-      {/* The combat opt-in: sirens, placard and the breaker all live here. */}
-      <SwitchWall position={switchPos} world={world} yaw={world.spawnYaw} />
-    </>
-  )
-}
+      />
+      {/* rack rails on the back wall */}
+      {[1.68, 0.72].map((y) => (
+        <mesh key={y} position={[0, y, -1.11]}>
+          <boxGeometry args={[3.3, 0.07, 0.07]} />
+          <meshStandardMaterial color={STEEL} metalness={0.5} roughness={0.5} />
+        </mesh>
+      ))}
+      {/* the guns, LINED UP vertically — PERMANENT displays: they never
+       * flip to taken (unlimited, the next player collects too). */}
+      <group position={[-1.25, 1.2, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={1.3}>
+        <PistolModel />
+      </group>
+      <group position={[-0.45, 1.2, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={1.15}>
+        <RifleModel />
+      </group>
+      <group position={[0.45, 1.25, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={0.95}>
+        <MinigunModel />
+      </group>
+      <group position={[1.35, 1.25, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={0.8}>
+        {ExternalWarhammer ? <ExternalWarhammer /> : <HammerModel />}
+      </group>
+      {/* work boots on the floor mat, toes toward the player walking up */}
+      <mesh position={[0, 0.135, 0.4]}>
+        <boxGeometry args={[0.85, 0.03, 0.55]} />
+        <meshStandardMaterial color="#22262a" roughness={0.95} />
+      </mesh>
+      <group position={[0, 0.15, 0.4]} rotation={[0, Math.PI + 0.35, 0]}>
+        <BootsPair />
+      </group>
+      {/* the taunt flip lives ONLY on the sign — never on the displays */}
+      <StencilSign
+        position={[0, 2.325, 1.256]}
+        text={geared ? 'YOU ARE COOKED' : 'GEAR UP'}
+        width={1.2}
+        height={0.24}
+      />
 
-/** Slow display spin, in place around the item's own y axis. */
-function Spin({ position, children }: { position: [number, number, number]; children: ReactNode }) {
-  const ref = useRef<Group>(null)
-  useFrame((_, dt) => {
-    if (ref.current) ref.current.rotation.y += dt * 0.9
-  })
-  return (
-    <group position={position} ref={ref}>
-      {children}
+      {/* ── BREAKER PANEL (right end wall, outside): the combat opt-in ── */}
+      <BreakerPanel world={world} />
+      {/* twin sirens on the roof above the breaker end — the primary
+       * carries the lot's single always-mounted red pointLight. */}
+      <SirenBeacon position={[2.55, 2.6, -0.45]} primary />
+      <SirenBeacon position={[2.55, 2.6, 0.45]} />
     </group>
   )
 }
 
-const SWITCH_NODE_ID = '__boots-switch'
+const BREAKER_NODE_ID = '__boots-switch'
 
 /** Lever pose: rotation.x of the pivot group. UP tips the big handle just
  * off vertical toward the player; DOWN throws it well past horizontal. */
@@ -300,68 +467,35 @@ const LEVER_DOWN = 2.7
 const LEVER_RATE = (LEVER_DOWN - LEVER_UP) / 0.4
 
 /**
- * The switch wall: a short concrete stub by the spawn tables carrying the
- * industrial breaker switch — a massive two-hand knife-lever on a steel
- * backplate, handle UP at rest, thrown DOWN on E. That throw (armWaves) is
- * the ONLY way combat starts; the handle chases waveState.armed every frame
- * so it stays down for the whole assault and swings back up when
- * resetBots() restores the grace. The siren beacons and the PUT YOUR BOOTS
- * ON placard live here. The stub's slab + cap are real colliders (and a
- * voxelizable destruction target) exactly like the tables, and the E
- * interaction joins the tables' nearest-grabbable arbitration.
+ * The breaker panel — the industrial zombie switch, now PART OF the depot:
+ * mounted on the container's right end wall (outside face), a massive
+ * two-hand knife-lever on a steel backplate, handle UP at rest, thrown
+ * DOWN on E. That throw (armWaves) is the ONLY way combat starts; the
+ * handle chases waveState.armed every frame so it stays down for the whole
+ * assault and swings back up when resetBots() restores the grace — exactly
+ * the switch wall's contract, on armored steel instead of a concrete stub.
+ * The end wall itself is the depot's collider; the panel joins the same
+ * nearest-grabbable arbitration under the legacy '__boots-switch' key.
+ * Rendered inside the depot's root group: local +z here faces OUTWARD
+ * along the container's +x end (rotation π/2).
  */
-function SwitchWall({
-  world,
-  position,
-  yaw,
-}: {
-  world: GameWorld
-  position: Vector3
-  yaw: number
-}) {
-  const solidRefs = useRef<(Mesh | null)[]>([])
+function BreakerPanel({ world }: { world: GameWorld }) {
+  const at = useMemo(() => breakerPosition(world), [world])
   const leverRef = useRef<Group>(null)
   const leverAngle = useRef(LEVER_UP)
   const prevE = useRef(false)
   const promptShown = useRef(false)
-  const broken = useDestruction((s) => s.targets.has(SWITCH_NODE_ID))
 
-  // Grab arbitration entry: the stub competes with the tables so one E
-  // press serves exactly one fixture. `taken` mirrors waveState.armed —
+  // Grab arbitration entry: the breaker competes with the stations so one
+  // E press serves exactly one fixture. `taken` mirrors waveState.armed —
   // refreshed per frame below (the flag lives outside React), so a thrown
   // switch stops prompting and a reset re-arms it without a remount.
   useEffect(() => {
-    grabTables.set(SWITCH_NODE_ID, { x: position.x, z: position.z, taken: waveState.armed })
+    grabTables.set(BREAKER_NODE_ID, { x: at.x, z: at.z, taken: waveState.armed })
     return () => {
-      grabTables.delete(SWITCH_NODE_ID)
+      grabTables.delete(BREAKER_NODE_ID)
     }
-  }, [position])
-
-  // The slab + cap are colliders for the session — the WeaponTable idiom:
-  // the RENDERED meshes register, so voxelization hides exactly what the
-  // player sees and the voxel replica is wall-shaped.
-  useEffect(() => {
-    const entries: ColliderEntry[] = []
-    for (const mesh of solidRefs.current) {
-      if (!mesh) continue
-      mesh.updateWorldMatrix(true, false)
-      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
-      const entry: ColliderEntry = {
-        mesh,
-        bvh: bvhFor(mesh),
-        inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
-        worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
-        root: mesh,
-        nodeId: SWITCH_NODE_ID,
-        nodeType: 'item',
-      }
-      world.colliders.push(entry)
-      entries.push(entry)
-    }
-    return () => {
-      for (const entry of entries) entry.disabled = true
-    }
-  }, [world])
+  }, [at])
 
   useFrame((_, dt) => {
     // The throw (and the reset): chase armed's target pose at the 0.4 s
@@ -375,12 +509,11 @@ function SwitchWall({
 
     const session = getSession()
     if (!session) return
-    const entry = grabTables.get(SWITCH_NODE_ID)
-    if (entry) entry.taken = waveState.armed || broken
+    const entry = grabTables.get(BREAKER_NODE_ID)
+    if (entry) entry.taken = waveState.armed
     const near =
       !waveState.armed &&
-      !broken &&
-      nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) === SWITCH_NODE_ID
+      nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) === BREAKER_NODE_ID
     if (near !== promptShown.current) {
       promptShown.current = near
       session.hud.prompt(near ? 'Press E — throw the switch' : null, 'switchwall')
@@ -395,74 +528,38 @@ function SwitchWall({
     prevE.current = ePressed
   })
 
-  const [wallW, wallH, wallD] = SWITCH_WALL_SIZE
   return (
-    <group position={[position.x, 0, position.z]} rotation={[0, yaw, 0]} userData={{ __boots: true }}>
-      {/* the stub: chest-high concrete and a steel cap the sirens bolt onto */}
-      <mesh
-        castShadow
-        position={[0, wallH / 2, 0]}
-        ref={(mesh) => {
-          solidRefs.current[0] = mesh
-        }}
-      >
-        <boxGeometry args={[wallW, wallH, wallD]} />
-        <meshStandardMaterial color="#8d9096" roughness={0.9} />
+    <group position={[3.0, 0, 0]} rotation={[0, Math.PI / 2, 0]}>
+      {/* steel backplate on the end wall */}
+      <mesh position={[0, 0.88, 0.03]}>
+        <boxGeometry args={[0.42, 0.55, 0.06]} />
+        <meshStandardMaterial color="#2a2d33" metalness={0.5} roughness={0.5} />
       </mesh>
-      <mesh
-        castShadow
-        position={[0, wallH + 0.025, 0]}
-        ref={(mesh) => {
-          solidRefs.current[1] = mesh
-        }}
-      >
-        <boxGeometry args={[wallW + 0.06, 0.05, wallD + 0.06]} />
-        <meshStandardMaterial color="#3a3d42" metalness={0.4} roughness={0.55} />
-      </mesh>
-      {!broken && (
-        <>
-          {/* the industrial breaker switch, on the spawn-facing face */}
-          <group position={[0, 0, wallD / 2]}>
-            {/* steel backplate */}
-            <mesh position={[0, 0.88, 0.03]}>
-              <boxGeometry args={[0.42, 0.55, 0.06]} />
-              <meshStandardMaterial color="#2a2d33" metalness={0.5} roughness={0.5} />
-            </mesh>
-            {/* hinge bosses on the pivot line */}
-            {[-0.11, 0.11].map((x) => (
-              <mesh key={x} position={[x, 0.72, 0.08]} rotation={[0, 0, Math.PI / 2]}>
-                <cylinderGeometry args={[0.035, 0.035, 0.05, 10]} />
-                <meshStandardMaterial color="#54565c" metalness={0.6} roughness={0.4} />
-              </mesh>
-            ))}
-            {/* the massive two-hand lever — pivot at the hinge line */}
-            <group position={[0, 0.72, 0.08]} ref={leverRef} rotation={[LEVER_UP, 0, 0]}>
-              {[-0.11, 0.11].map((x) => (
-                <mesh key={x} position={[x, 0.21, 0]}>
-                  <boxGeometry args={[0.045, 0.42, 0.035]} />
-                  <meshStandardMaterial color="#6d7076" metalness={0.65} roughness={0.35} />
-                </mesh>
-              ))}
-              {/* the big red cross-grip: grab it with both hands */}
-              <mesh position={[0, 0.42, 0]} rotation={[0, 0, Math.PI / 2]}>
-                <cylinderGeometry args={[0.034, 0.034, 0.36, 12]} />
-                <meshStandardMaterial color="#c43a35" roughness={0.5} />
-              </mesh>
-            </group>
-          </group>
-          {/* the marching orders moved here with the trigger */}
-          <TableSign
-            position={[0, 1.02, wallD / 2 + 0.005]}
-            rotation={[0, 0, 0]}
-            scale={0.9}
-            text="PUT YOUR BOOTS ON"
-          />
-          {/* twin sirens on the cap — the primary carries the lot's single
-           * always-mounted red pointLight (moved off the gear table). */}
-          <SirenBeacon position={[-0.42, wallH + 0.05, 0]} primary />
-          <SirenBeacon position={[0.42, wallH + 0.05, 0]} />
-        </>
-      )}
+      {/* hinge bosses on the pivot line */}
+      {[-0.11, 0.11].map((x) => (
+        <mesh key={x} position={[x, 0.72, 0.08]} rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.035, 0.035, 0.05, 10]} />
+          <meshStandardMaterial color="#54565c" metalness={0.6} roughness={0.4} />
+        </mesh>
+      ))}
+      {/* the massive two-hand lever — pivot at the hinge line */}
+      <group position={[0, 0.72, 0.08]} ref={leverRef} rotation={[LEVER_UP, 0, 0]}>
+        {[-0.11, 0.11].map((x) => (
+          <mesh key={x} position={[x, 0.21, 0]}>
+            <boxGeometry args={[0.045, 0.42, 0.035]} />
+            <meshStandardMaterial color="#6d7076" metalness={0.65} roughness={0.35} />
+          </mesh>
+        ))}
+        {/* the big red cross-grip: grab it with both hands */}
+        <mesh position={[0, 0.42, 0]} rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.034, 0.034, 0.36, 12]} />
+          <meshStandardMaterial color="#c43a35" roughness={0.5} />
+        </mesh>
+      </group>
+      {/* the marching orders, stenciled above the switch */}
+      <StencilSign position={[0, 1.42, 0.03]} text="PUT YOUR BOOTS ON" width={1.05} height={0.2} />
+      {/* hazard stripes under the handle's throw arc */}
+      <HazardStripes position={[0, 0.34, 0.03]} size={[1.0, 0.26]} />
     </group>
   )
 }
@@ -571,57 +668,127 @@ function SirenBeacon({
   )
 }
 
-/** Small tabletop placard — canvas-textured board on a stub post. */
-function TableSign({
+/**
+ * Military-crate stencil signage — the depot's replacement for the wooden
+ * table placards: a dark olive-steel plate, worn yellow stencil lettering
+ * (monospace, hand-tracked per character), painted corner bolts. The plate
+ * mounts flush at `position` facing local +z; text flips (GEAR UP → YOU
+ * ARE COOKED) rebuild the texture exactly like TableSign did.
+ */
+function StencilSign({
   position,
-  rotation,
+  rotation = [0, 0, 0],
   text,
-  scale = 1,
+  width = 1.0,
+  height = 0.22,
 }: {
   position: [number, number, number]
-  rotation: [number, number, number]
+  rotation?: [number, number, number]
   text: string
-  /** Uniform shrink for the small build table — the position stays put. */
-  scale?: number
+  width?: number
+  height?: number
 }) {
   const texture = useMemo(() => {
     if (typeof document === 'undefined') return null
     const canvas = document.createElement('canvas')
     canvas.width = 768
-    canvas.height = 96
+    canvas.height = 192
     const g = canvas.getContext('2d')!
-    g.fillStyle = '#efe8d8'
-    g.fillRect(0, 0, 768, 96)
-    g.strokeStyle = '#7a5c3e'
-    g.lineWidth = 6
-    g.strokeRect(3, 3, 762, 90)
-    g.fillStyle = '#3a2f22'
-    g.font = 'bold 44px system-ui, sans-serif'
-    g.textAlign = 'center'
+    // olive-steel plate with a worn stencil frame
+    g.fillStyle = '#39413a'
+    g.fillRect(0, 0, 768, 192)
+    g.strokeStyle = '#242a24'
+    g.lineWidth = 10
+    g.strokeRect(8, 8, 752, 176)
+    // hand-tracked stencil lettering, shrunk to fit long lines
+    const chars = [...text]
+    const track = 10
+    let font = 116
+    g.font = `bold ${font}px "Courier New", monospace`
+    let textW = g.measureText(text).width + track * (chars.length - 1)
+    if (textW > 680) {
+      font = Math.max(28, Math.floor((font * 680) / textW))
+      g.font = `bold ${font}px "Courier New", monospace`
+      textW = g.measureText(text).width + track * (chars.length - 1)
+    }
+    g.fillStyle = '#dfc95e'
+    g.textAlign = 'left'
     g.textBaseline = 'middle'
-    g.fillText(text, 384, 50)
+    let x = (768 - textW) / 2
+    for (const c of chars) {
+      g.fillText(c, x, 102)
+      x += g.measureText(c).width + track
+    }
+    // painted corner bolts
+    g.fillStyle = '#1c211c'
+    for (const [bx, by] of [
+      [26, 26],
+      [742, 26],
+      [26, 166],
+      [742, 166],
+    ]) {
+      g.beginPath()
+      g.arc(bx!, by!, 9, 0, Math.PI * 2)
+      g.fill()
+    }
     return new CanvasTexture(canvas)
   }, [text])
   // R3F disposes the JSX material, never this externally created texture —
   // release it on unmount AND on every text flip or each session leaks one.
   useEffect(() => () => texture?.dispose(), [texture])
   return (
-    <group position={position} rotation={rotation} scale={scale}>
-      {[-0.42, 0.42].map((x) => (
-        <mesh key={x} position={[x, 0.09, 0]}>
-          <cylinderGeometry args={[0.008, 0.008, 0.18]} />
-          <meshStandardMaterial color="#7a5c3e" roughness={0.8} />
-        </mesh>
-      ))}
-      <mesh position={[0, 0.22, 0]}>
-        <boxGeometry args={[1.02, 0.13, 0.014]} />
-        {texture ? (
-          <meshStandardMaterial map={texture} roughness={0.85} />
-        ) : (
-          <meshStandardMaterial color="#efe8d8" roughness={0.85} />
-        )}
-      </mesh>
-    </group>
+    <mesh position={position} rotation={rotation}>
+      <boxGeometry args={[width, height, 0.02]} />
+      {texture ? (
+        <meshStandardMaterial map={texture} roughness={0.8} />
+      ) : (
+        <meshStandardMaterial color="#39413a" roughness={0.8} />
+      )}
+    </mesh>
+  )
+}
+
+/** Yellow/black diagonal hazard stripes on a thin plate (CanvasTexture —
+ * the industrial warning band by the breaker and on the header). */
+function HazardStripes({
+  position,
+  rotation = [0, 0, 0],
+  size,
+}: {
+  position: [number, number, number]
+  rotation?: [number, number, number]
+  size: [number, number]
+}) {
+  const texture = useMemo(() => {
+    if (typeof document === 'undefined') return null
+    const canvas = document.createElement('canvas')
+    canvas.width = 256
+    canvas.height = 64
+    const g = canvas.getContext('2d')!
+    g.fillStyle = '#d9b83b'
+    g.fillRect(0, 0, 256, 64)
+    g.fillStyle = '#15171a'
+    for (let x = -64; x < 320; x += 56) {
+      g.beginPath()
+      g.moveTo(x, 64)
+      g.lineTo(x + 28, 64)
+      g.lineTo(x + 28 + 64, 0)
+      g.lineTo(x + 64, 0)
+      g.closePath()
+      g.fill()
+    }
+    return new CanvasTexture(canvas)
+  }, [])
+  useEffect(() => () => texture?.dispose(), [texture])
+  return (
+    <mesh position={position} rotation={rotation}>
+      <boxGeometry args={[size[0], size[1], 0.015]} />
+      {texture ? (
+        <meshStandardMaterial map={texture} roughness={0.85} />
+      ) : (
+        <meshStandardMaterial color="#d9b83b" roughness={0.85} />
+      )}
+    </mesh>
   )
 }
 
@@ -678,58 +845,14 @@ function FallbackSirenBeacon() {
   )
 }
 
-function WeaponTable({
-  world,
-  position,
-  yaw,
-  nodeId,
-  size = TABLE_SIZE,
-  taken,
-  prompt,
-  promptOwner,
-  onPickup,
-  fixtures,
-  children,
-}: {
-  world: GameWorld
-  position: Vector3
-  yaw: number
-  /** Destruction key — each table is its own voxelizable target. */
-  nodeId: string
-  /** Footprint (w, top thickness, d) — legs inset from the corners. */
-  size?: [number, number, number]
-  /** True once this table's gear is owned: displays gone, prompt off. */
-  taken: boolean
-  prompt: string
-  promptOwner: string
-  onPickup: () => void
-  /** Persistent set dressing: survives the pickup, leaves only if the table
-   * breaks (the siren beacon — its whole job happens AFTER `taken`). */
-  fixtures?: ReactNode
-  children: ReactNode
-}) {
-  const solidRefs = useRef<(Mesh | null)[]>([])
-  const prevE = useRef(false)
-  const promptShown = useRef(false)
-
-  // Grab arbitration entry (see grabTables): prompt and pickup only engage
-  // on the table nearestGrabbable elects, so overlapping discs never serve
-  // one E press twice.
-  useEffect(() => {
-    grabTables.set(nodeId, { x: position.x, z: position.z, taken })
-    return () => {
-      grabTables.delete(nodeId)
-    }
-  }, [nodeId, position, taken])
-
-  // Once the table voxelizes its solid meshes are ledger-hidden; the display
-  // guns aren't colliders, so drop them here (blown off with the first hit).
-  const broken = useDestruction((s) => s.targets.has(nodeId))
-
-  // Register the rendered top + legs as colliders for the session. Using the
-  // visible meshes themselves (not an invisible proxy) means voxelization
-  // hides exactly what the player sees, and the voxel volume is table-shaped
-  // — shoot the legs out and the top crumbles as an unsupported island.
+/**
+ * Register every solid depot mesh as a '__boots-depot' / 'fixture'
+ * collider — the WeaponTable idiom (the RENDERED meshes ARE the
+ * colliders), minus the voxelization: 'fixture' sits outside shooting's
+ * DESTRUCTIBLE set and the grenade EXPLODABLE sets, so the depot blocks
+ * movement, bots and bullets forever and only ever sparks.
+ */
+function useFixtureColliders(world: GameWorld, solidRefs: { current: (Mesh | null)[] }) {
   useEffect(() => {
     const entries: ColliderEntry[] = []
     for (const mesh of solidRefs.current) {
@@ -742,8 +865,8 @@ function WeaponTable({
         inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
         worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
         root: mesh,
-        nodeId,
-        nodeType: 'item',
+        nodeId: DEPOT_NODE_ID,
+        nodeType: DEPOT_NODE_TYPE,
       }
       world.colliders.push(entry)
       entries.push(entry)
@@ -751,7 +874,45 @@ function WeaponTable({
     return () => {
       for (const entry of entries) entry.disabled = true
     }
-  }, [world, nodeId])
+  }, [world, solidRefs])
+}
+
+/**
+ * One station's interaction contract — the WeaponTable prompt/pickup logic
+ * with the geometry factored out (the depot shell owns the meshes now).
+ * Registers the grab-arbitration entry at `at` and serves E exactly like
+ * the tables did: prompt only while this station is the nearest untaken
+ * fixture, one pickup per press edge, sfx.pickup on grant.
+ */
+function StationLogic({
+  at,
+  nodeId,
+  taken,
+  prompt,
+  promptOwner,
+  onPickup,
+}: {
+  at: Vector3
+  nodeId: string
+  /** True once this station's gear is owned: prompt off, arbitration
+   * falls through — the DISPLAYS stay (unlimited stock, owner call). */
+  taken: boolean
+  prompt: string
+  promptOwner: string
+  onPickup: () => void
+}) {
+  const prevE = useRef(false)
+  const promptShown = useRef(false)
+
+  // Grab arbitration entry (see grabTables): prompt and pickup only engage
+  // on the station nearestGrabbable elects, so overlapping discs never
+  // serve one E press twice.
+  useEffect(() => {
+    grabTables.set(nodeId, { x: at.x, z: at.z, taken })
+    return () => {
+      grabTables.delete(nodeId)
+    }
+  }, [nodeId, at, taken])
 
   useFrame(() => {
     const session = getSession()
@@ -774,39 +935,46 @@ function WeaponTable({
     prevE.current = ePressed
   })
 
+  return null
+}
+
+/** Rib count: 17 across the back + 7 on each end wall. */
+const RIB_COUNT = 31
+
+/**
+ * The corrugated read: ONE box geometry instanced over the closed sides
+ * (thin vertical ribs, the classic container profile). Matrices are set
+ * once on mount — zero per-frame work, no per-frame allocations.
+ */
+function CorrugationRibs() {
+  const ref = useRef<InstancedMesh>(null)
+  useEffect(() => {
+    const mesh = ref.current
+    if (!mesh) return
+    const helper = new Object3D()
+    let i = 0
+    const place = (x: number, z: number, yaw: number) => {
+      helper.position.set(x, 1.36, z)
+      helper.rotation.set(0, yaw, 0)
+      helper.updateMatrix()
+      mesh.setMatrixAt(i++, helper.matrix)
+    }
+    // back wall exterior
+    for (let n = 0; n < 17; n++) place(-2.72 + n * 0.34, -1.29, 0)
+    // end walls exterior
+    for (let n = 0; n < 7; n++) {
+      const z = -1.02 + n * 0.34
+      place(-3.04, z, Math.PI / 2)
+      place(3.04, z, Math.PI / 2)
+    }
+    mesh.instanceMatrix.needsUpdate = true
+  }, [])
+  // frustumCulled off: the geometry's bounding sphere is one rib, not the
+  // spread — a glancing camera would cull visible ribs otherwise.
   return (
-    <group position={[position.x, 0, position.z]} rotation={[0, yaw, 0]} userData={{ __boots: true }}>
-      {/* top */}
-      <mesh
-        castShadow
-        position={[0, TABLE_HEIGHT, 0]}
-        ref={(mesh) => {
-          solidRefs.current[0] = mesh
-        }}
-      >
-        <boxGeometry args={size} />
-        <meshStandardMaterial color="#6e5137" roughness={0.8} />
-      </mesh>
-      {/* legs — inset from the top's corners, whatever the footprint */}
-      {[
-        [-(size[0] / 2 - 0.1), -(size[2] / 2 - 0.08)],
-        [size[0] / 2 - 0.1, -(size[2] / 2 - 0.08)],
-        [-(size[0] / 2 - 0.1), size[2] / 2 - 0.08],
-        [size[0] / 2 - 0.1, size[2] / 2 - 0.08],
-      ].map(([x, z], i) => (
-        <mesh
-          key={i}
-          position={[x!, TABLE_HEIGHT / 2, z!]}
-          ref={(mesh) => {
-            solidRefs.current[i + 1] = mesh
-          }}
-        >
-          <boxGeometry args={[0.07, TABLE_HEIGHT, 0.07]} />
-          <meshStandardMaterial color="#54402c" roughness={0.85} />
-        </mesh>
-      ))}
-      {!broken && fixtures}
-      {!taken && !broken && children}
-    </group>
+    <instancedMesh args={[undefined, undefined, RIB_COUNT]} ref={ref} castShadow frustumCulled={false}>
+      <boxGeometry args={[0.09, 2.34, 0.05]} />
+      <meshStandardMaterial color={RIB} metalness={0.35} roughness={0.6} />
+    </instancedMesh>
   )
 }
