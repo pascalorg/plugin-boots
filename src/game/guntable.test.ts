@@ -2,20 +2,19 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { prevoxelizeTick, resetDestruction, useDestruction } from './destruction'
 import {
-  ARMORY_STATION_OFFSET,
   armoryStationPosition,
-  BREAKER_OFFSET,
   breakerEngageable,
   breakerPosition,
-  BUILD_STATION_OFFSET,
   buildStationPosition,
   DEPOT_NODE_ID,
   DEPOT_NODE_TYPE,
   DEPOT_OFFSET,
   DEPOT_SIZE,
+  depotLocalToWorld,
   depotPosition,
   GRAB_RANGE,
   nearestGrabbable,
+  worldToDepotLocal,
 } from './guntable'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -44,61 +43,56 @@ function spawnFrame(world: GameWorld, pos: Vector3): [number, number] {
   return [dx * -fwdZ + dz * fwdX, dx * fwdX + dz * fwdZ]
 }
 
-/** spawnFrame's inverse: a world point from [lateral, forward] offsets. */
-function fromFrame(world: GameWorld, lateral: number, forward: number): Vector3 {
-  const fwdX = -Math.sin(world.spawnYaw)
-  const fwdZ = -Math.cos(world.spawnYaw)
-  return new Vector3(
-    world.spawn.x + fwdX * forward - fwdZ * lateral,
-    0,
-    world.spawn.z + fwdZ * forward + fwdX * lateral,
-  )
-}
-
 /**
  * The ARMORED SPAWN DEPOT: one indestructible cargo container replaces the
- * three tables + switch stub. Same grab semantics — the pins below are the
- * tables' contracts re-expressed against the container's stations, plus the
- * new container-shape invariants (stations inside the shell, open side
- * toward spawn, breaker ON the right end wall).
+ * three tables + switch stub, SET BACK BEHIND SPAWN (owner ask — the view
+ * toward the building stays clear; turn around and the opening faces you).
+ * The pins below are the tables' grab contracts re-expressed against the
+ * container's stations in the depot-local frame, plus the container-shape
+ * invariants (stations inside the shell, open side toward spawn, breaker
+ * ON the +x end wall).
  */
 describe('spawn depot layout', () => {
-  test('build station is the only prompt inside grab range at spawn', () => {
+  test('the depot is set back behind spawn — nothing prompts at spawn', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)
       const spawn = world.spawn
-      const dBuild = buildStationPosition(world).distanceTo(spawn)
-      const dArmory = armoryStationPosition(world).distanceTo(spawn)
-      const dBreaker = breakerPosition(world).distanceTo(spawn)
-      expect(dBuild).toBeLessThan(dArmory)
-      expect(dBuild).toBeLessThan(dBreaker)
-      // The build prompt is up the moment the player spawns…
-      expect(dBuild).toBeLessThan(GRAB_RANGE)
-      // …and neither the armory nor the breaker competes with it there.
-      expect(dArmory).toBeGreaterThan(GRAB_RANGE)
-      expect(dBreaker).toBeGreaterThan(GRAB_RANGE)
+      // Behind the player: the container center's forward coordinate is
+      // negative (the player looks away from it at entry)…
+      const [, depotFwd] = spawnFrame(world, depotPosition(world))
+      expect(depotFwd).toBeLessThan(0)
+      // …and every fixture is walked to on purpose: no prompt at spawn.
+      expect(buildStationPosition(world).distanceTo(spawn)).toBeGreaterThan(GRAB_RANGE)
+      expect(armoryStationPosition(world).distanceTo(spawn)).toBeGreaterThan(GRAB_RANGE)
+      expect(breakerPosition(world).distanceTo(spawn)).toBeGreaterThan(GRAB_RANGE)
     }
   })
 
-  test('stations sit ahead of spawn; build opposite the armory laterally', () => {
+  test('depot-local transform round-trips (grab math ⇄ rendered group)', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(-7, 0, 11), yaw)
-      const [buildLat, buildFwd] = spawnFrame(world, buildStationPosition(world))
-      const [armoryLat, armoryFwd] = spawnFrame(world, armoryStationPosition(world))
-      expect(buildFwd).toBeGreaterThan(0)
-      expect(armoryFwd).toBeGreaterThan(0)
-      expect(buildLat * armoryLat).toBeLessThan(0)
+      for (const [lx, lz] of [
+        [3.05, 0],
+        [-1.7, 1.1],
+        [0.4, -0.9],
+      ] as const) {
+        const p = depotLocalToWorld(world, lx, lz)
+        const [rx, rz] = worldToDepotLocal(world, p.x, p.z)
+        expect(rx).toBeCloseTo(lx, 10)
+        expect(rz).toBeCloseTo(lz, 10)
+      }
     }
   })
 
   test('one E press serves ONE station: nearest untaken wins the overlap', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)
-      // 0.4 m forward of spawn — inside BOTH the build and armory grab
-      // discs (regression guard carried over from the tables: a single E
-      // here must never grant builder + guns together).
-      const px = world.spawn.x - Math.sin(yaw) * 0.4
-      const pz = world.spawn.z - Math.cos(yaw) * 0.4
+      // In the opening between the two stations — inside BOTH grab discs
+      // (regression guard carried over from the tables: a single E here
+      // must never grant builder + guns together).
+      const probe = depotLocalToWorld(world, -1.0, 0.9)
+      const px = probe.x
+      const pz = probe.z
       const at = new Vector3(px, 0, pz)
       expect(buildStationPosition(world).distanceTo(at)).toBeLessThan(GRAB_RANGE)
       expect(armoryStationPosition(world).distanceTo(at)).toBeLessThan(GRAB_RANGE)
@@ -128,22 +122,18 @@ describe('spawn depot layout', () => {
     expect(nearestGrabbable(0, 0, taken)).toBeNull()
   })
 
-  test('breaker: right end wall, gear side, walked to on purpose', () => {
+  test('breaker: mounted ON the +x end wall, walked to on purpose', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)
       expect(breakerPosition(world).distanceTo(world.spawn)).toBeGreaterThan(GRAB_RANGE)
-      const [breakerLat, breakerFwd] = spawnFrame(world, breakerPosition(world))
-      const [armoryLat] = spawnFrame(world, armoryStationPosition(world))
-      expect(breakerFwd).toBeGreaterThan(0)
-      // Same side of the lot as the armory (the switch stub's contract).
-      expect(breakerLat * armoryLat).toBeGreaterThan(0)
-      // Mounted ON the container's right end wall: proud of the end plane
-      // by at most 0.2 m, within the container's depth.
-      const [depotLat, depotFwd] = spawnFrame(world, depotPosition(world))
-      const endPlane = depotLat + DEPOT_SIZE[0] / 2
-      expect(breakerLat).toBeGreaterThan(endPlane - 1e-6)
-      expect(breakerLat - endPlane).toBeLessThan(0.2)
-      expect(Math.abs(breakerFwd - depotFwd)).toBeLessThan(DEPOT_SIZE[2] / 2)
+      // Proud of the end plane by at most 0.2 m, within the container's
+      // depth — pinned in the depot-local frame the cluster renders in.
+      const at = breakerPosition(world)
+      const [bx, bz] = worldToDepotLocal(world, at.x, at.z)
+      const endPlane = DEPOT_SIZE[0] / 2
+      expect(bx).toBeGreaterThan(endPlane - 1e-6)
+      expect(bx - endPlane).toBeLessThan(0.2)
+      expect(Math.abs(bz)).toBeLessThan(DEPOT_SIZE[2] / 2)
     }
   })
 
@@ -176,7 +166,7 @@ describe('spawn depot layout', () => {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)
       const at = breakerPosition(world)
       // Against the end wall's INSIDE face, staring at the panel through it.
-      const inside = fromFrame(world, DEPOT_OFFSET[0] + DEPOT_SIZE[0] / 2 - 0.3, BREAKER_OFFSET[1])
+      const inside = depotLocalToWorld(world, DEPOT_SIZE[0] / 2 - 0.3, 0)
       expect(at.distanceTo(inside)).toBeLessThan(GRAB_RANGE) // in reach — the trap
       expect(
         breakerEngageable(world, at, inside.x, inside.z, at.x - inside.x, at.z - inside.z),
@@ -188,7 +178,7 @@ describe('spawn depot layout', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)
       const at = breakerPosition(world)
-      const outside = fromFrame(world, DEPOT_OFFSET[0] + DEPOT_SIZE[0] / 2 + 1.2, BREAKER_OFFSET[1])
+      const outside = depotLocalToWorld(world, DEPOT_SIZE[0] / 2 + 1.2, 0)
       expect(at.distanceTo(outside)).toBeLessThan(GRAB_RANGE)
       const toX = at.x - outside.x
       const toZ = at.z - outside.z
@@ -202,37 +192,45 @@ describe('spawn depot layout', () => {
   test('pickup stations sit INSIDE the container shell', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(-1, 0, 6), yaw)
-      const [depotLat, depotFwd] = spawnFrame(world, depotPosition(world))
       for (const pos of [buildStationPosition(world), armoryStationPosition(world)]) {
-        const [lat, fwd] = spawnFrame(world, pos)
-        expect(Math.abs(lat - depotLat)).toBeLessThan(DEPOT_SIZE[0] / 2)
-        expect(Math.abs(fwd - depotFwd)).toBeLessThan(DEPOT_SIZE[2] / 2)
+        const [lx, lz] = worldToDepotLocal(world, pos.x, pos.z)
+        expect(Math.abs(lx)).toBeLessThan(DEPOT_SIZE[0] / 2)
+        expect(Math.abs(lz)).toBeLessThan(DEPOT_SIZE[2] / 2)
       }
+      // Build and armory occupy DIFFERENT bays of the opening.
+      const [bx] = worldToDepotLocal(
+        world,
+        buildStationPosition(world).x,
+        buildStationPosition(world).z,
+      )
+      const [ax] = worldToDepotLocal(
+        world,
+        armoryStationPosition(world).x,
+        armoryStationPosition(world).z,
+      )
+      expect(bx).toBeLessThan(ax)
     }
   })
 
   test('the open side faces spawn, with walking room in front', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(0.5, 0, 4), yaw)
-      const [depotLat, depotFwd] = spawnFrame(world, depotPosition(world))
-      const frontPlane = depotFwd - DEPOT_SIZE[2] / 2
-      // The shop front sits BETWEEN spawn and the container's center —
-      // that is what "the open side faces spawn" means in the spawn frame —
-      // and leaves at least 1.5 m of approach room.
-      expect(frontPlane).toBeGreaterThan(1.5)
-      // Spawn itself is outside the footprint (never inside the shell)…
-      expect(depotFwd).toBeGreaterThan(DEPOT_SIZE[2] / 2)
-      // …and both stations live in the FRONT half of the container: the
-      // player reaches them through the opening, not through a wall.
+      // In depot-local coordinates the opening is the +z side. Spawn's
+      // local z must clear the opening plane with ≥1.5 m of approach room —
+      // that is "the open side faces spawn" for a set-back container: the
+      // player turns around and walks straight in, never through a wall.
+      const [sx, sz] = worldToDepotLocal(world, world.spawn.x, world.spawn.z)
+      expect(sz).toBeGreaterThan(DEPOT_SIZE[2] / 2 + 1.5)
+      // Spawn is never inside the shell laterally-trapped either: it sits
+      // clear of the footprint, not wedged against an end wall.
+      expect(Math.abs(sx)).toBeLessThan(DEPOT_SIZE[0]) // sanity: near the lot
+      // Both stations live in the OPEN half of the container (+z bays).
       for (const pos of [buildStationPosition(world), armoryStationPosition(world)]) {
-        const [, fwd] = spawnFrame(world, pos)
-        expect(fwd).toBeLessThan(depotFwd)
+        const [, lz] = worldToDepotLocal(world, pos.x, pos.z)
+        expect(lz).toBeGreaterThan(0)
       }
-      // Static sanity on the constants themselves (yaw-independent).
-      expect(BUILD_STATION_OFFSET[1]).toBeLessThan(DEPOT_OFFSET[1])
-      expect(ARMORY_STATION_OFFSET[1]).toBeLessThan(DEPOT_OFFSET[1])
-      expect(BREAKER_OFFSET[0]).toBeGreaterThan(DEPOT_OFFSET[0])
-      expect(depotLat).toBeCloseTo(DEPOT_OFFSET[0], 10)
+      // Static sanity (yaw-independent): the depot anchors BEHIND spawn.
+      expect(DEPOT_OFFSET[1]).toBeLessThan(0)
     }
   })
 })

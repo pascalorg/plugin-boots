@@ -82,36 +82,43 @@ export const GRAB_RANGE = 2.4
 // up, stuff unlimited", the industrial zombie switch part of it, so future
 // multiplayer players collect their gear at the same structure).
 //
-// Everything is expressed in the SPAWN FRAME the tests use: [lateral,
-// forward] offsets from world.spawn, lateral positive = the player's right.
-// The container's long axis lies lateral, its one OPEN long side (the shop
-// front) faces spawn, and the three stations sit in the opening:
+// The container sits SET BACK, BEHIND the spawn point (owner ask: "en
+// retrait, derrière le personnage") — the view toward the building stays
+// clear; turn around and the opening faces you, base-camp style. Its
+// center is a [lateral, forward] offset in the SPAWN FRAME (lateral
+// positive = the player's right), and the cluster is spun DEPOT_YAW about
+// that center so the open side keeps facing spawn. Stations and the
+// breaker are DEPOT-LOCAL [x, z] points (the rendered group's own frame:
+// +x toward the breaker end wall, +z out the opening), mapped to world by
+// depotLocalToWorld — one rigid transform moves the whole cluster.
 //
-//        left end                                    right end (breaker)
+//        breaker end (right of the OPENING)              far end
 //   x  ┌──────────────────────────────────────────────┐  ← back wall
-//      │   BUILD bench      ARMORY rack + boots mat   ▐▌ breaker on the
-//      └────═══════─────────────═══════───────────────┘  end wall OUTSIDE
+//   ▐▌ │   (breaker         ARMORY rack + boots mat      BUILD bench
+//   on │    outside)
+//      └────────────────═══════─────────────═══════────┘
 //                     open side (faces spawn)
-//                          · spawn
+//                          · spawn  (player looks AWAY at entry)
 //
-// Grab-range contract (unchanged from the tables): the BUILD station is the
-// only prompt inside GRAB_RANGE at spawn; the armory and the breaker are
-// walked to on purpose. The overlap probe 0.4 m ahead of spawn still sits
-// inside BOTH the build and armory discs, so nearest-untaken arbitration
-// stays load-bearing.
+// Grab-range contract: NOTHING prompts at spawn anymore — every station
+// (and the breaker) is walked to on purpose. The build/armory discs still
+// overlap on the approach, so nearest-untaken arbitration stays
+// load-bearing: one E press serves exactly one fixture.
 // ---------------------------------------------------------------------------
 
-/** Container footprint: [length (lateral), height, depth (spawn-ward)]. */
+/** Container footprint: [length (local x), height, depth (local z)]. */
 export const DEPOT_SIZE: [number, number, number] = [6, 2.6, 2.5]
-/** Depot center in the spawn frame: [lateral, forward]. */
-export const DEPOT_OFFSET: [number, number] = [0.8, 3.2]
-/** BUILD station grab point — 2.29 m from spawn: nearest, inside range. */
-export const BUILD_STATION_OFFSET: [number, number] = [-0.9, 2.1]
-/** ARMORY grab point — 2.67 m from spawn: outside range on the peaceful
- * entry, inside the 0.4 m approach probe's disc. */
-export const ARMORY_STATION_OFFSET: [number, number] = [0.8, 2.55]
-/** Breaker grab point — proud of the right end wall (lat 0.8 + 3.05). */
-export const BREAKER_OFFSET: [number, number] = [3.85, 3.2]
+/** Depot center in the spawn frame: [lateral, forward] — behind spawn. */
+export const DEPOT_OFFSET: [number, number] = [0.5, -4.5]
+/** Cluster yaw about the center: π turns the open side back toward spawn
+ * now that the container sits behind it. */
+export const DEPOT_YAW = Math.PI
+/** BUILD station grab point, depot-local (left bay of the opening). */
+export const BUILD_STATION_LOCAL: [number, number] = [-1.7, 1.1]
+/** ARMORY grab point, depot-local (center bay of the opening). */
+export const ARMORY_STATION_LOCAL: [number, number] = [0, 0.65]
+/** Breaker grab point, depot-local — proud of the +x end wall (3.0). */
+export const BREAKER_LOCAL: [number, number] = [3.05, 0]
 
 /** Spawn-frame → world: lateral positive is the player's right. Matches the
  * legacy table math (x += fwdX·fwd − fwdZ·lat, z += fwdZ·fwd + fwdX·lat). */
@@ -125,24 +132,51 @@ function offsetFromSpawn(world: GameWorld, lateral: number, forward: number): Ve
   )
 }
 
-/** The container's center on the ground plane, rotated to face spawn. */
+/** The container's center on the ground plane. */
 export function depotPosition(world: GameWorld): Vector3 {
   return offsetFromSpawn(world, DEPOT_OFFSET[0], DEPOT_OFFSET[1])
 }
 
+/** The cluster's world yaw — the rendered root group's rotation. */
+export function depotWorldYaw(world: GameWorld): number {
+  return world.spawnYaw + DEPOT_YAW
+}
+
+/** Depot-local [x, z] → world: exactly the rendered group's transform
+ * (rotation about Y by depotWorldYaw, then the center translation), in
+ * plain math so grab points and tests share one source of truth. */
+export function depotLocalToWorld(world: GameWorld, lx: number, lz: number): Vector3 {
+  const yaw = depotWorldYaw(world)
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  const c = depotPosition(world)
+  return new Vector3(c.x + lx * cos + lz * sin, 0, c.z - lx * sin + lz * cos)
+}
+
+/** World → depot-local [x, z] (inverse of depotLocalToWorld). */
+export function worldToDepotLocal(world: GameWorld, px: number, pz: number): [number, number] {
+  const yaw = depotWorldYaw(world)
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  const c = depotPosition(world)
+  const dx = px - c.x
+  const dz = pz - c.z
+  return [dx * cos - dz * sin, dx * sin + dz * cos]
+}
+
 /** BUILD station (left bay): E gives the builder only — the peaceful entry. */
 export function buildStationPosition(world: GameWorld): Vector3 {
-  return offsetFromSpawn(world, BUILD_STATION_OFFSET[0], BUILD_STATION_OFFSET[1])
+  return depotLocalToWorld(world, BUILD_STATION_LOCAL[0], BUILD_STATION_LOCAL[1])
 }
 
 /** ARMORY rack (center bay): E gives the full loadout. */
 export function armoryStationPosition(world: GameWorld): Vector3 {
-  return offsetFromSpawn(world, ARMORY_STATION_OFFSET[0], ARMORY_STATION_OFFSET[1])
+  return depotLocalToWorld(world, ARMORY_STATION_LOCAL[0], ARMORY_STATION_LOCAL[1])
 }
 
-/** The industrial breaker on the right end wall: the ONLY combat trigger. */
+/** The industrial breaker on the +x end wall: the ONLY combat trigger. */
 export function breakerPosition(world: GameWorld): Vector3 {
-  return offsetFromSpawn(world, BREAKER_OFFSET[0], BREAKER_OFFSET[1])
+  return depotLocalToWorld(world, BREAKER_LOCAL[0], BREAKER_LOCAL[1])
 }
 
 /** How square-on the player must look at the breaker to work it (cos):
@@ -168,11 +202,10 @@ export function breakerEngageable(
   lookX: number,
   lookZ: number,
 ): boolean {
-  const fwdX = -Math.sin(world.spawnYaw)
-  const fwdZ = -Math.cos(world.spawnYaw)
-  // Spawn-frame lateral coordinate (the lat axis of offsetFromSpawn).
-  const lat = (px - world.spawn.x) * -fwdZ + (pz - world.spawn.z) * fwdX
-  if (lat <= DEPOT_OFFSET[0] + DEPOT_SIZE[0] / 2) return false
+  // The player's depot-local x must clear the +x end-wall plane: truly
+  // outside the container, on the panel's side of the steel.
+  const [lx] = worldToDepotLocal(world, px, pz)
+  if (lx <= DEPOT_SIZE[0] / 2) return false
   const tx = at.x - px
   const tz = at.z - pz
   const tLen = Math.hypot(tx, tz)
@@ -289,17 +322,16 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     if (frame > 120) return
     sweepFrame.current = frame + 1
     if (frame !== 10 && frame !== 120) return
-    const fwdX = -Math.sin(world.spawnYaw)
-    const fwdZ = -Math.cos(world.spawnYaw)
-    for (const lat of [-2, 0, 2]) {
-      clearScatterInRadius(center.x - fwdZ * lat, center.z + fwdX * lat, 1.75)
+    for (const lx of [-2, 0, 2]) {
+      const p = depotLocalToWorld(world, lx, 0)
+      clearScatterInRadius(p.x, p.z, 1.75)
     }
   })
 
   return (
     <group
       position={[center.x, 0, center.z]}
-      rotation={[0, world.spawnYaw, 0]}
+      rotation={[0, depotWorldYaw(world), 0]}
       userData={{ __boots: true }}
     >
       {/* ── the armored shell (all colliders) ─────────────────────────── */}
@@ -437,7 +469,8 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         prompt="Press E — gear up"
         promptOwner="guntable"
         onPickup={() => {
-          // The full loadout in one stop (old gear + heavy tables merged).
+          // The WHOLE kit in one stop (owner ask: take everything at the
+          // same time) — guns, hammer, builder and the paint can together.
           // Gear ONLY — the wave director never reads ownership; combat
           // waits for the breaker panel on the end wall.
           const s = useBoots.getState()
@@ -445,6 +478,8 @@ function SpawnDepot({ world }: { world: GameWorld }) {
           s.giveWeapon('rifle')
           s.giveWeapon('minigun')
           s.giveWeapon('hammer')
+          s.giveWeapon('builder')
+          s.giveWeapon('paint')
           s.setWeapon('rifle')
         }}
       />
