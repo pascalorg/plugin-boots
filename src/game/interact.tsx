@@ -8,7 +8,7 @@ import { Box3, Matrix4, type Object3D, Quaternion, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
-import { buildTablePosition, minigunTablePosition, tablePosition } from './guntable'
+import { armoryStationPosition, buildStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -570,13 +570,14 @@ export function Interact({ world }: { world: GameWorld }) {
   useEffect(() => {
     const states = mountInteract(world)
     statesRef.current = states
-    // BOTH gun tables own E while the player is gearing up in front of them
-    // (the rear minigun table was missing pre-refactor — the double-fire bug:
-    // E both grabbed the big one AND toggled a door behind the wall).
+    // The depot's pickup stations own E while the player is gearing up in
+    // front of them (the tables' contract, carried to the container — the
+    // double-fire bug: E both grabbed gear AND toggled a door behind the
+    // wall). The armory grants the full loadout in one press, so gating on
+    // 'rifle' covers it; the breaker has no door anywhere near its end wall.
     tablesRef.current = [
-      { position: buildTablePosition(world), weapon: 'builder' },
-      { position: tablePosition(world), weapon: 'rifle' },
-      { position: minigunTablePosition(world), weapon: 'minigun' },
+      { position: buildStationPosition(world), weapon: 'builder' },
+      { position: armoryStationPosition(world), weapon: 'rifle' },
     ]
     return () => {
       unmountInteract(states)
