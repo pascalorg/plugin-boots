@@ -1479,3 +1479,82 @@ QA leads for next round: owner-scene acceptance on his real house
 (eave/rake ring reads shingle-dark; detonation frame stays clean at his
 target density); first host-item wake spike still open from fix round 3;
 removedQueue upload budgeting if/when a WebGPU path lands.
+
+## Night 4 — species / silhouettes / face-keyed eaves / shell S0 (2026-08-29, fleet 3 lanes + shell track, manager stitch)
+
+Three lanes on one tree plus the supervised shell branch; manager
+integrated, merged, gated. 1004 tests / 38,640 assertions green; tsc
+clean; real exit codes.
+
+EAVE TEETH (skin-tone.ts, destruction.ts, voxel-walls.tsx): root cause
+REVISED from the round-5 brief — live hosts voxelize ceilings as a
+SINGLE 0.025 m cell layer (one Y-plane at 2.473), so the same cell's
+bottom face IS the room ceiling while its top/rim faces are the attic
+floor seen through the eave slit. Cell-keyed color can never satisfy
+both faces (the prior session's mute darkened the interior; its ny<2
+guard resurrected the teeth). The fix is literally face-keyed:
+CEILING_GEOMETRY (unit box, vertex colors — 4 bottom verts at 1, 20
+structural verts at CEILING_FACE_TINT ≈ [0.221, 0.186, 0.140]) + a
+CEILING_SKIN_MATERIAL with vertexColors:true (the only new material
+variant; vertexColor × instanceColor, no custom shader, WebGPU-safe).
+Interior white × tint lands EXACTLY on STRUCTURE_TOP #7a6f5e.
+isStructuralTopCell is walls-only again (plate row iy===ny-1);
+VoxelTarget.ceilingTop is the geometry pick key. Diag rig (per-instance
+AABB raycast, entry face + effective rendered color): slit rays L 0.809
+→ 0.148 (rim) and 0.369-0.872 → 0.105-0.155 (plate row); ceiling
+instance-color census bit-identical to baseline — interior provably
+unchanged. Known out-of-scope: pre-existing light wall-body texture
+cells (ty=2.3, present at HEAD); stepped gable-top walls would need
+column-top keying.
+
+TREE SPECIES (tree-species.ts NEW, trees-destruct.tsx, nature.tsx):
+4 low-poly cartoon species — tiered conifer ~40% (2-3 stacked cones,
+seeded overlap), broadleaf ~38% (crown blobs + bark stub, connectivity
+test-pinned), birch ~22% (thin tall trunk, light bark instanceColor,
+high tuft), bush (nature.tsx: three squashed lobes baked into ONE
+geometry, single draw). Distribution + all params from hashXZ (XZ
+quantized 0.25 m + seed → mulberry32) — stable across sessions by
+construction. Per-instance: height 0.7-1.4x, crown 0.8-1.25x,
+palette-family green jitter, 2-4° render-only lean, trunk 0.85-1.2x.
+Budgets: shared UNIT geometries, grove 5 draws / nature 5 (10 total,
+same class as before); zero per-frame allocations; burning flicker
+paints the species' own slots. COMBAT SYNC: treeParamsAt(x,z) is the
+single source of truth — raycasts (per-species trunk cylinder +
+analytic crown sphere), fell/ignite/char bursts, char branches, stumps,
+and host-replacement apex parity all read it; a felled birch chars as a
+birch. __boots.trees() now dumps species.
+
+ENEMY LOOKS (enemies-state.ts, enemies.tsx): droid grew an articulated
+silhouette (torso core + chest plate + pelvis, smaller head with glowing
+visor slit, shoulder pads + left stripe, thinner counter-swinging limbs
+with joint spheres); dog got head/snout/ear blocks, a chase-wagging
+tail, per-leg seeded gait offsets (no more synchronized pogo), 2 body
+lengths; drone got 2 or 4 spinning elliptical rotor discs (alternating
+direction), round vs boxy bodies, an unlit red sensor eye. All seeded
+per unit id via botVisualParams(id, kind, wave) stamped at spawn —
+render-only, logic never reads it. Visor + stripe take a PER-WAVE
+accent (ACCENT_PALETTE red/green/blue/amber — a wave reads as one
+color). Damage read: 2-stage shared-material scorch swap at 40%/20% hp
+(the group idiom has no instanceColor — honest deviation). Budget: 3
+shared unit geometries + 18 shared module materials; ZERO geometry/
+material allocations per spawn (previously ~5-7 of EACH per bot);
+per-part anim params in userData once at mount.
+
+SHELL S0 MERGED (origin/feat/shell-s0, milestones 1-4b — the final
+integration milestone per docs/SHELL-DESIGN.md): conforming wall-surface
+fragments behind a session-latched flag, OFF by default — pure surface
+partition (Sutherland–Hodgman clip + clustering + packing, shell.ts),
+degenerate-index carve renderer with partial uploads (shell-render.tsx),
+20-slot pooled world-frame fragment debris (shell-debris.tsx), dormant-
+until-first-damage swap + core mode wired through destruction.ts /
+voxel-walls.tsx / shell-layer.tsx / game-root.tsx. Merge conflicts
+(destruction, skin-tone.test, voxel-walls, voxel-walls.test) were all
+additive — both lanes' exports/fields/describe-blocks kept; toneKind
+(floor lane) feeds dominantTargetMaterial, wallShell rides beside
+floorCore/ceilingTop on VoxelTarget.
+
+Integration notes: local main already carried the floor-white fix
+(d4a8987) — nothing to pull. Hot-deployed changed files (cp, per file)
+into BOTH host copies. QA leads: headed visual pass on species + enemy
+looks batched next round; shell flag stays dark until its own QA night;
+pre-existing light wall-body texture cells (out of scope above).

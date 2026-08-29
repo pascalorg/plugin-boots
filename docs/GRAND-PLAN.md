@@ -187,6 +187,33 @@ One page every fleet agent reads first. Deeper docs: `MASTERPLAN.md`
   sandwich (voxel-walls floorUnderlayLayout, base ≤ 0.35 m) so a
   carved-through hole shows EARTH, not the host's white pad or lawn.
   Verified live on :3002 (wood floor intact, dirt hole carved). 915 tests.
+- Night 4 (2026-08-29, fleet 3 lanes + shell track, manager stitch):
+  EAVE TEETH KILLED FOR REAL — ceilings voxelize ONE cell layer, so the
+  same cell's bottom face is the room ceiling and its top/rim faces are
+  the attic seen through the eave slit; cell-keyed muting could never
+  satisfy both. Fix is face-keyed: CEILING_GEOMETRY (unit box, vertex
+  colors — bottom face 1, top+rim CEILING_FACE_TINT) + one vertexColors
+  material variant; interior white × tint lands EXACTLY on STRUCTURE_TOP.
+  isStructuralTopCell is walls-only (plate row) again. Interior ceiling
+  render provably bit-identical (instance-color census) · TREE SPECIES —
+  4 seeded low-poly species (tiered conifer ~40% / broadleaf ~38% /
+  birch ~22% / trunkless bush in nature.tsx) from pure tree-species.ts
+  (hashXZ 0.25 m grid + seed → mulberry32): per-instance height/crown/
+  green-jitter/lean/trunk bands, all instanced (grove 5 draws, nature 5).
+  treeParamsAt is the single combat truth: raycast cylinders/crown
+  spheres, fell/ignite/char bursts, stumps, host apex parity all read
+  species params · ENEMY LOOKS — articulated droid (chest plate, visor
+  slit, shoulder pads, counter-swinging thin limbs, joint spheres), dog
+  (head/snout/ears, wagging tail, per-leg gait offsets, 2 body lengths),
+  drone (2/4 spinning elliptical rotors, round vs boxy body, red sensor
+  eye); per-unit seeded size/amp via botVisualParams, PER-WAVE accent
+  color (4-palette), 2-stage scorch damage read; 3 shared geometries +
+  18 shared materials, zero per-spawn allocations · CONFORMING SHELL S0
+  MERGED (feat/shell-s0, milestones 1–4b, flag-latched OFF by default):
+  real wall surfaces partitioned into per-cell fragments (Sutherland–
+  Hodgman clipper), degenerate-index carve renderer, 20-slot pooled
+  world-frame fragment debris, dormant-until-first-damage swap + core
+  mode; docs/SHELL-DESIGN.md. 1004 tests / 38.6k assertions green.
 
 ## In flight
 
