@@ -452,7 +452,7 @@ export class Hud {
     // made players guess whether E would do anything — the prompt now sits
     // right under the crosshair, where the eyes already are.
     this.promptEl = el(
-      `position:absolute;left:50%;top:56%;transform:translateX(-50%);color:#fff;font:${FONT};font-size:15px;letter-spacing:0.04em;background:rgba(0,0,0,0.55);padding:8px 16px;border-radius:8px;white-space:nowrap;opacity:0`,
+      `position:absolute;left:50%;top:63%;transform:translateX(-50%);color:#fff;font:${FONT};font-size:15px;letter-spacing:0.04em;background:rgba(0,0,0,0.55);padding:8px 16px;border-radius:8px;white-space:nowrap;opacity:0`,
     )
     // Builder edit-mode hint — its own line above prompt() so interaction
     // prompts (doors, gun table) can come and go without clobbering it.
