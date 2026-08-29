@@ -13,6 +13,7 @@ import {
   collapseWholeTarget,
   damageSegment,
   ensureVoxelTarget,
+  prevoxelizeSchedulerStats,
   prevoxelizeTick,
   probeLandingY,
   resetDestruction,
@@ -27,6 +28,7 @@ import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
 import { GunTable } from './guntable'
+import { HostPostTuning, hostPostDebug } from './host-post'
 import { GameItems } from './item-place'
 import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
@@ -170,11 +172,15 @@ export function GameRoot() {
 }
 
 /**
- * Spreads prevoxelization across frames (~4 ms budget per tick — a full
- * house clads in well under a second without a hitch), then goes inert
- * once destruction reports every wall done. The very first frame is
- * skipped so first paint never carries the voxelization cost on top of
- * session-start work (fullscreen, HUD, snapshot).
+ * Spreads prevoxelization across frames on destruction's ADAPTIVE time
+ * budget (4 ms per tick, raised to 8 ms while frames run comfortably
+ * idle), NEAREST THE PLAYER FIRST (the rig position is the focus — the
+ * remaining queue re-sorts every ~2 s as the player moves), then goes
+ * inert once destruction reports every node done. Distant targets can
+ * wait: their hosts render + collide meanwhile, and first damage out
+ * there still builds on demand. The very first frame is skipped so first
+ * paint never carries the voxelization cost on top of session-start work
+ * (fullscreen, HUD, snapshot).
  */
 function Prevoxelize({ world }: { world: GameWorld }) {
   const done = useRef(false)
@@ -182,7 +188,7 @@ function Prevoxelize({ world }: { world: GameWorld }) {
   useFrame(() => {
     if (done.current) return
     if (frame.current++ === 0) return
-    done.current = prevoxelizeTick(world, 4)
+    done.current = prevoxelizeTick(world, undefined, playerRig.position)
   })
   return null
 }
@@ -631,6 +637,9 @@ function ActiveGame() {
             ? target.cellMetal.reduce((n, v) => n + v, 0)
             : 0,
         })),
+      // Prevoxelize scheduler live numbers (perf fix 2 QA): frame-dt EMA,
+      // the adaptive time budget it picked, and the queue remainder.
+      prevoxelize: () => prevoxelizeSchedulerStats(),
       // Conforming-shell lane (S0): census (shelled targets / fragments /
       // fragments killed) + the flag toggle. setShell is SESSION-LATCHED:
       // destruction reads the flag once at the session's first wall
@@ -737,6 +746,10 @@ function ActiveGame() {
       // ({sessionId, name, p, w, ageMs}) + the {published, received}
       // counters. Empty remotes + zero counters on a bus-less host.
       presence: () => presenceDebug(),
+      // Host post-tuning census (host-post.ts, perf fix 5): is the shadow
+      // throttle + outline guard live, how many lights are frozen, how
+      // often the outline guard had to re-clear. Plain data.
+      hostPost: () => hostPostDebug(),
     }
     return () => {
       delete (globalThis as Record<string, unknown>).__boots
@@ -777,6 +790,7 @@ function ActiveGame() {
       <LoadingDriver world={world} />
       <ResurrectionSweep />
       <TreesDestruct world={world} />
+      <HostPostTuning />
       <PerfMonitor />
       <FrameBooster />
     </>
