@@ -60,6 +60,75 @@ const TABLE_HEIGHT = 0.82
 const TABLE_TOP = TABLE_HEIGHT + 0.03
 export const GRAB_RANGE = 2.4
 
+// ---------------------------------------------------------------------------
+// THE ARMORED SPAWN DEPOT — layout math (owner vision: one PERMANENT,
+// INDESTRUCTIBLE cargo container replaces the loose tables; "all guns lined
+// up, stuff unlimited", the industrial zombie switch part of it, so future
+// multiplayer players collect their gear at the same structure).
+//
+// Everything is expressed in the SPAWN FRAME the tests use: [lateral,
+// forward] offsets from world.spawn, lateral positive = the player's right.
+// The container's long axis lies lateral, its one OPEN long side (the shop
+// front) faces spawn, and the three stations sit in the opening:
+//
+//        left end                                    right end (breaker)
+//   x  ┌──────────────────────────────────────────────┐  ← back wall
+//      │   BUILD bench      ARMORY rack + boots mat   ▐▌ breaker on the
+//      └────═══════─────────────═══════───────────────┘  end wall OUTSIDE
+//                     open side (faces spawn)
+//                          · spawn
+//
+// Grab-range contract (unchanged from the tables): the BUILD station is the
+// only prompt inside GRAB_RANGE at spawn; the armory and the breaker are
+// walked to on purpose. The overlap probe 0.4 m ahead of spawn still sits
+// inside BOTH the build and armory discs, so nearest-untaken arbitration
+// stays load-bearing.
+// ---------------------------------------------------------------------------
+
+/** Container footprint: [length (lateral), height, depth (spawn-ward)]. */
+export const DEPOT_SIZE: [number, number, number] = [6, 2.6, 2.5]
+/** Depot center in the spawn frame: [lateral, forward]. */
+export const DEPOT_OFFSET: [number, number] = [0.8, 3.2]
+/** BUILD station grab point — 2.29 m from spawn: nearest, inside range. */
+export const BUILD_STATION_OFFSET: [number, number] = [-0.9, 2.1]
+/** ARMORY grab point — 2.67 m from spawn: outside range on the peaceful
+ * entry, inside the 0.4 m approach probe's disc. */
+export const ARMORY_STATION_OFFSET: [number, number] = [0.8, 2.55]
+/** Breaker grab point — proud of the right end wall (lat 0.8 + 3.05). */
+export const BREAKER_OFFSET: [number, number] = [3.85, 3.2]
+
+/** Spawn-frame → world: lateral positive is the player's right. Matches the
+ * legacy table math (x += fwdX·fwd − fwdZ·lat, z += fwdZ·fwd + fwdX·lat). */
+function offsetFromSpawn(world: GameWorld, lateral: number, forward: number): Vector3 {
+  const fwdX = -Math.sin(world.spawnYaw)
+  const fwdZ = -Math.cos(world.spawnYaw)
+  return new Vector3(
+    world.spawn.x + fwdX * forward - fwdZ * lateral,
+    0,
+    world.spawn.z + fwdZ * forward + fwdX * lateral,
+  )
+}
+
+/** The container's center on the ground plane, rotated to face spawn. */
+export function depotPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, DEPOT_OFFSET[0], DEPOT_OFFSET[1])
+}
+
+/** BUILD station (left bay): E gives the builder only — the peaceful entry. */
+export function buildStationPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, BUILD_STATION_OFFSET[0], BUILD_STATION_OFFSET[1])
+}
+
+/** ARMORY rack (center bay): E gives the full loadout. */
+export function armoryStationPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, ARMORY_STATION_OFFSET[0], ARMORY_STATION_OFFSET[1])
+}
+
+/** The industrial breaker on the right end wall: the ONLY combat trigger. */
+export function breakerPosition(world: GameWorld): Vector3 {
+  return offsetFromSpawn(world, BREAKER_OFFSET[0], BREAKER_OFFSET[1])
+}
+
 /** Live fixtures' grab candidacy, keyed by nodeId — each WeaponTable (and
  * the switch wall) registers on mount and mirrors `taken`. The build and
  * gear grab discs overlap almost everywhere on the spawn approach, so one
