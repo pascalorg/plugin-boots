@@ -7,6 +7,7 @@ import {
   KEYBAR_DEFAULT,
   LOADING_TIP_INTERVAL_MS,
   LOADING_TIPS,
+  PAINT_CAROUSEL_HOLD_MS,
   presenceChipText,
 } from './hud'
 
@@ -229,6 +230,28 @@ describe('co-presence chip + toasts', () => {
     expect(() => hud.presenceChip(2)).not.toThrow() // change-gated repeat
     expect(() => hud.presenceChip(0)).not.toThrow()
     expect(() => hud.presenceToast('Alice joined')).not.toThrow()
+    expect(() => hud.unmount()).not.toThrow()
+  })
+})
+
+/**
+ * Paint color carousel (owner ask: "R switches to the next color in a
+ * carousel"): a transient palette strip above the paint chip, shown on
+ * every R cycle and faded after PAINT_CAROUSEL_HOLD_MS — the hotbar's
+ * brighten-then-idle idiom. The visual half lives behind mount(); these
+ * pin the pacing constant and the no-DOM contract (paint.tsx calls it
+ * feature-detected from the frame loop).
+ */
+describe('paint color carousel (R-cycle readout)', () => {
+  test('show-then-fade pace is a ~2s read', () => {
+    expect(PAINT_CAROUSEL_HOLD_MS).toBeGreaterThanOrEqual(1500)
+    expect(PAINT_CAROUSEL_HOLD_MS).toBeLessThanOrEqual(2500)
+  })
+
+  test('paintCarousel is a safe no-op without a DOM', () => {
+    const hud = new Hud()
+    expect(() => hud.paintCarousel(['#f4f4ef', '#26282c', '#8f959d'], 1)).not.toThrow()
+    expect(() => hud.paintCarousel(['#f4f4ef', '#26282c', '#8f959d'], 2)).not.toThrow()
     expect(() => hud.unmount()).not.toThrow()
   })
 })

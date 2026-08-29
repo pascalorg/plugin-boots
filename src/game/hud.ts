@@ -52,6 +52,16 @@ import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
  *   crosshair ticks fade OUT and a small center dot fades IN as v→1.
  *   viewmodel.tsx drives it per frame from playerRig.ads (guarded:
  *   `hud.setAds?.(v)`); change-gated like grenadePip.
+ * - paintCarousel(hexes, active) — the sprayer's R-cycle readout: a small
+ *   horizontal strip of palette dots just above the paint swatch chip
+ *   (bottom-right), the ACTIVE dot enlarged + white-ringed. Shows on every
+ *   call and eases back out after PAINT_CAROUSEL_HOLD_MS (the hotbar
+ *   brighten-then-idle idiom). Dots are built lazily from the passed hex
+ *   list (paint.tsx owns the palette — hud must not import it: paint →
+ *   session → hud would cycle) and restyles are change-gated on the active
+ *   index. Caller: paint.tsx on each R cycle, feature-detected as
+ *   `hud.paintCarousel?.(hexes, index)`. The permanent paint chip
+ *   (paintSwatch) is untouched — the carousel is the transient half.
  * - Keybind bar: automatic. Follows store.weapon — while the BUILDER is
  *   held it lists the piece hotkeys (builderKeybarText: Z/X/C/V/Q, with
  *   layout-map caps on non-QWERTY), otherwise KEYBAR_DEFAULT.
@@ -256,6 +266,10 @@ const PRESENCE_TOAST_GAP_MS = 300
 /** How long a kill flare owns the marker against trailing hit writes. */
 const KILL_HOLD_MS = 160
 
+/** How long the paint color carousel stays up after an R cycle before it
+ * eases back out (the hotbar brighten idiom, a touch quicker). */
+export const PAINT_CAROUSEL_HOLD_MS = 2000
+
 /** Micro-hint pacing: fade-in 300ms, hold ~4s, fade-out, small gap. */
 const HINT_HOLD_MS = 4000
 const HINT_GAP_MS = 700
@@ -326,6 +340,12 @@ export class Hud {
   private pipDotEl: HTMLDivElement | null = null
   private paintEl: HTMLDivElement | null = null
   private paintDotEl: HTMLDivElement | null = null
+  /** Paint color carousel — the strip, its dots (built lazily from the
+   * caller's palette), the active index (change gate) and the fade timer. */
+  private paintCarouselEl: HTMLDivElement | null = null
+  private paintCarouselDots: HTMLDivElement[] = []
+  private paintCarouselActive = -1
+  private paintCarouselTimer: ReturnType<typeof setTimeout> | null = null
   private crossTicksEl: HTMLDivElement | null = null
   private crossDotEl: HTMLDivElement | null = null
   private keybarEl: HTMLDivElement | null = null
@@ -613,6 +633,13 @@ export class Hud {
       'width:10px;height:10px;border-radius:3px;border:1px solid rgba(255,255,255,0.7)'
     this.paintEl.appendChild(this.paintDotEl)
     this.paintEl.appendChild(document.createElement('span'))
+    // Paint color carousel — transient palette strip above the swatch chip;
+    // paintCarousel() fills it lazily and drives the show-then-fade.
+    this.paintCarouselEl = el(
+      'position:absolute;right:28px;bottom:100px;display:flex;align-items:center;gap:5px;opacity:0;transition:opacity 0.4s ease',
+    )
+    this.paintCarouselDots = []
+    this.paintCarouselActive = -1
     // Change gates start from the mounted visual state (pip ready, hip ADS 0)
     // so the first driven frame diffs against what's actually on screen.
     this.pipF = 1
@@ -968,6 +995,51 @@ export class Hud {
   }
 
   /**
+   * Paint color carousel (above the swatch chip). `hexes` is the full
+   * palette in cycle order, `active` the current index — the active dot
+   * reads enlarged + white-ringed. Every call shows the strip and re-arms
+   * the PAINT_CAROUSEL_HOLD_MS fade (the hotbar brighten idiom). Caller:
+   * paint.tsx on each R cycle, feature-detected as `hud.paintCarousel?.()`.
+   */
+  paintCarousel(hexes: readonly string[], active: number): void {
+    const strip = this.paintCarouselEl
+    if (!strip) return
+    if (this.paintCarouselDots.length !== hexes.length) {
+      // First call (or a palette size change): build the dots once.
+      strip.textContent = ''
+      this.paintCarouselDots = []
+      for (const hex of hexes) {
+        const dot = document.createElement('div')
+        dot.style.cssText = `width:8px;height:8px;border-radius:50%;background:${hex};box-shadow:0 1px 2px rgba(0,0,0,0.6);transition:transform 0.15s ease,box-shadow 0.15s ease`
+        strip.appendChild(dot)
+        this.paintCarouselDots.push(dot)
+      }
+      this.paintCarouselActive = -1
+    }
+    if (active !== this.paintCarouselActive) {
+      // Change-gated restyle: only the dot that lost the ring and the one
+      // that gained it are touched.
+      const prev = this.paintCarouselDots[this.paintCarouselActive]
+      if (prev) {
+        prev.style.transform = ''
+        prev.style.boxShadow = '0 1px 2px rgba(0,0,0,0.6)'
+      }
+      const now = this.paintCarouselDots[active]
+      if (now) {
+        now.style.transform = 'scale(1.5)'
+        now.style.boxShadow = '0 0 0 2px rgba(255,255,255,0.9),0 1px 2px rgba(0,0,0,0.6)'
+      }
+      this.paintCarouselActive = active
+    }
+    strip.style.opacity = '1'
+    if (this.paintCarouselTimer) clearTimeout(this.paintCarouselTimer)
+    this.paintCarouselTimer = setTimeout(() => {
+      this.paintCarouselTimer = null
+      if (this.paintCarouselEl) this.paintCarouselEl.style.opacity = '0'
+    }, PAINT_CAROUSEL_HOLD_MS)
+  }
+
+  /**
    * Aim-down-sights crosshair morph. `v` 0..1 (playerRig.ads): the four hip
    * ticks fade OUT (opacity 1-v) and the small center dot fades IN (opacity
    * v). Safe to call every frame — change-gated. Caller: viewmodel.tsx, as
@@ -1274,6 +1346,11 @@ export class Hud {
     this.pipDotEl = null
     this.paintEl = null
     this.paintDotEl = null
+    if (this.paintCarouselTimer) clearTimeout(this.paintCarouselTimer)
+    this.paintCarouselTimer = null
+    this.paintCarouselEl = null
+    this.paintCarouselDots.length = 0
+    this.paintCarouselActive = -1
     this.crossTicksEl = null
     this.crossDotEl = null
     this.keybarEl = null

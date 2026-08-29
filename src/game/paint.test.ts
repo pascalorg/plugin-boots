@@ -2,29 +2,40 @@ import { describe, expect, test } from 'bun:test'
 import {
   COAT_ADD,
   coatBaseStrength,
+  coatRadiusFor,
+  currentPaintColor,
+  currentPaintIndex,
+  cyclePaintColor,
   DRIP_MAX_PER_TICK,
   DRIP_P,
   DRIP_STRENGTH_GATE,
   PAINT_PALETTE,
+  PAINT_PALETTE_HEXES,
   paintColorOf,
+  paintCycleSerial,
   paintLabelInk,
   paintLabelTexture,
   paintPrompt,
   paintStrengthOf,
   paintValue,
-  RIM_SPECKLE_ADD,
-  RIM_SPECKLE_P,
   selectSplatCells,
   shouldDrip,
-  speckleHash,
+  SPLAT_COALESCE_FRAC,
+  SPLAT_CORE_FRAC,
   SPLAT_FAR_DIST,
   SPLAT_FAR_RADIUS,
   SPLAT_NEAR_DIST,
   SPLAT_NEAR_RADIUS,
-  SPLAT_RIM_OUTER,
+  SPLAT_SPRITE_JITTER_MAX,
+  SPLAT_SPRITE_JITTER_MIN,
   splatCoat,
   splatFalloff,
   splatRadiusAt,
+  splatSpriteSize,
+  SWATH_MAX_GAP,
+  SWATH_MAX_STEPS,
+  SWATH_SPACING_FRAC,
+  swathPoints,
   WRITING_DISTANCE,
 } from './paint'
 
@@ -142,13 +153,15 @@ describe('coatBaseStrength (color change restarts the coat)', () => {
     expect(coatBaseStrength(undefined, 4)).toBe(0)
   })
 
-  test('REGRESSION: one navy rim fleck on a saturated sage cell reads faint navy, never full', () => {
-    // The old carry — min(1, 1.0 + 0.16) — flipped the cell to navy at 255.
-    const saturatedSage = paintValue(2, 1)
-    const before = coatBaseStrength(saturatedSage, 4)
-    const after = paintValue(4, Math.min(1, before + RIM_SPECKLE_ADD))
-    expect(paintColorOf(after)).toBe(4)
-    expect(paintStrengthOf(after)).toBeCloseTo(RIM_SPECKLE_ADD, 2)
+  test('REGRESSION: a faint graze of a new color on a saturated cell reads faint, never full', () => {
+    // The old carry — min(1, 1.0 + 0.16) — flipped the cell to the new
+    // color at 255 off one weak rim contribution.
+    const graze = 0.16
+    const saturatedGreen = paintValue(6, 1)
+    const before = coatBaseStrength(saturatedGreen, 8)
+    const after = paintValue(8, Math.min(1, before + graze))
+    expect(paintColorOf(after)).toBe(8)
+    expect(paintStrengthOf(after)).toBeCloseTo(graze, 2)
   })
 })
 
@@ -171,42 +184,11 @@ describe('splatFalloff (the feathered edge)', () => {
   })
 })
 
-describe('speckleHash (the rim overspray lottery)', () => {
-  test('deterministic per (cell, serial), in [0, 1)', () => {
-    for (let cell = 0; cell < 64; cell++) {
-      for (const serial of [0, 1, 7, 1000]) {
-        const h = speckleHash(cell, serial)
-        expect(h).toBe(speckleHash(cell, serial))
-        expect(h).toBeGreaterThanOrEqual(0)
-        expect(h).toBeLessThan(1)
-      }
-    }
-  })
-
-  test('a new serial redraws the pattern (successive ticks speckle differently)', () => {
-    let moved = 0
-    for (let cell = 0; cell < 64; cell++) {
-      if ((speckleHash(cell, 1) < RIM_SPECKLE_P) !== (speckleHash(cell, 2) < RIM_SPECKLE_P)) {
-        moved++
-      }
-    }
-    expect(moved).toBeGreaterThan(0)
-  })
-
-  test('lottery rate lands near RIM_SPECKLE_P over many draws', () => {
-    let hits = 0
-    const draws = 4000
-    for (let i = 0; i < draws; i++) if (speckleHash(i, 3) < RIM_SPECKLE_P) hits++
-    expect(hits / draws).toBeGreaterThan(RIM_SPECKLE_P * 0.6)
-    expect(hits / draws).toBeLessThan(RIM_SPECKLE_P * 1.4)
-  })
-})
-
 describe('splatCoat (accumulating feathered splat)', () => {
   test('adds peak at the hit point and feather toward the rim', () => {
     const grid = row(9, 0.15)
     const radius = 0.5
-    const coats = splatCoat(grid, 0.6, 0, 0, radius, 1)
+    const coats = splatCoat(grid, 0.6, 0, 0, radius)
     const byCell = new Map(coats.map((c) => [c.cell, c.add]))
     // Cell 4 sits exactly at the hit point: the full COAT_ADD.
     expect(byCell.get(4)).toBeCloseTo(COAT_ADD, 10)
@@ -218,36 +200,26 @@ describe('splatCoat (accumulating feathered splat)', () => {
     expect(byCell.get(2)!).toBeCloseTo(byCell.get(6)!, 6)
   })
 
-  test('rim annulus cells take only the faint speckle add, by the lottery', () => {
+  test('REGRESSION (phase 11): nothing lands past the disc radius — no square halo', () => {
+    // The old rim-speckle annulus tinted whole cells up to 1.25 r out: a
+    // square fleck halo around the round stamp (the blob read the owner
+    // rejected). Every coated cell now sits INSIDE the disc.
     const grid = row(200, 0.01)
     const radius = 0.5
-    const serial = 7 // draws 3 annulus winners — pinned by the hash
-    const coats = splatCoat(grid, 0, 0, 0, radius, serial)
-    const coated = new Set(coats.map((c) => c.cell))
-    let speckles = 0
-    for (const { cell, add } of coats) {
-      const d = cell * 0.01
-      expect(d).toBeLessThanOrEqual(radius * SPLAT_RIM_OUTER + 1e-9)
-      if (d > radius) {
-        // Annulus: the flat fleck strength, only for lottery winners.
-        expect(add).toBe(RIM_SPECKLE_ADD)
-        speckles++
-      }
+    const coats = splatCoat(grid, 0, 0, 0, radius)
+    expect(coats.length).toBeGreaterThan(0)
+    for (const { cell } of coats) {
+      expect(cell * 0.01).toBeLessThanOrEqual(radius + 1e-9)
     }
-    // Membership matches the deterministic lottery exactly, both ways.
-    for (let cell = 51; cell <= 62; cell++) {
-      expect(coated.has(cell)).toBe(speckleHash(cell, serial) < RIM_SPECKLE_P)
-    }
-    expect(speckles).toBeGreaterThan(0)
-    // Same serial, same splat — fully deterministic.
-    expect(splatCoat(grid, 0, 0, 0, radius, serial)).toEqual(coats)
+    // Deterministic — same inputs, same splat.
+    expect(splatCoat(grid, 0, 0, 0, radius)).toEqual(coats)
   })
 
-  test('dead cells never coat; beyond 1.25 r nothing lands', () => {
+  test('dead cells never coat; a miss lands nothing', () => {
     const grid = row(5, 0.15, [2])
-    const coats = splatCoat(grid, 0.3, 0, 0, 0.2, 1)
+    const coats = splatCoat(grid, 0.3, 0, 0, 0.2)
     expect(coats.some((c) => c.cell === 2)).toBe(false)
-    expect(splatCoat(row(4, 0.15), 9, 9, 9, 0.5, 1)).toEqual([])
+    expect(splatCoat(row(4, 0.15), 9, 9, 9, 0.5)).toEqual([])
   })
 
   test('repeated ticks accumulate to saturation (the ledger math)', () => {
@@ -281,26 +253,54 @@ describe('shouldDrip (over-coat runs, P4)', () => {
   })
 })
 
-describe('paint palette', () => {
-  test('6-8 building tones, valid unique hex', () => {
-    expect(PAINT_PALETTE.length).toBeGreaterThanOrEqual(6)
-    expect(PAINT_PALETTE.length).toBeLessThanOrEqual(8)
+describe('paint palette (the 12-color R carousel)', () => {
+  test('12 colors, the owner spread pinned in cycle order', () => {
+    expect(PAINT_PALETTE.length).toBe(12)
+    expect(PAINT_PALETTE.map((p) => p.name)).toEqual([
+      'WHITE',
+      'BLACK',
+      'GRAY',
+      'RED',
+      'ORANGE',
+      'YELLOW',
+      'GREEN',
+      'TEAL',
+      'BLUE',
+      'PURPLE',
+      'PINK',
+      'BROWN',
+    ])
     const seen = new Set<string>()
     for (const swatch of PAINT_PALETTE) {
       expect(swatch.hex).toMatch(/^#[0-9a-f]{6}$/)
-      expect(swatch.name.length).toBeGreaterThan(0)
       seen.add(swatch.hex)
     }
     expect(seen.size).toBe(PAINT_PALETTE.length)
+    // The HUD hex list mirrors the palette exactly (carousel dot order).
+    expect(PAINT_PALETTE_HEXES).toEqual(PAINT_PALETTE.map((p) => p.hex))
+  })
+
+  test('R steps the carousel with wrap; every cycle bumps the serial', () => {
+    const startIndex = currentPaintIndex()
+    const startSerial = paintCycleSerial()
+    expect(currentPaintColor()).toBe(PAINT_PALETTE[startIndex]!)
+    // One R press: the NEXT color, one serial tick (the HUD flash gate).
+    const next = cyclePaintColor()
+    expect(next).toBe(PAINT_PALETTE[(startIndex + 1) % PAINT_PALETTE.length]!)
+    expect(paintCycleSerial()).toBe(startSerial + 1)
+    // A full lap wraps back to where it started.
+    for (let i = 1; i < PAINT_PALETTE.length; i++) cyclePaintColor()
+    expect(currentPaintIndex()).toBe(startIndex)
+    expect(paintCycleSerial()).toBe(startSerial + PAINT_PALETTE.length)
   })
 })
 
 describe('can label ("PRESS R" band)', () => {
   test('ink contrast: dark print on light coats, light print on dark', () => {
-    expect(paintLabelInk('#f2efe6')).toBe('#1c1e22') // CHALK WHITE
-    expect(paintLabelInk('#d3a55f')).toBe('#1c1e22') // OCHRE
-    expect(paintLabelInk('#3b4a63')).toBe('#f4f2ea') // NAVY
-    expect(paintLabelInk('#44464a')).toBe('#f4f2ea') // CHARCOAL
+    expect(paintLabelInk('#f4f4ef')).toBe('#1c1e22') // WHITE
+    expect(paintLabelInk('#f5c542')).toBe('#1c1e22') // YELLOW
+    expect(paintLabelInk('#3e7fe1')).toBe('#f4f2ea') // BLUE
+    expect(paintLabelInk('#26282c')).toBe('#f4f2ea') // BLACK
   })
 
   test('texture cache is palette-bounded — foreign hex mints nothing', () => {
@@ -311,7 +311,88 @@ describe('can label ("PRESS R" band)', () => {
 describe('paint HUD prompt', () => {
   test('writing mode inside WRITING_DISTANCE, plain paint line otherwise', () => {
     expect(WRITING_DISTANCE).toBe(2)
-    expect(paintPrompt(true, 'SAGE')).toBe('WRITING MODE — R next color')
-    expect(paintPrompt(false, 'SAGE')).toBe('PAINT · SAGE — R next color')
+    expect(paintPrompt(true, 'TEAL')).toBe('WRITING MODE — R next color')
+    expect(paintPrompt(false, 'TEAL')).toBe('PAINT · TEAL — R next color')
+  })
+})
+
+describe('solid coverage constants (phase 11)', () => {
+  test('the stamp is the exact spray-cone diameter — jitter collapsed', () => {
+    expect(SPLAT_SPRITE_JITTER_MIN).toBe(1)
+    expect(SPLAT_SPRITE_JITTER_MAX).toBe(1)
+    // Any rand draw lands the true 2 × radius quad.
+    expect(splatSpriteSize(0.25, 0)).toBeCloseTo(0.5, 12)
+    expect(splatSpriteSize(0.25, 1)).toBeCloseTo(0.5, 12)
+    expect(splatSpriteSize(1.4, 0.33)).toBeCloseTo(2.8, 12)
+  })
+
+  test('bridge spacing ≤ radius/2 and the economy distance sits under it', () => {
+    expect(SWATH_SPACING_FRAC).toBeLessThanOrEqual(0.5)
+    // Coalescing can swallow stamps only CLOSER than the swath spacing —
+    // the held-trigger economy can never open a gap in a dragged band.
+    expect(SPLAT_COALESCE_FRAC).toBeLessThan(SWATH_SPACING_FRAC)
+  })
+
+  test('ledger coats hide UNDER the opaque core, floored at r/2', () => {
+    // The stamp is opaque out to SPLAT_CORE_FRAC × r; a coated 0.15 m wall
+    // cell's square reaches its center + 0.075 m. Keeping center + half-cell
+    // ≤ the CORE means no saturated square can show through the soft rim.
+    expect(SPLAT_CORE_FRAC).toBeCloseTo(0.86, 10)
+    expect(coatRadiusFor(0.25)).toBeCloseTo(0.14, 10)
+    expect(coatRadiusFor(0.25) + 0.075).toBeLessThanOrEqual(SPLAT_CORE_FRAC * 0.25 + 1e-12)
+    expect(coatRadiusFor(1.4)).toBeCloseTo(1.129, 10)
+    expect(coatRadiusFor(1.4) + 0.075).toBeLessThanOrEqual(SPLAT_CORE_FRAC * 1.4)
+    // Tiny radii floor at half — a coat always lands SOMETHING.
+    expect(coatRadiusFor(0.1)).toBeCloseTo(0.05, 10)
+  })
+})
+
+describe('swathPoints (drag continuity — phase 11)', () => {
+  test('no anchor, tiny moves and over-long jumps bridge nothing', () => {
+    expect(swathPoints(null, 1, 0, 0, 0.25)).toEqual([])
+    // Within one spacing of the anchor: the hit's own stamp covers it.
+    expect(swathPoints({ x: 0, y: 0, z: 0 }, 0.12, 0, 0, 0.25)).toEqual([])
+    expect(swathPoints({ x: 0, y: 0, z: 0 }, 0.125, 0, 0, 0.25)).toEqual([])
+    // Farther than SWATH_MAX_GAP is a new stroke — never bridge across it.
+    expect(swathPoints({ x: 0, y: 0, z: 0 }, SWATH_MAX_GAP + 0.01, 0, 0, 0.25)).toEqual([])
+  })
+
+  test('a dragged tick fills the gap at ≤ radius/2 spacing, endpoints excluded', () => {
+    const radius = 0.25
+    const spacing = radius * SWATH_SPACING_FRAC
+    const points = swathPoints({ x: 0, y: 0, z: 0 }, 1, 0, 0, radius)
+    expect(points.length).toBe(7) // ceil(1 / 0.125) − 1
+    // Consecutive stamps (anchor → bridges → hit) never sit farther apart
+    // than the spacing — full discs of `radius` overlap into a solid band.
+    const xs = [0, ...points.map((p) => p.x), 1]
+    for (let i = 1; i < xs.length; i++) {
+      expect(xs[i]! - xs[i - 1]!).toBeLessThanOrEqual(spacing + 1e-12)
+      expect(xs[i]!).toBeGreaterThan(xs[i - 1]!)
+    }
+    // Endpoints excluded: the caller stamps the hit itself.
+    expect(points[0]!.x).toBeGreaterThan(0)
+    expect(points[points.length - 1]!.x).toBeLessThan(1)
+  })
+
+  test('interpolation is true 3D along the segment', () => {
+    const points = swathPoints({ x: 0, y: 1, z: 2 }, 1, 2, 3, 1)
+    expect(points.length).toBeGreaterThan(0)
+    for (const p of points) {
+      // Every bridge point sits ON the anchor→hit segment (x−0 = y−1 = z−2).
+      expect(p.y - 1).toBeCloseTo(p.x, 10)
+      expect(p.z - 2).toBeCloseTo(p.x, 10)
+    }
+  })
+
+  test('per-tick work is capped at SWATH_MAX_STEPS', () => {
+    // radius 0.2 → spacing 0.1; a 2.4 m jump wants 23 bridges, gets 20.
+    const points = swathPoints({ x: 0, y: 0, z: 0 }, 2.4, 0, 0, 0.2)
+    expect(points.length).toBe(SWATH_MAX_STEPS)
+    // The cap covers SWATH_MAX_GAP at the NEAR radius exactly (no gaps in
+    // any bridgeable drag at the tight end of the cone).
+    const near = swathPoints({ x: 0, y: 0, z: 0 }, SWATH_MAX_GAP, 0, 0, SPLAT_NEAR_RADIUS)
+    const spacing = SPLAT_NEAR_RADIUS * SWATH_SPACING_FRAC
+    expect(near.length).toBeLessThanOrEqual(SWATH_MAX_STEPS)
+    expect(SWATH_MAX_GAP / (near.length + 1)).toBeLessThanOrEqual(spacing + 1e-12)
   })
 })

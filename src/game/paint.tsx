@@ -65,7 +65,7 @@ import type { GameWorld } from './world'
  * Save button is the only path that patches real nodes. The ledger resets
  * on PaintTool mount — the same session lifetime destruction state has.
  *
- * ── Round read (phase 10) ───────────────────────────────────────────────
+ * ── Round read (phase 10, reworked phase 11) ────────────────────────────
  * Cell tint alone is inherently SQUARE — whole 0.15 m voxels flip color
  * (owner: "it only colors full squares instead of a normal paint circle").
  * So every spray tick that coats a voxelized target ALSO stamps a round
@@ -73,9 +73,18 @@ import type { GameWorld } from './world'
  * idiom) of textured quads laid flat on the hit face (splatNormalFor: the
  * dominant grid axis of the reversed shot, biased to the FACE on layered
  * wall/slab/roof grids), lifted SPLAT_SPRITE_LIFT off the surface, palette
- * via instanceColor over ONE module-cached irregular-rim splat texture.
- * Held-trigger economy: a tick lands no new sprite within
- * SPLAT_COALESCE_FRAC × radius of the node's previous same-color sprite.
+ * via instanceColor over ONE module-cached SOLID-DISC texture.
+ *
+ * Phase 11 (owner: "no blobs/splats — a normal spray FULLY colors a round
+ * area, tight close, wide far"): the stamp is a fully-filled disc with only
+ * a soft ~14% falloff rim (no wobble, no satellite droplets, no scale
+ * jitter — the quad side IS the 2 × splatRadiusAt(distance) diameter), and
+ * a held DRAG paints a continuous swath: the module STROKE anchor bridges
+ * this tick's hit to the last one with intermediate stamps spaced ≤
+ * radius/2 (swathPoints), each feeding the cell ledger/decal votes exactly
+ * like a real tick so paint-keep accounting matches what's on the wall.
+ * Held-trigger economy stays: no new stamp within SPLAT_COALESCE_FRAC ×
+ * radius of the node's previous same-color stamp.
  * Sprites are purely visual — the cell ledger above still owns persistence
  * and the destroyed-cell look; a node's sprites evict when its target
  * drops or fully collapses (drainPaintTints spots both), and the pool
@@ -84,16 +93,26 @@ import type { GameWorld } from './world'
 
 export type PaintColor = { name: string; hex: string }
 
-/** Building-appropriate coats — muted architectural tones, not crayons. */
+/** The 12-color R-carousel (owner: "like 8 or 16 colors I just cycle
+ * through") — a full game-y spread, one obvious pick per hue family. */
 export const PAINT_PALETTE: readonly PaintColor[] = [
-  { name: 'CHALK WHITE', hex: '#f2efe6' },
-  { name: 'GREIGE', hex: '#c9c1b2' },
-  { name: 'SAGE', hex: '#9cab8b' },
-  { name: 'TERRACOTTA', hex: '#c07a5b' },
-  { name: 'NAVY', hex: '#3b4a63' },
-  { name: 'CHARCOAL', hex: '#44464a' },
-  { name: 'OCHRE', hex: '#d3a55f' },
+  { name: 'WHITE', hex: '#f4f4ef' },
+  { name: 'BLACK', hex: '#26282c' },
+  { name: 'GRAY', hex: '#8f959d' },
+  { name: 'RED', hex: '#e5443b' },
+  { name: 'ORANGE', hex: '#f28a2e' },
+  { name: 'YELLOW', hex: '#f5c542' },
+  { name: 'GREEN', hex: '#52b24c' },
+  { name: 'TEAL', hex: '#2fb8a6' },
+  { name: 'BLUE', hex: '#3e7fe1' },
+  { name: 'PURPLE', hex: '#8f5fd6' },
+  { name: 'PINK', hex: '#ef6fa7' },
+  { name: 'BROWN', hex: '#8c5a33' },
 ]
+
+/** Palette hexes in carousel order — the HUD paintCarousel argument (hud.ts
+ * can't import this module: paint → session → hud would cycle back). */
+export const PAINT_PALETTE_HEXES: readonly string[] = PAINT_PALETTE.map((p) => p.hex)
 
 /** Splats per second while the trigger is held. */
 const PAINT_RATE = 9
@@ -152,12 +171,20 @@ const PAINTABLE = new Set([
 // ── Palette selection (module state — survives weapon switches) ──────────
 
 let colorIndex = 0
+/** Bumped by every R cycle — PaintTool's change gate for the HUD carousel
+ * flash (equipping the sprayer alone must NOT flash it). */
+let cycleSerial = 0
 
 export const currentPaintColor = (): PaintColor => PAINT_PALETTE[colorIndex]!
+/** Carousel position of the live coat — the HUD's active-dot index. */
+export const currentPaintIndex = (): number => colorIndex
+/** How many R cycles ever happened (monotonic; module lifetime). */
+export const paintCycleSerial = (): number => cycleSerial
 
 /** R while the sprayer is held — viewmodel routes the action here. */
 export function cyclePaintColor(): PaintColor {
   colorIndex = (colorIndex + 1) % PAINT_PALETTE.length
+  cycleSerial++
   return PAINT_PALETTE[colorIndex]!
 }
 
@@ -187,16 +214,15 @@ export const paintStrengthOf = (value: number): number => (value & 0xff) / 255
 /** The strength a coat of `color` BUILDS ON at a cell: same color
  * accumulates; a DIFFERENT color covers the old coat and restarts from
  * zero — carrying the previous color's strength would flip a saturated
- * sage cell to navy at FULL strength off one 0.16 rim fleck (and inflate
- * its paint-keep vote ~16×). Pure — exported for tests. */
+ * green cell to blue at FULL strength off one faint rim graze (and inflate
+ * its paint-keep vote accordingly). Pure — exported for tests. */
 export function coatBaseStrength(prev: number | undefined, color: number): number {
   return prev !== undefined && paintColorOf(prev) === color ? paintStrengthOf(prev) : 0
 }
 
 /** nodeId → voxel cell index → packed (color << 8) | strength coat. */
 const paintedByNode = new Map<string, Map<number, number>>()
-/** Per-node write serial — the renderer-drain's change gate (also the
- * deterministic seed for the rim speckle hash). */
+/** Per-node write serial — the renderer-drain's change gate. */
 const nodeSerials = new Map<string, number>()
 
 export const getPaintedByNode = (): ReadonlyMap<string, ReadonlyMap<number, number>> =>
@@ -207,6 +233,7 @@ export function resetPaint(): void {
   paintedByNode.clear()
   nodeSerials.clear()
   lastHitDistance = null
+  endPaintStroke()
 }
 
 // ── Last hit distance (drives the cone + the writing-mode HUD line) ───────
@@ -217,16 +244,113 @@ let lastHitDistance: number | null = null
  * spraying at nothing. PaintTool reads it for the writing-mode prompt. */
 export const lastSprayHitDistance = (): number | null => lastHitDistance
 
-// ── Feathered coat math (pure — exported for tests) ───────────────────────
+// ── The spray stroke (drag continuity — phase 11) ─────────────────────────
+//
+// Spray ticks land at PAINT_RATE (9 Hz); a dragged aim moves the hit point
+// farther than the stamp diameter between ticks, which used to leave GAPS in
+// the swath. The module stroke anchor remembers the last stamp of the held
+// trigger; swathPoints bridges anchor → new hit with intermediate stamps
+// spaced ≤ radius × SWATH_SPACING_FRAC, so a drag paints one continuous
+// band. The anchor dies on trigger release (PaintTool), on a miss, and on a
+// node/color change — a stroke never bridges across air or between nodes.
 
-/** Rim speckle band: overspray flecks land between 1.0 r and this × r. */
-export const SPLAT_RIM_OUTER = 1.25
+/** Bridge stamp spacing as a fraction of the disc radius (≤ 1/2 the radius
+ * guarantees solid overlap between consecutive full discs). */
+export const SWATH_SPACING_FRAC = 0.5
+/** Per-tick cap on bridge stamps — covers SWATH_MAX_GAP even at the tight
+ * near radius (2.5 / (0.25 × 0.5) − 1 = 19), bounds the tick's work. */
+export const SWATH_MAX_STEPS = 20
+/** A jump longer than this (m) is a new stroke, not a drag — never bridge
+ * across a doorway or a wall edge the aim skipped over. */
+export const SWATH_MAX_GAP = 2.5
+
+/**
+ * Pure bridge math — exported for tests. Intermediate stamp centers evenly
+ * spread between the stroke anchor `prev` and this tick's hit (endpoints
+ * excluded — the caller stamps the hit itself), enough that consecutive
+ * stamps sit ≤ radius × SWATH_SPACING_FRAC apart. Empty when there is no
+ * anchor, the hit is already within spacing, or the jump exceeds
+ * SWATH_MAX_GAP.
+ */
+export function swathPoints(
+  prev: { x: number; y: number; z: number } | null,
+  x: number,
+  y: number,
+  z: number,
+  radius: number,
+): { x: number; y: number; z: number }[] {
+  if (!prev) return []
+  const dx = x - prev.x
+  const dy = y - prev.y
+  const dz = z - prev.z
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+  const spacing = radius * SWATH_SPACING_FRAC
+  if (dist <= spacing || dist > SWATH_MAX_GAP) return []
+  const steps = Math.min(Math.ceil(dist / spacing) - 1, SWATH_MAX_STEPS)
+  const out: { x: number; y: number; z: number }[] = []
+  for (let k = 1; k <= steps; k++) {
+    const t = k / (steps + 1)
+    out.push({ x: prev.x + dx * t, y: prev.y + dy * t, z: prev.z + dz * t })
+  }
+  return out
+}
+
+/** The held trigger's last stamp — nodeId keys the LEDGER id of that lane
+ * (scene id on the decal lane, member id on voxelized roof planes). */
+let stroke: { nodeId: string; color: number; x: number; y: number; z: number } | null = null
+
+/** Trigger released / miss / teardown — the next tick starts a new stroke. */
+export function endPaintStroke(): void {
+  stroke = null
+}
+
+/** This tick's bridge points, when the stroke continues on the same node
+ * with the same color; [] on a fresh stroke. */
+function strokeBridge(nodeId: string, x: number, y: number, z: number, radius: number) {
+  const prev = stroke && stroke.nodeId === nodeId && stroke.color === colorIndex ? stroke : null
+  return swathPoints(prev, x, y, z, radius)
+}
+
+/** Record this tick's stamp as the stroke anchor (record reused in place —
+ * one allocation per stroke). */
+function advanceStroke(nodeId: string, x: number, y: number, z: number): void {
+  if (stroke) {
+    stroke.nodeId = nodeId
+    stroke.color = colorIndex
+    stroke.x = x
+    stroke.y = y
+    stroke.z = z
+  } else {
+    stroke = { nodeId, color: colorIndex, x, y, z }
+  }
+}
+
+// ── Feathered coat math (pure — exported for tests) ───────────────────────
+//
+// Phase 11 dropped the rim-speckle annulus: overspray flecks tinted WHOLE
+// 0.15 m cells past the disc (a square halo around the round stamp — the
+// exact blob read the owner rejected). A coat now lands only on cells
+// inside the disc radius; the solid sprite covers them.
+
 /** Strength a splat's CENTER adds per tick — saturates in ~2–3 coats. */
 export const COAT_ADD = 0.45
-/** Fraction of annulus cells that catch an overspray fleck. */
-export const RIM_SPECKLE_P = 0.18
-/** Strength one rim fleck adds — faint, builds only under repeated passes. */
-export const RIM_SPECKLE_ADD = 0.16
+
+/** Fraction of the stamp radius that is fully OPAQUE — the soft falloff
+ * rim occupies the remaining ~14% (owner: "solid disc, soft edge only").
+ * Shared by the sprite/decal textures and the ledger inset below. */
+export const SPLAT_CORE_FRAC = 0.86
+/** Half of a 0.15 m wall cell — the farthest a coated cell's square can
+ * reach past its own center. */
+const COAT_HALF_CELL = 0.075
+
+/** The ledger radius for a disc of `radius`: coated cells must hide UNDER
+ * the disc's opaque core (cell center + half-cell ≤ core radius), floored
+ * at half the radius so a coat always lands something. Saturated square
+ * cells poking through the translucent rim were the blocky halo the owner
+ * rejected. Applied at the sprayPaint/convertDecals call sites; splatCoat
+ * itself stays the pure radius rule. */
+export const coatRadiusFor = (radius: number): number =>
+  Math.max(radius * 0.5, radius * SPLAT_CORE_FRAC - COAT_HALF_CELL)
 
 /** Smoothstep falloff across the splat: 1 at the center (t = 0), 0 at the
  * rim (t = d / radius = 1). Pure — the feathered-edge curve. */
@@ -237,21 +361,11 @@ export function splatFalloff(t: number): number {
   return u * u * (3 - 2 * u)
 }
 
-/** Deterministic per-(cell, serial) hash in [0, 1) — the rim speckle
- * lottery. Same (cell, serial) always draws the same number, so a splat's
- * overspray pattern is reproducible (tests pin it). */
-export function speckleHash(cell: number, serial: number): number {
-  let h = (Math.imul(cell + 1, 2654435761) ^ Math.imul(serial + 1, 1597334677)) >>> 0
-  h = Math.imul(h ^ (h >>> 13), 1 | h) >>> 0
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296
-}
-
 /**
  * One splat's strength contributions: every ALIVE cell inside `radius`
  * gains COAT_ADD × smoothstep falloff (full at the hit point, feathering
- * to zero at the rim); cells in the 1.0–1.25 r annulus catch faint
- * overspray flecks by the deterministic (cell, serial) lottery. Pure —
- * sprayPaint accumulates the adds into the packed ledger.
+ * to zero at the rim). Pure — sprayPaint accumulates the adds into the
+ * packed ledger.
  */
 export function splatCoat(
   grid: { count: number; alive: ArrayLike<number>; centers: ArrayLike<number> },
@@ -259,10 +373,8 @@ export function splatCoat(
   y: number,
   z: number,
   radius: number,
-  serial: number,
 ): { cell: number; add: number }[] {
   const r2 = radius * radius
-  const outer2 = r2 * SPLAT_RIM_OUTER * SPLAT_RIM_OUTER
   const out: { cell: number; add: number }[] = []
   for (let i = 0; i < grid.count; i++) {
     if (!grid.alive[i]) continue
@@ -270,13 +382,9 @@ export function splatCoat(
     const dy = (grid.centers[i * 3 + 1] ?? 0) - y
     const dz = (grid.centers[i * 3 + 2] ?? 0) - z
     const d2 = dx * dx + dy * dy + dz * dz
-    if (d2 > outer2) continue
-    if (d2 <= r2) {
-      const add = COAT_ADD * splatFalloff(Math.sqrt(d2) / radius)
-      if (add > 0) out.push({ cell: i, add })
-    } else if (speckleHash(i, serial) < RIM_SPECKLE_P) {
-      out.push({ cell: i, add: RIM_SPECKLE_ADD })
-    }
+    if (d2 > r2) continue
+    const add = COAT_ADD * splatFalloff(Math.sqrt(d2) / radius)
+    if (add > 0) out.push({ cell: i, add })
   }
   return out
 }
@@ -356,14 +464,15 @@ function nozzleAt(origin: Vector3, aim: Vector3): Vector3 {
 
 // ── Drips (P4 — heavy coats on walls shed runs) ───────────────────────────
 
-/** Drip pool size — one InstancedMesh of wall-plane streak quads. */
-export const DRIP_CAP = 48
+/** Drip pool size — one InstancedMesh of wall-plane streak quads. Halved
+ * in phase 11 (owner: "something simpler" — coverage is the point). */
+export const DRIP_CAP = 24
 /** A cell must already carry this much strength for a re-coat to run. */
 export const DRIP_STRENGTH_GATE = 0.75
-/** Chance a qualifying cell sheds a drip. */
-export const DRIP_P = 0.25
-/** Hard cap on drips born per spray tick. */
-export const DRIP_MAX_PER_TICK = 2
+/** Chance a qualifying cell sheds a drip (phase 11: halved). */
+export const DRIP_P = 0.12
+/** Hard cap on drips born per spray tick (phase 11: halved). */
+export const DRIP_MAX_PER_TICK = 1
 /** Seconds a fresh drip takes to run down to full length. */
 const DRIP_GROW_TIME = 1.1
 /** Streak quad width (m) and final run length range (m). */
@@ -599,11 +708,14 @@ export const SPLAT_SPRITE_CAP = 192
  * reading as floating (6–8 mm band; polygonOffset does the rest). */
 export const SPLAT_SPRITE_LIFT = 0.007
 /** No new sprite within this × radius of the node's previous same-color
- * sprite — the held-trigger economy rule the decal lane budgets by. */
+ * sprite — the held-trigger economy rule the decal lane budgets by. Stays
+ * under SWATH_SPACING_FRAC, so economy never opens a gap in a swath. */
 export const SPLAT_COALESCE_FRAC = 0.3
-/** Per-stamp scale jitter band around the true 2 × radius diameter. */
-export const SPLAT_SPRITE_JITTER_MIN = 0.85
-export const SPLAT_SPRITE_JITTER_MAX = 1.15
+/** Scale jitter band — collapsed to 1 in phase 11: a solid disc's quad
+ * side IS the true 2 × radius diameter (uniform coverage, no ragged
+ * swath edges). The splatSpriteSize seam stays for the pinned tests. */
+export const SPLAT_SPRITE_JITTER_MIN = 1
+export const SPLAT_SPRITE_JITTER_MAX = 1
 /** Layered grids (wall/slab/roof): the FACE (thickness axis) wins the
  * quad orientation whenever the spray crosses it by at least this much —
  * a glancing pass down a wall still stamps flat on the drywall. */
@@ -834,9 +946,12 @@ export function stampSplat(
   return true
 }
 
-/** ONE cached soft-round splat texture — white (instanceColor carries the
- * palette), irregular wobbly rim + satellite droplets so stamps read as
- * aerosol hits, not perfect discs. 128², module lifetime (the dust idiom). */
+/** ONE cached SOLID-DISC stamp texture — white (instanceColor carries the
+ * palette): fully opaque out to ~86% of the radius, soft falloff on the
+ * last ~14% only (phase 11, owner: "a normal spray FULLY colors a round
+ * area" — no wobble, no satellite droplets). The disc's diameter spans the
+ * whole quad, so the stamp truly is 2 × splatRadiusAt(distance) wide.
+ * 128², module lifetime (the dust idiom). */
 let splatTexture: CanvasTexture | null = null
 function getSplatTexture(): CanvasTexture | null {
   if (splatTexture) return splatTexture
@@ -846,41 +961,12 @@ function getSplatTexture(): CanvasTexture | null {
   canvas.height = 128
   const g = canvas.getContext('2d')
   if (!g) return null
-  // Dense core feathering toward a WOBBLY rim: the radial gradient fades,
-  // the irregular path clips it — a defined-but-organic circle edge.
-  const fill = g.createRadialGradient(64, 64, 0, 64, 64, 52)
-  fill.addColorStop(0, 'rgba(255,255,255,0.97)')
-  fill.addColorStop(0.55, 'rgba(255,255,255,0.95)')
-  fill.addColorStop(0.82, 'rgba(255,255,255,0.8)')
-  fill.addColorStop(1, 'rgba(255,255,255,0.2)')
+  const fill = g.createRadialGradient(64, 64, 0, 64, 64, 64)
+  fill.addColorStop(0, 'rgba(255,255,255,1)')
+  fill.addColorStop(SPLAT_CORE_FRAC, 'rgba(255,255,255,1)')
+  fill.addColorStop(1, 'rgba(255,255,255,0)')
   g.fillStyle = fill
-  g.beginPath()
-  const WOBBLES = 48
-  for (let i = 0; i <= WOBBLES; i++) {
-    const a = (i / WOBBLES) * Math.PI * 2
-    const r = 46 + Math.sin(a * 3 + 1.7) * 4.5 + Math.sin(a * 7 + 0.4) * 2.5
-    const px = 64 + Math.cos(a) * r
-    const py = 64 + Math.sin(a) * r
-    if (i === 0) g.moveTo(px, py)
-    else g.lineTo(px, py)
-  }
-  g.closePath()
-  g.fill()
-  // Satellite droplets just past the rim — overspray character.
-  for (let i = 0; i < 7; i++) {
-    const a = (i / 7) * Math.PI * 2 + (i % 3) * 0.7
-    const dist = 53 + (i % 3) * 3
-    const bx = 64 + Math.cos(a) * dist
-    const by = 64 + Math.sin(a) * dist
-    const r = 2.5 + (i % 3) * 1.5
-    const blob = g.createRadialGradient(bx, by, 0, bx, by, r)
-    blob.addColorStop(0, 'rgba(255,255,255,0.85)')
-    blob.addColorStop(1, 'rgba(255,255,255,0)')
-    g.fillStyle = blob
-    g.beginPath()
-    g.arc(bx, by, r, 0, Math.PI * 2)
-    g.fill()
-  }
+  g.fillRect(0, 0, 128, 128)
   splatTexture = new CanvasTexture(canvas)
   return splatTexture
 }
@@ -1127,7 +1213,9 @@ export function getDecalVotesByNode(): Map<string, Map<number, number>> {
   return out
 }
 
-/** One cached soft-splat alpha texture — white, tinted by the material. */
+/** One cached solid-disc alpha texture — white, tinted by the material.
+ * Same phase-11 read as the sprite stamp: fully opaque to ~86% of the
+ * radius, soft rim on the last ~14% only, no overspray blobs. */
 let decalTexture: CanvasTexture | null = null
 function getDecalTexture(): CanvasTexture | null {
   if (decalTexture) return decalTexture
@@ -1137,28 +1225,12 @@ function getDecalTexture(): CanvasTexture | null {
   canvas.height = 128
   const g = canvas.getContext('2d')
   if (!g) return null
-  // Dense core feathering out, with a few overspray blobs off the rim.
-  const core = g.createRadialGradient(64, 64, 0, 64, 64, 58)
-  core.addColorStop(0, 'rgba(255,255,255,0.96)')
-  core.addColorStop(0.62, 'rgba(255,255,255,0.9)')
-  core.addColorStop(0.85, 'rgba(255,255,255,0.4)')
+  const core = g.createRadialGradient(64, 64, 0, 64, 64, 64)
+  core.addColorStop(0, 'rgba(255,255,255,1)')
+  core.addColorStop(SPLAT_CORE_FRAC, 'rgba(255,255,255,1)')
   core.addColorStop(1, 'rgba(255,255,255,0)')
   g.fillStyle = core
   g.fillRect(0, 0, 128, 128)
-  for (let i = 0; i < 9; i++) {
-    const angle = (i / 9) * Math.PI * 2 + (i % 3) * 0.41
-    const dist = 44 + (i % 4) * 5
-    const bx = 64 + Math.cos(angle) * dist
-    const by = 64 + Math.sin(angle) * dist
-    const r = 4 + (i % 3) * 3
-    const blob = g.createRadialGradient(bx, by, 0, bx, by, r)
-    blob.addColorStop(0, 'rgba(255,255,255,0.55)')
-    blob.addColorStop(1, 'rgba(255,255,255,0)')
-    g.fillStyle = blob
-    g.beginPath()
-    g.arc(bx, by, r, 0, Math.PI * 2)
-    g.fill()
-  }
   decalTexture = new CanvasTexture(canvas)
   return decalTexture
 }
@@ -1278,7 +1350,7 @@ export function convertDecalsForNode(nodeId: string): void {
     for (const index of indices) {
       const s = decalSlots[index]!
       if (!s.alive) continue
-      const coats = splatCoat(target.grid, s.x, s.y, s.z, s.radius, serial)
+      const coats = splatCoat(target.grid, s.x, s.y, s.z, coatRadiusFor(s.radius))
       if (coats.length === 0) continue
       if (!painted) {
         painted = new Map()
@@ -1336,6 +1408,11 @@ const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _point = new Vector3()
 const _decalNormal = new Vector3()
+/** Bridge-stamp scratch (spawnPaintDecal wants a Vector3). */
+const _bridge = new Vector3()
+/** Every-other-tick gate on the nozzle/air mist (phase 11: less mist —
+ * coverage is the point, the hiss + bounce puff still sell the spray). */
+let mistParity = false
 
 /**
  * One trigger tick: resolve the crosshair ray (voxel skins beat solid
@@ -1395,30 +1472,57 @@ export function sprayPaint(world: GameWorld): boolean {
     _point.copy(voxelHit.point)
     bestDist = voxelHit.distance
   }
-  // Mist (P1): a tinted cone puffs off the nozzle every tick; on a surface
-  // hit the spray bounces back off the wall at the hit point, a clean miss
-  // hangs a puff in the air downrange instead.
+  // Mist (P1, thinned in phase 11): the nozzle cone puffs every OTHER tick
+  // (mistParity); on a surface hit a softer bounce puff marks the contact,
+  // a clean miss hangs a parity-gated puff in the air downrange instead.
   refreshMistTint()
   _mistDir.copy(_direction)
-  spawnDust(nozzleAt(_origin, _direction), 0.4, _mistOpts)
+  const nozzle = nozzleAt(_origin, _direction)
+  mistParity = !mistParity
+  if (mistParity) spawnDust(nozzle, 0.4, _mistOpts)
   if (!nodeId) {
-    _mistAt.copy(_nozzle).addScaledVector(_direction, 1.1)
-    spawnDust(_mistAt, 0.28, _mistOpts)
+    if (mistParity) {
+      _mistAt.copy(_nozzle).addScaledVector(_direction, 1.1)
+      spawnDust(_mistAt, 0.28, _mistOpts)
+    }
     lastHitDistance = null
+    endPaintStroke() // never bridge a drag across air
     return false
   }
   _bounce.copy(_direction).negate()
-  spawnDust(_point, 0.55, _bounceOpts)
+  spawnDust(_point, 0.4, _bounceOpts)
   lastHitDistance = bestDist
   let ensured: VoxelTarget | null = null
   if (needsVoxelize) {
-    if (!solidType || !PAINTABLE.has(solidType)) return false
-    // P5: a PRISTINE host wears a DecalGeometry splat — painting no longer
-    // voxelizes it. The node keeps its host meshes and colliders until
-    // real damage arrives; destruction's target-live hook then converts
-    // these splats into the cell ledger and frees the slots.
-    if (decalMesh && spawnPaintDecal(decalMesh, nodeId, _point, _decalNormal, splatRadiusAt(bestDist))) {
-      return true
+    if (!solidType || !PAINTABLE.has(solidType)) {
+      endPaintStroke()
+      return false
+    }
+    // P5: a PRISTINE host wears solid-disc DecalGeometry stamps — painting
+    // no longer voxelizes it. The node keeps its host meshes and colliders
+    // until real damage arrives; destruction's target-live hook then
+    // converts these stamps into the cell ledger and frees the slots.
+    if (decalMesh) {
+      const radius = splatRadiusAt(bestDist)
+      // Held-trigger economy (the sprite lane's coalescing rule): parked
+      // on one spot, the solid disc already covers it — no new clip, no
+      // ring churn, and the area votes stay honest.
+      if (
+        stroke &&
+        stroke.nodeId === nodeId &&
+        !shouldStampSplat(stroke, _point.x, _point.y, _point.z, colorIndex, radius)
+      ) {
+        return true
+      }
+      // Drag continuity (phase 11): bridge stamps between the stroke
+      // anchor and this hit — each clips its own decal and votes its area.
+      for (const p of strokeBridge(nodeId, _point.x, _point.y, _point.z, radius)) {
+        spawnPaintDecal(decalMesh, nodeId, _bridge.set(p.x, p.y, p.z), _decalNormal, radius)
+      }
+      if (spawnPaintDecal(decalMesh, nodeId, _point, _decalNormal, radius)) {
+        advanceStroke(nodeId, _point.x, _point.y, _point.z)
+        return true
+      }
     }
     // Fallback (heavy mesh / degenerate clip): the classic voxelize lane.
     ensured = ensureVoxelTarget(world, nodeId)
@@ -1434,12 +1538,28 @@ export function sprayPaint(world: GameWorld): boolean {
 
   const serial = nodeSerials.get(nodeId) ?? 0
   const radius = splatRadiusAt(bestDist)
-  const coats = splatCoat(target.grid, _point.x, _point.y, _point.z, radius, serial)
-  if (coats.length === 0) return false
+  // Drag continuity (phase 11): bridge coats between the stroke anchor and
+  // this hit — the swath the player SEES is exactly what the ledger holds,
+  // so paint-keep's strength-weighted votes track the whole band.
+  const bridge = strokeBridge(nodeId, _point.x, _point.y, _point.z, radius)
+  const coatRadius = coatRadiusFor(radius) // cells stay under the disc
+  const coats = splatCoat(target.grid, _point.x, _point.y, _point.z, coatRadius)
+  const bridgeCoats = bridge.map((p) => splatCoat(target.grid, p.x, p.y, p.z, coatRadius))
+  let landed = coats.length
+  for (const c of bridgeCoats) landed += c.length
+  if (landed === 0) return false
   let painted = paintedByNode.get(nodeId)
   if (!painted) {
     painted = new Map()
     paintedByNode.set(nodeId, painted)
+  }
+  // Bridge cells coat first, drip-free (drips belong to the tick's own
+  // stamp) — the hit's coat below then wins any shared cells.
+  for (const c of bridgeCoats) {
+    for (const { cell, add } of c) {
+      const before = coatBaseStrength(painted.get(cell), colorIndex)
+      painted.set(cell, paintValue(colorIndex, Math.min(1, before + add)))
+    }
   }
   // Drip frame (P4): the streak quad faces back along the spray, pushed
   // just off the voxel face; over-coated wall cells shed runs below.
@@ -1470,12 +1590,17 @@ export function sprayPaint(world: GameWorld): boolean {
     painted.set(cell, paintValue(colorIndex, Math.min(1, before + add)))
   }
   nodeSerials.set(nodeId, serial + 1)
-  // ROUND READ (phase 10): the cell tint above is square by construction —
-  // stamp a round sprite flat on the hit face so the pass reads as a paint
-  // circle. Coalescing may swallow it (held-trigger economy); the ledger
-  // coat already landed either way.
+  // ROUND READ (phase 10/11): the cell tint above is square by
+  // construction — stamp solid-disc sprites flat on the hit face (bridge
+  // points first, then the hit) so the pass reads as one continuous filled
+  // band. Coalescing may swallow the hit's stamp (held-trigger economy);
+  // the ledger coat already landed either way.
   splatNormalFor(target.grid, target.kind, _direction.x, _direction.y, _direction.z, _splatN)
+  for (const p of bridge) {
+    stampSplat(nodeId, p.x, p.y, p.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
+  }
   stampSplat(nodeId, _point.x, _point.y, _point.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
+  advanceStroke(nodeId, _point.x, _point.y, _point.z)
   return true
 }
 
@@ -1755,6 +1880,9 @@ export function PaintTool({ world }: { world: GameWorld }) {
   const spraying = useRef(false)
   /** Last HUD write ('' = hidden) — change gate, per-frame calls are free. */
   const hudKey = useRef('')
+  /** Last R-cycle serial seen — the carousel flashes only on a real cycle,
+   * never on equip (module serial survives weapon switches and sessions). */
+  const lastCycle = useRef(paintCycleSerial())
 
   useEffect(() => {
     resetPaint()
@@ -1771,6 +1899,7 @@ export function PaintTool({ world }: { world: GameWorld }) {
       spray.current?.stop()
       spray.current = null
       spraying.current = false
+      endPaintStroke()
       // Never hold host meshes (or their clipped decals/sprites) across
       // sessions.
       meshCache.clear()
@@ -1818,6 +1947,18 @@ export function PaintTool({ world }: { world: GameWorld }) {
       }
     }
 
+    // Color carousel flash: every R cycle (a paintCycleSerial edge — never
+    // a mere equip) shows the palette strip near the paint chip for ~2 s.
+    // Feature-detected like paintSwatch until hud.ts ships it.
+    const cycled = paintCycleSerial()
+    if (cycled !== lastCycle.current) {
+      lastCycle.current = cycled
+      const hudCarousel = session.hud as typeof session.hud & {
+        paintCarousel?: (hexes: readonly string[], active: number) => void
+      }
+      hudCarousel.paintCarousel?.(PAINT_PALETTE_HEXES, currentPaintIndex())
+    }
+
     if (wants !== spraying.current) {
       spraying.current = wants
       if (wants) {
@@ -1825,6 +1966,7 @@ export function PaintTool({ world }: { world: GameWorld }) {
         spray.current.start()
       } else {
         spray.current?.stop()
+        endPaintStroke() // trigger up — the next press starts a new stroke
       }
     }
     cooldown.current -= dt
