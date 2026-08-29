@@ -24,7 +24,7 @@ import {
   Vector3,
 } from 'three'
 import { Craters } from './craters'
-import { type GameWorld, pointOnRoad } from './world'
+import { type GameWorld, pointInPolygonXZ, pointOnRoad, siteGroundYAt } from './world'
 
 /**
  * The lot: a grass field with scattered flora replacing the editor's flat
@@ -41,6 +41,12 @@ import { type GameWorld, pointOnRoad } from './world'
  * mechanism only supports a single rectangle fully inside the contour
  * (overlapping / edge-crossing holes break ShapeGeometry triangulation),
  * which arbitrary road ribbons would violate.
+ *
+ * HOST SITE (world.site): when the scene has a visible site node, the host
+ * already renders the lot ground — sculpted terrain or the flat polygon
+ * fill — plus its own horizon plate. The boots disc is then suppressed
+ * (shouldMountGroundDisc) and every scatter instance clamps to the lot
+ * polygon and DRAPES onto the terrain surface height (scatterGroundY).
  */
 
 /** Deterministic RNG so re-entry looks identical. */
@@ -184,6 +190,50 @@ function bushClusterGeometry(): BufferGeometry {
 }
 
 export const GROUND_RADIUS = 95
+
+/** Terrain-less sites render their polygon ground fill at this Y (host
+ * SiteRenderer). Scatter on a flat site drapes to exactly this, so the
+ * per-kind lifts keep every instance a hair below/above where the y = 0
+ * era put them — never sunk under the fill. */
+export const SITE_FLAT_GROUND_Y = -0.05
+
+/**
+ * Mount the boots lawn disc only when NO visible host site was collected:
+ * a site brings its own lot ground (sculpted terrain or the polygon fill)
+ * plus an "infinite" horizon plate — the boots disc at y = 0.05 would fight
+ * both (the gray-moonscape bug: green disc + y = 0 scatter slicing through
+ * the sculpted hill). Pure gate; exported for tests.
+ */
+export function shouldMountGroundDisc(world: Pick<GameWorld, 'site'>): boolean {
+  return !world.site
+}
+
+/**
+ * The ground Y a scatter instance drapes to at (x, z) — the make callbacks
+ * ADD their per-kind lift on top of this base:
+ * - no site: 0, the legacy lot plane (behavior byte-identical to before).
+ * - terrain site: the analytic surface height when the host core exports it
+ *   (SiteSnapshot.surfaceHeightAt), else a downward BVH probe of the site
+ *   colliders. Real heights pass through UNclamped — flora follows the bank
+ *   down into an excavated yard, exactly like the rendered surface does.
+ * - flat site: the polygon fill plane at −0.05 (probe result clamped up to
+ *   it so numeric noise can never sink an instance under the fill).
+ * Pure over its inputs; exported for the drape tests.
+ */
+export function scatterGroundY(
+  world: Pick<GameWorld, 'site' | 'colliders'>,
+  x: number,
+  z: number,
+): number {
+  const site = world.site
+  if (!site) return 0
+  if (site.surfaceHeightAt) return site.surfaceHeightAt(x, z)
+  if (!site.hasTerrain) {
+    const probed = siteGroundYAt(world, x, z)
+    return Math.max(SITE_FLAT_GROUND_Y, probed ?? SITE_FLAT_GROUND_Y)
+  }
+  return siteGroundYAt(world, x, z) ?? SITE_FLAT_GROUND_Y
+}
 
 /** The lawn hole may reach this far from the disc center per axis: the
  * disc's inscribed square at a 0.95 safety — a rect whose CORNERS stay
@@ -347,6 +397,14 @@ export function freezeStaticObject(obj: Object3D): void {
  * trees-destruct.tsx does exactly that to build combat trees on the same
  * layout (so trees stay off the road too). Exported so flora placement
  * stays one algorithm across modules.
+ *
+ * Host-site rules (world.site — no site means neither applies):
+ * - CLAMP: samples outside the lot polygon are rejected — with the boots
+ *   disc suppressed, anything past the polygon would float over the host's
+ *   horizon plate.
+ * - DRAPE: `position.y` arrives at the make callback PRE-SET to the terrain
+ *   surface height at (x, z) (scatterGroundY); callbacks ADD their per-kind
+ *   lift (`position.y += lift`) instead of assigning an absolute Y.
  */
 export function scatter(
   world: GameWorld,
@@ -384,6 +442,18 @@ export function scatter(
     // No flora on pavement: roads, driveways, parking pads (default margin
     // keeps blades clear of the kerb line, not just the centerline).
     if (pointOnRoad(world.roadFootprints, position.x, position.z)) continue
+    // On-lot only when a host site exists (see the doc block above). A
+    // degenerate polygon (< 3 points — "inside" is meaningless) skips the
+    // clamp rather than rejecting the entire field.
+    if (
+      world.site &&
+      world.site.polygon.length >= 3 &&
+      !pointInPolygonXZ(world.site.polygon, position.x, position.z)
+    ) {
+      continue
+    }
+    // Drape onto the lot surface (0 without a site — same plane as ever).
+    position.y = scatterGroundY(world, position.x, position.z)
     const matrix = new Matrix4()
     const t = rMax > rMin ? (radius - rMin) / (rMax - rMin) : 0
     colors.push(make(rand, position, matrix, t))
@@ -514,7 +584,12 @@ export function Nature({ world }: { world: GameWorld }) {
 
   const texture = useMemo(groundTexture, [])
 
-  const groundGeo = useMemo(() => groundGeometry(world), [world])
+  // Host ground wins: with a visible site collected, the lot already has its
+  // ground (terrain or polygon fill) + horizon — the disc is not even built.
+  const groundGeo = useMemo(
+    () => (shouldMountGroundDisc(world) ? groundGeometry(world) : null),
+    [world],
+  )
 
   const grassGeometry = useMemo(grassClusterGeometry, [])
 
@@ -550,7 +625,7 @@ export function Nature({ world }: { world: GameWorld }) {
         _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
         const s = 0.05 + rand() * 0.045
         _scale.set(s, 1, s)
-        position.y = 0.07 + rand() * 0.1
+        position.y += 0.07 + rand() * 0.1 // lift ON TOP of the draped ground
         matrix.compose(position, _quat, _scale)
         return (rand() < 0.42 ? FLOWER_YELLOW : FLOWER_WHITE).clone()
       }),
@@ -566,7 +641,7 @@ export function Nature({ world }: { world: GameWorld }) {
       scatter(world, 37, 70, 4, 45, (rand, position, matrix) => {
         _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
         _scale.set(0.5 + rand() * 0.6, 0.35 + rand() * 0.3, 0.5 + rand() * 0.6)
-        position.y = 0.15
+        position.y += 0.15 // lift ON TOP of the draped ground
         matrix.compose(position, _quat, _scale)
         return new Color('#54804a').offsetHSL(0, 0, (rand() - 0.5) * 0.1)
       }),
@@ -578,7 +653,7 @@ export function Nature({ world }: { world: GameWorld }) {
       scatter(world, 51, 24, 6, 50, (rand, position, matrix) => {
         _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
         _scale.set(0.25 + rand() * 0.5, 0.18 + rand() * 0.3, 0.25 + rand() * 0.5)
-        position.y = 0.08
+        position.y += 0.08 // lift ON TOP of the draped ground
         matrix.compose(position, _quat, _scale)
         return new Color('#8d8d86').offsetHSL(0, 0, (rand() - 0.5) * 0.08)
       }),
@@ -608,14 +683,17 @@ export function Nature({ world }: { world: GameWorld }) {
   return (
     <group userData={{ __boots: true }}>
       {/* y 0.05 clears host slab tops; the footprint hole (groundGeometry)
-          keeps the lawn from ever running under the building. */}
-      <mesh geometry={groundGeo} position={[center.x, 0.05, center.z]} rotation={[-Math.PI / 2, 0, 0]}>
-        {texture ? (
-          <meshStandardMaterial map={texture} roughness={1} />
-        ) : (
-          <meshStandardMaterial color="#4e7c3a" roughness={1} />
-        )}
-      </mesh>
+          keeps the lawn from ever running under the building. Suppressed
+          entirely when a host site owns the ground (shouldMountGroundDisc). */}
+      {groundGeo && (
+        <mesh geometry={groundGeo} position={[center.x, 0.05, center.z]} rotation={[-Math.PI / 2, 0, 0]}>
+          {texture ? (
+            <meshStandardMaterial map={texture} roughness={1} />
+          ) : (
+            <meshStandardMaterial color="#4e7c3a" roughness={1} />
+          )}
+        </mesh>
+      )}
 
       {/* Grass sectors: shared geometry + module material, one chunk per
           45° wedge — each culls against its own scatterBoundingSphere. */}

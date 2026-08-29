@@ -1,4 +1,9 @@
 import { sceneRegistry, useScene } from '@pascal-app/core'
+// Namespace import for FEATURE DETECTION only (hostTerrainHelpers): the
+// plugin's pinned core (0.9.1) predates the terrain-field exports, but the
+// host the plugin actually runs inside resolves this import to ITS core,
+// which may carry them. Never referenced through static names.
+import * as pascalCore from '@pascal-app/core'
 import { snapLevelsToTruePositions, useViewer } from '@pascal-app/viewer'
 import {
   Box3,
@@ -151,6 +156,29 @@ export type HostTreeNode = {
   hidden: boolean
 }
 
+/**
+ * The host lot, snapshotted at collect time so render-time consumers
+ * (nature.tsx) never touch sceneRegistry themselves: identity + polygon +
+ * how to read the ground height. The site's terrain surface / skirt / flat
+ * ground fill meshes are regular 'site' colliders in GameWorld.colliders.
+ */
+export type SiteSnapshot = {
+  nodeId: string
+  /** The registered site root (the SiteRenderer group). */
+  root: Object3D
+  /** Lot polygon in WORLD XZ (node polygon points through the site root's
+   * matrixWorld — identity for top-level sites, but never assumed). */
+  polygon: Array<[number, number]>
+  /** True when the node carries sculpted terrain data; false = the flat
+   * polygon ground fill at y = −0.05. */
+  hasTerrain: boolean
+  /** Analytic terrain surface height (m) at world (x, z) — present only when
+   * the HOST core exports the terrain-field helpers (feature-detected: the
+   * plugin's pinned core 0.9.1 predates them) AND the site has terrain.
+   * Callers without it fall back to siteGroundYAt (BVH probe). */
+  surfaceHeightAt: ((x: number, z: number) => number) | null
+}
+
 export type GameWorld = {
   colliders: ColliderEntry[]
   /** wall nodeId → its colliders' indices + node data (for stud generation). */
@@ -198,6 +226,11 @@ export type GameWorld = {
    * to uniform 2.8 m storeys); collectWorld fills it whenever the scene has
    * registered levels. builder.tsx installs it via grid.setStoreyLadder. */
   storeyLadder?: number[]
+  /** The first VISIBLE host site collected (its ground meshes are 'site'
+   * colliders). Null when the scene has no visible site — nature then mounts
+   * its own ground disc. Optional so hand-built test worlds don't have to
+   * carry it; collectWorld always fills it (possibly null). */
+  site?: SiteSnapshot | null
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -229,6 +262,14 @@ const SOLID_KINDS = [
   'chimney',
   'dormer',
   'elevator',
+  // The host lot itself: sculpted terrain surface + skirt (or the flat
+  // polygon ground fill) become walk colliders, so the player stands ON the
+  // hill instead of hovering at the y = 0 plane. Indestructible by
+  // construction — 'site' is outside every damage dispatch (shooting
+  // DESTRUCTIBLE, grenade fallback, prevoxelize walls). Guards in
+  // collectWorld: never merged into buildingAabb, swept with the
+  // all-registered-roots fence so child buildings stay out of its lane.
+  'site',
 ]
 
 /** Item-family kinds (all in SOLID_KINDS) whose GLASS-LIKE sub-meshes route
@@ -488,6 +529,16 @@ export function isGlassLikeMesh(mesh: Mesh): boolean {
   return Boolean((m.transparent && (m.opacity ?? 1) < 0.95) || (m.transmission ?? 0) > 0.2)
 }
 
+/** Is this mesh presentation-only backdrop? The host's SiteRenderer tags its
+ * horizon disc — a 400 m+ raycast-noop ground plate at y = −0.07 fading into
+ * the sky — with `userData.pascalExport = 'strip'` (the only such tag in the
+ * host today). BVH collision never goes through `mesh.raycast`, so without
+ * this filter the disc would become an enormous walkable "floor" collider
+ * covering every XZ probe on the map. */
+function isPresentationStrip(mesh: Mesh): boolean {
+  return (mesh.userData as { pascalExport?: string }).pascalExport === 'strip'
+}
+
 /** Is every effective material of this mesh flagged invisible? Windows ship
  * full-rect interaction HITBOXES as `mesh.visible = true` meshes whose
  * MATERIAL has `visible = false` — three.js never renders (or raycasts,
@@ -525,6 +576,7 @@ export function collectMeshes(root: Object3D, stopAt?: ReadonlySet<Object3D>): M
       mesh.isMesh &&
       mesh.visible &&
       !(mesh.userData as { __boots?: boolean }).__boots &&
+      !isPresentationStrip(mesh) &&
       !isMaterialInvisible(mesh) &&
       (mesh.geometry?.getAttribute?.('position')?.count ?? 0) >= 3
     ) {
@@ -833,6 +885,145 @@ export function collectRoadFootprints(colliders: readonly ColliderEntry[]): Road
   }
 
   return footprints
+}
+
+// ---------------------------------------------------------------------------
+// Host site / terrain — the lot the whole session stands on
+// ---------------------------------------------------------------------------
+
+/**
+ * Even-odd point-in-polygon over XZ (winding-agnostic ray crossing). Used to
+ * clamp nature scatter to the lot polygon — without the boots ground disc,
+ * anything beyond the polygon floats over the host's horizon plate. Fewer
+ * than 3 points is no polygon: nothing is inside it. Pure; exported for the
+ * site tests.
+ */
+export function pointInPolygonXZ(
+  points: ReadonlyArray<readonly [number, number]>,
+  x: number,
+  z: number,
+): boolean {
+  if (points.length < 3) return false
+  let inside = false
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const xi = points[i]![0]
+    const zi = points[i]![1]
+    const xj = points[j]![0]
+    const zj = points[j]![1]
+    if (zi > z !== zj > z && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) inside = !inside
+  }
+  return inside
+}
+
+const _siteRay = new Ray()
+const _siteHitPoint = new Vector3()
+
+/**
+ * Terrain surface height at world (x, z) read from the SITE colliders alone:
+ * a downward BVH raycast per XZ-covering site collider, cast from above the
+ * highest candidate top (mirrors probeSpawnSurfaceY) — the topmost hit wins.
+ * No walkability filter: scatter drapes flora onto steep banks too. Returns
+ * null when no site collider covers the XZ (off the lot, or a scene without
+ * a site). This is the fallback ground authority when the host core doesn't
+ * export the analytic terrain field (SiteSnapshot.surfaceHeightAt) — cache
+ * friendly: bvhFor memoizes per geometry and the scratch Ray/Vector3 are
+ * module-level, so a 20k-instance scatter pass allocates nothing.
+ */
+export function siteGroundYAt(
+  world: Pick<GameWorld, 'colliders'>,
+  x: number,
+  z: number,
+): number | null {
+  let ceiling = Number.NEGATIVE_INFINITY
+  for (const collider of world.colliders) {
+    if (collider.nodeType !== 'site' || collider.disabled) continue
+    const box = collider.worldBox
+    if (x < box.min.x || x > box.max.x || z < box.min.z || z > box.max.z) continue
+    if (box.max.y > ceiling) ceiling = box.max.y
+  }
+  if (!Number.isFinite(ceiling)) return null
+
+  const fromY = ceiling + 1
+  let best: number | null = null
+  for (const collider of world.colliders) {
+    if (collider.nodeType !== 'site' || collider.disabled) continue
+    const box = collider.worldBox
+    if (x < box.min.x || x > box.max.x || z < box.min.z || z > box.max.z) continue
+    if (best !== null && box.max.y <= best) continue
+    _siteRay.origin.set(x, fromY, z)
+    _siteRay.direction.set(0, -1, 0)
+    _siteRay.applyMatrix4(collider.inverse)
+    const hit = collider.bvh.raycastFirst(_siteRay, 2)
+    if (!hit) continue
+    const worldY = _siteHitPoint.copy(hit.point).applyMatrix4(collider.mesh.matrixWorld).y
+    if (best === null || worldY > best) best = worldY
+  }
+  return best
+}
+
+/** The host core's analytic terrain helpers, when its version exports them. */
+type TerrainHelperFns = {
+  fieldOf: (site: { id: string; terrain?: unknown }) => unknown
+  surfaceHeightAt: (field: unknown, x: number, z: number) => number
+}
+
+/**
+ * FEATURE-DETECT the analytic ground authority: `terrainFieldOf` +
+ * `surfaceHeightAt` shipped in the host core well after the plugin's pinned
+ * 0.9.1 — a static named import would fail type-check against the pin and
+ * crash module load on an old host. Detected off the namespace import at
+ * call time, so whichever core the HOST bundles decides.
+ */
+function hostTerrainHelpers(): TerrainHelperFns | null {
+  const core = pascalCore as unknown as Record<string, unknown>
+  const fieldOf = core.terrainFieldOf
+  const surfaceHeightAt = core.surfaceHeightAt
+  if (typeof fieldOf !== 'function' || typeof surfaceHeightAt !== 'function') return null
+  return {
+    fieldOf: fieldOf as TerrainHelperFns['fieldOf'],
+    surfaceHeightAt: surfaceHeightAt as TerrainHelperFns['surfaceHeightAt'],
+  }
+}
+
+const _sitePolygonPoint = new Vector3()
+
+/**
+ * Build the GameWorld.site snapshot from the picked site node: world-space
+ * polygon + terrain flag + the analytic height closure when the host core
+ * provides one (see hostTerrainHelpers — injectable for tests). A throwing
+ * helper (host-version mismatch) degrades to the BVH-probe fallback, never
+ * takes down Jump-in.
+ */
+export function buildSiteSnapshot(
+  pick: { id: string; root: Object3D; node: Record<string, unknown> } | null,
+  helpers: TerrainHelperFns | null = hostTerrainHelpers(),
+): SiteSnapshot | null {
+  if (!pick) return null
+  const polygonRaw = (pick.node.polygon as { points?: unknown } | undefined)?.points
+  const polygon: Array<[number, number]> = []
+  if (Array.isArray(polygonRaw)) {
+    pick.root.updateWorldMatrix(true, false)
+    for (const point of polygonRaw) {
+      if (!Array.isArray(point) || typeof point[0] !== 'number' || typeof point[1] !== 'number') {
+        continue
+      }
+      _sitePolygonPoint.set(point[0], 0, point[1]).applyMatrix4(pick.root.matrixWorld)
+      polygon.push([_sitePolygonPoint.x, _sitePolygonPoint.z])
+    }
+  }
+  const hasTerrain = pick.node.terrain != null
+  let surfaceHeightAt: SiteSnapshot['surfaceHeightAt'] = null
+  if (hasTerrain && helpers) {
+    try {
+      const field = helpers.fieldOf({ id: pick.id, terrain: pick.node.terrain })
+      if (field) {
+        surfaceHeightAt = (x: number, z: number) => helpers.surfaceHeightAt(field, x, z)
+      }
+    } catch {
+      surfaceHeightAt = null
+    }
+  }
+  return { nodeId: pick.id, root: pick.root, polygon, hasTerrain, surfaceHeightAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,8 +1401,11 @@ export function probeSpawnSurfaceY(
 /**
  * The Y the spawn's FEET start at for a chosen XZ: the topmost walkable
  * collider surface there (+ SPAWN_SETTLE_EPS), else the lot's terrain plane
- * at 0. Surfaces BELOW the lot plane (recessed patios) clamp up to 0 too —
- * collision.ts's infinite ground plane would fight anything lower. This
+ * at 0. Surfaces BELOW the lot plane (recessed patios, EXCAVATED site
+ * terrain) clamp up to 0 too — collision.ts's infinite ground plane would
+ * fight anything lower. v1 site posture: hills probe to their true height
+ * through the 'site' colliders; excavations behave as an invisible floor
+ * at 0 (the Math.max stays until the lot plane learns siteMinHeight). This
  * replaces the old lowest-LEVEL-elevation guess, which knew nothing about
  * what actually stands at the spawn XZ: a raised site slab / terrace under
  * the ring spawn left the player waist-deep in it on large real projects
@@ -1448,6 +1642,16 @@ export function collectWorld(): GameWorld {
   // item roots; those subtrees are collected under their own nodeId instead.
   const solidRoots = collectSolidRoots()
 
+  // The SITE sweep fences at EVERY registered root, not just the solid ones:
+  // the SiteRenderer mounts its children (buildings → levels → …) inside the
+  // registered site group, and a solid-only fence would sweep any level-side
+  // presentation mesh (zone fills, grids) into the indestructible site lane.
+  // Lazy — only built when a site is actually collected.
+  let siteFence: Set<Object3D> | null = null
+
+  // First visible site — snapshotted for GameWorld.site after the loop.
+  let sitePick: { id: string; root: Object3D; node: Record<string, unknown> } | null = null
+
   for (const kind of SOLID_KINDS) {
     const ids = sceneRegistry.byType[kind]
     if (!ids) continue
@@ -1468,8 +1672,12 @@ export function collectWorld(): GameWorld {
       if (hidden) continue
 
       root.updateWorldMatrix(true, true)
-      const meshes = collectMeshes(root, solidRoots)
+      if (kind === 'site' && !siteFence) {
+        siteFence = new Set<Object3D>(sceneRegistry.nodes.values())
+      }
+      const meshes = collectMeshes(root, kind === 'site' ? siteFence! : solidRoots)
       if (meshes.length === 0) continue
+      if (kind === 'site' && !sitePick) sitePick = { id, root, node }
 
       // Glass split: window panes AND glass-like sub-meshes of item-family
       // nodes (shower doors, cabinet fronts, counter splash panels…) join
@@ -1491,7 +1699,10 @@ export function collectWorld(): GameWorld {
       for (const mesh of solidMeshes) {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
         meshBounds.copy(mesh.geometry.boundingBox!).applyMatrix4(mesh.matrixWorld)
-        buildingAabb.union(meshBounds)
+        // REQUIRED site guard: the lot surface spans the whole parcel —
+        // merging it into buildingAabb would inflate the spawn ring, the
+        // nature hole, the sky center and crater rejection to the entire lot.
+        if (kind !== 'site') buildingAabb.union(meshBounds)
         // BVH is LAZY: building hundreds of trees synchronously at snapshot
         // time blocks the main thread for seconds on a real house (the
         // "frozen frame on Jump in" class of bug). bvhFor caches per
@@ -1546,6 +1757,10 @@ export function collectWorld(): GameWorld {
   const overlayRoots = collectOverlayRoots()
   const roadFootprints = collectRoadFootprints(colliders)
   const hostTrees = collectHostTrees(nodes)
+  // The lot snapshot: nature reads existence (ground-disc suppression),
+  // polygon (scatter clamp) and the analytic height (drape) off this —
+  // never off the registry at render time.
+  const site = buildSiteSnapshot(sitePick)
   // The build lattice adopts the building's frame — identity when nothing
   // dominates (empty lot) or the building already sits on the legacy grid.
   const gridAnchor = deriveGridAnchor(walls.values())
@@ -1605,6 +1820,7 @@ export function collectWorld(): GameWorld {
     hostTrees,
     gridAnchor,
     storeyLadder,
+    site,
     buildingAabb,
     spawn,
     spawnYaw,
