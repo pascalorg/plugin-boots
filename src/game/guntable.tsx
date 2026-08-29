@@ -579,20 +579,29 @@ function BreakerPanel({ world }: { world: GameWorld }) {
 
   return (
     <group position={[3.0, 0, 0]} rotation={[0, Math.PI / 2, 0]}>
-      {/* steel backplate on the end wall */}
-      <mesh position={[0, 0.88, 0.03]}>
+      {/* SERVICE CABINET PLATE: the end-wall corrugation ribs stand 0.065 m
+       * proud of the wall plane and were slicing across the sign and the
+       * handle (owner report — vertical stripes in front of everything).
+       * This plate spans wall→0.12 and the whole assembly mounts on it, so
+       * sign, lever and stripes all read in FRONT of the ribs, square-on. */}
+      <mesh position={[0, 0.93, 0.06]}>
+        <boxGeometry args={[1.14, 1.58, 0.12]} />
+        <meshStandardMaterial color={STEEL} metalness={0.45} roughness={0.55} />
+      </mesh>
+      {/* steel backplate on the cabinet */}
+      <mesh position={[0, 0.88, 0.15]}>
         <boxGeometry args={[0.42, 0.55, 0.06]} />
         <meshStandardMaterial color="#2a2d33" metalness={0.5} roughness={0.5} />
       </mesh>
       {/* hinge bosses on the pivot line */}
       {[-0.11, 0.11].map((x) => (
-        <mesh key={x} position={[x, 0.72, 0.08]} rotation={[0, 0, Math.PI / 2]}>
+        <mesh key={x} position={[x, 0.72, 0.2]} rotation={[0, 0, Math.PI / 2]}>
           <cylinderGeometry args={[0.035, 0.035, 0.05, 10]} />
           <meshStandardMaterial color="#54565c" metalness={0.6} roughness={0.4} />
         </mesh>
       ))}
       {/* the massive two-hand lever — pivot at the hinge line */}
-      <group position={[0, 0.72, 0.08]} ref={leverRef} rotation={[LEVER_UP, 0, 0]}>
+      <group position={[0, 0.72, 0.2]} ref={leverRef} rotation={[LEVER_UP, 0, 0]}>
         {[-0.11, 0.11].map((x) => (
           <mesh key={x} position={[x, 0.21, 0]}>
             <boxGeometry args={[0.045, 0.42, 0.035]} />
@@ -605,10 +614,10 @@ function BreakerPanel({ world }: { world: GameWorld }) {
           <meshStandardMaterial color="#c43a35" roughness={0.5} />
         </mesh>
       </group>
-      {/* the marching orders, stenciled above the switch */}
-      <StencilSign position={[0, 1.42, 0.03]} text="PUT YOUR BOOTS ON" width={1.05} height={0.2} />
+      {/* the marching orders, stenciled on the cabinet above the switch */}
+      <StencilSign position={[0, 1.42, 0.135]} text="PUT YOUR BOOTS ON" width={1.05} height={0.2} />
       {/* hazard stripes under the handle's throw arc */}
-      <HazardStripes position={[0, 0.34, 0.03]} size={[1.0, 0.26]} />
+      <HazardStripes position={[0, 0.34, 0.135]} size={[1.0, 0.26]} />
     </group>
   )
 }
