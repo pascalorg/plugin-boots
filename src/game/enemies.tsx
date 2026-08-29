@@ -669,7 +669,7 @@ type BotPart = {
   amp?: number
   /** Gait phase offset (dog legs, rad). */
   off?: number
-  /** Spin per frame (rotors, signed rad). */
+  /** Spin rate (rotors, signed rad/s — dt-scaled in the frame loop). */
   spin?: number
   /** Pristine material to restore when the scorch read clears (hull). */
   base?: Material
@@ -680,7 +680,7 @@ function BotModel({ bot }: { bot: Bot }) {
   /** Applied scorch stage (0 pristine, 1 <40% hp, 2 <20%) — swap-on-change. */
   const scorch = useRef(0)
 
-  useFrame(() => {
+  useFrame((_, rawDt) => {
     const group = ref.current
     if (!group) return
     group.position.copy(bot.position)
@@ -696,8 +696,10 @@ function BotModel({ bot }: { bot: Bot }) {
     // Walk cycles — roles + per-unit params stamped in the JSX below; the
     // userData records are created once at mount, so this loop allocates
     // nothing. Droid arms counter-swing their legs; dog legs each carry a
-    // seeded gait phase; rotors are rotation-only spins.
+    // seeded gait phase; rotors are rotation-only dt-scaled spins (rad/s,
+    // wrapped to ±2π so rotation.y never drifts into float-precision loss).
     const swing = Math.sin(bot.phase)
+    const dt = Math.min(rawDt, 1 / 30)
     for (const child of group.children) {
       const part = child.userData as BotPart
       if (part.role === 'legL') child.rotation.x = swing * (part.amp ?? 0.7)
@@ -706,7 +708,11 @@ function BotModel({ bot }: { bot: Bot }) {
       else if (part.role === 'armR') child.rotation.x = swing * (part.amp ?? 0.5)
       else if (part.role === 'gait') child.rotation.x = Math.sin(bot.phase + (part.off ?? 0)) * 0.65
       else if (part.role === 'tail') child.rotation.y = Math.sin(bot.phase * 1.7) * 0.55
-      else if (part.role === 'rotor') child.rotation.y += part.spin ?? 0.9
+      else if (part.role === 'rotor') {
+        const y = child.rotation.y + (part.spin ?? 54) * dt
+        const tau = Math.PI * 2
+        child.rotation.y = y > tau ? y - tau : y < -tau ? y + tau : y
+      }
     }
     // DAMAGE READ: below 40% hp the main panels flip to the scorched set
     // (heavier again under 20%) — shared-material swap, only on stage change.
@@ -907,7 +913,7 @@ function BotModel({ bot }: { bot: Bot }) {
           material={ROTOR}
           position={[x, 0.07, z]}
           scale={[0.115, 0.014, 0.08]}
-          userData={{ role: 'rotor', spin: i % 2 ? -0.9 : 0.9 }}
+          userData={{ role: 'rotor', spin: i % 2 ? -54 : 54 }}
         />
       ))}
       {/* sensor eye — bright unlit red, reads as a glow */}

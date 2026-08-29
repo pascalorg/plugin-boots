@@ -128,25 +128,33 @@ export function deadLatticeKeys(
   return out
 }
 
+/** Module scratch for latticeCellWorldCenter — single-threaded, fully
+ * overwritten by rotateByBasisInverse on every call. */
+const latticeVec = { x: 0, y: 0, z: 0 }
+
 /** World-space center of a LATTICE cell (which may carry no voxel — edge
  * fragments live on such cells): the geometric cell center pushed through
- * the grid→world transform. Fresh tuple per call (per-carve path only). */
+ * the grid→world transform. Writes into `out` (like its voxel.ts siblings)
+ * so the per-carve debris pick allocates nothing. */
 export function latticeCellWorldCenter(
   grid: VoxelGridData,
   cell: number,
+  out: [number, number, number] = [0, 0, 0],
 ): [number, number, number] {
   const ix = cell % grid.nx
   const iy = Math.floor(cell / grid.nx) % grid.ny
   const iz = Math.floor(cell / (grid.nx * grid.ny))
-  const v = { x: 0, y: 0, z: 0 }
   rotateByBasisInverse(
     grid.q,
     grid.origin.x + (ix + 0.5) * grid.cellX,
     grid.origin.y + (iy + 0.5) * grid.cellY,
     grid.origin.z + (iz + 0.5) * grid.cellZ,
-    v,
+    latticeVec,
   )
-  return [v.x, v.y, v.z]
+  out[0] = latticeVec.x
+  out[1] = latticeVec.y
+  out[2] = latticeVec.z
+  return out
 }
 
 /**
@@ -262,7 +270,7 @@ const ShellTargetLayer = memo(function ShellTargetLayer({
   const killed = useRef<Uint8Array>(new Uint8Array(shell.fragments.length))
   const deadScratch = useRef<number[]>([])
   const keysScratch = useRef<number[]>([])
-  const batchScratch = useRef<ShellRemovalBatch>({ fragments: [], ranges: [] })
+  const batchScratch = useRef<ShellRemovalBatch>({ fragments: [] })
   const worldArraysRef = useRef<ShellGeometryArrays | null>(null)
 
   // Census registration: the wrapper's killed flags include the voxel-less
@@ -275,6 +283,14 @@ const ShellTargetLayer = memo(function ShellTargetLayer({
   }, [target])
 
   const transform = useMemo(() => gridFrameToWorld(target.grid), [target])
+
+  // Hoisted once per target (not rebuilt per carve): the debris pick's cell
+  // lookup, reusing one tuple — pickDebrisFragments reads the components
+  // immediately, so the shared scratch is safe.
+  const cellCenters = useMemo(() => {
+    const out: [number, number, number] = [0, 0, 0]
+    return (cell: number) => latticeCellWorldCenter(target.grid, cell, out)
+  }, [target])
 
   // Priority −1: run BEFORE the default-frame consumers (ShellMesh, the
   // debris binds, voxel-walls) so a carve's shell death + chip spawn land
@@ -322,7 +338,7 @@ const ShellTargetLayer = memo(function ShellTargetLayer({
       batch.fragments,
       shell,
       [cx, cy, cz],
-      (cell) => latticeCellWorldCenter(target.grid, cell),
+      cellCenters,
       DEBRIS_PICK_CAP,
     )
     const floorY = probeLandingY(world, cx, cy, cz)

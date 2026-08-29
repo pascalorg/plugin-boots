@@ -62,7 +62,6 @@ describe('drainShellRemovals', () => {
     const killed = new Uint8Array(3)
     const batch = drainShellRemovals(shell, [1], killed)
     expect(batch.fragments).toEqual([0])
-    expect(batch.ranges).toEqual([{ start: 0, count: 6 }])
     expect([...killed]).toEqual([1, 0, 0])
   })
 
@@ -75,7 +74,6 @@ describe('drainShellRemovals', () => {
     // Re-reading the same (non-cleared) queue later is free.
     const second = drainShellRemovals(shell, [0, 1, 0], killed)
     expect(second.fragments).toEqual([])
-    expect(second.ranges).toEqual([])
   })
 
   test('skips surface-less cells and returns each new fragment once', () => {
@@ -85,22 +83,16 @@ describe('drainShellRemovals', () => {
     expect([...killed]).toEqual([0, 0, 0])
     const batch = drainShellRemovals(shell, [4, 2, 0], killed)
     expect(batch.fragments).toEqual([2, 1, 0])
-    expect(batch.ranges).toEqual([
-      { start: 9, count: 9 },
-      { start: 6, count: 3 },
-      { start: 0, count: 6 },
-    ])
     expect([...killed]).toEqual([1, 1, 1])
   })
 
   test('reuses a caller-provided batch (lengths reset)', () => {
     const shell = fakeShell([0, 0, 1, -1, 2], fragments)
     const killed = new Uint8Array(3)
-    const out: ShellRemovalBatch = { fragments: [7, 7, 7], ranges: [] }
+    const out: ShellRemovalBatch = { fragments: [7, 7, 7] }
     const batch = drainShellRemovals(shell, [2], killed, out)
     expect(batch).toBe(out)
     expect(out.fragments).toEqual([1])
-    expect(out.ranges).toEqual([{ start: 6, count: 3 }])
   })
 })
 

@@ -78,8 +78,9 @@ export function killFragmentIndices(
   return { start: indexStart, count: indexCount }
 }
 
-/** One drain's newly dead fragments + their index ranges (reusable scratch). */
-export type ShellRemovalBatch = { fragments: number[]; ranges: ShellIndexRange[] }
+/** One drain's newly dead fragments (reusable scratch). Index ranges are
+ * re-derived from shell.fragments by whoever carves — never stored here. */
+export type ShellRemovalBatch = { fragments: number[] }
 
 /**
  * Map dead CELLS to newly dead FRAGMENTS. RULE: a fragment dies when ANY of
@@ -95,17 +96,14 @@ export function drainShellRemovals(
   shell: ShellData,
   deadCells: Iterable<number>,
   killed: Uint8Array,
-  out: ShellRemovalBatch = { fragments: [], ranges: [] },
+  out: ShellRemovalBatch = { fragments: [] },
 ): ShellRemovalBatch {
   out.fragments.length = 0
-  out.ranges.length = 0
   for (const cell of deadCells) {
     const fragment = shell.fragmentForCell[cell] ?? -1
     if (fragment < 0 || killed[fragment] !== 0) continue
     killed[fragment] = 1
-    const range = shell.fragments[fragment]!
     out.fragments.push(fragment)
-    out.ranges.push({ start: range.indexStart, count: range.indexCount })
   }
   return out
 }
@@ -146,7 +144,7 @@ export function ShellMesh({
   const killedRef = useRef<Uint8Array>(new Uint8Array(0))
   const aliveRef = useRef(0)
   const revisionSeen = useRef(Number.NaN)
-  const drainOut = useRef<ShellRemovalBatch>({ fragments: [], ranges: [] })
+  const drainOut = useRef<ShellRemovalBatch>({ fragments: [] })
 
   // Build ONCE per shell identity. Vertex attributes wrap shell's arrays
   // (never mutated); the index is a fresh COPY (the live one gets carved —

@@ -316,7 +316,20 @@ export function spawnShellDebris(
   for (const fragment of fragments) {
     const range = shell.fragments[fragment]
     if (!range || range.indexCount === 0) continue
-    const i = claimSlot(slots)
+    // ARRAY AFFINITY: prefer a dead slot whose geometry already wraps THESE
+    // vertex arrays — bindSlot then keeps its BufferAttributes and uploads
+    // only the index range. Any other pick makes bindSlot rebuild the vertex
+    // attributes (a full GPU re-upload of the shell's vertex set), which
+    // cross-target thrash would otherwise trigger on every ping-pong.
+    let i = -1
+    for (let k = 0; k < slots.length; k++) {
+      const s = slots[k]!
+      if (!s.alive && s.arrays === shellGeometryArrays) {
+        i = k
+        break
+      }
+    }
+    if (i < 0) i = claimSlot(slots)
     const slot = slots[i]!
     if (!slot.alive) liveCount++
     if (slot.indices.length < range.indexCount) slot.indices = new Uint32Array(range.indexCount)
