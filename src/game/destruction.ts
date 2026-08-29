@@ -4,6 +4,8 @@ import {
   BufferAttribute,
   BufferGeometry,
   Color,
+  type Material,
+  Matrix3,
   Matrix4,
   Mesh,
   type Object3D,
@@ -64,7 +66,8 @@ import {
   type VoxelGridData,
   type VoxelSource,
 } from './voxel'
-import { bvhFor, type GameWorld, ITEM_FAMILY_KINDS } from './world'
+import { buildShellData, type ShellData, type ShellSourceTri } from './shell'
+import { bvhFor, type GameWorld, isGlassLikeMesh, ITEM_FAMILY_KINDS } from './world'
 
 /**
  * Voxel destruction manager — "everything should be able to break apart".
@@ -355,6 +358,20 @@ export type VoxelTarget = {
    * baseColor per cell (same value jitter as walls) and debris tint reads
    * it through cellTint. Never touched per frame. */
   cellColors?: Float32Array
+  /** Conforming shell fragments (S0 — walls only, behind the session-
+   * latched shellFlags.wall): the wall's REAL surface clipped into
+   * 1–6-cell fragments (shell.ts). NOTE the indexing contract:
+   * fragmentForCell / cellsOfFragment use LATTICE keys
+   * (ix + nx·(iy + ny·iz)) — grid.count counts OCCUPIED voxels only, so
+   * the shell is built over the full lattice (map a voxel index through
+   * grid.coords to get its lattice key). Any fallback (flag off, tri cap,
+   * clipper throw, no readable triangles) leaves this undefined = today's
+   * voxel-only path, bit-identical. */
+  shell?: ShellData
+  /** The shell's material table — HOST material instances BY REFERENCE
+   * (never clone/mutate/dispose; they outlive the session), indexed by
+   * ShellGroup.materialIndex. Present exactly when `shell` is. */
+  shellMaterials?: Material[]
   /** True for plates SYNTHESIZED under zero-extent ceiling planes: their
    * cells hold another target up only by direct contact (structure.ts
    * PLATE_CONTACT_SLACK), never across the general SUPPORT_GAP band — a
@@ -1835,6 +1852,157 @@ export function setTargetLiveListener(cb: ((nodeId: string) => void) | null): vo
   targetLiveListener = cb
 }
 
+// ── Conforming shell lane (S0 — walls only, flag-latched) ───────────────────
+// The wall's REAL surface, clipped into per-cell fragments (shell.ts), so
+// the first hit swaps the host mesh for a pixel-identical partitioned twin
+// instead of the voxel-cube read. Everything here runs at VOXELIZE time
+// only; carves/saves/raycasts keep reading the grid, untouched.
+
+/** Live shell toggles (QA: `__boots.setShell('wall', true)`). Read ONCE per
+ * session, at the session's first wall voxelize (prevoxelize reaches every
+ * wall before any damage can) — see shellWallEnabled. Default OFF. */
+export const shellFlags = { wall: false }
+
+/** Flip a shell flag — affects the NEXT session only (prevoxelize latch). */
+export function setShellFlag(kind: 'wall', v: boolean): void {
+  shellFlags[kind] = v
+}
+
+/** The session's latched flag value (null = not latched yet). */
+let shellWallLatch: boolean | null = null
+
+/** Latch-on-first-read runtime guard: the first wall voxelize of a session
+ * freezes shellFlags.wall for the WHOLE session, so a mid-session flip
+ * can never split one house into shelled + unshelled walls — a state no
+ * renderer or save lane has to reason about. resetDestruction re-arms it. */
+function shellWallEnabled(): boolean {
+  if (shellWallLatch === null) shellWallLatch = shellFlags.wall
+  return shellWallLatch
+}
+
+/** FNV-1a over the node id — the deterministic shell seed (same node id ⇒
+ * same fragment pattern, every session). */
+function hashString(s: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193)
+  return h >>> 0
+}
+
+const _shellNormalMat = new Matrix3()
+const _shellV = new Vector3()
+const _shellFrame = { x: 0, y: 0, z: 0 }
+
+/**
+ * Collect a wall's host-mesh triangles in the SHELL frame — the grid frame
+ * with the origin at zero (shell.ts assigns cells by flooring positions by
+ * the cell size directly): p_shell = rotateByBasis(grid.q, p_world) − origin,
+ * exactly the world→grid math buildVoxelGrid folds into its samplers (and
+ * removeSphere/raycastVoxels apply per query). Normals ride the mesh's
+ * normal matrix then the same basis rotation; uvs are carried VERBATIM (the
+ * shell renders with the host's own material instances). Glass-like
+ * sub-meshes are skipped — wall mesh sets are NOT glass-split by
+ * collectWorld, and panes belong to the shatter lane. materialIndex points
+ * into the returned `materials` table: HOST material instances BY
+ * REFERENCE, deduped across meshes and geometry groups.
+ */
+function collectShellSourceTris(
+  meshes: readonly Mesh[],
+  grid: VoxelGridData,
+): { tris: ShellSourceTri[]; materials: Material[] } {
+  const tris: ShellSourceTri[] = []
+  const materials: Material[] = []
+  const { origin, q } = grid
+  for (const mesh of meshes) {
+    if (isGlassLikeMesh(mesh)) continue
+    const geometry = mesh.geometry
+    const position = geometry.getAttribute('position')
+    if (!position) continue
+    const normal = geometry.getAttribute('normal')
+    const uv = geometry.getAttribute('uv')
+    const index = geometry.index
+    const meshMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    const slotOfMaterial = meshMaterials.map((m) => {
+      let slot = materials.indexOf(m)
+      if (slot < 0) {
+        slot = materials.length
+        materials.push(m)
+      }
+      return slot
+    })
+    _shellNormalMat.getNormalMatrix(mesh.matrixWorld)
+    const vertexCount = index ? index.count : position.count
+    const groups =
+      geometry.groups.length > 0
+        ? geometry.groups
+        : [{ start: 0, count: vertexCount, materialIndex: 0 }]
+    for (const group of groups) {
+      const materialIndex =
+        slotOfMaterial[Math.min(group.materialIndex ?? 0, slotOfMaterial.length - 1)] ?? 0
+      const end = Math.min(group.start + group.count, vertexCount)
+      for (let i = group.start; i + 3 <= end; i += 3) {
+        const positions: number[] = []
+        const normals: number[] = []
+        const uvs: number[] = []
+        for (let k = 0; k < 3; k++) {
+          const vi = index ? index.getX(i + k) : i + k
+          _shellV.fromBufferAttribute(position, vi).applyMatrix4(mesh.matrixWorld)
+          rotateByBasis(q, _shellV.x, _shellV.y, _shellV.z, _shellFrame)
+          positions.push(
+            _shellFrame.x - origin.x,
+            _shellFrame.y - origin.y,
+            _shellFrame.z - origin.z,
+          )
+          if (normal) {
+            _shellV.fromBufferAttribute(normal, vi).applyMatrix3(_shellNormalMat).normalize()
+            rotateByBasis(q, _shellV.x, _shellV.y, _shellV.z, _shellFrame)
+            normals.push(_shellFrame.x, _shellFrame.y, _shellFrame.z)
+          } else normals.push(0, 1, 0)
+          if (uv) uvs.push(uv.getX(vi), uv.getY(vi))
+          else uvs.push(0, 0)
+        }
+        tris.push({ positions, normals, uvs, materialIndex })
+      }
+    }
+  }
+  return { tris, materials }
+}
+
+/**
+ * Build the conforming shell for one WALL target, or undefined on ANY
+ * fallback (no readable triangles, SHELL_TRI_CAP exceeded, clipper throw)
+ * — the caller keeps today's voxel-only path then, never crashes. The
+ * ShellGrid gets the FULL lattice count (nx·ny·nz): fragmentForCell is
+ * indexed by lattice keys, not voxel indices (see the VoxelTarget.shell
+ * doc).
+ */
+function buildWallShell(
+  nodeId: string,
+  meshes: readonly Mesh[],
+  grid: VoxelGridData,
+): { shell: ShellData; materials: Material[] } | undefined {
+  try {
+    const { tris, materials } = collectShellSourceTris(meshes, grid)
+    if (tris.length === 0 || materials.length === 0) return undefined
+    const shell = buildShellData(
+      tris,
+      {
+        nx: grid.nx,
+        ny: grid.ny,
+        nz: grid.nz,
+        cellX: grid.cellX,
+        cellY: grid.cellY,
+        cellZ: grid.cellZ,
+        count: grid.nx * grid.ny * grid.nz,
+      },
+      hashString(nodeId),
+    )
+    if (!shell) return undefined
+    return { shell, materials }
+  } catch {
+    return undefined // clipper threw — per-target voxel fallback, never crash
+  }
+}
+
 /**
  * Voxelize ANY collider group on first damage; hides the host meshes via
  * the session ledger. Walls (world.walls) become two drywall skins with
@@ -2029,6 +2197,14 @@ export function ensureVoxelTarget(
   const ceilingSlab = kind === 'slab' && nodeType === 'ceiling'
   const toneKind: SkinToneKind = floorSlab ? 'floor' : kind
   const surfaceMaterial = itemPalette || coatColor ? null : dominantTargetMaterial(meshes, toneKind)
+  // CONFORMING SHELL (S0, session-latched flag): walls also carry their
+  // real surface partitioned into per-cell fragments. Shelled walls
+  // register DORMANT below — the host keeps rendering AND colliding until
+  // the first damage wakes them (damageTarget → wakeTarget), and the wake
+  // IS the swap: hideHostNode runs there while the shell + core replicas
+  // flip visible off the same `dormant` drop / store bump. Any build
+  // fallback keeps today's instant-awake voxel path.
+  const wallShell = wall && shellWallEnabled() ? buildWallShell(nodeId, meshes, grid) : undefined
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -2072,12 +2248,16 @@ export function ensureVoxelTarget(
     contactOnlySupport,
     floorCore: floorSlab || undefined,
     ceilingTop: ceilingSlab || undefined,
+    shell: wallShell?.shell,
+    shellMaterials: wallShell?.materials,
   }
 
   // Hide the host meshes + hand the colliders over (keep-aware — see
   // hideHostNode for the hosted-children fencing rules). Dormant prebuilds
   // defer the hide to wakeTarget — the host keeps rendering AND colliding.
-  if (opts?.dormant) {
+  // Shelled walls ALWAYS register dormant: the first-damage wake is the
+  // host→shell swap moment (invisible — the shell IS the host surface).
+  if (opts?.dormant || wallShell) {
     target.dormant = true
     dormantCount++
     target.hostMeshes = meshes
@@ -2093,7 +2273,7 @@ export function ensureVoxelTarget(
   registerStructureTarget(target, kind)
   // Paint decal lane: awake voxelize = the replica is live NOW; dormant
   // prebuilds fire from wakeTarget instead (the host is still showing).
-  if (!opts?.dormant) targetLiveListener?.(nodeId)
+  if (!target.dormant) targetLiveListener?.(nodeId)
   return target
 }
 
@@ -3986,6 +4166,7 @@ export function resetDestruction(): void {
   blastEpoch++
   dormantRoofHide.clear()
   dormantCount = 0
+  shellWallLatch = null // next session re-reads shellFlags (prevoxelize latch)
   if (sceneSupportTimer !== null) {
     clearTimeout(sceneSupportTimer)
     sceneSupportTimer = null

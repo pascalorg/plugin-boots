@@ -190,6 +190,29 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
   return out.copy(base).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * jitter)
 }
 
+// ── Core tone (conforming-shell targets: the voxels become the CORE) ────────
+
+/** The gypsum-gray family a wall core pulls toward — the inside of a
+ * drywall sandwich reads as compressed gypsum, whatever the facade coat. */
+const CORE_GYPSUM = new Color('#a8a29a')
+
+/**
+ * The CORE tone of a shelled target's cell — voxel-walls' core mode primes
+ * the skin layer with this instead of the facade pattern tones (the facade
+ * lives on the conforming shell mesh now): the base darkened into a
+ * structural read (lightness −0.18 plus a slight desaturation), with one
+ * kind tweak — 'wall' cores first pull toward the gypsum-gray family,
+ * while every other kind (slab/floor cores keep their dirt-toned base)
+ * takes only the darkening. Pure — writes into `out` and returns it; no
+ * per-cell jitter (the core is a uniform structural fill, and the shell
+ * carries all the visual variation).
+ */
+export function coreCellColor(base: Color, kind: string, out: Color): Color {
+  out.copy(base)
+  if (kind === 'wall') out.lerp(CORE_GYPSUM, 0.35)
+  return out.offsetHSL(0, -0.08, -0.18)
+}
+
 // ── Per-cell texture patterns (stage 2: "the same texture", not one tone) ───
 // A voxel replica should carry the host surface's PATTERN — brick courses,
 // shingle rows — not one averaged tone. Whenever the tone chain has a

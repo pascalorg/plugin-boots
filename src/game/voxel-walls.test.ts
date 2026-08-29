@@ -4,6 +4,8 @@ import { ensureVoxelTarget, resetDestruction, useDestruction, wakeTarget } from 
 import { CEILING_FACE_TINT } from './skin-tone'
 import {
   CEILING_GEOMETRY,
+  CORE_INSET_FRAC,
+  coreThicknessAxis,
   DORMANT_PRIME_PER_FRAME,
   type DormantPrimeEntry,
   dormantPrimeQueueSize,
@@ -292,5 +294,26 @@ describe('ceiling face tint (round-5 QA eave teeth: attic side mutes per FACE)',
     expect(target.kind).toBe('slab')
     expect(target.ceilingTop).toBe(true)
     expect(target.floorCore).toBeFalsy()
+  })
+})
+
+describe('core mode (conforming-shell targets) — pure helpers', () => {
+  test('coreThicknessAxis picks the smallest PHYSICAL extent, like dropInteriorCells', () => {
+    // Anisotropic wall grid: thin z cells but as many layers as x/y spans —
+    // raw spans lie, metres do not.
+    expect(coreThicknessAxis({ nx: 14, ny: 18, nz: 3, cellX: 0.15, cellY: 0.15, cellZ: 0.04 })).toBe(2)
+    // Wall thin along x.
+    expect(coreThicknessAxis({ nx: 3, ny: 18, nz: 14, cellX: 0.04, cellY: 0.15, cellZ: 0.15 })).toBe(0)
+    // Slab sandwich: thickness axis is Y.
+    expect(coreThicknessAxis({ nx: 10, ny: 3, nz: 12, cellX: 0.3, cellY: 0.05, cellZ: 0.3 })).toBe(1)
+  })
+
+  test('CORE_INSET_FRAC leaves a strictly-inside core (both directions, > 0 remains)', () => {
+    // ~20% off each side: the remaining scale must be positive and strictly
+    // under the shell surface (1 − 2·frac of the cell).
+    expect(CORE_INSET_FRAC).toBeCloseTo(0.2, 10)
+    const remaining = 1 - 2 * CORE_INSET_FRAC
+    expect(remaining).toBeGreaterThan(0)
+    expect(remaining).toBeLessThan(1)
   })
 })

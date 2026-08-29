@@ -6,6 +6,7 @@ import {
   cellToneAt,
   clearToneAudit,
   FLOOR_CORE_HEX,
+  coreCellColor,
   isUntexturedWhite,
   kindFallbackTone,
   mapPatternGrid,
@@ -759,5 +760,49 @@ describe('per-cell texture patterns', () => {
     ceiling.getHSL(hslC)
     top.getHSL(hslT)
     expect(hslC.l).toBeGreaterThan(hslT.l)
+  })
+})
+
+describe('coreCellColor (conforming-shell core tone)', () => {
+  test('darkened structural read: lightness −0.18, slight desaturation, pure + deterministic', () => {
+    const base = new Color('#c0392b') // saturated brick red
+    const out = coreCellColor(base, 'slab', new Color())
+    // Non-wall kinds skip the gypsum pull: exactly base.offsetHSL(0, −0.08, −0.18).
+    const reference = base.clone().offsetHSL(0, -0.08, -0.18)
+    expect(out.r).toBeCloseTo(reference.r, 10)
+    expect(out.g).toBeCloseTo(reference.g, 10)
+    expect(out.b).toBeCloseTo(reference.b, 10)
+    const hslBase = { h: 0, s: 0, l: 0 }
+    const hslCore = { h: 0, s: 0, l: 0 }
+    base.getHSL(hslBase)
+    out.getHSL(hslCore)
+    expect(hslCore.l).toBeCloseTo(hslBase.l - 0.18, 10)
+    expect(hslCore.s).toBeLessThan(hslBase.s)
+    // Base is never mutated; writes into `out` and returns it.
+    expect(base.getHexString()).toBe('c0392b')
+    const again = new Color()
+    expect(coreCellColor(base, 'slab', again)).toBe(again)
+    expect(again.equals(out)).toBe(true)
+  })
+
+  test("kind tweak: 'wall' cores pull toward the gypsum-gray family, other kinds keep their base", () => {
+    const base = new Color('#c0392b')
+    const wallCore = coreCellColor(base, 'wall', new Color())
+    const slabCore = coreCellColor(base, 'slab', new Color())
+    const hslWall = { h: 0, s: 0, l: 0 }
+    const hslSlab = { h: 0, s: 0, l: 0 }
+    wallCore.getHSL(hslWall)
+    slabCore.getHSL(hslSlab)
+    // The gypsum pull desaturates the wall core well past the flat tweak…
+    expect(hslWall.s).toBeLessThan(hslSlab.s)
+    // …and lands it nearer the gray axis (r≈g≈b) than the slab core.
+    const graySpread = (c: Color) =>
+      Math.max(c.r, c.g, c.b) - Math.min(c.r, c.g, c.b)
+    expect(graySpread(wallCore)).toBeLessThan(graySpread(slabCore))
+    // Both still read darker than the base.
+    const hslBase = { h: 0, s: 0, l: 0 }
+    base.getHSL(hslBase)
+    expect(hslWall.l).toBeLessThan(hslBase.l)
+    expect(hslSlab.l).toBeLessThan(hslBase.l)
   })
 })
