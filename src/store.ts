@@ -109,8 +109,12 @@ let placedId = 1
 
 export const useBoots = create<BootsState>((set, get) => ({
   phase: 'editor',
-  owned: ['knife'],
-  weapon: 'knife',
+  // Spawn loadout (owner call 2026-08-29): the build hammer and the spray
+  // can are YOURS from the first frame — building is the default verb, in
+  // hand at spawn. Guns alone are the depot's E (armory); the bench and
+  // rack displays are decoration.
+  owned: ['knife', 'builder', 'paint'],
+  weapon: 'builder',
   clip: {},
   reloading: false,
   health: 100,
@@ -163,8 +167,8 @@ export const useBoots = create<BootsState>((set, get) => ({
   setPendingDecision: (pendingDecision) => set({ pendingDecision }),
   resetSession: () =>
     set({
-      owned: ['knife'],
-      weapon: 'knife',
+      owned: ['knife', 'builder', 'paint'],
+      weapon: 'builder',
       clip: {},
       reloading: false,
       health: 100,

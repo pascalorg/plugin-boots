@@ -2,7 +2,16 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Box3, BoxGeometry, type BufferGeometry, Color, Matrix4, type Group, type Mesh } from 'three'
+import {
+  Box3,
+  BoxGeometry,
+  type BufferGeometry,
+  Color,
+  EdgesGeometry,
+  type Group,
+  Matrix4,
+  type Mesh,
+} from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { type BuildPiece, FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import { sfx } from './audio'
@@ -1778,6 +1787,39 @@ export function Builder() {
           transparent
         />
       </mesh>
+      {/* Bright edge outline: a 0.12 m HORIZONTAL plate (floor/stairs) at
+       * eye height is a near-invisible sliver edge-on — the translucent
+       * fill only reads face-on (walls, roofs). The edges read from any
+       * angle (owner report: "no preview when I place floor"). */}
+      <lineSegments
+        geometry={ghostEdges(ghost.piece, ghost.span)}
+        position={[ghost.x, pose.y, ghost.z]}
+        rotation={[pose.tilt, ghost.yaw, 0, 'YXZ']}
+      >
+        <lineBasicMaterial
+          color={ghost.valid ? '#8ec4ff' : '#ff7a6e'}
+          depthWrite={false}
+          opacity={0.9}
+          transparent
+        />
+      </lineSegments>
     </group>
   )
+}
+
+/** Edge-outline geometry per (piece, span) — module cache: a handful of
+ * entries per session (pieces × storey spans), never disposed until the
+ * plugin unloads, matching pieceDims' cache lifetime. */
+const ghostEdgeCache = new Map<string, EdgesGeometry>()
+function ghostEdges(piece: BuildPiece, span: number): EdgesGeometry {
+  const key = `${piece}:${span}`
+  let edges = ghostEdgeCache.get(key)
+  if (!edges) {
+    const d = pieceDims(piece, span)
+    const box = new BoxGeometry(d[0] * 1.03, d[1] * 1.03, d[2] * 1.03)
+    edges = new EdgesGeometry(box)
+    box.dispose()
+    ghostEdgeCache.set(key, edges)
+  }
+  return edges
 }

@@ -8,7 +8,7 @@ import { Box3, Matrix4, type Object3D, Quaternion, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { useDestruction } from './destruction'
-import { armoryStationPosition, buildStationPosition } from './guntable'
+import { armoryStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -576,7 +576,8 @@ export function Interact({ world }: { world: GameWorld }) {
     // wall). The armory grants the full loadout in one press, so gating on
     // 'rifle' covers it; the breaker has no door anywhere near its end wall.
     tablesRef.current = [
-      { position: buildStationPosition(world), weapon: 'builder' },
+      // The build bench is decoration now (builder+paint are the spawn
+      // loadout) — only the armory still owns E on its disc.
       { position: armoryStationPosition(world), weapon: 'rifle' },
     ]
     return () => {

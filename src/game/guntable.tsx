@@ -30,14 +30,14 @@ import { bvhFor, type ColliderEntry, type GameWorld, spawnGroundY } from './worl
  * It replaces the three loose tables + the switch-wall stub while keeping
  * their exact interaction contracts:
  *
- * - BUILD STATION (left bay): a workbench at the shop front with the tiny
- *   hammer on display and a START BUILDING stencil. E gives ONLY the
- *   builder tool — no alert, no waves, the peaceful entry. Its prompt is
- *   the one up at spawn ("Press E — start building").
+ * - BUILD BENCH (left bay): DECORATION. The build hammer and the spray
+ *   can are the SPAWN LOADOUT (store defaults — building is the default
+ *   verb, hammer in hand at spawn), so the bench keeps its tiny display
+ *   hammer and START BUILDING stencil but prompts nothing.
  * - ARMORY RACK (center bay): pistol, rifle, the big rotary gun and the
  *   warhammer lined up vertically on a wall rack, the work boots on a
- *   floor mat below, GEAR UP stencil above. One E gives the FULL loadout
- *   (the old gear + heavy tables merged: pistol/rifle/minigun/hammer).
+ *   floor mat below, GEAR UP stencil above. One E gives the GUNS — the
+ *   depot's ONE interaction besides the breaker.
  *   The displays are PERMANENT — unlimited stock, they never flip to
  *   "taken"; only the small sign flips to the YOU ARE COOKED taunt.
  * - BREAKER PANEL (right end wall, outside): the massive two-hand
@@ -309,9 +309,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     () => spawnGroundY(world.colliders ?? [], center.x, center.z),
     [world, center],
   )
-  const buildAt = useMemo(() => buildStationPosition(world), [world])
   const armoryAt = useMemo(() => armoryStationPosition(world), [world])
-  const hasBuilder = useBoots((s) => s.owned.includes('builder'))
   const geared = useBoots((s) => s.owned.includes('rifle'))
   const solidRefs = useRef<(Mesh | null)[]>([])
   useFixtureColliders(world, solidRefs)
@@ -428,19 +426,11 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       {/* hazard stripes on the header, flagging the breaker end */}
       <HazardStripes position={[2.5, 2.325, 1.256]} size={[0.9, 0.28]} />
 
-      {/* ── BUILD STATION (left bay): the peaceful entry ───────────────── */}
-      <StationLogic
-        at={buildAt}
-        nodeId="__boots-depot-build"
-        taken={hasBuilder}
-        prompt="Press E — start building"
-        promptOwner="guntable3"
-        onPickup={() => {
-          const s = useBoots.getState()
-          s.giveWeapon('builder')
-          s.setWeapon('builder')
-        }}
-      />
+      {/* ── BUILD BENCH (left bay): DECORATION ONLY (owner call
+       * 2026-08-29) — the build hammer and spray can are the spawn
+       * loadout now (store defaults), so nothing prompts here. The bench,
+       * its tiny display hammer and the sign stay exactly as they were;
+       * the depot's ONE interaction is the armory's E (guns). */}
       {/* workbench at the shop front */}
       <mesh castShadow position={[-1.7, 0.945, 0.93]} ref={solid(7)}>
         <boxGeometry args={[1.15, 0.07, 0.6]} />
@@ -465,7 +455,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       </group>
       <StencilSign
         position={[-1.7, 2.325, 1.256]}
-        text={hasBuilder ? 'BUILD AWAY' : 'START BUILDING'}
+        text="START BUILDING"
         width={1.0}
         height={0.2}
       />
@@ -478,17 +468,15 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         prompt="Press E — gear up"
         promptOwner="guntable"
         onPickup={() => {
-          // The WHOLE kit in one stop (owner ask: take everything at the
-          // same time) — guns, hammer, builder and the paint can together.
-          // Gear ONLY — the wave director never reads ownership; combat
-          // waits for the breaker panel on the end wall.
+          // GUNS ONLY (owner call 2026-08-29): builder + paint are the
+          // spawn loadout, so the armory's E hands over the weapons rack —
+          // and nothing else. Gear ONLY — the wave director never reads
+          // ownership; combat waits for the breaker panel on the end wall.
           const s = useBoots.getState()
           s.giveWeapon('pistol')
           s.giveWeapon('rifle')
           s.giveWeapon('minigun')
           s.giveWeapon('hammer')
-          s.giveWeapon('builder')
-          s.giveWeapon('paint')
           s.setWeapon('rifle')
         }}
       />
@@ -531,10 +519,19 @@ function SpawnDepot({ world }: { world: GameWorld }) {
 
       {/* ── BREAKER PANEL (right end wall, outside): the combat opt-in ── */}
       <BreakerPanel world={world} />
-      {/* twin sirens on the roof above the breaker end — the primary
+      {/* twin red alarm gyros DIRECTLY ABOVE THE LEVER (owner ask — they
+       * pair with the siren sound the throw triggers, so they must be in
+       * your face when you work the handle, not hidden up on the roof).
+       * Wall brackets high on the end wall's outside face; the primary
        * carries the lot's single always-mounted red pointLight. */}
-      <SirenBeacon position={[2.55, 2.6, -0.45]} primary />
-      <SirenBeacon position={[2.55, 2.6, 0.45]} />
+      {[-0.45, 0.45].map((z) => (
+        <mesh key={z} position={[3.06, 2.18, z]}>
+          <boxGeometry args={[0.18, 0.05, 0.16]} />
+          <meshStandardMaterial color={STEEL} metalness={0.5} roughness={0.5} />
+        </mesh>
+      ))}
+      <SirenBeacon position={[3.12, 2.2, -0.45]} primary />
+      <SirenBeacon position={[3.12, 2.2, 0.45]} />
     </group>
   )
 }
