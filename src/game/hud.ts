@@ -92,14 +92,21 @@ import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
  *   under it; unlike hint() there is NO once-gate (peers come and go).
  * - loadingProgress(p, pending?) — the entry veil's REAL progress feed
  *   (game-root's LoadingDriver, weights in loading.ts). The veil mounts
- *   opaque with a thin bottom bar + one quip line and holds until p ≥ 1
- *   (or the LOADING_CAP_MS backstop), then fades 300ms and removes
- *   itself; a cap reveal console.infos the last `pending` label. Bar DOM
- *   writes are width%-only on ONE element, change-gated on whole percents
- *   and rate-limited to 10 Hz (loading.ts shouldWriteBar). `onReveal`
- *   fires exactly once at reveal — session.ts uses it to drop the
- *   loading input gate. unmount() tears the veil down with the session,
- *   so Esc during loading exits cleanly.
+ *   opaque as a DEDICATED loading screen (owner ask: "bigger, framed,
+ *   centered — not a smoothie at the end of the barrel"): a centered
+ *   framed card carrying the BOOTS wordmark + ALPHA chip, a hazard-stripe
+ *   accent, a big progress bar with a right-aligned whole-percent
+ *   readout, the quip line, and a rotating control-tip line
+ *   (LOADING_TIPS, one every LOADING_TIP_INTERVAL_MS; interval cleared
+ *   on reveal AND unmount). The veil holds until p ≥ 1 (or the
+ *   LOADING_CAP_MS backstop), then fades VEIL_FADE_MS — the card eases
+ *   up 8px as it goes — and removes itself; a cap reveal console.infos
+ *   the last `pending` label. Bar DOM writes are width%-only on ONE
+ *   element, change-gated on whole percents and rate-limited to 10 Hz
+ *   (loading.ts shouldWriteBar) — the percent readout and quip ride the
+ *   same gate. `onReveal` fires exactly once at reveal — session.ts uses
+ *   it to drop the loading input gate. unmount() tears the veil down
+ *   with the session, so Esc during loading exits cleanly.
  */
 
 const FONT = "600 13px/1.2 system-ui, -apple-system, sans-serif"
@@ -263,6 +270,21 @@ const VEIL_FADE_MS = 300
  * dump): the second lands when progress crosses the halfway mark. */
 const LOADING_QUIPS = ['lacing up your boots…', 'hanging the drywall…'] as const
 
+/** Rotating control tips at the bottom of the loading card — REAL binds
+ * only (input.ts / viewmodel.tsx vocabulary; pinned in hud.test.ts). The
+ * rotation interval dies at reveal and at unmount — it never outlives the
+ * veil. */
+export const LOADING_TIPS = [
+  'WASD move · Space jump',
+  'E gears you up at the depot behind you',
+  'Face the breaker outside to start — or stop — the waves',
+  '4 builds · Z X C V pick a piece',
+  'G throws a grenade · I opens the catalog',
+] as const
+
+/** Tip rotation pace — slow enough to read, fast enough to see a few. */
+export const LOADING_TIP_INTERVAL_MS = 2500
+
 const WEAPON_LABEL: Record<string, string> = {
   knife: 'KNIFE',
   pistol: 'PISTOL',
@@ -338,8 +360,16 @@ export class Hud {
   private lastAds = -1
   /** Entry veil (loading) — see loadingProgress() in the header. */
   private veilEl: HTMLDivElement | null = null
+  /** The centered framed card — reveal eases it up 8px while the veil fades. */
+  private veilCardEl: HTMLDivElement | null = null
   private veilBarEl: HTMLDivElement | null = null
+  /** Right-aligned whole-percent readout — rides the bar's write gate. */
+  private veilPctEl: HTMLDivElement | null = null
   private veilQuipEl: HTMLDivElement | null = null
+  /** Rotating control-tip line + its interval (cleared on reveal/unmount). */
+  private veilTipEl: HTMLDivElement | null = null
+  private veilTipTimer: ReturnType<typeof setInterval> | null = null
+  private veilTip = 0
   private veilRevealed = false
   private veilCapTimer: ReturnType<typeof setTimeout> | null = null
   private veilRemoveTimer: ReturnType<typeof setTimeout> | null = null
@@ -382,29 +412,86 @@ export class Hud {
     // wedged stage (or a dead frame loop) never traps the player. Pure
     // DOM, outside the scene graph, first child on purpose: every HUD
     // element paints ON TOP of it, so prompts stay readable through the
-    // fade. Carries its own minimal chrome — small title, one quip line,
-    // a thin bottom bar (ONE element, width%-only writes, ≤ 10 Hz).
+    // fade. A DEDICATED loading screen (owner ask: "bigger, framed,
+    // centered"): dark industrial backdrop (vignette + faint 45° texture,
+    // pure CSS gradients — no images, no network) flex-centering one
+    // framed card — wordmark + ALPHA chip, hazard stripe, big bar (still
+    // ONE fill element, width%-only writes, ≤ 10 Hz) with a percent
+    // readout, quip line, rotating control tip.
     const veil = document.createElement('div')
     veil.dataset.bootsVeil = '1' // QA hook: presence = still loading
-    veil.style.cssText = 'position:absolute;inset:0;background:#000;opacity:1'
-    const veilTitle = document.createElement('div')
-    veilTitle.textContent = 'BOOTS'
-    veilTitle.style.cssText = `position:absolute;left:50%;bottom:118px;transform:translateX(-50%);color:rgba(255,255,255,0.85);font:${FONT};font-size:14px;letter-spacing:0.42em;text-indent:0.42em`
-    veil.appendChild(veilTitle)
-    this.veilQuipEl = document.createElement('div')
-    this.veilQuipEl.textContent = LOADING_QUIPS[0]
-    this.veilQuip = 0
-    this.veilQuipEl.style.cssText = `position:absolute;left:50%;bottom:88px;transform:translateX(-50%);color:rgba(255,255,255,0.45);font:${FONT};font-size:11px;letter-spacing:0.14em;white-space:nowrap`
-    veil.appendChild(this.veilQuipEl)
-    const veilTrack = document.createElement('div')
-    veilTrack.style.cssText =
-      'position:absolute;left:50%;bottom:72px;transform:translateX(-50%);width:min(320px,42%);height:2px;border-radius:2px;background:rgba(255,255,255,0.14);overflow:hidden'
-    this.veilBarEl = document.createElement('div')
+    veil.style.cssText =
+      'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at center,rgba(0,0,0,0) 40%,rgba(0,0,0,0.55) 100%),repeating-linear-gradient(45deg,rgba(255,255,255,0.015) 0 2px,rgba(255,255,255,0) 2px 14px),#101214;opacity:1'
+    // el()-idiom helper scoped to the veil — children mount into the CARD
+    // (root's `el` below appends to the HUD root, which must stay above
+    // the veil in DOM order).
+    const veilChild = (parent: HTMLElement, css: string, text = ''): HTMLDivElement => {
+      const div = document.createElement('div')
+      div.style.cssText = css
+      div.textContent = text
+      parent.appendChild(div)
+      return div
+    }
+    // The framed card. Reveal eases it up 8px while the veil's opacity
+    // fades (transition armed here, transform written in revealVeil).
+    const card = veilChild(
+      veil,
+      `width:min(560px,72vw);box-sizing:border-box;padding:40px 44px;background:#14171b;border:2px solid #2e343b;border-radius:10px;transition:transform ${VEIL_FADE_MS / 1000}s ease`,
+    )
+    this.veilCardEl = card
+    // Wordmark row — big stencil BOOTS + the sidebar panel's ALPHA chip.
+    const mark = veilChild(card, 'display:flex;align-items:center;justify-content:center;gap:4px')
+    veilChild(
+      mark,
+      `color:rgba(255,255,255,0.92);font:${FONT};font-size:44px;font-weight:800;line-height:1;letter-spacing:0.35em;text-transform:uppercase;white-space:nowrap`,
+      'BOOTS',
+    )
+    veilChild(
+      mark,
+      `padding:3px 9px;border:1px solid rgba(255,255,255,0.28);border-radius:999px;color:rgba(255,255,255,0.6);font:${FONT};font-size:9px;font-weight:700;letter-spacing:0.2em;text-indent:0.2em;text-transform:uppercase`,
+      'ALPHA',
+    )
+    // Hazard-stripe accent — the depot aesthetic, one CSS gradient.
+    veilChild(
+      card,
+      'height:6px;margin:20px 0 28px;border-radius:3px;background:repeating-linear-gradient(45deg,#e8c229 0 12px,#15171a 12px 24px)',
+    )
+    // Whole-percent readout — textContent rides the SAME shouldWriteBar
+    // gate as the bar's width write (see loadingProgress).
+    this.veilPctEl = veilChild(
+      card,
+      `text-align:right;color:rgba(255,255,255,0.7);font:${FONT};font-size:12px;letter-spacing:0.12em;margin-bottom:8px`,
+      '0%',
+    )
+    const veilTrack = veilChild(
+      card,
+      'width:100%;height:10px;border-radius:5px;background:rgba(255,255,255,0.08);overflow:hidden',
+    )
+    this.veilBarEl = veilChild(
+      veilTrack,
+      'height:100%;width:0%;border-radius:5px;background:rgba(255,255,255,0.85);transition:width 0.25s linear',
+    )
     this.veilBarEl.dataset.bootsVeilBar = '1' // QA hook: width% = progress
-    this.veilBarEl.style.cssText =
-      'height:100%;width:0%;border-radius:2px;background:rgba(255,255,255,0.85);transition:width 0.25s linear'
-    veilTrack.appendChild(this.veilBarEl)
-    veil.appendChild(veilTrack)
+    this.veilQuipEl = veilChild(
+      card,
+      `margin-top:14px;text-align:center;color:rgba(255,255,255,0.45);font:${FONT};font-size:12px;letter-spacing:0.14em;white-space:nowrap`,
+      LOADING_QUIPS[0],
+    )
+    this.veilQuip = 0
+    // Rotating control tip — the card's bottom line, even more muted than
+    // the quip. Change-gated textContent on a plain interval; cleared at
+    // reveal and unmount so it can never outlive the veil.
+    this.veilTip = 0
+    this.veilTipEl = veilChild(
+      card,
+      `margin-top:26px;text-align:center;color:rgba(255,255,255,0.32);font:${FONT};font-size:11px;letter-spacing:0.1em`,
+      LOADING_TIPS[0],
+    )
+    this.veilTipTimer = setInterval(() => {
+      this.veilTip = (this.veilTip + 1) % LOADING_TIPS.length
+      const tip = LOADING_TIPS[this.veilTip] ?? ''
+      if (this.veilTipEl && this.veilTipEl.textContent !== tip) this.veilTipEl.textContent = tip
+    }, LOADING_TIP_INTERVAL_MS)
     root.appendChild(veil)
     this.veilEl = veil
     this.veilRevealed = false
@@ -763,6 +850,7 @@ export class Hud {
       this.veilBarWriteAt = now
       this.veilBarPct = barPercent(p)
       if (this.veilBarEl) this.veilBarEl.style.width = `${this.veilBarPct}%`
+      if (this.veilPctEl) this.veilPctEl.textContent = `${this.veilBarPct}%`
       const quip = p >= 0.5 ? 1 : 0
       if (quip !== this.veilQuip && this.veilQuipEl) {
         this.veilQuip = quip
@@ -782,20 +870,30 @@ export class Hud {
       clearTimeout(this.veilCapTimer)
       this.veilCapTimer = null
     }
+    if (this.veilTipTimer) {
+      clearInterval(this.veilTipTimer)
+      this.veilTipTimer = null
+    }
     if (this.veilPending) {
       console.info(
         `[boots] loading veil capped at ${LOADING_CAP_MS / 1000}s — still pending: ${this.veilPending}`,
       )
     }
     if (this.veilBarEl) this.veilBarEl.style.width = '100%'
+    if (this.veilPctEl) this.veilPctEl.textContent = '100%'
     veil.style.transition = `opacity ${VEIL_FADE_MS / 1000}s ease`
     veil.style.opacity = '0'
+    // The card eases up 8px while the veil fades (transition armed at mount).
+    if (this.veilCardEl) this.veilCardEl.style.transform = 'translateY(-8px)'
     this.veilRemoveTimer = setTimeout(() => {
       this.veilRemoveTimer = null
       veil.remove()
       this.veilEl = null
+      this.veilCardEl = null
       this.veilBarEl = null
+      this.veilPctEl = null
       this.veilQuipEl = null
+      this.veilTipEl = null
     }, VEIL_FADE_MS + 100)
     const onReveal = this.onReveal
     this.onReveal = null
@@ -1146,14 +1244,20 @@ export class Hud {
     // is over, there is nothing to un-gate).
     if (this.veilCapTimer) clearTimeout(this.veilCapTimer)
     if (this.veilRemoveTimer) clearTimeout(this.veilRemoveTimer)
+    if (this.veilTipTimer) clearInterval(this.veilTipTimer)
     this.veilCapTimer = this.veilRemoveTimer = null
+    this.veilTipTimer = null
     this.veilEl = null
+    this.veilCardEl = null
     this.veilBarEl = null
+    this.veilPctEl = null
     this.veilQuipEl = null
+    this.veilTipEl = null
     this.veilRevealed = false
     this.veilBarWriteAt = 0
     this.veilBarPct = -1
     this.veilQuip = -1
+    this.veilTip = 0
     this.veilPending = ''
     this.onReveal = null
     this.hitArms.length = 0

@@ -5,6 +5,8 @@ import {
   hotbarSignature,
   Hud,
   KEYBAR_DEFAULT,
+  LOADING_TIP_INTERVAL_MS,
+  LOADING_TIPS,
   presenceChipText,
 } from './hud'
 
@@ -178,6 +180,32 @@ describe('entry loading veil (headless contract)', () => {
     hud.unmount()
     expect(revealed).toBe(0)
     expect(hud.onReveal).toBeNull()
+  })
+})
+
+/**
+ * Loading-card control tips (the redesigned dedicated loading screen): the
+ * rotating bottom line must teach REAL binds — movement, the depot gear-up,
+ * the breaker, the four build pieces, the grenade + catalog keys — and pace
+ * itself slow enough to read (~2.5 s per tip).
+ */
+describe('loading-card control tips', () => {
+  test('4–6 tips covering the real controls', () => {
+    expect(LOADING_TIPS.length).toBeGreaterThanOrEqual(4)
+    expect(LOADING_TIPS.length).toBeLessThanOrEqual(6)
+    const all = LOADING_TIPS.join(' | ')
+    expect(all).toContain('WASD')
+    expect(all).toContain('Space')
+    expect(all).toContain('E ') // depot gear-up
+    expect(all).toContain('breaker')
+    expect(all).toContain('Z X C V')
+    expect(all).toContain('G ') // grenade
+    expect(all).toContain('I ') // catalog
+  })
+
+  test('rotation pace is a calm read (2–3s per tip)', () => {
+    expect(LOADING_TIP_INTERVAL_MS).toBeGreaterThanOrEqual(2000)
+    expect(LOADING_TIP_INTERVAL_MS).toBeLessThanOrEqual(3000)
   })
 })
 
