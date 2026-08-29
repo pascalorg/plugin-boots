@@ -13,6 +13,13 @@ import {
   Vector3,
 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
+import {
+  type BvhAsyncBuilder,
+  type BvhPrimeHandle,
+  type BvhPrimeTask,
+  runBvhPrimeQueue,
+  workerBvhBuilder,
+} from './bvh-worker'
 import { CELL, type GridAnchor, STOREY } from './grid'
 import { WALKABLE_NORMAL_Y } from './movement'
 import { perfEvent } from './perf-monitor'
@@ -308,12 +315,90 @@ function fallbackBvh(): MeshBVH {
 }
 
 /**
- * BVH per geometry, hardened for the wild (prod crash 2026-08-25: a scene
- * mesh with interleaved GLB attributes made `new MeshBVH` read `.offset` of
- * undefined INSIDE the game's mount useMemo — the viewer's error boundary
- * then ate the whole canvas). Interleaved positions are de-interleaved into
- * a BVH-only copy; anything that still throws degrades to a never-hit BVH
- * instead of crashing the session.
+ * BVH-only geometry copy, hardened against every host-geometry shape that
+ * has broken `new MeshBVH` in the wild:
+ *
+ * - GROUPS ARE STRIPPED (prod bug 2026-08-29, the "merged-stair" console
+ *   error): the host stair system's empty placeholder carries two
+ *   `addGroup(0, 0, …)` zero-count groups over a 3-vertex degenerate
+ *   triangle. three-mesh-bvh derives one BVH root PER GROUP RANGE — a group
+ *   set that intersects nothing yields ZERO roots and `buildPackedTree`
+ *   crashes reading `rootRanges[0].offset` of undefined (`TypeError:
+ *   reading 'offset'`), which world.ts then degraded to a NON-SOLID mesh
+ *   (players/bullets fell through, and the build re-failed every session).
+ *   Groups only exist to split material draw ranges; a collision BVH wants
+ *   every triangle in one root — which also fixes the quieter bug where
+ *   triangles OUTSIDE any group were silently absent from the BVH.
+ * - Interleaved positions de-interleave into a plain attribute (prod crash
+ *   2026-08-25: GLB attributes made MeshBVH read `.offset` of undefined).
+ * - The index is rebuilt as a fresh Uint32Array, dropping any triangle that
+ *   references a vertex beyond the position count (a malformed merge can't
+ *   crash the build or read garbage bounds).
+ * - The copy shares NOTHING with the host geometry, so the build never
+ *   mutates the host's index order (MeshBVH reorders in place) and the
+ *   worker path can transfer the copy's buffers without neutering a live
+ *   render mesh.
+ *
+ * Exported for the background prime (bvh-worker.ts) and its tests.
+ */
+export function sanitizeGeometryForBvh(source: BufferGeometry): BufferGeometry {
+  const position = source.getAttribute('position')
+  const vertexCount = position?.count ?? 0
+  const flat = new Float32Array(vertexCount * 3)
+  const plain = position as {
+    isInterleavedBufferAttribute?: boolean
+    array?: unknown
+    normalized?: boolean
+  }
+  if (
+    position &&
+    !plain.isInterleavedBufferAttribute &&
+    !plain.normalized &&
+    position.itemSize === 3 &&
+    plain.array instanceof Float32Array
+  ) {
+    flat.set(plain.array.subarray(0, vertexCount * 3))
+  } else if (position) {
+    for (let i = 0; i < vertexCount; i++) {
+      flat[i * 3] = position.getX(i)
+      flat[i * 3 + 1] = position.getY(i)
+      flat[i * 3 + 2] = position.getZ(i)
+    }
+  }
+  const copy = new BufferGeometry()
+  copy.setAttribute('position', new BufferAttribute(flat, 3))
+  const index = source.index
+  if (index) {
+    const triCount = Math.floor(index.count / 3)
+    const clean = new Uint32Array(triCount * 3)
+    let write = 0
+    for (let t = 0; t < triCount; t++) {
+      const a = index.getX(t * 3)
+      const b = index.getX(t * 3 + 1)
+      const c = index.getX(t * 3 + 2)
+      if (a < vertexCount && b < vertexCount && c < vertexCount) {
+        clean[write] = a
+        clean[write + 1] = b
+        clean[write + 2] = c
+        write += 3
+      }
+    }
+    copy.setIndex(new BufferAttribute(write === clean.length ? clean : clean.slice(0, write), 1))
+  }
+  // No groups, no drawRange, no extra attributes: full-coverage single-root
+  // BVH input. (Audit 2026-08-29: no host system draw-ranges a collider
+  // mesh, so covering the full triangle list never over-collides.)
+  return copy
+}
+
+/**
+ * BVH per geometry, built SYNCHRONOUSLY on demand from a sanitized copy
+ * (see sanitizeGeometryForBvh) — the correctness path: a capsule sweep or
+ * spawn probe that needs a collider THIS frame must get a real BVH now.
+ * Anything that still throws degrades to a never-hit BVH instead of
+ * crashing the session. The background prime (primeColliderBvhs) fills the
+ * same cache from a worker so this path is a WeakMap hit in the common
+ * case; see it for the stall numbers this used to cause.
  */
 export function bvhFor(mesh: Mesh): MeshBVH {
   let bvh = bvhCache.get(mesh.geometry)
@@ -322,21 +407,7 @@ export function bvhFor(mesh: Mesh): MeshBVH {
     // wake frame is a known first-hit cost — tag it so spikes name it.
     perfEvent('bvh-build')
     try {
-      let geometry = mesh.geometry
-      const position = geometry.getAttribute('position')
-      if ((position as { isInterleavedBufferAttribute?: boolean }).isInterleavedBufferAttribute) {
-        const flat = new Float32Array(position.count * 3)
-        for (let i = 0; i < position.count; i++) {
-          flat[i * 3] = position.getX(i)
-          flat[i * 3 + 1] = position.getY(i)
-          flat[i * 3 + 2] = position.getZ(i)
-        }
-        const copy = new BufferGeometry()
-        copy.setAttribute('position', new BufferAttribute(flat, 3))
-        if (geometry.index) copy.setIndex(geometry.index.clone())
-        geometry = copy
-      }
-      bvh = new MeshBVH(geometry)
+      bvh = new MeshBVH(sanitizeGeometryForBvh(mesh.geometry))
     } catch (error) {
       console.warn('[boots] BVH build failed — mesh will be non-solid', mesh.name, error)
       bvh = fallbackBvh()
@@ -344,6 +415,61 @@ export function bvhFor(mesh: Mesh): MeshBVH {
     bvhCache.set(mesh.geometry, bvh)
   }
   return bvh
+}
+
+/** Cache probe — true when `mesh`'s BVH is already built (sync or worker).
+ * Never triggers a build. Exported for the prime tests and diagnostics. */
+export function bvhBuilt(mesh: Mesh): boolean {
+  return bvhCache.has(mesh.geometry)
+}
+
+let activeBvhPrime: BvhPrimeHandle | null = null
+
+/**
+ * Background BVH fill (perf fix #3): hand every collider geometry to the
+ * shared worker builder, nearest-to-spawn first, so the cache is warm by
+ * the time gameplay first raycasts each collider. Before this, EVERY build
+ * ran synchronously inside whatever frame first touched the collider —
+ * profiling a real 670-node scene showed 2136 / 1017 / 853 / 451 ms
+ * `bvh-build` stalls at t≈12–17 s (historic worst 3177 ms), because a
+ * MeshBVH construction is atomic and the budgeted warmup drain still eats
+ * one whole build per frame.
+ *
+ * Correctness never depends on this: bvhFor stays synchronous for anything
+ * demanded before its background build lands (the spawn settle's
+ * probeSpawnSurfaceY touches 1–2 colliders at mount — those build sync,
+ * exactly as before), and a null builder (no Worker, SSR, bun test, host
+ * bundler without worker-chunk support, broken worker) makes this a no-op —
+ * today's lazy behavior. collectWorld calls it last; each call supersedes
+ * the previous session's queue. Returns the handle (null when priming is
+ * unavailable or unneeded) for tests.
+ */
+export function primeColliderBvhs(
+  colliders: readonly ColliderEntry[],
+  spawn: Vector3,
+  buildAsync: BvhAsyncBuilder | null = workerBvhBuilder(),
+): BvhPrimeHandle | null {
+  activeBvhPrime?.cancel()
+  activeBvhPrime = null
+  if (!buildAsync) return null
+  const seen = new Set<BufferGeometry>()
+  const tasks: BvhPrimeTask[] = []
+  for (const collider of colliders) {
+    const geometry = collider.mesh.geometry
+    if (!geometry || seen.has(geometry) || bvhCache.has(geometry)) continue
+    seen.add(geometry)
+    tasks.push({ geometry, priority: collider.worldBox.distanceToPoint(spawn) })
+  }
+  if (tasks.length === 0) return null
+  const handle = runBvhPrimeQueue(tasks, {
+    // Sanitize on the main thread at build time (cheap O(n) copies), build
+    // in the worker; the copy's buffers transfer, never the host mesh's.
+    build: (geometry) => buildAsync(sanitizeGeometryForBvh(geometry)),
+    isBuilt: (geometry) => bvhCache.has(geometry),
+    onBuilt: (geometry, bvh) => bvhCache.set(geometry, bvh),
+  })
+  activeBvhPrime = handle
+  return handle
 }
 
 /** Is this mesh's material glass-like? transparent with opacity < 0.95, or
@@ -1450,6 +1576,11 @@ export function collectWorld(): GameWorld {
     spawnYaw = Math.atan2(-dx, -dz)
   }
   spawn.y = spawnGroundY(colliders, spawn.x, spawn.z)
+
+  // Background BVH fill — AFTER the spawn probe above so the 1–2 colliders
+  // the settle touched are already cached, and with the spawn known so the
+  // queue builds nearest-first. No-op wherever workers can't run.
+  primeColliderBvhs(colliders, spawn)
 
   // Telemetry only (the game is whole-building; nothing gameplay-side keys
   // on this). The editor's active level lives on the VIEWER's selection —
