@@ -7,14 +7,15 @@ import {
   BufferAttribute,
   CanvasTexture,
   Color,
-  DynamicDrawUsage,
   type Group,
   type InstancedMesh,
   Matrix4,
   MeshStandardMaterial,
+  type Object3D,
   PlaneGeometry,
   Quaternion,
   RepeatWrapping,
+  Sphere,
   Vector3,
 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
@@ -154,6 +155,158 @@ export function syncDormantWallFrame(
   if (group.visible !== awake) group.visible = awake
   if (awake) primeDormantNow(entry)
   return awake
+}
+
+// ── Static-scene discipline (idle perf 2026-08-29) ─────────────────────────
+// A standing-still frame used to spend ~13% in writeBuffer and ~15% in
+// updateMatrixWorld with NOTHING changing. Three root causes, all fixed at
+// the replica level:
+//
+//   1. IDLE GPU RE-UPLOADS. The WebGPU renderer re-uploads an InstancedMesh's
+//      instanceMatrix EVERY FRAME on both of its default paths: small meshes
+//      (count ≤ ~1024 — uniformBufferLimit/64) ride a uniform buffer whose
+//      binding has no dirty check (NodeUniformBuffer inherits
+//      Buffer.update() { return true }), and bigger meshes rode our old
+//      DynamicDrawUsage flag, which Attributes.update re-uploads
+//      unconditionally. Walls cap at MAX_VOXELS=1600 cells, so EVERY wall
+//      sat on one of the two always-upload paths — megabytes per idle
+//      frame. Fix: flag instanceMatrix as a STORAGE attribute
+//      (markStorageInstanced) — the storage path is version-gated
+//      (Attributes.update compares attribute.version), so uploads happen on
+//      needsUpdate = actual mutation, exactly the shell-render discipline.
+//      instanceColor already rides the version-gated attribute path.
+//   2. MATRIX CHURN. Three recomposes matrix + matrixWorld for every
+//      auto-updating object every frame (the scene root marks itself dirty
+//      each updateMatrix(), force-cascading multiplyMatrices down the whole
+//      graph). Replicas never move after mount, so freezeStaticSubtree
+//      turns off BOTH auto flags for the replica subtree after settling
+//      world matrices once. The warm draw is the single post-mount move and
+//      refreshes world matrices by hand (shiftFrozenSubtreeY).
+//   3. NO CULLING. frustumCulled was globally off (the shared unit-box
+//      geometry's bounding sphere is one cell, not the wall). The spread is
+//      known per target, so each replica now carries a correct
+//      mesh.boundingSphere (gridBoundingSphere / membersBoundingSphere) and
+//      culls — off-screen walls skip _renderObjectDirect AND their
+//      per-object binding updates. Culling stays OFF until the warm draw
+//      finished (a culled warm draw would never upload its buffers).
+
+/** Flag the mesh's instanceMatrix as a WebGPU STORAGE attribute so instance
+ * uploads become version-gated (needsUpdate-on-mutation) instead of
+ * every-frame. The renderer duck-types the flag (StorageBufferNode sets the
+ * very same one on plain attributes), so no webgpu-build import is needed.
+ * No-op off WebGPU: the WebGL fallback has no storage-buffer vertex path.
+ * Mount-time only — the flag must be set before the mesh first renders. */
+export function markStorageInstanced(mesh: InstancedMesh, renderer: unknown): boolean {
+  const backend = (renderer as { backend?: { isWebGPUBackend?: boolean } } | null)?.backend
+  if (backend?.isWebGPUBackend !== true) return false
+  ;(
+    mesh.instanceMatrix as unknown as { isStorageInstancedBufferAttribute?: boolean }
+  ).isStorageInstancedBufferAttribute = true
+  return true
+}
+
+/** Conservative world-space bounding sphere over a voxel grid: min/max of
+ * the (world-space) cell centers plus a half-cell diagonal margin. Covers
+ * dead cells too — kills only shrink the live set, so the sphere never goes
+ * stale. O(count), runs once per prime. */
+export function gridBoundingSphere(
+  grid: { count: number; centers: Float32Array; cellX: number; cellY: number; cellZ: number },
+  out = new Sphere(),
+): Sphere {
+  if (grid.count === 0) {
+    out.center.set(0, 0, 0)
+    out.radius = -1 // three's empty-sphere convention — always culled
+    return out
+  }
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  for (let i = 0; i < grid.count; i++) {
+    const x = grid.centers[i * 3]!
+    const y = grid.centers[i * 3 + 1]!
+    const z = grid.centers[i * 3 + 2]!
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+    if (z < minZ) minZ = z
+    if (z > maxZ) maxZ = z
+  }
+  out.center.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
+  out.radius =
+    Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2 +
+    Math.hypot(grid.cellX, grid.cellY, grid.cellZ) / 2
+  return out
+}
+
+/** Bounding sphere over a member layer: min/max of the member centers plus
+ * half the largest member diagonal (yaw/pitch-proof — a rotated box never
+ * leaves its center's half-diagonal ball). Members are fixed-length after
+ * voxelize and never move, so this is mount-time only. */
+export function membersBoundingSphere(
+  members: Array<{ center: [number, number, number]; size: [number, number, number] }>,
+  out = new Sphere(),
+): Sphere {
+  if (members.length === 0) {
+    out.center.set(0, 0, 0)
+    out.radius = -1
+    return out
+  }
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  let margin = 0
+  for (const m of members) {
+    const [x, y, z] = m.center
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+    if (z < minZ) minZ = z
+    if (z > maxZ) maxZ = z
+    const half = Math.hypot(m.size[0], m.size[1], m.size[2]) / 2
+    if (half > margin) margin = half
+  }
+  out.center.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
+  out.radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2 + margin
+  return out
+}
+
+/** Settle world matrices once (live ancestors included), then freeze the
+ * whole subtree out of three's per-frame matrix churn: no recompose, no
+ * multiplyMatrices, immune to the scene root's force cascade. Mount-time,
+ * after every child is attached. */
+export function freezeStaticSubtree(root: Object3D): void {
+  root.updateWorldMatrix(true, true)
+  root.traverse((obj) => {
+    obj.matrixAutoUpdate = false
+    obj.matrixWorldAutoUpdate = false
+  })
+}
+
+/** Move a FROZEN subtree vertically and refresh its world matrices by hand
+ * (auto-update is off, so nobody else will) — the warm draw's drop/restore
+ * is the only post-mount move a replica ever makes. */
+export function shiftFrozenSubtreeY(root: Object3D, deltaY: number): void {
+  root.position.y += deltaY
+  root.updateMatrix()
+  root.matrixWorldNeedsUpdate = false // updateMatrix marks it; we do the work here
+  if (root.parent === null) root.matrixWorld.copy(root.matrix)
+  else root.matrixWorld.multiplyMatrices(root.parent.matrixWorld, root.matrix)
+  refreshFrozenChildren(root)
+}
+
+function refreshFrozenChildren(parent: Object3D): void {
+  for (const child of parent.children) {
+    child.matrixWorld.multiplyMatrices(parent.matrixWorld, child.matrix)
+    refreshFrozenChildren(child)
+  }
 }
 
 const _matrix = new Matrix4()
@@ -443,11 +596,19 @@ function MemberLayer({
   const meshRef = useRef<InstancedMesh>(null!)
   const checksum = useRef(Number.NaN)
   const maxHp = useRef(1)
+  const gl = useThree((s) => s.gl)
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
-    mesh.instanceMatrix.setUsage(DynamicDrawUsage)
-    mesh.frustumCulled = false
+    // Version-gated uploads (no DynamicDrawUsage, no uniform-buffer path):
+    // member layers only re-upload when the checksum below actually moves.
+    markStorageInstanced(mesh, gl)
+    // Members never move — one correct sphere at mount and the layer culls.
+    // (A dormant replica's warm draw renders underground, where this layer
+    // culls away and skips its first upload — at ≤ ~100 instances that's a
+    // few KB on the wake frame, not worth plumbing the warm-draw latch in.)
+    mesh.boundingSphere = membersBoundingSphere(members, mesh.boundingSphere ?? undefined)
+    mesh.frustumCulled = true
     // Full hp = the healthiest member at voxelize time (fresh members are
     // all at max; robust even if we mount mid-fight).
     let max = 1
@@ -455,7 +616,7 @@ function MemberLayer({
     maxHp.current = max
     uploadLayer(mesh, members, base, damaged, jitter, inset, pinch, max)
     checksum.current = layerChecksum(members)
-  }, [members, base, damaged, jitter, inset, pinch])
+  }, [members, base, damaged, jitter, inset, pinch, gl])
 
   useFrame(() => {
     const mesh = meshRef.current
@@ -593,10 +754,16 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
   // Dirt underlay for terrain-borne floor slabs (see header above): a hole
   // carved through the floor reveals earth, not the host's white pad/lawn.
   const underlay = useMemo(() => floorUnderlayLayout(wall), [wall])
+  const gl = useThree((s) => s.gl)
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
-    mesh.instanceMatrix.setUsage(DynamicDrawUsage)
+    // Version-gated instance uploads (see the static-scene discipline block):
+    // the skin only re-uploads on revision/skinRevision mutations now.
+    markStorageInstanced(mesh, gl)
+    // Culling stays OFF until this replica primed (and, for dormant
+    // prebuilds, until the warm draw ran) — a culled warm draw would never
+    // reach the GPU and the wake frame would pay the upload again.
     mesh.frustumCulled = false
     // Awake targets prime here, at mount, like always. DORMANT prebuilds
     // stay hidden with identity matrices and prime through the budgeted
@@ -611,6 +778,9 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
         revision.current = wall.revision
         skinRevision.current = wall.skinRevision ?? 0
         wall.removedQueue.length = 0
+        // The buffers are real now — give the mesh its true bounding sphere
+        // (grid AABB + half-cell margin; kills only shrink, never grow).
+        mesh.boundingSphere = gridBoundingSphere(wall.grid, mesh.boundingSphere ?? undefined)
         // WARM DRAW (first-blast decomposition, QA 2026-08-28): priming a
         // HIDDEN replica fills CPU-side buffers only — the GPU upload of
         // ~thousands of instance matrices (per layer) happens on the first
@@ -625,7 +795,8 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
           const group = groupRef.current
           if (group) {
             group.visible = true
-            group.position.y -= WARM_DRAW_DROP
+            // The subtree froze at mount — move + refresh matrices by hand.
+            shiftFrozenSubtreeY(group, -WARM_DRAW_DROP)
             // 2, not 1: the drain (parent useFrame) may run BEFORE this
             // replica's own useFrame in the same frame — a 1-frame latch
             // would restore + re-hide before anything ever drew.
@@ -636,6 +807,9 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
             return true
           }
         }
+        // Awake (mount or wake-path) prime: the mesh draws in place from
+        // here on — safe to start culling against the sphere set above.
+        mesh.frustumCulled = true
         return false
       },
     }
@@ -644,10 +818,15 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
     skinRevision.current = wall.skinRevision ?? 0
     if (wall.dormant) queueDormantPrime(entry)
     else primeDormantNow(entry)
+    // Replicas never move: settle world matrices once, then opt the whole
+    // subtree (group + skin + underlay + member layers — child effects ran
+    // before this one) out of three's per-frame matrix churn. The warm
+    // draw's drop/restore goes through shiftFrozenSubtreeY.
+    freezeStaticSubtree(groupRef.current)
     return () => {
       entry.primed = true // tombstone — the drain skips unmounted replicas
     }
-  }, [wall])
+  }, [wall, gl])
 
   useFrame(() => {
     const mesh = meshRef.current
@@ -663,7 +842,9 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
       if (wall.dormant !== true) warmDraw.current = 1
       warmDraw.current--
       if (warmDraw.current > 0) return
-      group.position.y += WARM_DRAW_DROP
+      shiftFrozenSubtreeY(group, WARM_DRAW_DROP)
+      // Warm frames done — the buffers are on the GPU, culling is safe.
+      mesh.frustumCulled = true
       perfSection('warm-draw-done', 0)
     }
     // Wake = visibility flip (+ an on-the-spot prime if the budgeted queue

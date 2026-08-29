@@ -1,5 +1,6 @@
 'use client'
 
+import { useThree } from '@react-three/fiber'
 import { useMemo } from 'react'
 import {
   type Box3,
@@ -8,14 +9,18 @@ import {
   CanvasTexture,
   CircleGeometry,
   Color,
+  DoubleSide,
   IcosahedronGeometry,
   type InstancedMesh,
   Matrix4,
+  MeshStandardMaterial,
+  type Object3D,
   Path,
   Quaternion,
   RepeatWrapping,
   Shape,
   ShapeGeometry,
+  Sphere,
   Vector3,
 } from 'three'
 import { Craters } from './craters'
@@ -23,8 +28,9 @@ import { type GameWorld, pointOnRoad } from './world'
 
 /**
  * The lot: a grass field with scattered flora replacing the editor's flat
- * gray void. Optimization first — one InstancedMesh per species (grass is a
- * single draw call for ~20k blade clusters), no shadows, static transforms,
+ * gray void. Optimization first — one InstancedMesh per species (grass:
+ * ~20k blade clusters split into GRASS_SECTORS angular chunks so frustum
+ * culling can drop off-screen wedges), no shadows, static transforms,
  * all placement rejected out of the building's footprint AND off every
  * hard-surface footprint (Streetscape roads, driveway slabs, parking pads —
  * world.roadFootprints) so no blade pokes through asphalt.
@@ -246,6 +252,93 @@ export function groundGeometry(world: Pick<GameWorld, 'buildingAabb'>): BufferGe
 
 export type Scatter = { matrices: Matrix4[]; colors: Color[] }
 
+// ── Static-field discipline (idle perf 2026-08-29) ─────────────────────────
+// The flora fields never move after mount, but they used to render with
+// frustumCulled OFF (the shared cluster geometry's own bounding sphere is
+// one clump, not the field) and with three recomposing their matrices every
+// frame. Each field now carries a correct mesh.boundingSphere over its
+// actual instance spread (scatterBoundingSphere) with culling ON, freezes
+// its Object3D matrices (freezeStaticObject), and GRASS — the one field big
+// enough to matter on the GPU (20k clusters ≈ 300k tris) — splits into
+// GRASS_SECTORS angular chunks around the building so looking away culls
+// most of the blades. Craters clearing keeps working per chunk: every chunk
+// registers as its own scatter field.
+
+/** Angular grass chunks — one InstancedMesh each. 8 keeps the added object
+ * count trivial while a typical FPS view culls roughly half the sectors. */
+export const GRASS_SECTORS = 8
+
+/** Bounding-sphere margin (m) over instance ORIGINS — covers the biggest
+ * scaled cluster geometry any field uses (grass ≈ 1.4 m tips, bush lobes
+ * ≈ 1.2 m) with room to spare. */
+export const FIELD_MARGIN = 2.5
+
+/** Split one scatter into `sectors` angular chunks about (cx, cz). Instance
+ * order inside a chunk keeps the source order; every (matrix, color) pair
+ * travels together. Chunks may be empty (footprint/road rejection). */
+export function sectorizeScatter(data: Scatter, cx: number, cz: number, sectors: number): Scatter[] {
+  const out: Scatter[] = Array.from({ length: sectors }, () => ({ matrices: [], colors: [] }))
+  for (let i = 0; i < data.matrices.length; i++) {
+    const e = data.matrices[i]!.elements
+    const angle = Math.atan2(e[14]! - cz, e[12]! - cx) // [-PI, PI]
+    let k = Math.floor(((angle + Math.PI) / (2 * Math.PI)) * sectors)
+    if (k >= sectors) k = sectors - 1 // angle === +PI lands on the seam
+    if (k < 0) k = 0
+    out[k]!.matrices.push(data.matrices[i]!)
+    out[k]!.colors.push(data.colors[i]!)
+  }
+  return out
+}
+
+/** World-space bounding sphere over a scatter's instance origins plus
+ * FIELD_MARGIN-style padding. Cleared (zero-scale) instances park at the
+ * origin outside the sphere — they emit no fragments, so culling stays
+ * correct. Empty scatters get three's empty-sphere (radius −1 = culled). */
+export function scatterBoundingSphere(
+  matrices: Matrix4[],
+  margin: number,
+  out = new Sphere(),
+): Sphere {
+  if (matrices.length === 0) {
+    out.center.set(0, 0, 0)
+    out.radius = -1
+    return out
+  }
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  for (const matrix of matrices) {
+    const e = matrix.elements
+    const x = e[12]!
+    const y = e[13]!
+    const z = e[14]!
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+    if (z < minZ) minZ = z
+    if (z > maxZ) maxZ = z
+  }
+  out.center.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
+  out.radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2 + margin
+  return out
+}
+
+/** Opt a never-moving object out of three's per-frame matrix churn. Safe to
+ * re-run (re-entry re-attaches refs): flips auto-update back on for one
+ * settle pass, then freezes. Frozen ancestors keep their (already frozen,
+ * already correct) world matrices — updateWorldMatrix skips them. */
+export function freezeStaticObject(obj: Object3D): void {
+  obj.matrixAutoUpdate = true
+  obj.matrixWorldAutoUpdate = true
+  obj.updateWorldMatrix(true, false)
+  obj.matrixAutoUpdate = false
+  obj.matrixWorldAutoUpdate = false
+}
+
 /**
  * Deterministic ring scatter around the building, rejecting the footprint
  * (+ pad) and every hard-surface footprint (roads, driveways, pads) with a
@@ -299,8 +392,18 @@ export function scatter(
   return { matrices, colors }
 }
 
-function setInstances(mesh: InstancedMesh | null, data: Scatter): void {
+function setInstances(mesh: InstancedMesh | null, data: Scatter, storage: boolean): void {
   if (!mesh) return
+  // Version-gated instance uploads on WebGPU (voxel-walls.tsx's
+  // markStorageInstanced — inlined here because importing voxel-walls would
+  // cycle through destruction → craters → nature): without the flag, small
+  // fields ride the uniform-buffer path the renderer re-uploads EVERY frame.
+  // Sticky on the attribute, so a re-attach re-running this is a no-op.
+  if (storage) {
+    ;(
+      mesh.instanceMatrix as unknown as { isStorageInstancedBufferAttribute?: boolean }
+    ).isStorageInstancedBufferAttribute = true
+  }
   for (let i = 0; i < data.matrices.length; i++) {
     mesh.setMatrixAt(i, data.matrices[i]!)
     mesh.setColorAt(i, data.colors[i]!)
@@ -308,6 +411,12 @@ function setInstances(mesh: InstancedMesh | null, data: Scatter): void {
   mesh.count = data.matrices.length
   mesh.instanceMatrix.needsUpdate = true
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+  // Static-field discipline: a real sphere over the actual spread (the
+  // shared cluster geometry's own sphere is one clump), culling ON, and no
+  // per-frame matrix recompose for a field that never moves.
+  mesh.boundingSphere = scatterBoundingSphere(data.matrices, FIELD_MARGIN, mesh.boundingSphere ?? undefined)
+  mesh.frustumCulled = true
+  freezeStaticObject(mesh)
 }
 
 // --- Clearable scatter fields (craters strip blades) ---------------------------
@@ -373,13 +482,13 @@ export function clearScatterInRadius(x: number, z: number, r: number): number {
  * clearing; detach = unregister. Memoized per Scatter in the component so
  * React doesn't churn the registration on unrelated renders.
  */
-function fieldRef(data: Scatter): (mesh: InstancedMesh | null) => void {
+function fieldRef(data: Scatter, storage: boolean): (mesh: InstancedMesh | null) => void {
   let unregister: (() => void) | null = null
   return (mesh) => {
     unregister?.()
     unregister = null
     if (mesh) {
-      setInstances(mesh, data)
+      setInstances(mesh, data, storage)
       unregister = registerScatterField(mesh, data.matrices)
     }
   }
@@ -387,6 +496,10 @@ function fieldRef(data: Scatter): (mesh: InstancedMesh | null) => void {
 
 const GRASS_A = new Color('#79b054')
 const GRASS_B = new Color('#55853c')
+/** One shared material for every grass chunk (module-lifetime, passed via
+ * `args` like the voxel-wall layer materials — R3F never auto-disposes it,
+ * and all chunks keep hitting the same warm pipeline). */
+const GRASS_MATERIAL = new MeshStandardMaterial({ roughness: 1, side: DoubleSide, vertexColors: true })
 const FLOWER_WHITE = new Color('#f6f3e7')
 const FLOWER_YELLOW = new Color('#f2c14e')
 const _quat = new Quaternion()
@@ -394,6 +507,11 @@ const _scale = new Vector3()
 const _yAxis = new Vector3(0, 1, 0)
 
 export function Nature({ world }: { world: GameWorld }) {
+  const gl = useThree((s) => s.gl)
+  // Storage-flagged instance buffers are WebGPU-only (see setInstances).
+  const storage =
+    (gl as unknown as { backend?: { isWebGPUBackend?: boolean } }).backend?.isWebGPUBackend === true
+
   const texture = useMemo(groundTexture, [])
 
   const groundGeo = useMemo(() => groundGeometry(world), [world])
@@ -467,14 +585,25 @@ export function Nature({ world }: { world: GameWorld }) {
     [world],
   )
 
-  // Grass + flowers are clearable fields (craters strip the blades they
-  // cover); bushes/rocks survive a blast, so they bind the plain way.
-  const grassRef = useMemo(() => fieldRef(grass), [grass])
-  const flowersRef = useMemo(() => fieldRef(flowers), [flowers])
-
   const center = world.buildingAabb.isEmpty()
     ? new Vector3()
     : world.buildingAabb.getCenter(new Vector3())
+
+  // Grass splits into angular sectors so its bounding spheres can actually
+  // cull (one 55 m-radius field never leaves the frustum; a 45° wedge does).
+  const grassChunks = useMemo(
+    () => sectorizeScatter(grass, center.x, center.z, GRASS_SECTORS),
+    // center derives from world (the grass memo key) — no drift possible.
+    [grass, center.x, center.z],
+  )
+
+  // Grass + flowers are clearable fields (craters strip the blades they
+  // cover); bushes/rocks survive a blast, so they bind the plain way.
+  const grassChunkRefs = useMemo(
+    () => grassChunks.map((chunk) => fieldRef(chunk, storage)),
+    [grassChunks, storage],
+  )
+  const flowersRef = useMemo(() => fieldRef(flowers, storage), [flowers, storage])
 
   return (
     <group userData={{ __boots: true }}>
@@ -488,36 +617,36 @@ export function Nature({ world }: { world: GameWorld }) {
         )}
       </mesh>
 
-      <instancedMesh
-        args={[grassGeometry, undefined, grass.matrices.length]}
-        frustumCulled={false}
-        ref={grassRef}
-      >
-        <meshStandardMaterial roughness={1} side={2} vertexColors />
-      </instancedMesh>
+      {/* Grass sectors: shared geometry + module material, one chunk per
+          45° wedge — each culls against its own scatterBoundingSphere. */}
+      {grassChunks.map(
+        (chunk, sector) =>
+          chunk.matrices.length > 0 && (
+            <instancedMesh
+              args={[grassGeometry, GRASS_MATERIAL, chunk.matrices.length]}
+              // biome-ignore lint/suspicious/noArrayIndexKey: sectors are positional by construction
+              key={sector}
+              ref={grassChunkRefs[sector]}
+            />
+          ),
+      )}
 
       {/* Flower dots: flat discs floating in the blade layer for charm. */}
-      <instancedMesh
-        args={[flowerGeometry, undefined, flowers.matrices.length]}
-        frustumCulled={false}
-        ref={flowersRef}
-      >
+      <instancedMesh args={[flowerGeometry, undefined, flowers.matrices.length]} ref={flowersRef}>
         <meshStandardMaterial roughness={1} />
       </instancedMesh>
 
       {/* Bushes: baked three-lobe clusters (species 4 — low, trunkless). */}
       <instancedMesh
         args={[bushGeometry, undefined, bushes.matrices.length]}
-        frustumCulled={false}
-        ref={(mesh) => setInstances(mesh, bushes)}
+        ref={(mesh) => setInstances(mesh, bushes, storage)}
       >
         <meshStandardMaterial roughness={1} vertexColors />
       </instancedMesh>
 
       <instancedMesh
         args={[undefined, undefined, rocks.matrices.length]}
-        frustumCulled={false}
-        ref={(mesh) => setInstances(mesh, rocks)}
+        ref={(mesh) => setInstances(mesh, rocks, storage)}
       >
         <icosahedronGeometry args={[0.5, 0]} />
         <meshStandardMaterial roughness={0.9} />

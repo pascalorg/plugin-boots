@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import {
+  Box3,
+  BoxGeometry,
+  Group,
+  InstancedMesh,
+  Matrix4,
+  Mesh,
+  MeshStandardMaterial,
+  StaticDrawUsage,
+  Vector3,
+} from 'three'
 import { ensureVoxelTarget, resetDestruction, useDestruction, wakeTarget } from './destruction'
 import { CEILING_FACE_TINT } from './skin-tone'
 import {
@@ -11,8 +21,13 @@ import {
   dormantPrimeQueueSize,
   drainDormantPrimes,
   floorUnderlayLayout,
+  freezeStaticSubtree,
+  gridBoundingSphere,
+  markStorageInstanced,
+  membersBoundingSphere,
   primeDormantNow,
   queueDormantPrime,
+  shiftFrozenSubtreeY,
   syncDormantWallFrame,
   UNDERLAY_DROP,
   UNDERLAY_MAX_BASE_Y,
@@ -294,6 +309,120 @@ describe('ceiling face tint (round-5 QA eave teeth: attic side mutes per FACE)',
     expect(target.kind).toBe('slab')
     expect(target.ceilingTop).toBe(true)
     expect(target.floorCore).toBeFalsy()
+  })
+})
+
+describe('static-scene discipline (idle perf 2026-08-29)', () => {
+  test('markStorageInstanced: WebGPU flags the matrix attribute, usage stays STATIC', () => {
+    const mesh = new InstancedMesh(new BoxGeometry(), new MeshStandardMaterial(), 4)
+    const attr = mesh.instanceMatrix as unknown as { isStorageInstancedBufferAttribute?: boolean }
+
+    // Non-WebGPU renderers (or none): untouched — the WebGL fallback has no
+    // storage-buffer vertex path.
+    expect(markStorageInstanced(mesh, null)).toBe(false)
+    expect(markStorageInstanced(mesh, {})).toBe(false)
+    expect(markStorageInstanced(mesh, { backend: {} })).toBe(false)
+    expect(attr.isStorageInstancedBufferAttribute).toBeUndefined()
+
+    expect(markStorageInstanced(mesh, { backend: { isWebGPUBackend: true } })).toBe(true)
+    expect(attr.isStorageInstancedBufferAttribute).toBe(true)
+    // The whole point: no DynamicDrawUsage anywhere — uploads ride version
+    // bumps (needsUpdate on actual mutation), never the every-frame path.
+    expect(mesh.instanceMatrix.usage).toBe(StaticDrawUsage)
+  })
+
+  test('gridBoundingSphere covers every cell center of a real target with cell margin', () => {
+    const crate = boxCollider('crate-bs', 'item', [1.4, 0.9, 1.1], [4, 0.45, -2])
+    const world = makeWorld([crate])
+    const target = ensureVoxelTarget(world, 'crate-bs')!
+    const sphere = gridBoundingSphere(target.grid)
+
+    const { grid } = target
+    let maxDist = 0
+    for (let i = 0; i < grid.count; i++) {
+      const dx = grid.centers[i * 3]! - sphere.center.x
+      const dy = grid.centers[i * 3 + 1]! - sphere.center.y
+      const dz = grid.centers[i * 3 + 2]! - sphere.center.z
+      const dist = Math.hypot(dx, dy, dz)
+      if (dist > maxDist) maxDist = dist
+    }
+    const halfCell = Math.hypot(grid.cellX, grid.cellY, grid.cellZ) / 2
+    // Every center inside, with at least the half-cell diagonal to spare —
+    // the cell's own extent can never poke out of the sphere.
+    expect(maxDist + halfCell).toBeLessThanOrEqual(sphere.radius + 1e-9)
+    // …and the sphere is TIGHT (no bigger than the AABB guarantee).
+    expect(sphere.radius).toBeLessThanOrEqual(Math.hypot(1.4, 0.9, 1.1) / 2 + 2 * halfCell + 1e-9)
+  })
+
+  test('gridBoundingSphere / membersBoundingSphere: empty input culls (radius −1)', () => {
+    expect(
+      gridBoundingSphere({ count: 0, centers: new Float32Array(), cellX: 1, cellY: 1, cellZ: 1 })
+        .radius,
+    ).toBe(-1)
+    expect(membersBoundingSphere([]).radius).toBe(-1)
+  })
+
+  test('membersBoundingSphere covers member centers plus the largest half-diagonal', () => {
+    const sphere = membersBoundingSphere([
+      { center: [0, 0, 0], size: [1, 2, 1] },
+      { center: [4, 0, 0], size: [2, 0.1, 0.1] },
+    ])
+    expect(sphere.center.x).toBeCloseTo(2, 10)
+    expect(sphere.center.y).toBeCloseTo(0, 10)
+    // half AABB diagonal (2) + biggest member half-diagonal (hypot(1,2,1)/2)
+    expect(sphere.radius).toBeCloseTo(2 + Math.hypot(1, 2, 1) / 2, 10)
+    // A yawed member never leaves its center's half-diagonal ball, so both
+    // members stay inside no matter their rotation.
+    expect(sphere.radius).toBeGreaterThan(2 + Math.hypot(2, 0.1, 0.1) / 2 - 1e-9)
+  })
+
+  test('freezeStaticSubtree settles world matrices once, then the force-cascade skips it', () => {
+    const parent = new Group()
+    parent.position.set(1, 2, 3)
+    const replica = new Group()
+    parent.add(replica)
+    const skin = new InstancedMesh(new BoxGeometry(), new MeshStandardMaterial(), 2)
+    const underlay = new Mesh(new BoxGeometry())
+    underlay.position.set(0.5, -0.1, 0)
+    replica.add(skin)
+    replica.add(underlay)
+
+    freezeStaticSubtree(replica)
+    for (const obj of [replica, skin, underlay]) {
+      expect(obj.matrixAutoUpdate).toBe(false)
+      expect(obj.matrixWorldAutoUpdate).toBe(false)
+    }
+    expect(parent.matrixAutoUpdate).toBe(true) // ancestors stay live
+    expect(new Vector3().setFromMatrixPosition(underlay.matrixWorld).y).toBeCloseTo(1.9, 10)
+
+    // The renderer's per-frame walk (root recompose → force=true cascade)
+    // must not rewrite the frozen matrices — that's the 15% idle cost.
+    parent.position.set(100, 100, 100)
+    parent.updateMatrixWorld(true)
+    expect(new Vector3().setFromMatrixPosition(skin.matrixWorld).x).toBeCloseTo(1, 10)
+    expect(new Vector3().setFromMatrixPosition(underlay.matrixWorld).y).toBeCloseTo(1.9, 10)
+  })
+
+  test('shiftFrozenSubtreeY: the warm draw moves a frozen replica and restores it exactly', () => {
+    const parent = new Group()
+    parent.position.set(0, 1, 0)
+    const replica = new Group()
+    parent.add(replica)
+    const skin = new InstancedMesh(new BoxGeometry(), new MeshStandardMaterial(), 2)
+    replica.add(skin)
+    freezeStaticSubtree(replica)
+
+    shiftFrozenSubtreeY(replica, -600)
+    expect(replica.position.y).toBeCloseTo(-600, 10)
+    expect(new Vector3().setFromMatrixPosition(replica.matrixWorld).y).toBeCloseTo(-599, 8)
+    expect(new Vector3().setFromMatrixPosition(skin.matrixWorld).y).toBeCloseTo(-599, 8)
+
+    shiftFrozenSubtreeY(replica, 600)
+    expect(new Vector3().setFromMatrixPosition(skin.matrixWorld).y).toBeCloseTo(1, 8)
+    // Still frozen — the walk that follows must keep skipping it.
+    expect(replica.matrixAutoUpdate).toBe(false)
+    expect(replica.matrixWorldAutoUpdate).toBe(false)
+    expect(replica.matrixWorldNeedsUpdate).toBe(false)
   })
 })
 
