@@ -153,15 +153,23 @@ import { bvhFor, type GameWorld, isGlassLikeMesh, ITEM_FAMILY_KINDS } from './wo
  *                             (phase 6); everything else is a plain adaptive
  *                             volume (≤ 1600 voxels).
  *                             `ensureVoxelWall` is a legacy alias.
- *   prevoxelizeTick(world, budgetMs?)   voxelize the scene's remaining
- *                             walls AND item-family nodes a few per tick,
- *                             AWAKE (host meshes hide in the SAME tick, via
- *                             the ensureVoxelTarget path — voxel-first:
- *                             items read as voxels from session start and
- *                             never morph on first hit); everything else a
- *                             blast can reach prebuilds DORMANT. Returns
- *                             true once every node is handled — drive it
- *                             from a useFrame until then.
+ *   prevoxelizeTick(world, budgetMs?, focus?)   voxelize the scene's
+ *                             remaining walls AND item-family nodes AWAKE
+ *                             (host meshes hide in the SAME tick, via the
+ *                             ensureVoxelTarget path — voxel-first: items
+ *                             read as voxels from session start and never
+ *                             morph on first hit); everything else a blast
+ *                             can reach prebuilds DORMANT. Work runs under
+ *                             a per-frame TIME budget (explicit budgetMs,
+ *                             or ADAPTIVE when omitted: 4 ms, raised to
+ *                             8 ms while recent frames run comfortably
+ *                             idle) and NEAREST `focus` (the player) FIRST,
+ *                             re-sorted every ~2 s — the far tail keeps its
+ *                             host meshes rendering and never blocks entry;
+ *                             any first damage out there still lands via
+ *                             the ensureVoxelTarget on-demand build.
+ *                             Returns true once every node is handled —
+ *                             drive it from a useFrame until then.
  *   damageTarget(world, nodeId, point, radius, direction?)   carve a sphere
  *                             at a world point (voxelizes on first hit);
  *                             direction aims the tear dust plume. Wall
@@ -2355,58 +2363,112 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   perfSection('wake', performance.now() - wakeT0)
 }
 
-const now: () => number =
+const realNow: () => number =
   typeof performance !== 'undefined' ? () => performance.now() : () => Date.now()
 
+/** Scheduler clock — swappable so tests drive deadlines deterministically. */
+let now: () => number = realNow
+
+/** TEST ONLY: inject a fake clock into the prevoxelize scheduler (deadline
+ * math, re-sort staleness, the frame-dt average). Pass null to restore the
+ * real clock. */
+export function setPrevoxelizeClock(clock: (() => number) | null): void {
+  now = clock ?? realNow
+}
+
+// ── Prevoxelize scheduling (perf fix 2: proximity order + time budget) ──────
+
+/** Per-tick prevoxelize TIME budget under load (ms) — the legacy game-root
+ * value, so worst-case throughput never regresses. */
+export const PREVOXELIZE_BUDGET_BASE_MS = 4
+/** Idle-accelerated budget (ms): frames comfortably under 60 Hz leave
+ * headroom, so the background tail finishes sooner. */
+export const PREVOXELIZE_BUDGET_IDLE_MS = 8
+/** A frame-dt rolling average at or under this (ms) reads as idle. */
+export const PREVOXELIZE_IDLE_FRAME_MS = 14
+/** Re-sort the remaining queue around the (moving) player this often. */
+export const PREVOXELIZE_RESORT_MS = 2000
+/** EMA weight per frame-dt sample (~10 frames to mostly converge). */
+const PREVOXELIZE_DT_ALPHA = 0.2
+/** Ignore absurd tick gaps (tab hidden, debugger) in the dt average. */
+const PREVOXELIZE_DT_MAX_SAMPLE_MS = 250
+
+/** ADAPTIVE BUDGET: pick the per-tick time budget from the recent frame-dt
+ * average — raise it while the loop runs comfortably idle, drop back to the
+ * base the moment frames load up. Pure; exported for tests. */
+export function prevoxelizeBudgetMs(frameDtEmaMs: number): number {
+  return frameDtEmaMs <= PREVOXELIZE_IDLE_FRAME_MS
+    ? PREVOXELIZE_BUDGET_IDLE_MS
+    : PREVOXELIZE_BUDGET_BASE_MS
+}
+
+/** PROXIMITY ORDER: pending node ids sorted by squared distance from the
+ * focus (nearest first). Ids without a known center sort LAST — they can
+ * never displace a wall the player is standing next to. Pure; exported for
+ * tests. */
+export function sortPendingByDistance2(
+  nodeIds: readonly string[],
+  centers: ReadonlyMap<string, readonly [number, number, number]>,
+  focus: { x: number; y: number; z: number },
+): string[] {
+  const scored = nodeIds.map((nodeId) => {
+    const center = centers.get(nodeId)
+    const d2 = center
+      ? (center[0] - focus.x) ** 2 + (center[1] - focus.y) ** 2 + (center[2] - focus.z) ** 2
+      : Number.MAX_VALUE
+    return { nodeId, d2 }
+  })
+  scored.sort((a, b) => a.d2 - b.d2)
+  return scored.map((s) => s.nodeId)
+}
+
+/** One pending-scan result: ids still needing a target, plus each id's
+ * awake-vs-dormant lane (see scanPrevoxelizePending). */
+type PrevoxelizePending = { ids: string[]; awake: Map<string, boolean> }
+
 /**
- * Pre-clad the scene's walls — and, voxel-first, its item-family nodes —
- * in voxels a few per tick, so the building already reads voxel at session
- * start instead of anything flipping on first hit. Every awake node goes
- * through ensureVoxelTarget — host meshes hide and colliders hand over IN
- * THE SAME TICK it voxelizes, never later. Returns true once every node in
- * the snapshot has a target; drive it from a per-frame loop until then
- * (game-root's Prevoxelize does).
+ * Snapshot every node prevoxelize still owes a target — walls first, then
+ * everything else a blast can reach (slabs, ceilings, roofs, items,
+ * fixtures): first hits used to voxelize these synchronously — a grenade
+ * mid-house built several BIG grids (BVH occupancy sweeps, segments,
+ * sheets) inside the blast frame, the "big lag when grenades explode"
+ * live report. Prebuilt DORMANT: the host keeps rendering/colliding
+ * untouched; the first hit wakes a target with the expensive part already
+ * done.
+ *
+ * VOXEL-FIRST ITEMS (owner call 2026-08-28): item-family nodes are the
+ * exception — they voxelize AWAKE, exactly like walls. The host GLB hides
+ * through the session ledger in the same tick and the silhouette replica
+ * (fine shape-tracing cells + per-cell region palette) renders FROM
+ * SESSION START — an item never morphs into voxels on its first hit, it
+ * just starts losing chunks. This also deletes the first-item-wake spike
+ * (62–68 ms live finding): there is no item wake left to pay for.
+ *
+ * VOXEL-FIRST ROOFS + SLABS (owner call 2026-08-28 round 2: "the roof
+ * looked like editor, and 1st bullet it changed into voxels" — NO
+ * morphing anywhere): roof and slab/ceiling/floor kinds voxelize AWAKE
+ * too, wearing their per-cell texture patterns from frame one. The same
+ * prevoxelize budget spreads the cost (the entry veil covers gear-up);
+ * Esc-restore is untouched — the hide rides the same session ledger.
+ * Only doors/windows and the block/column/stair family still prebuild
+ * dormant: their hosts keep live behaviors (Doors renderer, stair walk
+ * feel) that should not hand over until first damage.
  */
-export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
-  const deadline = now() + budgetMs
-  const targets = useDestruction.getState().targets
+function scanPrevoxelizePending(
+  world: GameWorld,
+  targets: ReadonlyMap<string, VoxelTarget>,
+): PrevoxelizePending {
+  const ids: string[] = []
+  const awake = new Map<string, boolean>()
   for (const nodeId of world.walls.keys()) {
     if (targets.has(nodeId) || prevoxelizeSkip.has(nodeId)) continue
-    if (now() >= deadline) return false
-    if (!ensureVoxelTarget(world, nodeId)) {
-      // Degenerate wall (no meshes / empty grid) — it can never voxelize,
-      // so don't let it wedge the driver in a forever-false loop.
-      prevoxelizeSkip.add(nodeId)
-    }
+    ids.push(nodeId)
+    awake.set(nodeId, true)
   }
-  // Then EVERYTHING else a blast can reach (slabs, ceilings, roofs, items,
-  // fixtures): first hits used to voxelize these synchronously — a grenade
-  // mid-house built several BIG grids (BVH occupancy sweeps, segments,
-  // sheets) inside the blast frame, the "big lag when grenades explode"
-  // live report. Prebuilt DORMANT: the host keeps rendering/colliding
-  // untouched; the first hit wakes a target with the expensive part already
-  // done. Same budget, walls first.
-  //
-  // VOXEL-FIRST ITEMS (owner call 2026-08-28): item-family nodes are the
-  // exception — they voxelize AWAKE, exactly like walls. The host GLB hides
-  // through the session ledger in the same tick and the silhouette replica
-  // (fine shape-tracing cells + per-cell region palette) renders FROM
-  // SESSION START — an item never morphs into voxels on its first hit, it
-  // just starts losing chunks. This also deletes the first-item-wake spike
-  // (62–68 ms live finding): there is no item wake left to pay for.
-  //
-  // VOXEL-FIRST ROOFS + SLABS (owner call 2026-08-28 round 2: "the roof
-  // looked like editor, and 1st bullet it changed into voxels" — NO
-  // morphing anywhere): roof and slab/ceiling/floor kinds voxelize AWAKE
-  // too, wearing their per-cell texture patterns from frame one. The same
-  // prevoxelize budget spreads the cost (the entry veil covers gear-up);
-  // Esc-restore is untouched — the hide rides the same session ledger.
-  // Only doors/windows and the block/column/stair family still prebuild
-  // dormant: their hosts keep live behaviors (Doors renderer, stair walk
-  // feel) that should not hand over until first damage.
   for (const collider of world.colliders) {
     const nodeId = collider.nodeId
     if (
+      awake.has(nodeId) || // wall id / earlier collider of the same node
       targets.has(nodeId) ||
       prevoxelizeSkip.has(nodeId) ||
       roofGroups.has(nodeId) ||
@@ -2424,19 +2486,194 @@ export function prevoxelizeTick(world: GameWorld, budgetMs = 4): boolean {
     ) {
       continue
     }
-    if (now() >= deadline) return false
-    const awake =
+    ids.push(nodeId)
+    awake.set(
+      nodeId,
       ITEM_FAMILY_KINDS.has(collider.nodeType) ||
-      ROOF_KINDS.has(collider.nodeType) ||
-      SLAB_KINDS.has(collider.nodeType)
-    if (!ensureVoxelTarget(world, nodeId, awake ? undefined : { dormant: true })) {
-      prevoxelizeSkip.add(nodeId)
-    }
+        ROOF_KINDS.has(collider.nodeType) ||
+        SLAB_KINDS.has(collider.nodeType),
+    )
   }
-  return true
+  return { ids, awake }
 }
 
-/** Walls ensureVoxelTarget refused (degenerate) — skipped on later ticks. */
+/** nodeId → world-space AABB center for every collider group (plus walls
+ * missing from the collider list — hand-built worlds): ONE cheap
+ * O(colliders + walls) pass per session, reused by every 2 s re-sort. */
+function buildPrevoxelizeCenters(world: GameWorld): Map<string, [number, number, number]> {
+  const boxes = new Map<string, Box3>()
+  for (const collider of world.colliders) {
+    const box = boxes.get(collider.nodeId)
+    if (box) box.union(collider.worldBox)
+    else boxes.set(collider.nodeId, collider.worldBox.clone())
+  }
+  const scratch = new Box3()
+  for (const [nodeId, wall] of world.walls) {
+    if (boxes.has(nodeId)) continue
+    const box = new Box3()
+    for (const mesh of wall.meshes) {
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+      box.union(scratch.copy(mesh.geometry.boundingBox!).applyMatrix4(mesh.matrixWorld))
+    }
+    if (!box.isEmpty()) boxes.set(nodeId, box)
+  }
+  const centers = new Map<string, [number, number, number]>()
+  for (const [nodeId, box] of boxes) {
+    centers.set(nodeId, [
+      (box.min.x + box.max.x) / 2,
+      (box.min.y + box.max.y) / 2,
+      (box.min.z + box.max.z) / 2,
+    ])
+  }
+  return centers
+}
+
+/** Persistent nearest-first work order (focus lane) — consumed across
+ * ticks via the cursor, rebuilt on the PREVOXELIZE_RESORT_MS cadence
+ * instead of every frame. */
+let prevoxelizeQueue: string[] = []
+let prevoxelizeQueueCursor = 0
+let prevoxelizeQueueSortedAt = Number.NEGATIVE_INFINITY
+/** Session-cached node centers for the re-sorts (null until first sort). */
+let prevoxelizeCenters: Map<string, [number, number, number]> | null = null
+/** Rolling frame-dt average (ms): the gap between consecutive ADAPTIVE
+ * ticks IS the frame time — a local average, no perf-monitor coupling. */
+let prevoxelizeDtEma = 1000 / 60
+let prevoxelizeLastTickAt = -1
+
+/** QA/tests introspection: the adaptive scheduler's live numbers. */
+export function prevoxelizeSchedulerStats(): {
+  frameDtEmaMs: number
+  budgetMs: number
+  queued: number
+} {
+  return {
+    frameDtEmaMs: prevoxelizeDtEma,
+    budgetMs: prevoxelizeBudgetMs(prevoxelizeDtEma),
+    queued: Math.max(prevoxelizeQueue.length - prevoxelizeQueueCursor, 0),
+  }
+}
+
+/**
+ * Pre-clad the scene's walls — and, voxel-first, its item-family nodes —
+ * in voxels a slice per tick, so the building already reads voxel at
+ * session start instead of anything flipping on first hit. Every awake
+ * node goes through ensureVoxelTarget — host meshes hide and colliders
+ * hand over IN THE SAME TICK it voxelizes, never later. Returns true once
+ * every node in the snapshot has a target; drive it from a per-frame loop
+ * until then (game-root's Prevoxelize does).
+ *
+ * Scheduling (perf fix 2 — the 20-31 s post-veil churn on a 670-node
+ * scene, ~211 s on a 3,745-node one):
+ *  - TIME budget: work stops at a per-tick deadline (explicit budgetMs, or
+ *    ADAPTIVE when omitted — prevoxelizeBudgetMs over a local frame-dt
+ *    average), so cheap targets batch up and the tick never spends a fixed
+ *    count regardless of size. At least ONE build always lands per funded
+ *    tick, so a tiny budget can never stall the queue. budgetMs 0 keeps
+ *    the "check, never work" probe contract (warmup.tsx, loading.ts).
+ *  - PROXIMITY order: with a `focus` (the player rig), pending targets
+ *    build nearest-first and the REMAINING queue re-sorts every
+ *    PREVOXELIZE_RESORT_MS as the player moves. The far tail can wait
+ *    minutes: hosts render + collide meanwhile, and any first damage out
+ *    there builds on demand through ensureVoxelTarget (damageTarget /
+ *    damageExplosion) exactly as before.
+ */
+export function prevoxelizeTick(
+  world: GameWorld,
+  budgetMs?: number,
+  focus?: { x: number; y: number; z: number },
+): boolean {
+  const start = now()
+  let budget: number
+  if (budgetMs === undefined) {
+    // ADAPTIVE lane (the game driver passes no budget): sample the gap
+    // since the previous adaptive tick as this frame's dt.
+    if (prevoxelizeLastTickAt >= 0) {
+      const dt = start - prevoxelizeLastTickAt
+      if (dt > 0 && dt < PREVOXELIZE_DT_MAX_SAMPLE_MS) {
+        prevoxelizeDtEma += (dt - prevoxelizeDtEma) * PREVOXELIZE_DT_ALPHA
+      }
+    }
+    prevoxelizeLastTickAt = start
+    budget = prevoxelizeBudgetMs(prevoxelizeDtEma)
+  } else {
+    budget = budgetMs
+  }
+
+  let targets = useDestruction.getState().targets
+  let pending = scanPrevoxelizePending(world, targets)
+  if (pending.ids.length === 0) {
+    prevoxelizeQueue = []
+    prevoxelizeQueueCursor = 0
+    return true
+  }
+  if (budget <= 0) return false // zero-budget probe: check, never work
+
+  if (focus) {
+    // Rebuild the nearest-first order when it went stale (the player kept
+    // moving) or the persistent queue ran out from under the cursor.
+    if (
+      start - prevoxelizeQueueSortedAt >= PREVOXELIZE_RESORT_MS ||
+      prevoxelizeQueueCursor >= prevoxelizeQueue.length
+    ) {
+      prevoxelizeCenters ??= buildPrevoxelizeCenters(world)
+      prevoxelizeQueue = sortPendingByDistance2(pending.ids, prevoxelizeCenters, focus)
+      prevoxelizeQueueCursor = 0
+      prevoxelizeQueueSortedAt = start
+    }
+  } else {
+    // No focus (headless callers, tests): the legacy walls-then-colliders
+    // scan order, rebuilt per tick.
+    prevoxelizeQueue = pending.ids
+    prevoxelizeQueueCursor = 0
+  }
+
+  const deadline = start + budget
+  let built = 0
+  for (;;) {
+    while (prevoxelizeQueueCursor < prevoxelizeQueue.length) {
+      const nodeId = prevoxelizeQueue[prevoxelizeQueueCursor]!
+      const awake = pending.awake.get(nodeId)
+      if (
+        awake === undefined || // handled since the queue was sorted
+        targets.has(nodeId) ||
+        roofGroups.has(nodeId) ||
+        prevoxelizeSkip.has(nodeId)
+      ) {
+        prevoxelizeQueueCursor++
+        continue
+      }
+      // TIME budget: yield the moment the clock is out — but always land
+      // at least one build per funded tick so the queue can never stall.
+      if (built > 0 && now() >= deadline) return false
+      built++
+      if (!ensureVoxelTarget(world, nodeId, awake ? undefined : { dormant: true })) {
+        // Degenerate node (no meshes / empty grid) — it can never
+        // voxelize, so don't let it wedge the driver in a forever-false
+        // loop.
+        prevoxelizeSkip.add(nodeId)
+      }
+      prevoxelizeQueueCursor++
+    }
+    // Queue drained with budget left: rescan. Anything still pending means
+    // the persistent order predated it — rebuild and keep going under the
+    // same deadline (each pass builds or skips at least one node, so this
+    // always terminates).
+    targets = useDestruction.getState().targets
+    pending = scanPrevoxelizePending(world, targets)
+    if (pending.ids.length === 0) return true
+    if (focus) {
+      prevoxelizeCenters ??= buildPrevoxelizeCenters(world)
+      prevoxelizeQueue = sortPendingByDistance2(pending.ids, prevoxelizeCenters, focus)
+      prevoxelizeQueueSortedAt = start
+    } else {
+      prevoxelizeQueue = pending.ids
+    }
+    prevoxelizeQueueCursor = 0
+  }
+}
+
+/** Nodes ensureVoxelTarget refused (degenerate) — skipped on later ticks. */
 const prevoxelizeSkip = new Set<string>()
 
 /** Collider nodeId prefix item-place.tsx gives placed items (kept in
@@ -4229,6 +4466,12 @@ export function resetDestruction(): void {
   skeletonTimers.length = 0
   skeletonSnapped.clear()
   prevoxelizeSkip.clear()
+  prevoxelizeQueue = []
+  prevoxelizeQueueCursor = 0
+  prevoxelizeQueueSortedAt = Number.NEGATIVE_INFINITY
+  prevoxelizeCenters = null
+  prevoxelizeDtEma = 1000 / 60
+  prevoxelizeLastTickAt = -1
   roofGroups.clear()
   roofMemberOf.clear()
   resetSkinTones()

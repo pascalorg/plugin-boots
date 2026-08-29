@@ -30,10 +30,18 @@ import {
   ITEM_CHUNK_SCALE_SPAN,
   itemChunkCount,
   itemChunkSize,
+  PREVOXELIZE_BUDGET_BASE_MS,
+  PREVOXELIZE_BUDGET_IDLE_MS,
+  PREVOXELIZE_IDLE_FRAME_MS,
+  PREVOXELIZE_RESORT_MS,
+  prevoxelizeBudgetMs,
+  prevoxelizeSchedulerStats,
   prevoxelizeTick,
   raycastSegments,
   resetDestruction,
   savedCoatHex,
+  setPrevoxelizeClock,
+  sortPendingByDistance2,
   useDestruction,
   wakeAheadTick,
 } from './destruction'
@@ -225,6 +233,153 @@ describe('prevoxelizeTick', () => {
     expect(prevoxelizeTick(world, 0)).toBe(true)
     expect(prevoxelizeTick(world, 8)).toBe(true)
     expect(useDestruction.getState().targets.has('__boots-item-7')).toBe(false)
+  })
+})
+
+describe('prevoxelize scheduling (perf fix 2: proximity order + time budget)', () => {
+  afterEach(() => {
+    setPrevoxelizeClock(null)
+  })
+
+  test('sortPendingByDistance2: nearest-first by squared distance; unknown centers last', () => {
+    const centers = new Map<string, [number, number, number]>([
+      ['far', [10, 0, 0]],
+      ['near', [1, 0, 0]],
+      ['mid', [-4, 0, 0]],
+    ])
+    expect(
+      sortPendingByDistance2(['far', 'mystery', 'mid', 'near'], centers, { x: 0, y: 0, z: 0 }),
+    ).toEqual(['near', 'mid', 'far', 'mystery'])
+    // From a MOVED focus the same pending set flips its order — the input
+    // array is never mutated (the caller may hold the scan snapshot).
+    const pending = ['far', 'mid', 'near']
+    expect(sortPendingByDistance2(pending, centers, { x: 11, y: 0, z: 0 })).toEqual([
+      'far',
+      'near',
+      'mid',
+    ])
+    expect(pending).toEqual(['far', 'mid', 'near'])
+  })
+
+  test('prevoxelizeBudgetMs: idle frames raise the budget, load drops it back', () => {
+    expect(prevoxelizeBudgetMs(8)).toBe(PREVOXELIZE_BUDGET_IDLE_MS)
+    expect(prevoxelizeBudgetMs(PREVOXELIZE_IDLE_FRAME_MS)).toBe(PREVOXELIZE_BUDGET_IDLE_MS)
+    expect(prevoxelizeBudgetMs(1000 / 60)).toBe(PREVOXELIZE_BUDGET_BASE_MS)
+    expect(prevoxelizeBudgetMs(50)).toBe(PREVOXELIZE_BUDGET_BASE_MS)
+    // Idle must actually accelerate over the base.
+    expect(PREVOXELIZE_BUDGET_IDLE_MS).toBeGreaterThan(PREVOXELIZE_BUDGET_BASE_MS)
+  })
+
+  test('a focused tick voxelizes the NEAREST pending node first and yields on the time budget', () => {
+    const world = makeWorld() // wall-1 @ x0, wall-2 @ x5, crate-1 @ x10
+    let t = 0
+    // Every clock read jumps 5 ms — one build exhausts any tick's budget,
+    // so each tick lands exactly one target (deterministic order probe).
+    setPrevoxelizeClock(() => (t += 5))
+    const focus = { x: 10, y: 1.3, z: 0 } // the player spawns at the crate
+    expect(prevoxelizeTick(world, undefined, focus)).toBe(false)
+    const targets = useDestruction.getState().targets
+    expect(targets.has('crate-1')).toBe(true) // nearest builds FIRST
+    expect(targets.has('wall-2')).toBe(false)
+    expect(targets.has('wall-1')).toBe(false)
+    expect(prevoxelizeTick(world, undefined, focus)).toBe(false)
+    expect(targets.has('wall-2')).toBe(true) // then the mid wall (5 m out)
+    expect(targets.has('wall-1')).toBe(false)
+    // The farthest wall lands last — and the tick that finishes it reports
+    // the whole snapshot done.
+    expect(prevoxelizeTick(world, undefined, focus)).toBe(true)
+    expect(targets.has('wall-1')).toBe(true)
+  })
+
+  test('the remaining queue re-sorts to the player every PREVOXELIZE_RESORT_MS', () => {
+    const world = makeWorld()
+    let t = 0
+    setPrevoxelizeClock(() => (t += 5))
+    // First tick from the crate end: crate-1 builds, [wall-2, wall-1] pends.
+    expect(prevoxelizeTick(world, undefined, { x: 10, y: 1.3, z: 0 })).toBe(false)
+    expect(useDestruction.getState().targets.has('crate-1')).toBe(true)
+    // The player sprints to the OTHER end; once the re-sort window passes,
+    // the stale wall-2-first order flips and wall-1 builds next.
+    t += PREVOXELIZE_RESORT_MS
+    expect(prevoxelizeTick(world, undefined, { x: 0, y: 1.3, z: 0 })).toBe(false)
+    expect(useDestruction.getState().targets.has('wall-1')).toBe(true)
+    expect(useDestruction.getState().targets.has('wall-2')).toBe(false)
+  })
+
+  test('cheap builds batch inside one time budget (never a fixed per-frame count)', () => {
+    const world = makeWorld()
+    let t = 0
+    setPrevoxelizeClock(() => (t += 1)) // 1 ms per build — all three fit one tick
+    expect(prevoxelizeTick(world, undefined, { x: 0, y: 1.3, z: 0 })).toBe(true)
+    expect(useDestruction.getState().targets.size).toBe(3)
+  })
+
+  test('a funded tick always lands at least one build — a tiny budget can never stall the queue', () => {
+    const world = makeWorld()
+    let t = 0
+    setPrevoxelizeClock(() => (t += 100)) // every read blows any deadline
+    expect(prevoxelizeTick(world, 0.5)).toBe(false)
+    expect(useDestruction.getState().targets.size).toBe(1)
+    // The zero-budget probe stays check-only even in the focused lane.
+    expect(prevoxelizeTick(world, 0, { x: 0, y: 0, z: 0 })).toBe(false)
+    expect(useDestruction.getState().targets.size).toBe(1)
+  })
+
+  test('the adaptive lane tracks a local frame-dt average and switches budget tiers', () => {
+    const world = makeWorld()
+    let t = 0
+    setPrevoxelizeClock(() => t)
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) {
+      t += 1
+      done = prevoxelizeTick(world, 8)
+    }
+    expect(done).toBe(true)
+    // 5 ms frames: comfortably idle → the budget rises to finish sooner.
+    for (let i = 0; i < 40; i++) {
+      t += 5
+      prevoxelizeTick(world)
+    }
+    expect(prevoxelizeSchedulerStats().frameDtEmaMs).toBeLessThan(PREVOXELIZE_IDLE_FRAME_MS)
+    expect(prevoxelizeSchedulerStats().budgetMs).toBe(PREVOXELIZE_BUDGET_IDLE_MS)
+    // 40 ms frames: loaded → drop back to the base budget.
+    for (let i = 0; i < 40; i++) {
+      t += 40
+      prevoxelizeTick(world)
+    }
+    expect(prevoxelizeSchedulerStats().frameDtEmaMs).toBeGreaterThan(PREVOXELIZE_IDLE_FRAME_MS)
+    expect(prevoxelizeSchedulerStats().budgetMs).toBe(PREVOXELIZE_BUDGET_BASE_MS)
+    // Tab-hidden / debugger gaps (≥ 250 ms) never poison the average.
+    const before = prevoxelizeSchedulerStats().frameDtEmaMs
+    t += 100_000
+    prevoxelizeTick(world)
+    expect(prevoxelizeSchedulerStats().frameDtEmaMs).toBe(before)
+  })
+
+  test('ON-DEMAND fallback: a blast at a target the queue has not reached builds it in the hit frame', () => {
+    const world = makeWorld()
+    let t = 0
+    setPrevoxelizeClock(() => (t += 5))
+    // One focused tick from the crate end: only the nearest node has a
+    // target; wall-2 is still queue-pending (minutes away in a big scene).
+    expect(prevoxelizeTick(world, undefined, { x: 10, y: 1.3, z: 0 })).toBe(false)
+    expect(useDestruction.getState().targets.has('wall-2')).toBe(false)
+    setPrevoxelizeClock(null)
+    // A grenade lands at the far, unvoxelized wall — the blast must build
+    // AND carve it synchronously (damageExplosion → ensureVoxelTarget).
+    const removed = damageExplosion(world, new Vector3(5, 1.35, 0), 2.5, { immediate: true })
+    expect(removed).toBeGreaterThan(0)
+    const wall = useDestruction.getState().targets.get('wall-2')!
+    expect(wall).toBeDefined()
+    expect(wall.dormant).toBeFalsy()
+    expect(wall.grid.aliveCount).toBeLessThan(wall.grid.count)
+    // The out-of-range far wall stayed pending — the queue was skipped, not
+    // wedged — and later ticks still finish the snapshot.
+    expect(useDestruction.getState().targets.has('wall-1')).toBe(false)
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
+    expect(done).toBe(true)
+    expect(useDestruction.getState().targets.has('wall-1')).toBe(true)
   })
 })
 
