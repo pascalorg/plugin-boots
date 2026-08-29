@@ -174,7 +174,10 @@ export function nearestGrabbable(
 /** Every solid depot mesh registers under this single destruction key —
  * '__boots'-prefixed (the prevoxelize guard skips it) AND nodeType
  * 'fixture' (shooting sparks, grenades skip): armored twice over. */
-const DEPOT_NODE_ID = '__boots-depot'
+export const DEPOT_NODE_ID = '__boots-depot'
+/** Outside shooting's DESTRUCTIBLE set and the grenade EXPLODABLE sets —
+ * the QA P6R1 lane where hits only spark. Exported for the armor pin. */
+export const DEPOT_NODE_TYPE = 'fixture'
 
 /** Kept export name — game-root mounts <GunTable/>; it now builds the
  * armored spawn depot in place of the loose tables. */
@@ -843,7 +846,7 @@ function useFixtureColliders(world: GameWorld, solidRefs: { current: (Mesh | nul
         worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
         root: mesh,
         nodeId: DEPOT_NODE_ID,
-        nodeType: 'fixture',
+        nodeType: DEPOT_NODE_TYPE,
       }
       world.colliders.push(entry)
       entries.push(entry)

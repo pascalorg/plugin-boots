@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'bun:test'
-import { Vector3 } from 'three'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
+import { prevoxelizeTick, resetDestruction, useDestruction } from './destruction'
 import {
   ARMORY_STATION_OFFSET,
   armoryStationPosition,
@@ -7,13 +8,15 @@ import {
   breakerPosition,
   BUILD_STATION_OFFSET,
   buildStationPosition,
+  DEPOT_NODE_ID,
+  DEPOT_NODE_TYPE,
   DEPOT_OFFSET,
   DEPOT_SIZE,
   depotPosition,
   GRAB_RANGE,
   nearestGrabbable,
 } from './guntable'
-import type { GameWorld } from './world'
+import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
  * Pure layout math for the ARMORED SPAWN DEPOT. The contract under test is
@@ -185,5 +188,69 @@ describe('spawn depot layout', () => {
       expect(BREAKER_OFFSET[0]).toBeGreaterThan(DEPOT_OFFSET[0])
       expect(depotLat).toBeCloseTo(DEPOT_OFFSET[0], 10)
     }
+  })
+})
+
+/**
+ * The armor itself: the depot must be mechanically indestructible AND must
+ * never wedge the session's voxel machinery. Two layers, both pinned:
+ * the '__boots' prefix (destruction.ts's prevoxelize guard — every
+ * game-only node manages its own lifecycle) and nodeType 'fixture'
+ * (outside shooting's DESTRUCTIBLE set and the grenade EXPLODABLE sets,
+ * so no damage path ever routes the depot into damageTarget).
+ */
+describe('spawn depot armor', () => {
+  afterEach(() => {
+    resetDestruction()
+  })
+
+  test('depot ids ride both guards: __boots prefix + fixture node type', () => {
+    expect(DEPOT_NODE_ID.startsWith('__boots')).toBe(true)
+    expect(DEPOT_NODE_TYPE).toBe('fixture')
+  })
+
+  test('prevoxelize skips the depot and still completes (gate not wedged)', () => {
+    // A depot shell collider next to one real wall-less item crate: the
+    // sweep must voxelize the crate, NEVER the depot, and report done —
+    // a target-less fixture must not wedge warmup's completeness gate.
+    const box = (
+      nodeId: string,
+      nodeType: string,
+      size: [number, number, number],
+      center: [number, number, number],
+    ): ColliderEntry => {
+      const mesh = new Mesh(new BoxGeometry(size[0], size[1], size[2]))
+      mesh.position.set(center[0], center[1], center[2])
+      mesh.updateMatrixWorld(true)
+      mesh.geometry.computeBoundingBox()
+      return {
+        mesh,
+        bvh: bvhFor(mesh),
+        inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+        worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+        root: mesh,
+        nodeId,
+        nodeType,
+      }
+    }
+    const depotWall = box(DEPOT_NODE_ID, DEPOT_NODE_TYPE, [6, 2.48, 0.1], [0, 1.36, -1.2])
+    const crate = box('crate-1', 'item', [1.2, 0.6, 1.2], [8, 0.3, 0])
+    const world = {
+      colliders: [depotWall, crate],
+      walls: new Map(),
+      glass: [],
+      doors: [],
+      overlayRoots: [],
+      buildingAabb: new Box3().union(depotWall.worldBox).union(crate.worldBox),
+      spawn: new Vector3(0, 0, 4),
+      spawnYaw: 0,
+      levelId: null,
+    } as unknown as GameWorld
+    let done = false
+    for (let i = 0; i < 50 && !done; i++) done = prevoxelizeTick(world, 8)
+    expect(done).toBe(true)
+    const targets = useDestruction.getState().targets
+    expect(targets.has('crate-1')).toBe(true)
+    expect(targets.has(DEPOT_NODE_ID)).toBe(false)
   })
 })
