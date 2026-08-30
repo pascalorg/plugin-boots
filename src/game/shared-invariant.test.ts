@@ -32,7 +32,7 @@ import { useScene } from '@pascal-app/core'
 import { useBoots } from '../store'
 import { armSceneWriteSentinel } from './session'
 import { mulberry32 } from './shared-derive'
-import { decodeDelta, encodeDelta } from './shared-wire'
+import { decodeDelta, encodeDelta, MAX_TEXT_CHARS, MAX_WIRE_PARTS } from './shared-wire'
 import {
   addLocalItem,
   addLocalPiece,
@@ -126,6 +126,46 @@ describe('the shared model cannot write a scene', () => {
         expect(code, `${module} uses ${needle}`).not.toContain(needle)
       }
     }
+  })
+
+  test('the frame budget is the transport, arithmetic checked not imported', async () => {
+    // shared-wire may not import net.ts — a pure codec that reaches for the bus
+    // is not pure any more — so the two numbers are related by a comment and
+    // could drift. This is the thing that notices. 8000 serialized characters
+    // per frame, 120 reserved for the envelope, two for the JSON quotes around
+    // a bare base64 string.
+    const net = codeOf(await read('./net.ts'))
+    const frame = Number(/MAX_FRAME_SERIALIZED\s*=\s*(\d+)/.exec(net)?.[1])
+    const envelope = Number(/MAX_PAYLOAD_SERIALIZED\s*=\s*MAX_FRAME_SERIALIZED\s*-\s*(\d+)/.exec(net)?.[1])
+    expect(frame).toBe(8000)
+    expect(envelope).toBe(120)
+    expect(MAX_TEXT_CHARS).toBe(frame - envelope - 2)
+    // And the host refuses an envelope claiming more parts than this.
+    expect(net).toContain('f.parts > 1024')
+    expect(MAX_WIRE_PARTS).toBe(1024)
+  })
+
+  test('nothing in the plugin vouches for a stranger', async () => {
+    // mergeDelta's third argument is the AUTHORSHIP GATE'S INPUT. null means
+    // "this came out of our own model, skip the gate", and the bus never
+    // produces it: every inbound frame is stamped with the sender's session id
+    // by the host. A caller passing a literal null would hand any peer the
+    // right to author records as anyone — including as us.
+    const glob = new Bun.Glob('*.{ts,tsx}')
+    const dir = new URL('.', import.meta.url).pathname
+    let callers = 0
+    for await (const file of glob.scan({ cwd: dir })) {
+      if (file.includes('.test.')) continue
+      const code = codeOf(await Bun.file(`${dir}${file}`).text())
+      for (const match of code.matchAll(/mergeDelta\(([^)]*)\)/g)) {
+        const args = (match[1] as string).split(',')
+        if (args.length < 3) continue
+        callers++
+        expect((args[2] as string).trim(), `${file} passes it as the sender`).not.toBe('null')
+      }
+    }
+    // The fence is worthless if it scanned nothing.
+    expect(callers).toBeGreaterThan(0)
   })
 
   test('a Save bridge may consume localWork and nothing else from it', async () => {
@@ -283,11 +323,14 @@ describe('localWork is the only door, and it opens on our work alone', () => {
     const { world } = mixedWorld()
     const observer = createSharedWorld('observer')
     setGridStamp(observer, STAMP)
-    // A late-join snapshot is ingested with sender = null: it is a RELAY of
-    // several peers' records, so the authorship gate cannot apply to it (with
-    // sender = 'me' only me's own records would survive, which is precisely
-    // what the gate is for on the per-frame path).
-    mergeDelta(observer, snapshotOf(world), null)
+    // Ingested the way the transport actually delivers it: the bus does NOT
+    // vouch for anyone. Every inbound frame carries a host-stamped sender, so a
+    // joiner learns the room from EACH peer's own snapshot — one frame per
+    // author, each gated against that author. There is no relay frame and no
+    // sender = null on the wire; null means "replayed from our own model".
+    const snapshot = snapshotOf(world)
+    mergeDelta(observer, snapshot, 'me')
+    mergeDelta(observer, snapshot, 'stranger')
 
     // The observer sees everything...
     expect(observer.nodes.size).toBe(world.nodes.size)
