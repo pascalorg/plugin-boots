@@ -1,0 +1,978 @@
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { useScene } from '@pascal-app/core'
+import { Mesh, PlaneGeometry, Vector3 } from 'three'
+import { useBoots } from '../store'
+import { useDestruction, type VoxelTarget } from './destruction'
+import {
+  gridTerrainY,
+  parseSlotId,
+  resetGridAnchor,
+  resetStoreyLadder,
+  setGridAnchor,
+  setStoreyLadder,
+  slotPose,
+} from './grid'
+import { type CatalogEntry, OPENING_ENTRIES, placeableCatalog } from './inventory'
+import { applyItems, discardItems, placedItemCount } from './item-keep'
+import { useItems } from './item-place'
+import { discardPlaced, keepPlaced } from './keep'
+import {
+  coatRadiusFor,
+  convertDecalsForNode,
+  foldRemoteStrokes,
+  getOwnPaintedByNode,
+  getPaintedByNode,
+  PAINT_PALETTE,
+  paintColorOf,
+  paintStrengthOf,
+  paintValue,
+  remoteCoatedCells,
+  resetPaint,
+  resetPaintDecals,
+  spawnPaintDecal,
+} from './paint'
+import { applyPaint, capturePaint, usePaintKeep } from './paint-keep'
+import { pieceAt, registerPlacement, resetPieceSlots } from './piece-slots'
+import { armSceneWriteSentinel } from './session'
+import {
+  attachBuildSync,
+  buildSyncOn,
+  detachBuildSync,
+  isForeignPiece,
+  isForeignPlacement,
+  pieceRecordOf,
+  publishAperture,
+  publishGridStamp,
+  publishItem,
+  publishStroke,
+  receiveBuildDelta,
+  reconcileSharedPieces,
+  resetSharedBuild,
+  setBuildAppliers,
+  sharedBuildDebug,
+} from './shared-build'
+import { gridStamp } from './shared-derive'
+import {
+  addLocalAperture,
+  addLocalItem,
+  addLocalPiece,
+  addLocalStroke,
+  createSharedWorld,
+  emptyDelta,
+  liveRecords,
+  localWork,
+  type PieceRec,
+  quantYaw,
+  type SharedDelta,
+  type SharedWorld,
+} from './shared-world'
+import type { GameWorld } from './world'
+
+/**
+ * The BUILD LANE against the convergent model: what this peer publishes, what
+ * a stranger's frame is allowed to do to this screen, and — the invariant that
+ * matters most — what Save may write afterwards.
+ *
+ * Every test drives the lane through `attachBuildSync` + `receiveBuildDelta`
+ * and reads the outgoing frames from a captured sink. There is no transport
+ * here on purpose: those two functions ARE the injection point, and this file
+ * imports nothing from net.ts or the copresence layer.
+ */
+
+const LADDER = [0, 2.8, 5.6, 8.4]
+const WALL_SLOT = 'Wx:0,0,0'
+const OTHER_SLOT = 'Wz:1,1,0'
+
+/** The editor package is a zustand-shaped stub under bun test, so the bundled
+ * CATALOG_ITEMS list is empty (inventory.tsx's BUNDLED guard). Placements
+ * therefore run against an explicit catalog, filtered by the real
+ * `placeableCatalog` so the lookup the applier does is the production one. */
+const catalogEntry = (id: string): CatalogEntry => ({
+  id,
+  category: 'furniture',
+  name: id,
+  thumbnail: `https://cdn.test/${id}/thumbnail.png`,
+  src: `https://cdn.test/${id}/model.glb`,
+})
+const CATALOG = placeableCatalog([catalogEntry('couch'), catalogEntry('fridge')])
+const ITEM = CATALOG[0]!
+
+type SceneStore = {
+  getState: () => {
+    setScene: (nodes: Record<string, unknown>, roots: string[]) => void
+    setReadOnly?: (readOnly: boolean) => void
+    nodes: Record<string, unknown>
+  }
+}
+const scene = useScene as unknown as SceneStore
+
+/** The session under test: our world, a peer's world to mint from, the wire. */
+type Harness = {
+  mine: SharedWorld
+  theirs: SharedWorld
+  sent: SharedDelta[]
+  notices: string[]
+  stamp: number
+}
+
+/** Attach the lane exactly the way builder.tsx does — grid first (the stamp
+ * is published the moment the anchor and ladder are installed), then the
+ * sink and the notice channel a test can read. */
+function boot(): Harness {
+  setGridAnchor({ x: 0, z: 0, yaw: 0 })
+  setStoreyLadder(LADDER)
+  const mine = createSharedWorld('me')
+  const theirs = createSharedWorld('them')
+  const sent: SharedDelta[] = []
+  const notices: string[] = []
+  attachBuildSync(mine, {
+    sink: (delta) => sent.push(delta),
+    notice: (text) => notices.push(text),
+  })
+  const stamp = publishGridStamp(0, 0, [gridTerrainY(), ...LADDER])
+  return { mine, theirs, sent, notices, stamp }
+}
+
+/** One frame from a peer, stamped with a grid we agree on unless told not to. */
+function frame(h: Harness, from: string, fill: (delta: SharedDelta) => void): SharedDelta {
+  const delta = emptyDelta(from)
+  delta.gridStamp = h.stamp
+  delta.lamport = h.theirs.clock
+  fill(delta)
+  return delta
+}
+
+/** A peer's wall record, minted in THEIR world so the id and lamport are the
+ * real thing (`them#3`), which is what the authorship gate checks. */
+function theirWall(h: Harness, slot: string, opts?: { yaw?: number; mask?: number }): PieceRec {
+  const rec = addLocalPiece(h.theirs, {
+    kind: 'wall',
+    slot,
+    mask: opts?.mask ?? 511,
+    yaw: opts?.yaw ?? Math.PI / 2,
+    height: 2.8,
+    corners: null,
+  })
+  expect(rec).not.toBeNull()
+  return rec!
+}
+
+/** A wall this player builds, exactly the way builder.tsx builds one: the
+ * store append, the slot claim, then the effect that publishes it. */
+function myWall(slot: string): number {
+  const stored = useBoots.getState().addPlaced({
+    piece: 'wall',
+    position: [0, 0, 0],
+    yaw: Math.PI / 2,
+    slotId: slot,
+    height: 2.8,
+  })
+  registerPlacement(slot, stored.id)
+  reconcileSharedPieces()
+  return stored.id
+}
+
+/** A five-cell voxel strip along X at 0.15 m spacing — enough grid for
+ * splatCoat to expand a ball against (the paint-decals.test stub). */
+function fakeTarget(nodeId: string): VoxelTarget {
+  const count = 5
+  const centers = new Float32Array(count * 3)
+  for (let i = 0; i < count; i++) centers[i * 3] = (i - 2) * 0.15
+  return {
+    nodeId,
+    kind: 'wall',
+    dormant: false,
+    grid: { count, alive: new Uint8Array(count).fill(1), centers, cellY: 0.15 },
+  } as unknown as VoxelTarget
+}
+
+/** foldRemoteStrokes only reads `world` to voxelize a node it cannot find;
+ * every test pre-seeds the target, so the argument is never touched. */
+const NO_WORLD = {} as unknown as GameWorld
+
+/**
+ * The appliers item-place.tsx's GameItems and paint.tsx's PaintTool install
+ * at mount, mirrored here because neither component can mount headless. Same
+ * catalog lookups, same stores, same null-means-refuse contract.
+ */
+function installAppliers(): void {
+  setBuildAppliers({
+    spawnItem: (rec) => {
+      const entry = CATALOG.find((e) => e.id === rec.catalogId)
+      if (!entry) return null
+      return useItems.getState().addItem(entry, [rec.x, rec.y, rec.z], rec.yaw).id
+    },
+    spawnAperture: (rec) => {
+      const def = OPENING_ENTRIES.find((e) => e.id === rec.catalogId)
+      if (!def) return null
+      return useItems
+        .getState()
+        .addAperture(def, rec.host, rec.u, rec.v, { width: rec.width, height: rec.height }).id
+    },
+    removePlacement: (id) => useItems.getState().removeItem(id),
+    foldStrokes: (strokes) => foldRemoteStrokes(NO_WORLD, strokes),
+  })
+}
+
+afterEach(() => {
+  resetSharedBuild()
+  useBoots.getState().resolvePlaced()
+  useBoots.getState().setPhase('editor')
+  useItems.getState().resolveItems()
+  usePaintKeep.getState().clear()
+  resetPieceSlots()
+  resetPaintDecals()
+  resetPaint()
+  useDestruction.getState().reset()
+  resetGridAnchor()
+  resetStoreyLadder()
+  scene.getState().setReadOnly?.(false)
+  scene.getState().setScene({}, [])
+})
+
+// ── Sync off: single-player is not touched ──────────────────────────────────
+
+describe('with sync off the build lane does not exist', () => {
+  test('every publish and receive entry point is inert, and the store is byte-identical', () => {
+    expect(buildSyncOn()).toBe(false)
+    setGridAnchor({ x: 0, z: 0, yaw: 0 })
+    setStoreyLadder(LADDER)
+
+    const id = useBoots.getState().addPlaced({
+      piece: 'wall',
+      position: [1, 0, 2],
+      yaw: Math.PI / 2,
+      slotId: WALL_SLOT,
+      height: 2.8,
+    }).id
+    const target = fakeTarget('wall-1')
+    useDestruction.getState().targets.set('wall-1', target)
+
+    const before = JSON.stringify({
+      placed: useBoots.getState().placed,
+      items: useItems.getState().items,
+      painted: [...getPaintedByNode()].map(([node, cells]) => [node, [...cells]]),
+    })
+
+    // Every seam the wiring touches, called exactly as the game calls it.
+    expect(publishGridStamp(0, 0, LADDER)).toBe(0)
+    reconcileSharedPieces()
+    expect(publishItem(id, 'crate-small', [0, 0, 0], 0)).toBeNull()
+    expect(publishAperture(id, 'opening-door-hinged', 'wall-1', 1, 1, 0.9, 2)).toBeNull()
+    expect(publishStroke('wall-1', 2, 0, 0, 0, 0.25)).toBeNull()
+
+    // And a stranger shouting a full frame at a single-player session: the
+    // receive door is shut, so not one record is even merged.
+    const loner = createSharedWorld('them')
+    const rec = addLocalPiece(loner, {
+      kind: 'wall',
+      slot: OTHER_SLOT,
+      mask: 511,
+      yaw: 0,
+      height: 2.8,
+      corners: null,
+    })!
+    const hostile = emptyDelta('them')
+    hostile.gridStamp = gridStamp(0, 0, LADDER)
+    hostile.pieces.push(rec)
+    const fx = receiveBuildDelta(hostile, 'them')
+    expect(fx.addedPieces).toHaveLength(0)
+    expect(fx.dropped).toBe(0) // nothing was even looked at
+
+    const after = JSON.stringify({
+      placed: useBoots.getState().placed,
+      items: useItems.getState().items,
+      painted: [...getPaintedByNode()].map(([node, cells]) => [node, [...cells]]),
+    })
+    expect(after).toBe(before)
+    expect(isForeignPiece(id)).toBe(false)
+    expect(isForeignPlacement(id)).toBe(false)
+    expect(pieceRecordOf(id)).toBeNull()
+    expect(sharedBuildDebug().on).toBe(false)
+  })
+
+  test('the paint ledger Save reads is the SAME OBJECT the game writes', () => {
+    // Not "an equal map" — the identical object, so single-player walks the
+    // pre-sync code path with no copy and no filter in it.
+    expect(getOwnPaintedByNode()).toBe(getPaintedByNode())
+    const target = fakeTarget('wall-1')
+    useDestruction.getState().targets.set('wall-1', target)
+    const mesh = new Mesh(new PlaneGeometry(6, 6))
+    mesh.updateMatrixWorld(true)
+    expect(spawnPaintDecal(mesh, 'wall-1', new Vector3(0, 0, 0), new Vector3(0, 0, 1), 0.4, 3)).toBe(
+      true,
+    )
+    convertDecalsForNode('wall-1')
+    expect(getPaintedByNode().get('wall-1')!.size).toBeGreaterThan(0)
+    expect(getOwnPaintedByNode()).toBe(getPaintedByNode())
+    expect(remoteCoatedCells('wall-1').size).toBe(0)
+  })
+
+  test('a local piece still reaches Save untouched', () => {
+    setGridAnchor({ x: 0, z: 0, yaw: 0 })
+    setStoreyLadder(LADDER)
+    useBoots.getState().addPlaced({
+      piece: 'wall',
+      position: [0, 0, 0],
+      yaw: Math.PI / 2,
+      slotId: WALL_SLOT,
+      height: 2.8,
+    })
+    // Whatever the host registry offers in this environment, the piece was
+    // CONSIDERED: kept or skipped, it went through the pass.
+    const result = keepPlaced()
+    expect(result.kept + result.skipped).toBe(1)
+  })
+})
+
+// ── Pieces: a stranger's wall becomes a real wall ────────────────────────────
+
+describe('a remote piece materializes from its slot alone', () => {
+  test('the pose is derived, the slot is claimed, and it is marked as theirs', () => {
+    const h = boot()
+    const rec = theirWall(h, WALL_SLOT)
+    const fx = receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+
+    expect(fx.addedPieces).toHaveLength(1)
+    expect(fx.refusedGrid).toBe(false)
+    const placed = useBoots.getState().placed
+    expect(placed).toHaveLength(1)
+    const piece = placed[0]!
+    // Not one coordinate travelled: the pose is slotPose of the slot id.
+    const pose = slotPose(parseSlotId(WALL_SLOT)!)
+    expect(piece.position[0]).toBeCloseTo(pose.position[0], 10)
+    expect(piece.position[1]).toBeCloseTo(pose.position[1], 10)
+    expect(piece.position[2]).toBeCloseTo(pose.position[2], 10)
+    expect(piece.yaw).toBeCloseTo(rec.yaw, 10)
+    expect(piece.slotId).toBe(WALL_SLOT)
+    expect(piece.height).toBe(2.8)
+    // The runtime slot registry is the occupancy authority and it agrees.
+    expect(pieceAt(WALL_SLOT)).toBe(piece.id)
+    expect(isForeignPiece(piece.id)).toBe(true)
+    expect(sharedBuildDebug().pieces.foreign).toBe(1)
+    // Nothing of theirs goes back out on the wire.
+    expect(h.sent).toHaveLength(0)
+  })
+
+  test('re-delivery, a snapshot and a reordered frame all land on one wall', () => {
+    const h = boot()
+    const rec = theirWall(h, WALL_SLOT)
+    const f = frame(h, 'them', (d) => d.pieces.push(rec))
+    receiveBuildDelta(f, 'them')
+    const first = useBoots.getState().placed[0]!.id
+    for (let i = 0; i < 5; i++) receiveBuildDelta(f, 'them')
+    const snapshot = frame(h, 'them', (d) => {
+      d.kind = 'snapshot'
+      d.pieces.push(rec)
+    })
+    receiveBuildDelta(snapshot, 'them')
+    expect(useBoots.getState().placed).toHaveLength(1)
+    expect(useBoots.getState().placed[0]!.id).toBe(first) // not respawned
+    expect(pieceAt(WALL_SLOT)).toBe(first)
+  })
+
+  test('a tombstone from anywhere takes the wall down and frees the slot', () => {
+    const h = boot()
+    const rec = theirWall(h, WALL_SLOT)
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+    expect(useBoots.getState().placed).toHaveLength(1)
+    receiveBuildDelta(frame(h, 'them', (d) => d.deadPieces.push(rec.id)), 'them')
+    expect(useBoots.getState().placed).toHaveLength(0)
+    expect(pieceAt(WALL_SLOT)).toBeUndefined()
+    expect(sharedBuildDebug().pieces.bound).toBe(0)
+  })
+
+  test('a slotless legacy piece publishes nothing but still lives locally', () => {
+    const h = boot()
+    const stored = useBoots.getState().addPlaced({
+      piece: 'wall',
+      position: [3, 0, 0],
+      yaw: 0,
+      height: 2.8,
+    })
+    reconcileSharedPieces()
+    expect(pieceRecordOf(stored.id)).toBeNull()
+    expect(liveRecords(h.mine.pieces)).toHaveLength(0)
+    expect(useBoots.getState().placed).toHaveLength(1) // it renders and saves
+  })
+})
+
+// ── Publish: what leaves this client ────────────────────────────────────────
+
+describe('what this player builds goes out once, quantized', () => {
+  test('a placement mints one record and one frame', () => {
+    const h = boot()
+    const id = myWall(WALL_SLOT)
+    expect(h.sent).toHaveLength(1)
+    const delta = h.sent[0]!
+    expect(delta.pieces).toHaveLength(1)
+    expect(delta.gridStamp).toBe(h.stamp)
+    const rec = delta.pieces[0]!
+    expect(rec.slot).toBe(WALL_SLOT)
+    expect(rec.kind).toBe('wall')
+    // Quantized ON MINT: the local world holds exactly the number the peer
+    // will hold, so nothing downstream can drift from the wire.
+    expect(rec.yaw).toBe(quantYaw(Math.PI / 2))
+    expect(rec.height).toBe(2.8)
+    expect(pieceRecordOf(id)).toBe(rec.id)
+    expect(isForeignPiece(id)).toBe(false)
+    // Re-running the diff publishes nothing new.
+    reconcileSharedPieces()
+    expect(h.sent).toHaveLength(1)
+
+    // An off-quarter yaw proves the rounding is real and happens at the mint,
+    // not at the codec: the record — and so this client's own state — carries
+    // the 65536-step value.
+    useBoots.getState().addPlaced({
+      piece: 'wall',
+      position: [3, 0, 0],
+      yaw: 1.2345678,
+      slotId: OTHER_SLOT,
+      height: 2.8,
+    })
+    reconcileSharedPieces()
+    const odd = liveRecords(h.mine.pieces).find((r) => r.slot === OTHER_SLOT)!
+    expect(odd.yaw).not.toBe(1.2345678)
+    expect(odd.yaw).toBe(quantYaw(1.2345678))
+  })
+
+  test('an F-edit replaces the record; undo tombstones it', () => {
+    const h = boot()
+    const id = myWall(WALL_SLOT)
+    const firstRec = pieceRecordOf(id)!
+
+    useBoots.getState().setPlacedMask(id, 447) // pocket the middle cell
+    reconcileSharedPieces()
+    const second = pieceRecordOf(id)!
+    expect(second).not.toBe(firstRec)
+    expect(liveRecords(h.mine.pieces)).toHaveLength(1)
+    expect(liveRecords(h.mine.pieces)[0]!.mask).toBe(447)
+    expect(h.mine.pieces.dead.has(firstRec)).toBe(true)
+    const edit = h.sent[1]!
+    expect(edit.deadPieces).toContain(firstRec)
+    expect(edit.pieces).toHaveLength(1)
+
+    useBoots.getState().removePlaced(id)
+    reconcileSharedPieces()
+    expect(liveRecords(h.mine.pieces)).toHaveLength(0)
+    expect(h.sent[2]!.deadPieces).toContain(second)
+    expect(pieceRecordOf(id)).toBeNull()
+  })
+
+  test('items, apertures and strokes each publish their own record', () => {
+    const h = boot()
+    const itemId = publishItem(9001, ITEM.id, [1.234567, 0, -2], Math.PI)
+    expect(itemId).not.toBeNull()
+    const apId = publishAperture(9002, 'opening-door-hinged', 'wall-1', 1.5, 1, 0.9, 2.1)
+    expect(apId).not.toBeNull()
+    expect(publishStroke('wall-1', 3, 0.5, 1, 0.5, 0.25)).not.toBeNull()
+
+    const work = localWork(h.mine)
+    expect(work.items).toHaveLength(1)
+    expect(work.apertures).toHaveLength(1)
+    expect(work.strokes).toHaveLength(1)
+    expect(work.items[0]!.catalogId).toBe(ITEM.id)
+    expect(work.items[0]!.x).toBe(1.235) // quantized on mint
+    expect(work.apertures[0]!.host).toBe('wall-1')
+    expect(isForeignPlacement(9001)).toBe(false)
+    // Publishing the same runtime placement twice is refused, not duplicated.
+    expect(publishItem(9001, ITEM.id, [1, 0, 1], 0)).toBeNull()
+    expect(localWork(h.mine).items).toHaveLength(1)
+  })
+})
+
+// ── One slot, two builders ──────────────────────────────────────────────────
+
+describe('two builders claim one slot', () => {
+  /**
+   * Two OTHER peers claim the same slot; we only watch. Both claims exist
+   * before either arrives, which is the case convergence is actually about —
+   * a local claim minted after hearing theirs is genuinely later (the lamport
+   * says so), and there would be nothing to converge.
+   */
+  function race(order: 'ab' | 'ba'): string | null {
+    const h = boot()
+    const alpha = createSharedWorld('alpha')
+    const beta = createSharedWorld('beta')
+    beta.clock = 500 // beta's claim is later in (lamport, id) order
+    const mk = (w: SharedWorld) =>
+      addLocalPiece(w, {
+        kind: 'wall',
+        slot: WALL_SLOT,
+        mask: 511,
+        yaw: 0,
+        height: 2.8,
+        corners: null,
+      })!
+    const a = mk(alpha)
+    const b = mk(beta)
+    const send = (from: string, rec: PieceRec) => {
+      const d = emptyDelta(from)
+      d.gridStamp = h.stamp
+      d.lamport = rec.lamport
+      d.pieces.push(rec)
+      receiveBuildDelta(d, from)
+    }
+    if (order === 'ab') {
+      send('alpha', a)
+      send('beta', b)
+    } else {
+      send('beta', b)
+      send('alpha', a)
+    }
+    expect(useBoots.getState().placed).toHaveLength(1)
+    return pieceRecordOf(useBoots.getState().placed[0]!.id)
+  }
+
+  test('the same record wins whichever order the claims arrive in', () => {
+    const ab = race('ab')
+    resetSharedBuild()
+    useBoots.getState().resolvePlaced()
+    resetPieceSlots()
+    const ba = race('ba')
+    expect(ab).toBe('beta#1') // the later lamport, on both clients
+    expect(ba).toBe('beta#1')
+  })
+
+  test('the local loser is TOLD, not silently deleted', () => {
+    const h = boot()
+    // We built here first; their claim was stamped later than ours.
+    const id = myWall(WALL_SLOT)
+    h.theirs.clock = 500
+    const rec = theirWall(h, WALL_SLOT, { yaw: 0 })
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+
+    const placed = useBoots.getState().placed
+    expect(placed).toHaveLength(1)
+    expect(placed[0]!.id).not.toBe(id) // our wall went
+    expect(isForeignPiece(placed[0]!.id)).toBe(true) // theirs stands in its place
+    expect(pieceAt(WALL_SLOT)).toBe(placed[0]!.id)
+    // And the player found out why, in their own words.
+    expect(h.notices).toContain('Another builder claimed that wall slot')
+  })
+
+  test('losing once is final — the deposed record never comes back', () => {
+    const h = boot()
+    const id = myWall(WALL_SLOT)
+    const mineRec = pieceRecordOf(id)
+    h.theirs.clock = 500
+    const rec = theirWall(h, WALL_SLOT, { yaw: 0 })
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+    expect(sharedBuildDebug().pieces.deposed).toBe(1)
+    // Their frame replays (a snapshot, a retransmit): our deposed wall must
+    // not flicker back into the slot it lost.
+    for (let i = 0; i < 3; i++) {
+      receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+      reconcileSharedPieces()
+    }
+    expect(useBoots.getState().placed).toHaveLength(1)
+    expect(pieceRecordOf(useBoots.getState().placed[0]!.id)).toBe(rec.id)
+    expect(mineRec).not.toBe(rec.id)
+  })
+
+  test('an earlier claim from a peer loses to the wall already standing', () => {
+    const h = boot()
+    myWall(OTHER_SLOT) // lamport 1
+    const id = myWall(WALL_SLOT) // lamport 2
+    const stale = theirWall(h, WALL_SLOT, { yaw: 0 }) // lamport 1 in their world
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(stale)), 'them')
+    expect(useBoots.getState().placed).toHaveLength(2)
+    expect(pieceAt(WALL_SLOT)).toBe(id)
+    expect(isForeignPiece(id)).toBe(false)
+    expect(h.notices).toHaveLength(0) // we lost nothing, so we hear nothing
+  })
+})
+
+// ── The grid gate ───────────────────────────────────────────────────────────
+
+describe('a builder on a different lot grid', () => {
+  test('their slot pieces are refused and the player is told once', () => {
+    const h = boot()
+    const rec = theirWall(h, WALL_SLOT)
+    const wrong = frame(h, 'them', (d) => d.pieces.push(rec))
+    wrong.gridStamp = h.stamp ^ 0x5f5f5f5f // a different lot entirely
+
+    const fx = receiveBuildDelta(wrong, 'them')
+    expect(fx.refusedGrid).toBe(true)
+    expect(fx.addedPieces).toHaveLength(0)
+    expect(useBoots.getState().placed).toHaveLength(0)
+    expect(h.notices).toEqual(['A builder is on a different lot grid — their pieces are hidden'])
+
+    // Refused, not spammed: a second bad frame says nothing new.
+    receiveBuildDelta(wrong, 'them')
+    expect(h.notices).toHaveLength(1)
+  })
+
+  test('the same peer’s items still arrive — only slots are lot-relative', () => {
+    const h = boot()
+    installAppliers()
+    const item = addLocalItem(h.theirs, {
+      catalogId: ITEM.id,
+      x: 2,
+      y: 0,
+      z: 3,
+      yaw: 0,
+    })!
+    const wrong = frame(h, 'them', (d) => d.items.push(item))
+    wrong.gridStamp = 0 // unknown grid: the hardest case the gate allows
+    const fx = receiveBuildDelta(wrong, 'them')
+    // The gate closed (their slots are meaningless to us) but the item is
+    // world-absolute, so it lands: a mismatch costs pieces, not everything.
+    expect(fx.refusedGrid).toBe(true)
+    expect(useItems.getState().items).toHaveLength(1)
+    expect(isForeignPlacement(useItems.getState().items[0]!.id)).toBe(true)
+  })
+
+  test('a stamp we have not published yet refuses everyone’s slots', () => {
+    setGridAnchor({ x: 0, z: 0, yaw: 0 })
+    setStoreyLadder(LADDER)
+    const mine = createSharedWorld('me')
+    const notices: string[] = []
+    attachBuildSync(mine, { notice: (t) => notices.push(t) }) // no publishGridStamp
+    const theirs = createSharedWorld('them')
+    const rec = addLocalPiece(theirs, {
+      kind: 'wall',
+      slot: WALL_SLOT,
+      mask: 511,
+      yaw: 0,
+      height: 2.8,
+      corners: null,
+    })!
+    const delta = emptyDelta('them')
+    delta.gridStamp = gridStamp(0, 0, LADDER)
+    delta.pieces.push(rec)
+    expect(receiveBuildDelta(delta, 'them').refusedGrid).toBe(true)
+    expect(useBoots.getState().placed).toHaveLength(0)
+    expect(notices).toHaveLength(1)
+  })
+})
+
+// ── Items and apertures ─────────────────────────────────────────────────────
+
+describe('remote catalog items and openings', () => {
+  test('an item is looked up locally and spawned; an unknown id is refused', () => {
+    const h = boot()
+    installAppliers()
+    const good = addLocalItem(h.theirs, { catalogId: ITEM.id, x: 1, y: 0, z: 2, yaw: Math.PI / 2 })!
+    const junk = addLocalItem(h.theirs, { catalogId: 'no-such-thing', x: 0, y: 0, z: 0, yaw: 0 })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.items.push(good, junk)), 'them')
+
+    const items = useItems.getState().items
+    expect(items).toHaveLength(1)
+    const placement = items[0]!
+    expect(placement.kind).toBe('item')
+    expect(isForeignPlacement(placement.id)).toBe(true)
+    // The refused record stays alive in the model — another client may well
+    // have that asset, and a later re-fold can pick it up.
+    expect(liveRecords(h.mine.items)).toHaveLength(2)
+  })
+
+  test('an aperture is materialized from the record, not re-derived', () => {
+    const h = boot()
+    installAppliers()
+    const def = OPENING_ENTRIES[0]!
+    const rec = addLocalAperture(h.theirs, {
+      catalogId: def.id,
+      host: 'wall-1',
+      u: 1.25,
+      v: 1,
+      width: def.width + 0.4, // a resized opening on their screen
+      height: def.height,
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.apertures.push(rec)), 'them')
+    const placed = useItems.getState().items[0]!
+    expect(placed.kind).toBe('aperture')
+    if (placed.kind !== 'aperture') return
+    expect(placed.wallId).toBe('wall-1')
+    expect(placed.u).toBe(1.25)
+    expect(placed.width).toBeCloseTo(def.width + 0.4, 6)
+  })
+
+  test('a tombstoned placement leaves this screen too', () => {
+    const h = boot()
+    installAppliers()
+    const rec = addLocalItem(h.theirs, { catalogId: ITEM.id, x: 1, y: 0, z: 2, yaw: 0 })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.items.push(rec)), 'them')
+    expect(useItems.getState().items).toHaveLength(1)
+    receiveBuildDelta(frame(h, 'them', (d) => d.deadItems.push(rec.id)), 'them')
+    expect(useItems.getState().items).toHaveLength(0)
+    expect(sharedBuildDebug().placements.bound).toBe(0)
+  })
+})
+
+// ── Paint ───────────────────────────────────────────────────────────────────
+
+describe('remote strokes fold into the one coat ledger', () => {
+  test('the fold uses the live coat arithmetic and accumulates like a spray', () => {
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const color = 3
+    const radius = coatRadiusFor(0.5)
+    const one = addLocalStroke(h.theirs, { node: 'wall_a', color, x: 0, y: 0, z: 0, radius })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(one)), 'them')
+
+    const cells = getPaintedByNode().get('wall_a')!
+    expect(cells.size).toBe(3) // the strip's middle three, under the disc
+    const center = cells.get(2)!
+    expect(paintColorOf(center)).toBe(color)
+    // COAT_ADD at the centre — the same number sprayPaint would have written,
+    // because paintValue/coatBaseStrength are IMPORTED, not re-implemented.
+    expect(center).toBe(paintValue(color, 0.45))
+    expect(paintStrengthOf(center)).toBeCloseTo(0.45, 2)
+
+    // A second stroke of the same colour builds on the first.
+    const two = addLocalStroke(h.theirs, { node: 'wall_a', color, x: 0, y: 0, z: 0, radius })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(two)), 'them')
+    expect(paintStrengthOf(getPaintedByNode().get('wall_a')!.get(2)!)).toBeCloseTo(0.9, 2)
+
+    // A different colour RESTARTS the accumulator (coatBaseStrength's rule).
+    const other = addLocalStroke(h.theirs, { node: 'wall_a', color: 5, x: 0, y: 0, z: 0, radius })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(other)), 'them')
+    const repainted = getPaintedByNode().get('wall_a')!.get(2)!
+    expect(paintColorOf(repainted)).toBe(5)
+    expect(repainted).toBe(paintValue(5, 0.45)) // not 0.9 carried across colours
+  })
+
+  test('re-delivering the same strokes does not double-coat', () => {
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const radius = coatRadiusFor(0.5)
+    const strokes = [0, 1, 2].map(
+      (i) =>
+        addLocalStroke(h.theirs, { node: 'wall_a', color: 2, x: i * 0.15 - 0.15, y: 0, z: 0, radius })!,
+    )
+    const f = frame(h, 'them', (d) => d.strokes.push(...strokes))
+    receiveBuildDelta(f, 'them')
+    const settled = JSON.stringify([...getPaintedByNode().get('wall_a')!].sort())
+    for (let i = 0; i < 4; i++) receiveBuildDelta(f, 'them')
+    // Shuffled, and as a snapshot: a lattice join, so the ledger is the same.
+    const shuffled = frame(h, 'them', (d) => {
+      d.kind = 'snapshot'
+      d.strokes.push(strokes[2]!, strokes[0]!, strokes[1]!)
+    })
+    receiveBuildDelta(shuffled, 'them')
+    expect(JSON.stringify([...getPaintedByNode().get('wall_a')!].sort())).toBe(settled)
+  })
+
+  test('a colour outside this client’s palette is refused', () => {
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const hostile = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: PAINT_PALETTE.length + 9, // sane on the wire, unknown to the drain
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(hostile)), 'them')
+    expect(getPaintedByNode().get('wall_a')).toBeUndefined()
+  })
+
+  test('painting over a stranger’s coat makes that cell yours again', () => {
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const rec = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: 4,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(rec)), 'them')
+    expect(remoteCoatedCells('wall_a').size).toBe(3)
+    expect(getOwnPaintedByNode().get('wall_a')!.size).toBe(0)
+
+    // Our own spray over the middle of their patch (the decal lane, which is
+    // the local write path that runs headless).
+    const mesh = new Mesh(new PlaneGeometry(6, 6))
+    mesh.updateMatrixWorld(true)
+    expect(spawnPaintDecal(mesh, 'wall_a', new Vector3(0, 0, 0), new Vector3(0, 0, 1), 0.4, 7)).toBe(
+      true,
+    )
+    convertDecalsForNode('wall_a')
+    const own = getOwnPaintedByNode().get('wall_a')!
+    expect(own.size).toBeGreaterThan(0)
+    expect(remoteCoatedCells('wall_a').size).toBeLessThan(3)
+    // Every cell we now own reads OUR colour.
+    for (const value of own.values()) expect(paintColorOf(value)).toBe(7)
+    // And the shared ledger still holds the full picture for the drain.
+    expect(getPaintedByNode().get('wall_a')!.size).toBe(3)
+  })
+})
+
+// ── The invariant that matters most: Save writes only our work ──────────────
+
+describe('a world full of other people’s work yields nothing to Save', () => {
+  test('live, with the scene-write sentinel armed', () => {
+    const error = spyOn(console, 'error').mockImplementation(() => {})
+    const info = spyOn(console, 'info').mockImplementation(() => {})
+
+    const seeded = {
+      'wall-1': { id: 'wall-1', type: 'wall', name: 'south wall' },
+      'wall-2': { id: 'wall-2', type: 'wall', name: 'north wall' },
+      'slab-1': { id: 'slab-1', type: 'slab', name: 'floor' },
+    }
+    scene.getState().setScene(seeded, ['wall-1', 'wall-2', 'slab-1'])
+    useBoots.getState().setPhase('game')
+    const teardown: Array<() => void> = []
+    armSceneWriteSentinel(teardown)
+
+    const before = scene.getState().nodes
+    const beforeJson = JSON.stringify(before)
+
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall-1', fakeTarget('wall-1'))
+    const def = OPENING_ENTRIES[0]!
+
+    // A whole neighbourhood built by three strangers: walls, floors, roofs,
+    // furniture, openings and paint.
+    for (let peer = 0; peer < 3; peer++) {
+      const from = `peer-${peer}`
+      const theirs = createSharedWorld(from)
+      const delta = emptyDelta(from)
+      delta.gridStamp = h.stamp
+      delta.lamport = 10 + peer
+      for (let i = 0; i < 4; i++) {
+        delta.pieces.push(
+          addLocalPiece(theirs, {
+            kind: i % 2 === 0 ? 'wall' : 'floor',
+            slot: i % 2 === 0 ? `Wx:${peer},${i},0` : `F:${peer},${i},0`,
+            mask: 511,
+            yaw: 0,
+            height: 2.8,
+            corners: null,
+          })!,
+        )
+        delta.items.push(
+          addLocalItem(theirs, { catalogId: ITEM.id, x: peer, y: 0, z: i, yaw: 0 })!,
+        )
+        delta.strokes.push(
+          addLocalStroke(theirs, {
+            node: 'wall-1',
+            color: (peer + i) % PAINT_PALETTE.length,
+            x: (i - 2) * 0.15,
+            y: 0,
+            z: 0,
+            radius: coatRadiusFor(0.4),
+          })!,
+        )
+      }
+      delta.apertures.push(
+        addLocalAperture(theirs, {
+          catalogId: def.id,
+          host: 'wall-1',
+          u: 1 + peer,
+          v: 1,
+          width: def.width,
+          height: def.height,
+        })!,
+      )
+      receiveBuildDelta(delta, from)
+    }
+
+    // The screen is FULL of their work.
+    expect(useBoots.getState().placed.length).toBe(12)
+    expect(useItems.getState().items.length).toBe(15)
+    expect(getPaintedByNode().get('wall-1')!.size).toBeGreaterThan(0)
+    expect(sharedBuildDebug().pieces.foreign).toBe(12)
+
+    // And Save has nothing whatsoever to write.
+    expect(placedItemCount()).toBe(0)
+    expect(capturePaint()).toBe(0)
+    expect(usePaintKeep.getState().painted).toEqual([])
+    expect(applyPaint()).toBe(0)
+    const pieces = keepPlaced()
+    expect(pieces).toEqual({ kept: 0, skipped: 0, windows: 0, doors: 0, roofs: 0, floors: 0 })
+    const items = applyItems()
+    expect(items).toEqual({ kept: 0, skipped: 0, doors: 0, windows: 0 })
+
+    const after = scene.getState().nodes
+    expect(after).toBe(before) // object identity: not even a re-spread
+    expect(JSON.stringify(after)).toBe(beforeJson)
+    expect(Object.keys(after).sort()).toEqual(['slab-1', 'wall-1', 'wall-2'])
+    expect(error).not.toHaveBeenCalled()
+
+    for (const fn of teardown.splice(0)) fn()
+    error.mockRestore()
+    info.mockRestore()
+  })
+
+  test('mine saves, theirs does not, from the same store', () => {
+    const h = boot()
+    installAppliers()
+    const rec = theirWall(h, OTHER_SLOT)
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+    myWall(WALL_SLOT)
+    expect(useBoots.getState().placed).toHaveLength(2)
+
+    // Exactly one piece is considered by the pass — ours.
+    const result = keepPlaced()
+    expect(result.kept + result.skipped).toBe(1)
+  })
+
+  test('Save unbinds our records but never tombstones them', () => {
+    const h = boot()
+    const id = myWall(WALL_SLOT)
+    const recId = pieceRecordOf(id)!
+    keepPlaced()
+    // On this screen the wall became a real node; on every other screen it is
+    // still the wall it always was, so the record must survive.
+    expect(h.mine.pieces.dead.has(recId)).toBe(false)
+    expect(liveRecords(h.mine.pieces)).toHaveLength(1)
+    expect(pieceRecordOf(id)).toBeNull()
+    // And the now-empty store must not read as a demolition, nor re-spawn.
+    reconcileSharedPieces()
+    expect(liveRecords(h.mine.pieces)).toHaveLength(1)
+    expect(h.mine.pieces.dead.size).toBe(0)
+    expect(useBoots.getState().placed).toHaveLength(0)
+    expect(h.sent.some((d) => d.deadPieces.length > 0)).toBe(false)
+  })
+
+  test('Discard forgets our placements without killing anyone’s', () => {
+    const h = boot()
+    installAppliers()
+    publishItem(7001, ITEM.id, [1, 0, 1], 0)
+    const theirItem = addLocalItem(h.theirs, { catalogId: ITEM.id, x: 5, y: 0, z: 5, yaw: 0 })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.items.push(theirItem)), 'them')
+    discardPlaced()
+    discardItems()
+    expect(liveRecords(h.mine.items)).toHaveLength(2)
+    expect(h.mine.items.dead.size).toBe(0)
+    expect(isForeignPlacement(7001)).toBe(false)
+  })
+
+  test('authorship outlives the session, because Save runs after teardown', () => {
+    const h = boot()
+    installAppliers()
+    const rec = theirWall(h, WALL_SLOT)
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(rec)), 'them')
+    const theirPieceId = useBoots.getState().placed[0]!.id
+    const item = addLocalItem(h.theirs, { catalogId: ITEM.id, x: 1, y: 0, z: 1, yaw: 0 })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.items.push(item)), 'them')
+    const theirItemId = useItems.getState().items[0]!.id
+
+    // exitGame detaches the lane; the panel's Save happens LATER. If detaching
+    // forgot who built what, every stranger's wall would read as ours at
+    // exactly the moment Save writes the document.
+    detachBuildSync()
+    expect(buildSyncOn()).toBe(false)
+    expect(isForeignPiece(theirPieceId)).toBe(true)
+    expect(isForeignPlacement(theirItemId)).toBe(true)
+    expect(keepPlaced()).toEqual({
+      kept: 0,
+      skipped: 0,
+      windows: 0,
+      doors: 0,
+      roofs: 0,
+      floors: 0,
+    })
+    expect(applyItems()).toEqual({ kept: 0, skipped: 0, doors: 0, windows: 0 })
+  })
+})
