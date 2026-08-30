@@ -13,6 +13,7 @@ import {
   Quaternion,
   Vector3,
 } from 'three'
+import { groundSurfaceY } from './ground'
 import { createProbeMemo } from './probe-memo'
 
 /**
@@ -323,7 +324,9 @@ export function spawnDust(
   if (puffLive > PUFF_CAP * PRESSURE) count = Math.max(1, count >> 1)
 
   const jitter = kind === 'plume' ? 0.45 : 0.2
-  const floorY = floorProbe ? probeMemo.get(floorProbe, x, y, z) : 0
+  // No probe installed (tests, headless): the ground at this XZ, which is
+  // y = 0 on a flat lot and the terrain height on a sculpted site.
+  const floorY = floorProbe ? probeMemo.get(floorProbe, x, y, z) : groundSurfaceY(x, z)
   for (let n = 0; n < count; n++) {
     const s = puffs[puffCursor]!
     puffCursor = (puffCursor + 1) % PUFF_CAP

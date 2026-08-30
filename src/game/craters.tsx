@@ -4,6 +4,7 @@ import { useEffect, useMemo, useSyncExternalStore } from 'react'
 import { BufferAttribute, BufferGeometry, Color, NormalBlending, Vector3 } from 'three'
 import { spawnDebris } from './debris'
 import { spawnDust } from './dust'
+import { groundSurfaceY, hasGroundSurfaceProbe } from './ground'
 import { clearScatterInRadius } from './nature'
 import { type GameWorld, pointOnRoad } from './world'
 
@@ -16,6 +17,13 @@ import { type GameWorld, pointOnRoad } from './world'
  * one-shot dirt burst (brown debris cubes + a dust plume; spawnDust has no
  * tint channel — checked 2026-08-26 — so the plume stays gypsum-gray).
  * Collision is NOT deformed — the player walks the old ground plane.
+ *
+ * SCULPTED GROUND: every height here is relative to ground.ts's height at
+ * the scar's XZ, not to y = 0 (which is what "the green" used to mean). On a
+ * flat or void lot that IS zero and nothing changes; on a site with terrain
+ * the eligibility band follows the dirt, the patch base rides it, and the
+ * patch itself is DRAPED per vertex so a crater on a slope cuts into the
+ * slope instead of hovering over it as a level disc.
  *
  * ── API ───────────────────────────────────────────────────────────────
  *   spawnCrater(world, center, blastRadius)
@@ -68,10 +76,18 @@ export const CRATER_RIM_T = 0.7
 /** Crater diameter clamps (m) — scales with the blast radius between them. */
 export const CRATER_MIN_DIAMETER = 1.6
 export const CRATER_MAX_DIAMETER = 2.4
-/** A blast further than this from terrain y = 0 hit a floor/roof, not dirt. */
+/** A blast further than this from THE GROUND UNDER IT hit a floor/roof, not
+ * dirt. Measured against ground.ts's height at the blast XZ — on a flat lot
+ * that is y = 0 as before, on a sculpted site it follows the terrain (the
+ * owner's lot runs −5.1 m to +1.7 m, so an absolute band around zero
+ * disqualified nearly every real ground blast). */
 export const CRATER_MAX_BLAST_Y = 0.6
-/** Patch base: epsilon above the lawn disc (y = 0.05) — see header. */
+/** Patch base on a FLAT lot: epsilon above the lawn disc (y = 0.05) — see
+ * header. */
 export const CRATER_BASE_Y = 0.058
+/** Patch base on a SCULPTED site: the terrain suppresses nature's lawn disc,
+ * so the patch only has to clear the dirt it is cut into. */
+export const CRATER_TERRAIN_LIFT = 0.008
 /** Scorch decal floats this far above the patch base. */
 const SCORCH_LIFT = 0.006
 
@@ -101,6 +117,39 @@ export const BREACH_MAX_BASE_Y = 0.35
 /** Breach decal base height floor: just above the lawn plane (y = 0.05),
  * in the 0.06–0.07 band the crater base also lives in. */
 export const BREACH_MIN_Y = 0.062
+/** The same clearance measured off sculpted ground (no lawn plane there). */
+export const BREACH_TERRAIN_LIFT = BREACH_MIN_Y - 0.05
+
+// --- Ground-relative helpers --------------------------------------------------
+
+/** Per-vertex height offset for a crater patch, local XZ → Δy (see
+ * craterDrapeFor). */
+export type CraterDrape = (localX: number, localZ: number) => number
+
+/**
+ * Patch base height at a world XZ. On a flat or void scene this is exactly
+ * CRATER_BASE_Y — the lawn-disc epsilon the whole crater look was tuned
+ * against. On a sculpted site the lawn disc doesn't exist and the ground is
+ * wherever the heightfield says, so the patch rides that instead.
+ */
+export function craterBaseYAt(x: number, z: number): number {
+  if (!hasGroundSurfaceProbe()) return CRATER_BASE_Y
+  return groundSurfaceY(x, z) + CRATER_TERRAIN_LIFT
+}
+
+/**
+ * A crater patch is a flat-based disc; on a slope its rim would knife into
+ * the hill on the uphill side and hang in the air downhill. This bends the
+ * patch to the terrain: Δy from the patch center, sampled per vertex off the
+ * same analytic height everything else reads. ~120 samples once at spawn (a
+ * crater is built in a useMemo, never per frame). Returns undefined on a flat
+ * lot so the geometry stays bit-identical there.
+ */
+export function craterDrapeFor(x: number, z: number): CraterDrape | undefined {
+  if (!hasGroundSurfaceProbe()) return undefined
+  const baseline = groundSurfaceY(x, z)
+  return (localX, localZ) => groundSurfaceY(x + localX, z + localZ) - baseline
+}
 /** Lift over the slab's grid base — clears the dirt underlay plane at
  * base − 0.004 (voxel-walls UNDERLAY_DROP) without z-fighting it. */
 export const BREACH_LIFT = 0.006
@@ -134,8 +183,8 @@ export function craterRadiusFor(blastRadius: number): number {
 }
 
 /**
- * Green check: near terrain height (|y| ≤ CRATER_MAX_BLAST_Y — a blast on
- * an upper floor or roof never scars the lawn below), NOT on any
+ * Green check: near GROUND height (|y − groundY| ≤ CRATER_MAX_BLAST_Y — a
+ * blast on an upper floor or roof never scars the lawn below), NOT on any
  * hard-surface footprint (roads, driveways, pads — world.roadFootprints
  * via world.ts's exported pointOnRoad), and NOT under the building AABB
  * (host slabs/floors own that ground).
@@ -146,7 +195,8 @@ export function craterEligible(
   y: number,
   z: number,
 ): boolean {
-  if (y > CRATER_MAX_BLAST_Y || y < -CRATER_MAX_BLAST_Y) return false
+  const groundY = groundSurfaceY(x, z)
+  if (y > groundY + CRATER_MAX_BLAST_Y || y < groundY - CRATER_MAX_BLAST_Y) return false
   const aabb = world.buildingAabb
   if (
     !aabb.isEmpty() &&
@@ -181,7 +231,12 @@ function mulberry32(seed: number) {
  * the `breach` variant runs dark-earth → soil instead (a broken floor is
  * torn ground, not a scorch site).
  */
-export function buildCraterGeometry(radius: number, seed: number, breach = false): BufferGeometry {
+export function buildCraterGeometry(
+  radius: number,
+  seed: number,
+  breach = false,
+  drape?: CraterDrape,
+): BufferGeometry {
   const rand = mulberry32(seed)
   const positions: number[] = []
   const colors: number[] = []
@@ -208,7 +263,9 @@ export function buildCraterGeometry(radius: number, seed: number, breach = false
       const angle = (s / CRATER_SEGMENTS) * Math.PI * 2
       const r = t * radius + (edge ? 0 : (rand() - 0.5) * 0.16 * (radius / CRATER_RINGS))
       const y = craterProfile(t) + (edge ? 0 : (rand() - 0.5) * 0.03 * (1 - t))
-      positions.push(Math.cos(angle) * r, y, Math.sin(angle) * r)
+      const px = Math.cos(angle) * r
+      const pz = Math.sin(angle) * r
+      positions.push(px, drape ? y + drape(px, pz) : y, pz)
       pushColor(t)
     }
   }
@@ -241,7 +298,11 @@ export function buildCraterGeometry(radius: number, seed: number, breach = false
  * The `breach` variant centers on dark earth instead of char — same
  * machinery, dirt read.
  */
-export function buildScorchGeometry(radius: number, breach = false): BufferGeometry {
+export function buildScorchGeometry(
+  radius: number,
+  breach = false,
+  drape?: CraterDrape,
+): BufferGeometry {
   const positions: number[] = [0, 0, 0]
   const colors: number[] = breach ? [0.14, 0.1, 0.062, 0.8] : [0.09, 0.075, 0.06, 0.85]
   const indices: number[] = []
@@ -252,7 +313,9 @@ export function buildScorchGeometry(radius: number, breach = false): BufferGeome
   for (const [r, cr, cg, cb, ca] of rings) {
     for (let s = 0; s < CRATER_SEGMENTS; s++) {
       const angle = (s / CRATER_SEGMENTS) * Math.PI * 2
-      positions.push(Math.cos(angle) * r, 0, Math.sin(angle) * r)
+      const px = Math.cos(angle) * r
+      const pz = Math.sin(angle) * r
+      positions.push(px, drape ? drape(px, pz) : 0, pz)
       colors.push(cr, cg, cb, ca)
     }
   }
@@ -358,17 +421,19 @@ export function spawnCrater(
   slot.gen++
   slot.x = center.x
   slot.z = center.z
-  slot.y = CRATER_BASE_Y
+  slot.y = craterBaseYAt(center.x, center.z)
   slot.breach = false
   slot.radius = craterRadiusFor(blastRadius)
   slot.seed = (Math.random() * 0xffffffff) >>> 0
   // Nothing grows on scorched dirt — clear the blades to just past the rim.
   clearScatterInRadius(slot.x, slot.z, slot.radius * 1.05)
-  // Dirt burst: brown cubes out of the hole + one plume over it.
+  // Dirt burst: brown cubes out of the hole + one plume over it. Thrown from
+  // just over the GROUND at the hole (0.2–0.45 m up), not over y = 0.
+  const burstY = groundSurfaceY(slot.x, slot.z)
   for (let i = 0; i < 10; i++) {
     spawnDebris(
       slot.x + (Math.random() - 0.5) * slot.radius,
-      0.2 + Math.random() * 0.25,
+      burstY + 0.2 + Math.random() * 0.25,
       slot.z + (Math.random() - 0.5) * slot.radius,
       0.035 + Math.random() * 0.045,
       SOIL,
@@ -388,10 +453,10 @@ export function spawnCrater(
  * under the breach never reads as pristine lawn or bare void. BYPASSES
  * craterEligible by design — the road/AABB veto exists to keep BLAST scars
  * off hard surfaces, and a breach is by definition under one. Policy:
- *   - upper storeys (slabBaseY > BREACH_MAX_BASE_Y) no-op — the hole must
- *     show the room below;
- *   - base height rides the slab: max(BREACH_MIN_Y, slabBaseY +
- *     BREACH_LIFT) — above the lawn plane AND the slab's dirt underlay;
+ *   - upper storeys (slabBaseY more than BREACH_MAX_BASE_Y above the ground
+ *     under the hole) no-op — the hole must show the room below;
+ *   - base height rides the slab: max(ground clearance, slabBaseY +
+ *     BREACH_LIFT) — above the ground AND the slab's dirt underlay;
  *   - modest size: ≈ the carve radius, 1.2× at most (never the blast
  *     clamps — a bullet-drilled breach stays a small scar);
  *   - repeat carves widening one hole GROW the existing decal in place
@@ -405,10 +470,16 @@ export function spawnFloorBreach(
   slabBaseY: number,
   carveRadius: number,
 ): boolean {
-  if (slabBaseY > BREACH_MAX_BASE_Y) return false
+  // "Upper storey" is a height ABOVE THE GROUND HERE, and the decal's own
+  // floor clears whatever ground that is — on the owner's site a ground slab
+  // sits at −4.6 m and used to read as a basement, so its breach never
+  // stamped; one that did stamped 4.6 m overhead.
+  const groundY = groundSurfaceY(x, z)
+  if (slabBaseY - groundY > BREACH_MAX_BASE_Y) return false
   const radius = Math.min(carveRadius * 1.2, CRATER_MAX_DIAMETER / 2)
   if (radius <= 0.05) return false
-  const y = Math.max(BREACH_MIN_Y, slabBaseY + BREACH_LIFT)
+  const minY = hasGroundSurfaceProbe() ? groundY + BREACH_TERRAIN_LIFT : BREACH_MIN_Y
+  const y = Math.max(minY, slabBaseY + BREACH_LIFT)
   for (const slot of slots) {
     if (!slot.alive || !slot.breach) continue
     const dx = slot.x - x
@@ -443,13 +514,19 @@ export function spawnFloorBreach(
 function CraterMesh({ crater }: { crater: CraterSlot }) {
   // Keyed by gen in <Craters/>, so a reused slot remounts and rebuilds —
   // deps here only guard against in-place slot mutation.
+  // Blast craters are cut into the GROUND, so they bend with it. Floor
+  // breaches ride a flat slab (see spawnFloorBreach) and must stay flat.
+  const drape = useMemo(
+    () => (crater.breach ? undefined : craterDrapeFor(crater.x, crater.z)),
+    [crater.breach, crater.x, crater.z],
+  )
   const geometry = useMemo(
-    () => buildCraterGeometry(crater.radius, crater.seed, crater.breach),
-    [crater.radius, crater.seed, crater.breach],
+    () => buildCraterGeometry(crater.radius, crater.seed, crater.breach, drape),
+    [crater.radius, crater.seed, crater.breach, drape],
   )
   const scorch = useMemo(
-    () => buildScorchGeometry(crater.radius, crater.breach),
-    [crater.radius, crater.breach],
+    () => buildScorchGeometry(crater.radius, crater.breach, drape),
+    [crater.radius, crater.breach, drape],
   )
   useEffect(
     () => () => {

@@ -16,6 +16,7 @@ import {
 } from 'three'
 import { create } from 'zustand'
 import { sfx } from './audio'
+import { groundSurfaceY } from './ground'
 import { getSession, hideForGame } from './session'
 import { bvhFor, type GameWorld, type GlassPane } from './world'
 
@@ -269,20 +270,18 @@ function spawnPaneShards(pane: GlassPane): void {
   // One floor probe per pane FACE (never per shard): sample ~0.45 m out
   // along each face normal so shards land on the storey they fall into.
   box.getCenter(_paneCenter).applyMatrix4(mesh.matrixWorld)
+  // No probe installed (tests, headless) falls back to the GROUND at the
+  // sample XZ — y = 0 on a flat lot, the terrain height on a sculpted site.
+  const negX = _paneCenter.x - _thinDir.x * 0.45
+  const negZ = _paneCenter.z - _thinDir.z * 0.45
+  const posX = _paneCenter.x + _thinDir.x * 0.45
+  const posZ = _paneCenter.z + _thinDir.z * 0.45
   const floorNeg = floorProbe
-    ? floorProbe(
-        _paneCenter.x - _thinDir.x * 0.45,
-        _paneCenter.y,
-        _paneCenter.z - _thinDir.z * 0.45,
-      )
-    : 0
+    ? floorProbe(negX, _paneCenter.y, negZ)
+    : groundSurfaceY(negX, negZ)
   const floorPos = floorProbe
-    ? floorProbe(
-        _paneCenter.x + _thinDir.x * 0.45,
-        _paneCenter.y,
-        _paneCenter.z + _thinDir.z * 0.45,
-      )
-    : 0
+    ? floorProbe(posX, _paneCenter.y, posZ)
+    : groundSurfaceY(posX, posZ)
   const count = glassShardCount(area)
   for (let i = 0; i < count; i++) {
     const slot = shardSlots[shardCursor]!

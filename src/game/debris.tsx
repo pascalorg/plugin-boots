@@ -17,6 +17,7 @@ import {
   Vector3,
 } from 'three'
 import { spawnDust } from './dust'
+import { groundSurfaceY } from './ground'
 import { createProbeMemo } from './probe-memo'
 
 /**
@@ -278,7 +279,12 @@ export function spawnDebris(
   slot.sy = scale
   slot.sz = scale
   slot.rest = scale * SHAPE_REST[slot.shape]!
-  slot.ground = slot.rest
+  // Pre-probe guess: the GROUND under the spawn XZ (0 on a flat lot, exactly
+  // as before). Without this a piece thrown over a −5 m excavation stopped
+  // dead at y = rest until its real probe landed, and any piece whose probe
+  // never resolved (over the per-frame miss budget, then recycled) rested in
+  // mid-air for its whole life.
+  slot.ground = slot.rest + groundSurfaceY(slot.px, slot.pz)
   slot.probed = false
   slot.ttl = ttl * (0.7 + Math.random() * 0.6)
   slot.ttl0 = slot.ttl
@@ -374,7 +380,8 @@ export function spawnFlatDebris(
   slot.sy = Math.max(0.05, h) * (0.7 + Math.random() * 0.3)
   slot.sz = PLATE_THICKNESS
   slot.rest = 0.045
-  slot.ground = slot.rest
+  // Pre-probe guess: the ground under the spawn XZ (see spawnDebris).
+  slot.ground = slot.rest + groundSurfaceY(slot.px, slot.pz)
   slot.probed = false
   slot.ttl = 2.6 + Math.random() * 1.5
   slot.ttl0 = slot.ttl
