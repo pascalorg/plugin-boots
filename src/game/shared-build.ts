@@ -662,6 +662,131 @@ export function forgetSharedPlacements(): void {
   }
 }
 
+// ── A rename's unsent work ──────────────────────────────────────────────────
+
+/**
+ * Move a runtime piece's binding onto a new record without disturbing anything
+ * else about it. NOT unbind+bind: `unbindPiece` drops the published
+ * fingerprint, and reconcile reads a missing fingerprint as an F-edit and
+ * replaces the record we just minted.
+ */
+function rebindPiece(runtimeId: number, oldId: RecordId, newId: RecordId): void {
+  pieceRecord.set(runtimeId, newId)
+  pieceRuntime.delete(oldId)
+  pieceRuntime.set(newId, runtimeId)
+}
+
+function rebindPlacement(runtimeId: number, oldId: RecordId, newId: RecordId): void {
+  placementRecord.set(runtimeId, newId)
+  placementRuntime.delete(oldId)
+  placementRuntime.set(newId, runtimeId)
+}
+
+/**
+ * Re-publish work whose record names an author no peer will vouch for again.
+ *
+ * `rekeySharedWorld` renames a live session in place, and returns the ids of
+ * adds that were still in the journal when the rename landed. Those records
+ * are the one thing a rename cannot save by itself: no peer has them yet, and
+ * every peer will refuse them now that our envelope says a different name. The
+ * model will not rewrite their ids because it does not know what the runtime
+ * bound them to. This map does, so this is where that work gets a name that
+ * will be honoured — the transport calls it after the rename and before it
+ * queues the snapshot, so the re-mints travel in the same breath.
+ *
+ * THE RULES THIS KEEPS, all four of them load-bearing:
+ *
+ * - It does not publish. The new adds land in `world.journal` via `addLocal*`
+ *   and the transport's tick drains them. Pushing them into `outgoing()` as
+ *   well would send every record twice on a bus that coalesces.
+ * - It does not throw. This runs inside the transport's tick, where a throw
+ *   would skip the snapshot that carries the re-mints out. A record that
+ *   cannot be re-minted costs itself and nothing else.
+ * - It does not tombstone the old record. Nobody ever saw it, so a kill would
+ *   only cost bytes — and for pieces the election collapses the pair anyway
+ *   (the new record is canonically later, so it wins; the old one is unbound,
+ *   so nothing is uninstalled and nobody is told a slot was taken).
+ * - It refuses unbound ids. A record with no runtime object was resolved into
+ *   the document by Save or removed by the player; re-publishing it would
+ *   resurrect a wall that is either already real or deliberately gone, which
+ *   is the one outcome worse than losing an unsent tick of work.
+ *
+ * Strokes are dropped in silence: a stroke has no runtime object to re-read,
+ * only the coat ledger it already folded into.
+ *
+ * Returns the new ids in input order — `ids.length` minus the result length is
+ * the genuinely unrecoverable remainder.
+ */
+export function remintSharedRecords(ids: readonly RecordId[]): RecordId[] {
+  const s = sync
+  if (!s || ids.length === 0) return []
+  const out: RecordId[] = []
+  for (const id of ids) {
+    try {
+      const next = remintOne(s, id)
+      if (next !== null) out.push(next)
+    } catch {
+      // Contained deliberately — see "It does not throw" above.
+    }
+  }
+  return out
+}
+
+function remintOne(s: BuildSync, id: RecordId): RecordId | null {
+  const piece = s.world.pieces.adds.get(id)
+  if (piece) {
+    const runtimeId = pieceRuntime.get(id)
+    if (runtimeId === undefined) return null
+    const rec = addLocalPiece(s.world, {
+      kind: piece.kind,
+      slot: piece.slot,
+      mask: piece.mask,
+      yaw: piece.yaw,
+      height: piece.height,
+      corners: piece.corners,
+    })
+    if (!rec) return null
+    rebindPiece(runtimeId, id, rec.id)
+    return rec.id
+  }
+
+  const item = s.world.items.adds.get(id)
+  if (item) {
+    const runtimeId = placementRuntime.get(id)
+    if (runtimeId === undefined) return null
+    const rec = addLocalItem(s.world, {
+      catalogId: item.catalogId,
+      x: item.x,
+      y: item.y,
+      z: item.z,
+      yaw: item.yaw,
+    })
+    if (!rec) return null
+    rebindPlacement(runtimeId, id, rec.id)
+    return rec.id
+  }
+
+  const aperture = s.world.apertures.adds.get(id)
+  if (aperture) {
+    const runtimeId = placementRuntime.get(id)
+    if (runtimeId === undefined) return null
+    const rec = addLocalAperture(s.world, {
+      catalogId: aperture.catalogId,
+      host: aperture.host,
+      u: aperture.u,
+      v: aperture.v,
+      width: aperture.width,
+      height: aperture.height,
+    })
+    if (!rec) return null
+    rebindPlacement(runtimeId, id, rec.id)
+    return rec.id
+  }
+
+  // A stroke, or an id from a lane we do not own, or nothing at all.
+  return null
+}
+
 // ── The paint lane: publish ─────────────────────────────────────────────────
 
 /**

@@ -48,6 +48,7 @@ import {
   publishStroke,
   receiveBuildDelta,
   reconcileSharedPieces,
+  remintSharedRecords,
   resetSharedBuild,
   setBuildAppliers,
   sharedBuildDebug,
@@ -67,6 +68,7 @@ import {
   rekeySharedWorld,
   type SharedDelta,
   type SharedWorld,
+  takePending,
 } from './shared-world'
 import type { GameWorld } from './world'
 
@@ -1067,5 +1069,146 @@ describe('the host renames us mid-session', () => {
     expect(fx.addedItems).toHaveLength(0)
     expect(fx.addedStrokes).toHaveLength(0)
     expect(useItems.getState().items).toHaveLength(0) // never spawned a copy
+  })
+})
+
+// ── The work the rename could not save by itself ────────────────────────────
+
+/**
+ * `rekeySharedWorld` renames a live session in place, so everything a peer has
+ * already seen keeps its name. What it cannot fix is the handful of adds still
+ * in the journal at that instant: no peer has them, and every peer will refuse
+ * them now that our envelope says a different name. Left alone that is a
+ * silent, permanent, one-client desync — the wall you happened to be placing
+ * stands on your screen and on nobody else's.
+ *
+ * A note on the numbers below: the residue is bounded by "since the last
+ * `takePending`", which in play is one tick because the transport drains
+ * unconditionally. This harness drives the lane through a sink and never
+ * pumps, so its journal holds everything the test ever made. These counts are
+ * harness counts, not play counts.
+ */
+describe('a rename leaves unsent work behind', () => {
+  test('re-minting gives it a name peers will accept, through the journal and not the wire', () => {
+    const h = boot()
+    installAppliers()
+    const wall = myWall(WALL_SLOT)
+    const oldPiece = pieceRecordOf(wall)!
+    const oldItem = publishItem(41, ITEM.id, [1, 0, 2], 0)!
+    const stale = rekeySharedWorld(h.mine, 'me-2')
+    expect(stale).toContain(oldPiece)
+    expect(stale).toContain(oldItem)
+
+    const sentBefore = h.sent.length
+    const fresh = remintSharedRecords(stale)
+    expect(fresh).toHaveLength(stale.length)
+    for (const id of fresh) expect(id.startsWith('me-2#')).toBe(true)
+
+    // IN INPUT ORDER: the caller reads the difference between what it handed
+    // over and what came back as the genuinely unrecoverable remainder, so the
+    // positions have to line up lane for lane.
+    const freshPiece = fresh[stale.indexOf(oldPiece)]!
+    const freshItem = fresh[stale.indexOf(oldItem)]!
+    expect(pieceRecordOf(wall)).toBe(freshPiece)
+    expect(liveRecords(h.mine.items).map((r) => r.id)).toContain(freshItem)
+
+    // The same two runtime objects, re-addressed — not two more of them.
+    expect(sharedBuildDebug().pieces).toMatchObject({ bound: 1, foreign: 0 })
+    expect(sharedBuildDebug().placements).toMatchObject({ bound: 1, foreign: 0 })
+    expect(useBoots.getState().placed).toHaveLength(1)
+    expect(publishItem(41, ITEM.id, [1, 0, 2], 0)).toBeNull() // still bound
+
+    // IT MUST NOT PUBLISH. The re-mints leave by the one road the transport
+    // drains, so a bus that coalesces frames never sees them twice.
+    expect(h.sent.length).toBe(sentBefore)
+    const pending = takePending(h.mine)!
+    expect(pending.pieces.map((r) => r.id)).toContain(freshPiece)
+    expect(pending.items.map((r) => r.id)).toContain(freshItem)
+  })
+
+  test('the re-bound piece is not read as an edit and replaced all over again', () => {
+    const h = boot()
+    const wall = myWall(WALL_SLOT)
+    const stale = rekeySharedWorld(h.mine, 'me-2')
+    const fresh = remintSharedRecords(stale)
+    expect(fresh).toHaveLength(1)
+    const live = liveRecords(h.mine.pieces).length
+
+    // Reconcile compares each standing piece against the fingerprint it
+    // published. A re-mint that forgot to carry that fingerprint over would
+    // look like a moved wall here, and reconcile would tombstone the record we
+    // just minted and mint a third one.
+    reconcileSharedPieces()
+    expect(liveRecords(h.mine.pieces)).toHaveLength(live)
+    expect(h.mine.pieces.dead.size).toBe(0)
+    expect(pieceRecordOf(wall)).toBe(fresh[0]!)
+  })
+
+  test('work already resolved into the document is never resurrected', () => {
+    const h = boot()
+    const wall = myWall(WALL_SLOT)
+    const stale = rekeySharedWorld(h.mine, 'me-2')
+    expect(stale).toEqual([pieceRecordOf(wall)!])
+
+    // Save took that wall: the record is released and the game piece is gone,
+    // exactly as keep.ts leaves things. Re-publishing it now would put a
+    // stranger's copy of a wall the player already owns back on the field —
+    // the one outcome worse than losing an unsent tick of work.
+    forgetSharedPieces()
+    useBoots.getState().removePlaced(wall)
+    onPieceRemoved(WALL_SLOT)
+    const live = liveRecords(h.mine.pieces).length
+
+    expect(remintSharedRecords(stale)).toEqual([])
+    expect(liveRecords(h.mine.pieces)).toHaveLength(live)
+    expect(useBoots.getState().placed).toHaveLength(0)
+  })
+
+  test('strokes, strangers, an empty list and a detached lane are no-ops', () => {
+    const h = boot()
+    installAppliers()
+    const stroke = publishStroke('wall-1', 3, 0, 0, 0, 0.3)!
+    const wall = myWall(WALL_SLOT)
+    const oldPiece = pieceRecordOf(wall)!
+    rekeySharedWorld(h.mine, 'me-2')
+
+    expect(remintSharedRecords([])).toEqual([])
+    // A stroke has no runtime object to re-read, only the coat ledger it
+    // already folded into; a stranger's id was never ours to mint.
+    expect(remintSharedRecords([stroke, 'them#4', 'nobody#9'])).toEqual([])
+    expect(liveRecords(h.mine.strokes).map((r) => r.id)).toEqual([stroke])
+
+    // A junk id in the batch costs itself and nothing else: the one record
+    // that can be recovered still is.
+    const fresh = remintSharedRecords([stroke, oldPiece, 'them#4'])
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]).toBe(pieceRecordOf(wall)!)
+
+    detachBuildSync()
+    expect(buildSyncOn()).toBe(false)
+    expect(remintSharedRecords([oldPiece])).toEqual([])
+  })
+
+  test('the re-mint does not depose the wall it replaces', () => {
+    const h = boot()
+    installAppliers()
+    const wall = myWall(WALL_SLOT)
+    const fresh = remintSharedRecords(rekeySharedWorld(h.mine, 'me-2'))
+    expect(fresh).toHaveLength(1)
+
+    // Both records claim the slot now, and a stranger's frame re-runs the
+    // election over every live record. The re-mint is canonically later so it
+    // wins; the record it replaced lost, but nothing is bound to it any more,
+    // so no wall is uninstalled and nobody is told their slot was taken.
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(theirWall(h, OTHER_SLOT))), 'them')
+    expect(
+      useBoots
+        .getState()
+        .placed.map((p) => p.slotId)
+        .sort(),
+    ).toEqual([OTHER_SLOT, WALL_SLOT].sort())
+    expect(h.notices).toEqual([])
+    expect(pieceRecordOf(wall)).toBe(fresh[0]!)
+    expect(isForeignPiece(wall)).toBe(false) // still ours to Save
   })
 })
