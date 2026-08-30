@@ -367,14 +367,16 @@ export function buildPassageBox(colliders: readonly ColliderEntry[]): Box3 | nul
  *    pose we are leaving, so it would wake wrong (see the header block).
  *  - an AWAKE grid that was baked MID-SWING and now stands where the leaf
  *    isn't: destruction.resyncPosedTarget compares the leaf's live world
- *    matrices against the ones the grid was baked from and hands the node
- *    back when they disagree. The handback heals the holes that grid held —
- *    which beats a solid voxel ghost hanging in the doorway, blocking shots
- *    in mid-air, for the rest of the session.
+ *    matrices against the ones the grid was baked from. It prefers to RE-POSE
+ *    the grid onto the leaf, so the player's holes travel with the swing; it
+ *    hands the node back only where a rigid re-pose isn't sound, healing the
+ *    holes — which still beats a solid voxel ghost hanging in the doorway,
+ *    blocking shots in mid-air, for the rest of the session.
  *
- * Returns whether destruction gave the node BACK (the awake case only — a
- * dormant prebuild never owned it), so the caller can re-assert the collider
- * posture the handback latched solid.
+ * Returns whether destruction gave the node BACK — so FALSE for a re-pose,
+ * where destruction keeps it, as well as for a dormant prebuild (which never
+ * owned it) and for a grid that never went stale. Only a handback latches the
+ * node solid, so only a handback needs the caller to re-assert posture.
  */
 function retireStaleBake(nodeId: string): boolean {
   const target = useDestruction.getState().targets.get(nodeId)
@@ -521,14 +523,29 @@ export function advanceOperables(states: Iterable<OperableState>, dt: number): v
         }
         state.ballistic = true
       }
-      if (!state.open && state.passable && !isVoxelized(state.nodeId)) {
-        // Fully shut: solid again, latch catches; the passage prism and the
-        // ballistic exception retire with the re-latch.
-        for (const collider of state.colliders) {
-          collider.disabled = false
-          collider.ballistic = false
+      if (!state.open && state.passable) {
+        // FULLY SHUT. The passage prism is the aperture's relief in every lane
+        // (feet, bullets, drawn cubes, framing sticks), so it retires with the
+        // leaf REGARDLESS of who owns the node — a shut door standing behind a
+        // live prism is a hole in the wall that nothing can see: walk-through,
+        // undrawable, and still stopping bullets on the cells the prism misses.
+        //
+        // Whether the HOST collides again is a different question, and the
+        // answer is no while destruction holds the node: a re-posed voxel leaf
+        // (destruction.ts reposePosedTarget) settles here still voxelized, with
+        // the host hidden and its colliders disabled, and its grid — which now
+        // stands on the leaf and carries the player's damage — does the
+        // colliding. Re-enabling the host underneath it would collide the same
+        // door twice, once through geometry with no holes in it. The ballistic
+        // exception is likewise the grid's to answer, and the stand-down pass
+        // in the frame loop clears it (clearBallistic).
+        if (!isVoxelized(state.nodeId)) {
+          for (const collider of state.colliders) {
+            collider.disabled = false
+            collider.ballistic = false
+          }
+          state.ballistic = false
         }
-        state.ballistic = false
         if (state.passage) unregisterPassage(state.passage)
         sfx.doorLatch()
       }

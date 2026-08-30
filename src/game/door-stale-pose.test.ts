@@ -17,8 +17,9 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 /**
  * THE STALE-POSE BAKE — a door's voxel grid frozen at a pose the leaf has left.
  *
- * A grid is baked in WORLD space and nothing re-poses one, so it is correct
- * only at the pose its source meshes stood in when it was built. The toggle
+ * A grid is baked in WORLD space, so it is correct only at the pose its source
+ * meshes stood in when it was built (destruction.reposePosedTarget moves one
+ * bodily; nothing else does). The toggle
  * paths all guard that: a DORMANT prebuild is retired before the pose changes,
  * and a toggle refuses to pose an AWAKE node at all. What was NOT guarded is
  * the swing itself — 0.28 s during which the leaf's colliders stay ballistic
@@ -39,11 +40,18 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * live collider bounds (plus a cell radius — cells overhang their source box
  * by up to half a cell by construction). It is deliberately indifferent to
  * HOW that is achieved: dropping the grid and rebuilding on the next hit
- * satisfies it, and so would re-posing the grid to follow the leaf. The bound
- * points the other way and is just as load-bearing: the tests below fence a
- * fix that reaches too far — a shot door that is never operated keeps its grid
- * AND its holes, a leaf voxelized at the pose it is standing in keeps its
- * grid, and one door's swing never retires another door's damage.
+ * satisfies it, and so does re-posing the grid to follow the leaf — which is
+ * what the settle now prefers, so the player's holes ride the swing instead of
+ * healing (see door-repose.test.ts for the algebra and the lane agreement).
+ * Every assertion below that could only be satisfied by ONE of the two was a
+ * bug in this suite against its own stated intent, and has been replaced by
+ * the invariant it was standing in for: the prism retires with the leaf, and
+ * exactly one lane — the host's colliders or the grid — owns a shut door.
+ *
+ * The bound points the other way and is just as load-bearing: the tests below
+ * fence a fix that reaches too far — a shot door that is never operated keeps
+ * its grid AND its holes, a leaf voxelized at the pose it is standing in keeps
+ * its grid, and one door's swing neither retires NOR re-poses another door's.
  */
 
 // Conforming shells register DORMANT and hand rays to the host mesh, which is
@@ -150,6 +158,29 @@ function gridBox(grid: VoxelGridData): Box3 {
   return box
 }
 
+/**
+ * WHO COLLIDES this node — and the guarantee that it is exactly one of them.
+ * A shut door collided by BOTH the host mesh and its carved grid is solid
+ * where the player shot holes in it; collided by NEITHER, it is a door you
+ * walk through. Both are shipped bugs. WHICH one owns it is a policy detail
+ * this suite deliberately does not legislate: the host does after a handback,
+ * the grid does after a re-pose, and hideHostNode/restoreOperableTarget are
+ * the two sides of the same `disabled` flag.
+ */
+function expectExactlyOneOwner(nodeId: string, collider: ColliderEntry): 'grid' | 'host' {
+  const target = targets().get(nodeId)
+  const gridOwns = !!target && !target.dormant
+  expect(collider.disabled).toBe(gridOwns)
+  return gridOwns ? 'grid' : 'host'
+}
+
+/** Every live cell centre stands inside the node's live collider bounds, padded
+ * by one cell's half-diagonal — the whole-grid form of expectHitOnTheLeaf, and
+ * sharper: one ray samples one line, this samples every cell. */
+function expectGridOnTheLeaf(grid: VoxelGridData, live: Box3): void {
+  expect(live.clone().expandByScalar(grid.cell * 0.87).containsBox(gridBox(grid))).toBe(true)
+}
+
 const at = (from: Vector3, dir: Vector3, distance: number) =>
   from.clone().addScaledVector(dir, distance)
 
@@ -216,7 +247,7 @@ describe('a door shot MID-SWING does not leave its grid behind', () => {
     expectHitOnTheLeaf(AIM_FROM, AIM_DIR, live, cell)
   })
 
-  test('and the door still WORKS afterwards — it is not sealed for the session', () => {
+  test('and the doorway is NOT sealed afterwards — feet pass, and the holes rode the swing', () => {
     const leaf = doorLeaf('door_bed1')
     const world = makeWorld([leaf])
     const states = (mounted = mountInteract(world))
@@ -225,23 +256,34 @@ describe('a door shot MID-SWING does not leave its grid behind', () => {
     toggleOperable(state)
     step(states, 6)
     damageTarget(world, 'door_bed1', leaf.collider.worldBox.getCenter(new Vector3()), 0.18)
+    const shot = targets().get('door_bed1')!.grid
+    const carved = shot.aliveCount
+    expect(carved).toBeLessThan(shot.count)
     settle(states)
 
-    // The doorway is still open: pass-through for feet, live for bullets, and
-    // the prism the handback must not have retired.
+    // The OWNER REPRO this whole lane exists for was a door that could not be
+    // walked through, so that is what "not sealed" has to mean — and it holds
+    // however the settle resolved: the leaf ended OPEN, its prism is live, and
+    // its host colliders pass feet while still answering bullets.
     expect(state.open).toBe(true)
     expect(leaf.collider.disabled).toBe(true)
     expect(leaf.collider.ballistic).toBe(true)
     expect(passageCount()).toBe(1)
 
-    // E answers again (the whole point: destruction no longer owns the node),
-    // and closing it latches solid and retires the prism.
-    toggleOperable(state)
-    expect(state.open).toBe(false)
-    settle(states)
-    expect(leaf.collider.disabled).toBe(false)
-    expect(leaf.collider.ballistic).toBe(false)
-    expect(passageCount()).toBe(0)
+    const live = leaf.collider.worldBox
+    const target = targets().get('door_bed1')
+    if (target) {
+      // RE-POSED: the grid rode the swing, so the player's holes are still
+      // there — exactly as many cells gone as the bullet took, not one more
+      // (a re-pose that re-derived `alive` would silently heal or over-carve).
+      expect(target.grid.aliveCount).toBe(carved)
+      expectGridOnTheLeaf(target.grid, live)
+      expect(expectHitOnTheLeaf(AIM_FROM, AIM_DIR, live, target.grid.cell)?.nodeId).toBe('door_bed1')
+    } else {
+      // HANDED BACK: the holes healed and the host leaf answers rays again, so
+      // no voxel target may claim this line at all.
+      expect(raycastVoxelTargets(AIM_FROM, AIM_DIR, 20)).toBeNull()
+    }
   })
 
   test('a leaf shot mid-CLOSE latches shut instead of staying walk-through', () => {
@@ -256,15 +298,26 @@ describe('a door shot MID-SWING does not leave its grid behind', () => {
     expect(state.open).toBe(false)
     step(states, 6) // shot while swinging shut
     damageTarget(world, 'door_bed1', leaf.collider.worldBox.getCenter(new Vector3()), 0.18)
+    const shot = targets().get('door_bed1')!.grid
+    const midArc = gridBox(shot)
+    const cell = shot.cell
     settle(states)
+    const live = leaf.collider.worldBox
 
-    // The ordering half of the fix: the handback runs BEFORE the re-latch
-    // reads isVoxelized, so a door that ends shut is solid, its prism is gone,
-    // and it does not stand open-to-the-feet behind a ghost grid.
-    expect(targets().has('door_bed1')).toBe(false)
-    expect(leaf.collider.disabled).toBe(false)
-    expect(leaf.collider.ballistic).toBe(false)
+    // SELF-GUARD, pure geometry: the bake landed where the SHUT leaf isn't, so
+    // a grid that survived the swing unmoved must fail the containment below —
+    // the assertions cannot pass vacuously.
+    expect(live.clone().expandByScalar(cell * 0.87).containsBox(midArc)).toBe(false)
+
+    // The ordering half of the fix: the stale bake is settled BEFORE the
+    // re-latch reads isVoxelized, so a door that ends shut really is shut. The
+    // prism is the aperture's relief in every lane, and it retires with the
+    // leaf no matter who ends up owning the node.
     expect(passageCount()).toBe(0)
+    // Solid, and solid ONCE.
+    const owner = expectExactlyOneOwner('door_bed1', leaf.collider)
+    if (owner === 'host') expect(leaf.collider.ballistic).toBe(false)
+    else expectGridOnTheLeaf(targets().get('door_bed1')!.grid, live)
   })
 })
 
@@ -320,6 +373,8 @@ describe('the handback is BOUNDED — pose staleness, nothing else', () => {
     damageTarget(world, 'door_bath', new Vector3(4, 1.2, 0), 0.2)
     const bath = targets().get('door_bath')!
     const alive = bath.grid.aliveCount
+    const bathCenters = bath.grid.centers
+    const bathOrigin = { ...bath.grid.origin }
     expect(alive).toBeLessThan(bath.grid.count)
 
     const state = states.get('door_bed1')!
@@ -328,9 +383,21 @@ describe('the handback is BOUNDED — pose staleness, nothing else', () => {
     damageTarget(world, 'door_bed1', swung.collider.worldBox.getCenter(new Vector3()), 0.18)
     settle(states)
 
-    expect(targets().has('door_bed1')).toBe(false) // the stale one went back
-    expect(targets().get('door_bath')).toBe(bath) // this one is untouched
-    expect(bath.grid.aliveCount).toBe(alive)
+    // The door that swung resolved somehow (its own outcome is the other tests'
+    // business) — what is fenced here is that the door across the room did not.
+    const settled = targets().get('door_bed1')
+    if (settled) expectGridOnTheLeaf(settled.grid, swung.collider.worldBox)
+
+    expect(targets().get('door_bath')).toBe(bath) // untouched: same target,
+    expect(bath.grid.aliveCount).toBe(alive) // same damage,
+    // ...and the same FRAME. The re-pose lane has to be as bounded as the
+    // handback it replaced: door_bath never moved, so its grid must not have
+    // either. Buffer identity is the sharpest form of that — a re-pose
+    // allocates a fresh `centers` — and origin/poseRevision pin the frame
+    // itself, which is what every world-space reader composes from.
+    expect(bath.grid.centers).toBe(bathCenters)
+    expect(bath.grid.origin).toEqual(bathOrigin)
+    expect(bath.poseRevision ?? 0).toBe(0)
   })
 
   test('the handback REFUSES a grid that matches the pose', () => {

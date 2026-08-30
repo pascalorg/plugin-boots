@@ -1009,6 +1009,11 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
   const groupRef = useRef<Group>(null!)
   const revision = useRef(-1)
   const skinRevision = useRef(0)
+  /** Last grid FRAME this replica's instance matrices reflect (destruction.ts
+   * poseRevision — the rigid re-pose that walks a shot door's holes along with
+   * its swinging leaf). Every drawn cube's matrix is composed from grid.centers
+   * and grid.q, so a frame move invalidates all of them at once. */
+  const poseRevision = useRef(0)
   const warmDraw = useRef(0)
   /** Last passage generation this replica's instance matrices reflect. -1 so the
    * first awake frame always reconciles (a door may already be open). */
@@ -1051,6 +1056,7 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
         // prime waited are already baked in — sync counters, drop the queue.
         revision.current = wall.revision
         skinRevision.current = wall.skinRevision ?? 0
+        poseRevision.current = wall.poseRevision ?? 0
         wall.removedQueue.length = 0
         // The buffers are real now — give the mesh its true bounding sphere
         // (grid AABB + half-cell margin; kills only shrink, never grow).
@@ -1090,6 +1096,7 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
     primeEntry.current = entry
     revision.current = wall.revision
     skinRevision.current = wall.skinRevision ?? 0
+    poseRevision.current = wall.poseRevision ?? 0
     if (wall.dormant) queueDormantPrime(entry)
     else primeDormantNow(entry)
     // Replicas never move: settle world matrices once, then opt the whole
@@ -1133,6 +1140,24 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
       queue.length = 0
       mesh.instanceMatrix.needsUpdate = true
       perfSection('skin-drain', performance.now() - drainT0)
+    }
+    // THE GRID FRAME MOVED (destruction.ts reposePosedTarget): a door that was
+    // shot mid-swing has had its grid rigidly re-posed onto the leaf, so the
+    // player's holes ride the door instead of healing. Every cube's matrix is
+    // composed from grid.centers + grid.q, so all of them are stale at once —
+    // one full sweep, on an integer compare, so an unmoved grid pays nothing.
+    if (poseRevision.current !== (wall.poseRevision ?? 0)) {
+      poseRevision.current = wall.poseRevision ?? 0
+      // The sweep writes every cell against the LIVE passage registry, so it
+      // doubles as a passage sync — bank the generation, or the branch below
+      // would immediately sweep the same grid a second time.
+      passageHoles.current = syncPassageHoles(mesh, wall)
+      passageGen.current = passageGeneration()
+      // NOTHING ELSE recomputes this. It is set once at prime, and a re-posed
+      // door whose sphere still sits at the old pose gets frustum-culled at a
+      // location it no longer occupies — invisible from most angles, while
+      // bullets and bodies still hit it. That is the ghost, inverted.
+      mesh.boundingSphere = gridBoundingSphere(wall.grid, mesh.boundingSphere ?? undefined)
     }
     // OPEN DOORWAY HOLES (collision.ts::passageHidesCell): opening or closing a
     // door changes which of this replica's cells may draw. The registry stamps a

@@ -78,6 +78,7 @@ import {
   raycastVoxels,
   raycastYawObb,
   removeSphere,
+  reposeVoxelGrid,
   rotateByBasis,
   rotateByBasisInverse,
   type SkinLimit,
@@ -333,6 +334,16 @@ export type VoxelTarget = {
    * a bump; paint coats re-apply on top via drainPaintTints (the paint
    * ledger's own serials never move). */
   skinRevision?: number
+  /** Bumped when the GRID FRAME itself moves — the rigid re-pose that lets a
+   * shot door keep its holes while its leaf swings (reposePosedTarget). The
+   * cells, their damage and every index-space payload are untouched; what
+   * changed is `grid.q` / `grid.origin` / `grid.centers`, so every WORLD-space
+   * reader has to re-derive: voxel-walls.tsx rewrites the instance matrices
+   * AND the mesh bounding sphere on a bump (nothing else recomputes that
+   * sphere, and a stale one frustum-culls the door at its old location).
+   * Absent = the grid has never moved since it baked, which is the case for
+   * every kind but a posed leaf. */
+  poseRevision?: number
   /** The surface texture's CPU pattern grid (skin-tone.ts mapPatternGrid)
    * — when present, primedCellColor samples the PATTERN (brick courses,
    * shingle rows) per cell instead of the flat baseColor. Set at voxelize
@@ -5245,23 +5256,211 @@ export function posedTargetIsStale(nodeId: string): boolean {
   return false
 }
 
+/** Tolerance on the DERIVED rigid motion (derivePosedRigidMotion), applied to
+ * raw matrix elements and to quaternion/scale components. Deliberately three
+ * orders tighter than POSE_EPSILON, which asks the loose question "did this
+ * move?"; this one asks the strict question "is this motion EXACTLY one rigid
+ * turn about world Y, reproducing every mesh?", and a wrong yes reintroduces a
+ * ghost. The stamps are float64 and the composition is a 4x4 inverse-multiply,
+ * so the round-trip error is ~1e-13 even at lot-scale coordinates — while the
+ * smallest real motion this must reject (a sash sliding in its frame, i.e. one
+ * mesh moving and another not) is centimetres. Nothing lands in between. */
+const MOTION_EPSILON = 1e-6
+
+const _poseMotion = new Matrix4()
+const _poseStampInv = new Matrix4()
+const _poseCheck = new Matrix4()
+const _poseQuat = new Quaternion()
+const _posePos = new Vector3()
+const _poseScale = new Vector3()
+const _poseSourceBox = new Box3()
+const _poseMeshBox = new Box3()
+const _posePoint = new Vector3()
+
 /**
- * Hand a STALE posed node back to the host (see posedBake): its grid does not
- * correspond to the leaf anymore, and a grid standing where the geometry
- * isn't is strictly worse than losing the damage it holds — the same trade
- * restoreOperableTarget already makes for a sealed door, for the same reason.
- * The node re-voxelizes from its live pose on the next hit.
+ * THE RIGID MOTION a posed node has undergone since its grid baked, or null if
+ * there isn't one.
  *
- * Returns whether the host owns the node again; a no-op (false) when the node
- * never voxelized, carries no stamp, or still stands exactly where it baked.
- * The CALLER owns collider posture afterwards: the handback latches the node
- * SOLID, which is right for a leaf that settled shut and wrong for one that
- * settled open — only the interact state knows which pose won.
+ * A voxel grid's pose lives in exactly two fields — `q` (world→grid rotation)
+ * and `origin` — so ONE world rigid motion can be pushed into the frame
+ * exactly, carrying the cells, the removed set and the holes with it
+ * (reposeVoxelGrid). But that is only meaningful if the source geometry really
+ * moved as ONE rigid body, and this decides that from the stamp alone:
+ *
+ *  1. ONE motion for all meshes. A hinged leaf is posed by rotating its ROOT,
+ *     so every mesh's world matrix is `R_root · matrix_i` and
+ *     `T = M_live_i · M_stamp_i⁻¹ = R_root_live · R_root_stamp⁻¹` — the same T
+ *     for every mesh, whatever the child matrices are. A sash posed through
+ *     NAMED MOVING PARTS (interact's window operations move a leaf inside a
+ *     still frame) yields a different T per mesh, and there is no single frame
+ *     that describes the result. Checked by reproducing every mesh's live
+ *     matrix from its stamp through the T derived from mesh 0.
+ *  2. RIGID: unit scale. A non-unit scale is not expressible in (q, origin) at
+ *     all — the cell size would have to change with it.
+ *  3. About WORLD Y only. Grid Y stays world Y, which keeps the yaw-only fast
+ *     path in every consumer live and keeps the several readers that treat
+ *     `origin.y` as a world height and grid row 0 as the ground row
+ *     (findUnsupportedIslands, probeTargetSupport) correct. Both real motions
+ *     — a hinge swing and a slide — are already in this class, so this costs
+ *     nothing and removes a whole family of ways to be subtly wrong.
+ *
+ * Returns a SHARED scratch matrix: use it before calling again.
+ */
+function derivePosedRigidMotion(bake: { meshes: Mesh[]; stamp: Float64Array }): Matrix4 | null {
+  const meshes = bake.meshes
+  if (meshes.length === 0) return null
+  _poseStampInv.fromArray(bake.stamp, 0)
+  // A degenerate stamp (a mesh baked with a zero-scale ancestor) has no
+  // inverse; three's invert() would silently hand back the zero matrix.
+  if (Math.abs(_poseStampInv.determinant()) < 1e-12) return null
+  _poseStampInv.invert()
+  _poseMotion.multiplyMatrices(meshes[0]!.matrixWorld, _poseStampInv)
+  for (let i = 1; i < meshes.length; i++) {
+    _poseCheck.fromArray(bake.stamp, i * 16).premultiply(_poseMotion)
+    const live = meshes[i]!.matrixWorld.elements
+    for (let e = 0; e < 16; e++) {
+      if (Math.abs(_poseCheck.elements[e]! - live[e]!) > MOTION_EPSILON) return null
+    }
+  }
+  _poseMotion.decompose(_posePos, _poseQuat, _poseScale)
+  if (
+    Math.abs(_poseScale.x - 1) > MOTION_EPSILON ||
+    Math.abs(_poseScale.y - 1) > MOTION_EPSILON ||
+    Math.abs(_poseScale.z - 1) > MOTION_EPSILON
+  ) {
+    return null
+  }
+  if (Math.abs(_poseQuat.x) > MOTION_EPSILON || Math.abs(_poseQuat.z) > MOTION_EPSILON) return null
+  return _poseMotion
+}
+
+/**
+ * INDEPENDENT CHECK on a re-pose I just applied: does every live cell centre
+ * lie inside the source meshes' LIVE world bounds?
+ *
+ * This deliberately does not use the motion, the stamp, or anything the
+ * re-pose computed — it reads `matrixWorld` and `geometry.boundingBox` off the
+ * leaf as the renderer sees it, so it is an oracle for the frame algebra
+ * rather than a restatement of it. A grid standing where the geometry isn't is
+ * the ghost bug (see posedBake), and it is worth one linear pass over the
+ * cells at settle time to make that unreachable instead of merely unlikely.
+ *
+ * The pad is half a cell DIAGONAL: a cell is marked solid when its BOX meets a
+ * triangle, so a correct cell's centre can sit up to that far outside the
+ * surface it was sampled from — and `grid.cell` is the largest axis, so
+ * `0.87 * cell >= 0.5 * hypot(cellX, cellY, cellZ)` always. Any tighter and
+ * correct re-poses would fail; much looser and a half-metre error would pass.
+ */
+function gridStandsOnItsSource(grid: VoxelGridData, meshes: Mesh[]): boolean {
+  _poseSourceBox.makeEmpty()
+  for (const mesh of meshes) {
+    const geometry = mesh.geometry
+    if (!geometry.boundingBox) geometry.computeBoundingBox()
+    const box = geometry.boundingBox
+    if (!box) return false
+    _poseSourceBox.union(_poseMeshBox.copy(box).applyMatrix4(mesh.matrixWorld))
+  }
+  if (_poseSourceBox.isEmpty()) return false
+  _poseSourceBox.expandByScalar(grid.cell * 0.87)
+  const centers = grid.centers
+  for (let i = 0; i < grid.count; i++) {
+    if (!grid.alive[i]) continue
+    _posePoint.set(centers[i * 3]!, centers[i * 3 + 1]!, centers[i * 3 + 2]!)
+    if (!_poseSourceBox.containsPoint(_posePoint)) return false
+  }
+  return true
+}
+
+/**
+ * RE-POSE a stale posed target's grid so the damage rides the leaf.
+ *
+ * The alternative (restoreOperableTarget) heals the player's bullet holes: it
+ * is the correct fallback, not the goal. Where the motion is one rigid turn
+ * and the target carries no second world-space payload, the removed-cell set
+ * is still exactly as meaningful as it was — so move the frame instead.
+ *
+ * Refuses unless the target is grid-and-nothing-else. Framing segments and
+ * drywall sheets hold their own WORLD-space endpoints/quads, a shell holds
+ * world triangles, and an item carries a host hide this cannot reverse; none
+ * of those ride `(q, origin)`, and re-posing the grid out from under them is
+ * exactly the render-disagrees-with-physics class of bug. A door is
+ * grid-and-nothing-else by construction (ensureVoxelTarget: kind 'volume', no
+ * segments, no sheets, no shell), so these are assertions of a real invariant
+ * rather than a wish — and a window with named moving parts has already been
+ * rejected upstream by the one-motion test.
+ *
+ * Returns whether the grid now stands on the leaf. On false the caller must
+ * fall back to the handback: the grid is UNCHANGED on every refusal except a
+ * failed containment check, which restores nothing and is why that path drops.
+ */
+function reposePosedTarget(
+  nodeId: string,
+  target: VoxelTarget,
+  bake: { meshes: Mesh[]; stamp: Float64Array },
+): boolean {
+  // A dormant prebuild is still the HOST's to render and collide: re-posing it
+  // would fix a grid nobody is looking at, and the wake path already rebuilds
+  // from the live pose. Leave the existing retire-the-prebuild behaviour.
+  if (target.dormant) return false
+  if (target.kind !== 'volume') return false
+  if (target.segments.length > 0 || target.sheets.length > 0) return false
+  if (target.shell !== undefined || target.shellPending !== undefined) return false
+  if (target.item) return false
+  if (target.grid.count === 0) return false
+  const motion = derivePosedRigidMotion(bake)
+  if (motion === null) return false
+  reposeVoxelGrid(target.grid, motion)
+  if (!gridStandsOnItsSource(target.grid, bake.meshes)) {
+    // The frame algebra and the live geometry disagree — trust the geometry.
+    // The grid has already moved, so there is no way back to a correct grid
+    // here; hand the node to the host, which is what today's code does
+    // unconditionally. A tripwire, not a control path: it should never fire.
+    console.warn(`[boots] re-posed grid left its source (${nodeId}) — handing back`)
+    return false
+  }
+  // The support graph caches a WORLD AABB per target and refuses to
+  // re-register over a live entry, so the drop is what makes the re-register
+  // take. Nothing index-space moved: the island/collapse math sees the same
+  // lattice it did before.
+  dropStructureTarget(nodeId)
+  registerStructureTarget(target, target.kind)
+  target.poseRevision = (target.poseRevision ?? 0) + 1
+  // Re-stamp at the pose the grid now stands in, or the next settle sees the
+  // same staleness and re-poses by a motion that has already been applied.
+  for (let i = 0; i < bake.meshes.length; i++) {
+    bake.stamp.set(bake.meshes[i]!.matrixWorld.elements, i * 16)
+  }
+  return true
+}
+
+/**
+ * SETTLE a STALE posed node (see posedBake): its grid no longer corresponds to
+ * the leaf, and a grid standing where the geometry isn't is the ghost bug. Two
+ * ways out, best first:
+ *
+ *  1. RE-POSE the grid onto the leaf (reposePosedTarget). The cells keep their
+ *     indices, so the player's bullet holes travel with the swinging leaf
+ *     instead of healing. Taken whenever the motion is one rigid turn about
+ *     world Y and the target is grid-and-nothing-else.
+ *  2. Otherwise HAND THE NODE BACK to the host (restoreOperableTarget) — the
+ *     damage heals, which is the trade this made unconditionally before and is
+ *     still strictly better than a ghost. The node re-voxelizes from its live
+ *     pose on the next hit.
+ *
+ * Returns whether the host owns the node again — so FALSE on the re-pose path,
+ * where destruction keeps the node. That is the answer the caller's collider
+ * posture turns on: only a handback latches the node solid, and only a
+ * handback needs an open leaf to re-assert its open posture afterwards. Also
+ * false, unchanged, when the node never voxelized, carries no stamp, or still
+ * stands exactly where it baked.
  */
 export function resyncPosedTarget(nodeId: string): boolean {
-  if (!posedBake.has(nodeId)) return false
-  if (!useDestruction.getState().targets.has(nodeId)) return false
+  const bake = posedBake.get(nodeId)
+  if (!bake) return false
+  const target = useDestruction.getState().targets.get(nodeId)
+  if (!target) return false
   if (!posedTargetIsStale(nodeId)) return false
+  if (reposePosedTarget(nodeId, target, bake)) return false
   return restoreOperableTarget(nodeId)
 }
 
