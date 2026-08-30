@@ -6,6 +6,8 @@ import {
   type CollabBusMessage,
   type CollabParticipant,
   forgetSender,
+  FORMER_SELF_MAX,
+  formerLocalSessions,
   FRAME_KINDS,
   getCollabBus,
   getParticipants,
@@ -29,6 +31,7 @@ import {
   readEnvelope,
   registerFrameKind,
   requestState,
+  resetNetIdentity,
   resetNetKinds,
   resyncNet,
   sendStateSnapshot,
@@ -37,6 +40,7 @@ import {
   shouldAnswerStateRequest,
   startNet,
   stopNet,
+  wasLocalSession,
 } from './net'
 
 /**
@@ -152,6 +156,7 @@ function collect<P = unknown>(kind: BootsFrameKind): { got: Array<NetMessage<P>>
 afterEach(() => {
   stopNet()
   resetNetKinds()
+  resetNetIdentity()
   delete g.__pascalCollabBus
 })
 
@@ -893,9 +898,6 @@ describe('the installed bus is not forever', () => {
     startNet()
     registerFrameKind('pose', echo)
     const { got } = collect('pose')
-    // `swaps` deliberately survives startNet — a rebind is not a fresh session —
-    // so it is a lifetime counter and the suite measures it as a delta.
-    const swaps = netCounters().swaps
 
     const next = makeBus()
     next.sessionId = 'session-new'
@@ -903,7 +905,9 @@ describe('the installed bus is not forever', () => {
 
     expect(resyncNet()).toBe(true)
     expect(netBus()).toBe(next)
-    expect(netCounters().swaps).toBe(swaps + 1)
+    // `swaps` and the former-self ring deliberately survive stopNet — they are
+    // the page's history, not the session's — hence resetNetIdentity in afterEach.
+    expect(netCounters().swaps).toBe(1)
     expect(localSessionId()).toBe('session-new')
     // Registered kinds and their handlers survive: a rebind is not a reset.
     next.handler!(inbound(frame('pose', 1, { x: 1 }), { sessionId: 'session-a' }))
@@ -934,9 +938,9 @@ describe('the installed bus is not forever', () => {
   test('the same bus is not a swap', () => {
     installBus()
     startNet()
-    const swaps = netCounters().swaps
     expect(resyncNet()).toBe(false)
-    expect(netCounters().swaps).toBe(swaps)
+    expect(netCounters().swaps).toBe(0)
+    expect(formerLocalSessions()).toEqual([])
   })
 
   test('a bus that vanished leaves us stopped rather than bound to a corpse', () => {
@@ -951,8 +955,63 @@ describe('the installed bus is not forever', () => {
 
   test('nothing to rebind before anything started', () => {
     installBus()
-    const swaps = netCounters().swaps
     expect(resyncNet()).toBe(false)
-    expect(netCounters().swaps).toBe(swaps)
+    expect(netCounters().swaps).toBe(0)
+  })
+
+  /**
+   * WHY WE REMEMBER OUR OLD NAMES. Records carry their author's session id as an
+   * id prefix, and after a re-key those records cannot be renamed (peers hold
+   * them) or tombstoned (killing one needs its prefix). So "is this mine?" has
+   * two different answers depending on whether the question is about the wire
+   * (the live id) or about the player (any id we ever published under).
+   */
+  test('a re-key remembers the name we published under', () => {
+    installBus()
+    startNet()
+    expect(wasLocalSession('session-me')).toBe(false) // the CURRENT name is not former
+
+    const next = makeBus()
+    next.sessionId = 'session-two'
+    g.__pascalCollabBus = next
+    resyncNet()
+
+    expect(wasLocalSession('session-me')).toBe(true)
+    expect(wasLocalSession('session-two')).toBe(false)
+    expect(wasLocalSession('session-a')).toBe(false) // a stranger stays a stranger
+    expect(formerLocalSessions()).toEqual(['session-me'])
+  })
+
+  test('a rebind to the SAME name adds no history', () => {
+    installBus()
+    startNet()
+    g.__pascalCollabBus = makeBus() // new object, same sessionId
+    expect(resyncNet()).toBe(true)
+    expect(netCounters().swaps).toBe(1)
+    expect(formerLocalSessions()).toEqual([])
+  })
+
+  test('the names we remember are bounded', () => {
+    installBus()
+    startNet()
+    for (let i = 0; i < FORMER_SELF_MAX + 4; i++) {
+      const next = makeBus()
+      next.sessionId = `session-${i}`
+      g.__pascalCollabBus = next
+      resyncNet()
+    }
+    const former = formerLocalSessions()
+    expect(former.length).toBe(FORMER_SELF_MAX)
+    // The oldest names fall off the front; the newest are the ones worth keeping.
+    expect(former[former.length - 1]).toBe(`session-${FORMER_SELF_MAX + 2}`)
+    expect(wasLocalSession('session-me')).toBe(false)
+  })
+
+  test('a bus that vanished still leaves its name in our history', () => {
+    installBus()
+    startNet()
+    delete g.__pascalCollabBus
+    resyncNet()
+    expect(wasLocalSession('session-me')).toBe(true)
   })
 })

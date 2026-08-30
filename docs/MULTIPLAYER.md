@@ -174,6 +174,15 @@ a check against it could never fire. Any subsystem that keys long-lived state on
 `localSessionId()` must call `resyncNet()` before trusting it — `net-world.ts`
 does this at the top of every publish tick (Part 4).
 
+A rebind also files the name away: `wasLocalSession(id)` answers whether an id is
+one **this client published under earlier** (false for the live name and for
+every stranger), with `formerLocalSessions()` for the whole ring, bounded to
+`FORMER_SELF_MAX`. Records carry their author's session id as an id prefix and
+can be neither renamed nor tombstoned after a re-key, so "is this mine?" has two
+different answers: ask `localSessionId()` when the question is about the **wire**
+(who may author this frame), and `wasLocalSession()` as well when it is about the
+**player** (whose wall is that, whom should this notice blame).
+
 # Part 2 — avatar co-presence (`presence.ts`)
 
 While a Boots session runs, the plugin publishes a tiny pose frame ~12 times
@@ -546,20 +555,37 @@ The recovery is never silent: a silent recovery is nearly as bad as the bug.
 **What that costs, because it is not obvious.** The work we already published
 under the old name does not come back to us. Peers **keep** those records — they
 are grow-only and still validly authored by an id that existed — and we can no
-longer tombstone them, because killing a record requires owning its prefix. Then
-`reconcileSharedPieces()` re-mints the same pieces under the new prefix and the
-snapshot publishes them, so in every peer that saw both, **the same wall can
-exist twice**: once orphaned under the dead name, once live under ours. Locally
-we see one. The pieces are co-located, so it shows up as z-fighting or doubled
-paint rather than clutter, and demolishing ours leaves the orphan standing.
+longer tombstone them, because killing a record requires owning its prefix. It
+cannot spread or return, either: peers only ever answer a state request with
+their **own** records (Part 1), so an orphan of ours dies with the peers that
+already hold it. Then `reconcileSharedPieces()` re-mints the same pieces under
+the new prefix, so in a peer that saw both, one thing exists twice. What that
+looks like depends entirely on whether the lane is slot-addressed:
 
-Fixing that properly needs something this design does not have: a stable identity
-independent of the transport session (a per-client build id minted once and
-carried in the record prefix, with the session id used only for the authorship
-gate). That is a Part 3 change to a frozen file, so it is logged here rather than
-attempted. A re-key is rare — it needs an outbox lease to be restored mid-game —
-and `rekeys > 0` on the QA handle is the thing to look at first if anyone reports
-duplicated geometry in a lobby.
+| Lane | Outcome of a re-key |
+| --- | --- |
+| **Pieces** | Converge. `PieceRec` carries a `slot`, so `electedPieces()` sees two claimants for one `kind\|slot` and the canonical ascending `(lamport, id)` rule makes the LATER record win — which is always the re-minted one. The loser is not merely hidden: `installPieces` unbinds it, `removePlaced` drops the mesh, `onPieceRemoved` frees the slot registry, and `deposedPieces` remembers it so a later frame cannot resurrect it. No z-fighting, and demolishing the survivor leaves nothing standing. |
+| **Items, apertures** | **Duplicate.** Neither `ItemRec` nor `ApertureRec` has a slot, so nothing elects between them: re-minted furniture genuinely lands twice, co-located, in a peer that saw both. This is the visible cost. |
+| **Strokes** | Harmless. Paint is a G-Set folded per cell, and the same colour *accumulates*, so a re-minted stroke deepens a coat that was already there rather than doubling geometry. |
+
+The deposed-piece notice stays honest, but only just. `installPieces` gates it on
+`isAuthoredBy(id, world.self)`, and after a re-key the orphan's prefix is our
+**old** name, so `mine` is false and nobody reads "Another builder claimed that
+wall slot" about a wall no stranger touched. That is the right outcome reached by
+accident — the record stopped looking like ours — so any future ownership
+question that means *the player* rather than *the wire* must ask
+`wasLocalSession(prefix)` (Part 1) as well as comparing against `world.self`.
+
+Fixing the duplicates properly needs something this design does not have: an
+identity that outlives the transport session (a client id persisted per browser
+and carried in the record prefix, with the session id demoted to a routing
+detail, used only for the authorship gate). `mintRecordId` derives authorship
+from the session id instead, which the host can re-key mid-session — so record
+identity is not stable across the lifetime of the client that authored it. That
+is a Part 3 change to a frozen file, logged here rather than attempted. A re-key
+needs an outbox lease restored mid-game, so it is rare; `rekeys > 0` on
+`__boots.worldSync()` is the first thing to check if anyone reports doubled
+furniture in a lobby.
 
 **What is still not handled, stated rather than hidden.** A frame lost to the
 outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a

@@ -270,6 +270,9 @@ type NetState = {
   dropped: number
   /** Times the host replaced the installed bus under us (see resyncNet). */
   swaps: number
+  /** Session ids this client published under BEFORE a re-key, newest last.
+   * Bounded: a re-key is rare, but "rare" is not a memory bound. */
+  formerSelves: string[]
 }
 
 const state: NetState = {
@@ -283,7 +286,12 @@ const state: NetState = {
   received: 0,
   dropped: 0,
   swaps: 0,
+  formerSelves: [],
 }
+
+/** How many past identities we remember. Only used to tell "an earlier me" from
+ * "a stranger", so forgetting the oldest degrades to today's behaviour. */
+export const FORMER_SELF_MAX = 8
 
 // ── Registration + subscription ──────────────────────────────────────────────
 
@@ -670,6 +678,7 @@ export function resyncNet(): boolean {
   // startNet zeroes the traffic counters; a rebind is not a fresh session, so
   // the history carries across or a swap would erase the evidence of itself.
   const carried = { published: state.published, received: state.received, dropped: state.dropped }
+  const was = state.bus?.sessionId ?? null
   stopNet()
   // A bus that is simply gone (collab turned off, editor teardown) leaves us
   // stopped and honest rather than bound to a corpse.
@@ -678,7 +687,35 @@ export function resyncNet(): boolean {
   state.received = carried.received
   state.dropped = carried.dropped
   state.swaps++
+  // Remember the name we published under, so a record we authored earlier can
+  // still be recognised as ours after the host renamed us (see wasLocalSession).
+  if (was !== null && was !== state.bus?.sessionId) {
+    state.formerSelves.push(was)
+    if (state.formerSelves.length > FORMER_SELF_MAX) state.formerSelves.shift()
+  }
   return true
+}
+
+/**
+ * Was `sessionId` a name THIS client published under earlier in this page's
+ * life? False for the current name and for every stranger.
+ *
+ * The point is the difference between "a stranger did this" and "an earlier me
+ * did this", which the current session id alone cannot express. After a re-key,
+ * records we authored keep the old prefix forever — peers cannot be told to
+ * rename them and we cannot tombstone them — so any code that reasons about
+ * ownership across a whole play session (a notice that blames another builder,
+ * a "yours" filter, a duplicate check) must ask this as well as comparing
+ * against the live id. Bounded to FORMER_SELF_MAX; forgetting the oldest name
+ * simply degrades to treating an ancient record as a stranger's.
+ */
+export function wasLocalSession(sessionId: string): boolean {
+  return state.formerSelves.includes(sessionId)
+}
+
+/** Every name we have published under before now, oldest first. */
+export function formerLocalSessions(): readonly string[] {
+  return state.formerSelves
 }
 
 export function netCounters(): {
@@ -700,4 +737,12 @@ export function netCounters(): {
 export function resetNetKinds(): void {
   state.kinds.clear()
   registerBuiltinKinds()
+}
+
+/** Test-only: forget who we used to be. `swaps` and `formerSelves` deliberately
+ * outlive stopNet — they are the page's history, not the session's — so a suite
+ * that exercises re-keys has to clear them explicitly. */
+export function resetNetIdentity(): void {
+  state.formerSelves.length = 0
+  state.swaps = 0
 }

@@ -21,8 +21,10 @@ import {
   ingestBusMessage,
   NET_PROTOCOL,
   netCounters,
+  resetNetIdentity,
   resetNetKinds,
   stopNet,
+  wasLocalSession,
 } from './net'
 import {
   damageSyncActive,
@@ -125,6 +127,7 @@ afterEach(() => {
   stopWorldSync()
   stopNet()
   resetNetKinds()
+  resetNetIdentity()
   resetSharedBuild()
   resetSharedDamage()
   resetWorldSyncCounters()
@@ -545,6 +548,25 @@ describe('our own name is not a constant', () => {
     expect(worldSyncWorld()?.self).toBe('session-new')
     // The recovery must not be silent, and it must not look like an error.
     expect(worldSyncDebug().applyErrors).toBe(0)
+  })
+
+  /**
+   * The records we published under the old name are unreachable afterwards —
+   * peers keep them and we cannot tombstone a prefix we no longer own — so any
+   * code asking "did another builder do this?" about an old record needs to be
+   * able to answer "no, that was me". This is the hook it uses.
+   */
+  test('a re-key leaves the old prefix recognisable as ours', () => {
+    installBus('session-old')
+    startWorldSync()
+    expect(wasLocalSession('session-old')).toBe(false)
+
+    installBus('session-new')
+    pumpWorldSync()
+
+    expect(wasLocalSession('session-old')).toBe(true)
+    expect(wasLocalSession('session-new')).toBe(false)
+    expect(wasLocalSession('session-stranger')).toBe(false)
   })
 
   /**
