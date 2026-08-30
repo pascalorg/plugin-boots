@@ -73,6 +73,7 @@ import {
   isForeignPiece,
   publishGridStamp,
   reconcileSharedPieces,
+  setBuildSyncNotice,
   sharedBuildDebug,
 } from './shared-build'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -1263,6 +1264,18 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
   useEffect(() => {
     reconcileSharedPieces()
   }, [placed])
+
+  // The lane's player-facing voice. shared-build deliberately does not import
+  // session.ts (it would close a cycle through paint-keep), so the HUD is
+  // handed to it from here — the one place that is mounted for exactly as long
+  // as the pieces are. Without it a lost slot or a refused grid would be
+  // silent, which is the failure the election exists to prevent.
+  useEffect(() => {
+    setBuildSyncNotice((text) => getSession()?.hud.presenceToast(text))
+    return () => {
+      setBuildSyncNotice(null)
+    }
+  }, [])
 
   // Dev handle for the multiplayer QA scripts, alongside __bootsBuilder.
   useEffect(() => {

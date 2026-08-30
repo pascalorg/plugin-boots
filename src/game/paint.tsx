@@ -26,6 +26,9 @@ import { itemGhostActive } from './item-place'
 import { playerRig } from './player'
 import { primedCellColor } from './skin-tone'
 import { getSession } from './session'
+import { buildSyncOn, flushBuildSync, publishStroke, setBuildAppliers } from './shared-build'
+import { foldCoats, strokesByNode } from './shared-derive'
+import type { StrokeRec } from './shared-world'
 import { aimDirection } from './shooting'
 import { rotateByBasis, rotateByBasisInverse, type VoxelBasis } from './voxel'
 import type { GameWorld } from './world'
@@ -227,13 +230,67 @@ const paintedByNode = new Map<string, Map<number, number>>()
 /** Per-node write serial — the renderer-drain's change gate. */
 const nodeSerials = new Map<string, number>()
 
+/**
+ * Cells whose coat came from ANOTHER PLAYER's stroke, per ledger node.
+ *
+ * One ledger holds everyone's paint, because a wall has one colour and every
+ * client must agree on it. But Save writes only what THIS player did, so the
+ * two have to be told apart, and the honest granularity is the cell: a remote
+ * fold marks the cells it touched, a local spray over one of them takes it
+ * back (the last writer owns the cell — the same rule the packed ledger value
+ * already follows). Empty whenever sync is off, which is what keeps the Save
+ * snapshot byte-identical in single-player.
+ */
+const remoteCoated = new Map<string, Set<number>>()
+
 export const getPaintedByNode = (): ReadonlyMap<string, ReadonlyMap<number, number>> =>
   paintedByNode
+
+/** Note a cell as this player's own work — a local coat over a remote one. */
+function claimCell(nodeId: string, cell: number): void {
+  remoteCoated.get(nodeId)?.delete(cell)
+}
+
+/**
+ * The ledger MINUS every cell another player coated — what Save may write.
+ *
+ * paint-keep.ts calls this rather than reaching into a shared module: a Save
+ * bridge may import `localWork` and nothing else, and
+ * shared-invariant.test.ts enforces it. With nothing remote in the ledger it
+ * returns the ledger itself, so single-player takes the identical object down
+ * the identical path.
+ */
+export function getOwnPaintedByNode(): ReadonlyMap<string, ReadonlyMap<number, number>> {
+  if (remoteCoated.size === 0) return paintedByNode
+  const out = new Map<string, Map<number, number>>()
+  for (const [nodeId, cells] of paintedByNode) {
+    const theirs = remoteCoated.get(nodeId)
+    if (!theirs || theirs.size === 0) {
+      out.set(nodeId, cells)
+      continue
+    }
+    const mine = new Map<number, number>()
+    for (const [cell, value] of cells) {
+      if (theirs.has(cell)) continue
+      mine.set(cell, value)
+    }
+    out.set(nodeId, mine)
+  }
+  return out
+}
+
+/** Cells another player painted on this node (QA + tests). */
+export function remoteCoatedCells(nodeId: string): ReadonlySet<number> {
+  return remoteCoated.get(nodeId) ?? EMPTY_CELLS
+}
+
+const EMPTY_CELLS: ReadonlySet<number> = new Set<number>()
 
 /** Fresh session, fresh coats — called from PaintTool's mount effect. */
 export function resetPaint(): void {
   paintedByNode.clear()
   nodeSerials.clear()
+  remoteCoated.clear()
   lastHitDistance = null
   endPaintStroke()
 }
@@ -1519,6 +1576,7 @@ export function convertDecalsForNode(nodeId: string): void {
         const strength = Math.min(1, add / COAT_ADD)
         const before = coatBaseStrength(painted.get(cell), s.color)
         painted.set(cell, paintValue(s.color, Math.min(1, before + strength)))
+        claimCell(ledgerId, cell) // a decal is always this player's own spray
       }
       wrote = true
     }
@@ -1528,6 +1586,66 @@ export function convertDecalsForNode(nodeId: string): void {
   // host surface they were clipped against is hidden now.
   for (const index of [...indices]) releaseSlot(index)
   emitDecals()
+}
+
+/**
+ * Fold another player's strokes into this client's coat ledger.
+ *
+ * FOLDED, NOT REPLAYED. `foldCoats` walks the strokes in canonical (lamport,
+ * id) order and applies the same accumulate-or-restart arithmetic the local
+ * spray uses — with the REAL `paintValue` and `coatBaseStrength` passed in as
+ * the ops, not a second copy of them, so there is exactly one definition of
+ * what a coat is. That is what makes a late joiner who folds forty strokes at
+ * once land on the ledger a client who watched them arrive one at a time
+ * already has.
+ *
+ * A stroke carries the BALL, not the cells: `splatCoat` is pure, so it expands
+ * against whatever grid THIS client has, at whatever tier. That is also why a
+ * node with no live replica is voxelized first — a dormant prebuild is woken
+ * (ensureVoxelTarget does it) rather than the paint being dropped on the floor.
+ *
+ * Colours outside the local palette are refused. The drain indexes
+ * PAINT_PALETTE with no bounds check, and every remote input is hostile.
+ */
+export function foldRemoteStrokes(world: GameWorld, strokes: readonly StrokeRec[]): void {
+  for (const [nodeId, list] of strokesByNode(strokes)) {
+    const usable = list.filter((rec) => rec.color < PAINT_PALETTE.length)
+    if (usable.length === 0) continue
+    // Force the target into existence BEFORE anything grid-dependent runs:
+    // dormant prebuilds and shell-pending nodes have no grid to expand into
+    // until they are woken.
+    const target = useDestruction.getState().targets.get(nodeId) ?? ensureVoxelTarget(world, nodeId)
+    if (!target || target.dormant) continue
+    let painted = paintedByNode.get(nodeId)
+    if (!painted) {
+      painted = new Map()
+      paintedByNode.set(nodeId, painted)
+    }
+    let theirs = remoteCoated.get(nodeId)
+    if (!theirs) {
+      theirs = new Set()
+      remoteCoated.set(nodeId, theirs)
+    }
+    const mark = theirs
+    // The expand hook is also where the cells get attributed — folding in
+    // place is what keeps the arithmetic right (a scratch map would start
+    // every cell from zero and then overwrite the local coat underneath).
+    foldCoats(
+      usable,
+      (rec) => {
+        const splats = splatCoat(target.grid, rec.x, rec.y, rec.z, rec.radius)
+        for (const splat of splats) mark.add(splat.cell)
+        return splats
+      },
+      { pack: paintValue, base: coatBaseStrength },
+      painted,
+    )
+    // Nudge the drain's change gate so the new coats reach the mesh. No
+    // sprite stamps: a stroke carries no surface normal to clip a disc
+    // against, so remote paint reads as cell tint — which is the durable
+    // outcome anyway, and exactly what Save would have written.
+    nodeSerials.set(nodeId, (nodeSerials.get(nodeId) ?? 0) + 1)
+  }
 }
 
 /** Feature-detected registration — destruction.ts gains
@@ -1590,6 +1708,28 @@ let mistParity = false
  * spray cone at the HIT DISTANCE (close = writing stroke, far = wall
  * coat). Returns true when any cell took paint.
  */
+/**
+ * Publish this tick's stamps: the bridge points first, then the hit — the same
+ * order the local ledger writes them in. Each addLocalStroke takes the next
+ * lamport, and the fold on the far side walks canonical (lamport, id) order,
+ * so a peer reproduces this client's swath in this client's sequence.
+ *
+ * The whole swath goes out, not just the hit: the spray samples at 9 Hz and the
+ * bridge is what fills the gaps between samples, so publishing the hit alone
+ * would leave every peer looking at a dotted line where this player sees a
+ * continuous band.
+ */
+function publishStrokes(
+  nodeId: string,
+  bridge: readonly { x: number; y: number; z: number }[],
+  coatRadius: number,
+): void {
+  if (!buildSyncOn()) return
+  for (const p of bridge) publishStroke(nodeId, colorIndex, p.x, p.y, p.z, coatRadius)
+  publishStroke(nodeId, colorIndex, _point.x, _point.y, _point.z, coatRadius)
+  flushBuildSync()
+}
+
 export function sprayPaint(world: GameWorld): boolean {
   _origin.copy(playerRig.position)
   aimDirection(_direction, 0)
@@ -1685,10 +1825,17 @@ export function sprayPaint(world: GameWorld): boolean {
       }
       // Drag continuity (phase 11): bridge stamps between the stroke
       // anchor and this hit — each clips its own decal and votes its area.
-      for (const p of strokeBridge(nodeId, _point.x, _point.y, _point.z, radius)) {
+      const decalBridge = strokeBridge(nodeId, _point.x, _point.y, _point.z, radius)
+      for (const p of decalBridge) {
         spawnPaintDecal(decalMesh, nodeId, _bridge.set(p.x, p.y, p.z), _decalNormal, radius)
       }
       if (spawnPaintDecal(decalMesh, nodeId, _point, _decalNormal, radius)) {
+        // A DECAL ON A PRISTINE HOST STILL PUBLISHES A COAT. The tier is a
+        // local rendering choice — this client kept its host meshes, a peer
+        // that has already shot the wall holds a voxel replica — so the
+        // stroke travels as the coat geometry both tiers agree on
+        // (coatRadiusFor is what convertDecalsForNode would use here too).
+        publishStrokes(nodeId, decalBridge, coatRadiusFor(radius))
         advanceStroke(nodeId, _point.x, _point.y, _point.z)
         return true
       }
@@ -1737,6 +1884,7 @@ export function sprayPaint(world: GameWorld): boolean {
     for (const { cell, add } of c) {
       const before = coatBaseStrength(painted.get(cell), colorIndex)
       painted.set(cell, paintValue(colorIndex, Math.min(1, before + add)))
+      claimCell(nodeId, cell) // painting over a stranger's coat makes it yours
     }
   }
   // Drip frame (P4): the streak quad faces back along the spray, pushed
@@ -1766,8 +1914,10 @@ export function sprayPaint(world: GameWorld): boolean {
       )
     }
     painted.set(cell, paintValue(colorIndex, Math.min(1, before + add)))
+    claimCell(nodeId, cell)
   }
   nodeSerials.set(nodeId, serial + 1)
+  publishStrokes(nodeId, bridge, coatRadius)
   // ROUND READ (phase 10/11): the cell tint above is square by
   // construction — stamp solid-disc sprites flat on the hit face (bridge
   // points first, then the hit) so the pass reads as one continuous filled
@@ -2108,6 +2258,18 @@ export function PaintTool({ world }: { world: GameWorld }) {
       resetPaintSplats()
     }
   }, [])
+
+  // REMOTE STROKES. Registered against THIS world (folding may have to wake a
+  // dormant prebuild to have a grid to expand into), so it re-registers on a
+  // world swap and is gone on unmount. Mounted for the whole session, not just
+  // while the can is held — a peer's paint must land whatever this player is
+  // holding. Never called with no world attached.
+  useEffect(() => {
+    setBuildAppliers({ foldStrokes: (strokes) => foldRemoteStrokes(world, strokes) })
+    return () => {
+      setBuildAppliers({ foldStrokes: undefined })
+    }
+  }, [world])
 
   useFrame((_, rawDt) => {
     // The render that last drew any ring-evicted decal geometry is over —

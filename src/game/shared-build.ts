@@ -63,7 +63,6 @@
 import { useBoots, type BuildPiece, type PlacedPiece } from '../store'
 import { parseSlotId, slotPose } from './grid'
 import { onPieceRemoved, registerPlacement } from './piece-slots'
-import { getSession } from './session'
 import { canonicalRecordOrder, electSlots, gridStamp } from './shared-derive'
 import {
   addLocalAperture,
@@ -129,12 +128,21 @@ export type NoticeSink = (text: string) => void
 type BuildSync = {
   world: SharedWorld
   sink: DeltaSink | null
-  notice: NoticeSink | null
   /** Records accumulated since the last flush (one frame's worth). */
   pending: SharedDelta | null
 }
 
 let sync: BuildSync | null = null
+
+/**
+ * Where a player-facing line goes. MODULE-LEVEL, not part of the session,
+ * for two reasons: it must survive attach/detach ordering (the HUD is mounted
+ * by the game, the world arrives from the transport, and neither waits for the
+ * other), and keeping session.ts out of this module's imports avoids a cycle
+ * through paint-keep. builder.tsx installs the HUD one; a test installs its
+ * own. Null = the lane says nothing, which is the single-player case.
+ */
+let noticeSink: NoticeSink | null = null
 
 /**
  * THE GATE. Every call site in builder.tsx, item-place.tsx and paint.tsx
@@ -160,12 +168,8 @@ export function attachBuildSync(
   world: SharedWorld,
   opts?: { sink?: DeltaSink; notice?: NoticeSink },
 ): void {
-  sync = {
-    world,
-    sink: opts?.sink ?? null,
-    notice: opts?.notice ?? null,
-    pending: null,
-  }
+  sync = { world, sink: opts?.sink ?? null, pending: null }
+  if (opts?.notice) noticeSink = opts.notice
   resetRegistries()
 }
 
@@ -181,16 +185,11 @@ export function setBuildSyncSink(sink: DeltaSink | null): void {
 }
 
 export function setBuildSyncNotice(notice: NoticeSink | null): void {
-  if (sync) sync.notice = notice
+  noticeSink = notice
 }
 
 function say(text: string): void {
-  const custom = sync?.notice
-  if (custom) {
-    custom(text)
-    return
-  }
-  getSession()?.hud.presenceToast(text)
+  noticeSink?.(text)
 }
 
 /**
@@ -751,5 +750,6 @@ export function sharedBuildDebug(): {
 export function resetSharedBuild(): void {
   detachBuildSync()
   clearBuildAppliers()
+  noticeSink = null
   refusedGridSaid = false
 }

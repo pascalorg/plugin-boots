@@ -1,7 +1,7 @@
 import { type AnyNode, type AnyNodeId, useScene } from '@pascal-app/core'
 import { create } from 'zustand'
 import { useDestruction } from './destruction'
-import { getDecalVotesByNode, getPaintedByNode, PAINT_PALETTE } from './paint'
+import { getDecalVotesByNode, getOwnPaintedByNode, PAINT_PALETTE } from './paint'
 
 /**
  * Save-the-paint — the sprayer's half of the persistence contract
@@ -113,7 +113,12 @@ export function capturePaint(): number {
   // filter still reads each member's OWN grid.
   const votesByNode = new Map<string, Map<number, number>>()
   const cellsByNode = new Map<string, number>()
-  for (const [ledgerId, cells] of getPaintedByNode()) {
+  // ONLY THIS PLAYER'S COATS. The ledger holds everyone's paint — a wall has
+  // one colour and every client has to agree on it — but a Save writes the work
+  // of the person who pressed the button. getOwnPaintedByNode drops cells
+  // another player coated (and hands back the whole ledger untouched when there
+  // is nobody else, so single-player walks the identical map).
+  for (const [ledgerId, cells] of getOwnPaintedByNode()) {
     if (cells.size === 0) continue
     const hash = ledgerId.indexOf('#')
     const nodeId = hash === -1 ? ledgerId : ledgerId.slice(0, hash)
