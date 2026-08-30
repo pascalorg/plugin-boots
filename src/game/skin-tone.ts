@@ -60,6 +60,14 @@ export type SkinToneSource = {
    * carved floor shows earth, never white (owner wave 5). Needs grid.ny to
    * tell the top layer apart. */
   floorCore?: boolean
+  /** Voxel-only member of a SHELLED family (the roof RESIDUAL target —
+   * gable ends, fascia/gutter lines outside the plane slabs): its facade
+   * look lives nowhere once the family wakes, so awake voxels mute toward
+   * bare structure/trim (STRUCTURE_TOP family) instead of rendering the
+   * residual material's near-white siding tone — the S1 QA "white stepped
+   * blocks on the roof rim at wake". Multiplicative (the ceiling-plate
+   * discipline), so darker residual materials mute proportionally. */
+  structuralMute?: boolean
   /** Per-voxel RGB, 3 floats per index (item silhouette lane). */
   cellColors?: Float32Array
   /** The surface texture's CPU color grid (mapPatternGrid) — when present,
@@ -145,6 +153,14 @@ export const CEILING_FACE_TINT: readonly [number, number, number] = (() => {
   return [STRUCTURE_TOP.r / white.r, STRUCTURE_TOP.g / white.g, STRUCTURE_TOP.b / white.b]
 })()
 
+/** CEILING_FACE_TINT as a Color — the multiplicative structural mute a
+ * `structuralMute` target's cells wear (white family → STRUCTURE_TOP). */
+const STRUCTURAL_MUTE = new Color(
+  CEILING_FACE_TINT[0],
+  CEILING_FACE_TINT[1],
+  CEILING_FACE_TINT[2],
+)
+
 /** True when cell `i` sits on a WALL's top row — the plate, bare structure
  * under the eave. Walls are always layered (their interior faces come from
  * lower rows), so per-cell muting is safe; ceiling plates are NOT (single
@@ -153,6 +169,20 @@ function isStructuralTopCell(wall: SkinToneSource, i: number): boolean {
   const ny = wall.grid.ny
   if (ny === undefined || ny < 2 || wall.kind !== 'wall') return false
   return wall.grid.coords[i * 3 + 1] === ny - 1
+}
+
+/** The floor-family DIRT tone of plan column (ix,iz) — the clod/dry-dirt
+ * anchor blend plus the occasional desaturated surface fleck (cracked-tile
+ * bits), shared by primedCellColor's floorCore under-layers and
+ * shellCoreCellColor's top walking layer (a shelled floor's exposed core
+ * must read as the same rubble family everywhere). Writes into `out`. */
+function floorDirtBase(out: Color, wall: SkinToneSource, i: number, tone: Color): Color {
+  const h = floorColumnHash(wall.grid.coords[i * 3]!, wall.grid.coords[i * 3 + 2]!)
+  out.copy(FLOOR_CLOD_DARK).lerp(FLOOR_DIRT_LIGHT, (h % 1024) / 1024)
+  if (wall.toneGrid && ((h >>> 10) & 1023) / 1024 < FLOOR_FLECK_RATE) {
+    out.lerp(_fleck.copy(tone).offsetHSL(0, -0.3, 0), FLOOR_FLECK_MIX)
+  }
+  return out
 }
 
 /**
@@ -190,6 +220,14 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
     // these cells, not roof). Ceilings handle their attic side per FACE
     // (CEILING_FACE_TINT) — their per-cell tone stays the interior one.
     base = STRUCTURE_TOP
+  } else if (wall.structuralMute === true) {
+    // Voxel-only member of a SHELLED family (the roof residual): the plane
+    // siblings wake pixel-identical shells while these cells wake as CUBES
+    // — they must read as bare structure/trim (cut sheathing), never the
+    // residual material's near-white siding (S1 QA: white stepped blocks
+    // on the roof rim). Multiplicative, so patterned/painted residual
+    // materials mute proportionally and never flash light.
+    base = _derived.copy(tone).multiply(STRUCTURAL_MUTE)
   } else if (
     wall.kind === 'slab' &&
     wall.floorCore === true &&
@@ -207,11 +245,7 @@ export function primedCellColor(out: Color, wall: SkinToneSource, i: number): Co
     // cell's toneGrid sample from the pattern lane above, or the flat
     // baseColor when the grid can't sample). Pure math, so re-primes and
     // paint coats derive identically.
-    const h = floorColumnHash(wall.grid.coords[i * 3]!, wall.grid.coords[i * 3 + 2]!)
-    base = _derived.copy(FLOOR_CLOD_DARK).lerp(FLOOR_DIRT_LIGHT, (h % 1024) / 1024)
-    if (wall.toneGrid && ((h >>> 10) & 1023) / 1024 < FLOOR_FLECK_RATE) {
-      base.lerp(_fleck.copy(tone).offsetHSL(0, -0.3, 0), FLOOR_FLECK_MIX)
-    }
+    base = floorDirtBase(_derived, wall, i, tone)
   } else if (wall.kind === 'slab' && wall.grid.coords[i * 3 + 1] === 0) {
     // Bottom skin — the ceiling face a player looks up at — renders as
     // slightly lighter, desaturated drywall.
@@ -243,23 +277,40 @@ const CORE_GYPSUM = new Color('#a8a29a')
 export const CORE_DECK_HEX = '#8a6a48'
 const CORE_DECK = new Color(CORE_DECK_HEX)
 
+/** Scratch for coreCellColor's clip-safe darken. */
+const _coreHsl = { h: 0, s: 0, l: 0 }
+
 /**
  * The CORE tone of a shelled target's cell — voxel-walls' core mode primes
  * the skin layer with this instead of the facade pattern tones (the facade
  * lives on the conforming shell mesh now): the base darkened into a
- * structural read (lightness −0.18 plus a slight desaturation), with kind
- * tweaks — 'wall' cores first pull toward the gypsum-gray family, 'roof'
- * cores (S1a plane members) toward the deck/sheathing brown, while every
- * other kind (slab/floor cores keep their dirt-toned base) takes only the
- * darkening. Pure — writes into `out` and returns it; no per-cell jitter
- * (the core is a uniform structural fill, and the shell carries all the
- * visual variation).
+ * structural read, with kind tweaks — 'wall' cores pull 35% toward the
+ * gypsum-gray family; 'roof' cores (S1a plane members) anchor firmly ON
+ * the deck/sheathing brown (80% CORE_DECK — under the shingles sits
+ * plywood, whatever the shingle tone), while every other kind takes only
+ * the darkening.
+ *
+ * CLIP-SAFE DARKEN (S1 QA finish): the old absolute offsetHSL(0, −0.08,
+ * −0.18) worked for light drywall bases but CRUSHED every textured tone to
+ * pure black — the working space is linear, where resolved wood/shingle
+ * tones live near L 0.05–0.2, so L−0.18 clamped to 0 (the roof cores that
+ * were meant to read CORE_DECK rendered as black plates, and a shelled
+ * floor's rim cells showed as the "dark dead-fragment rectangles"). The
+ * darken is now max(L−0.18, L·0.6): bit-identical for light bases
+ * (L ≥ 0.45 — the shipped wall-core gray), proportional for dark ones —
+ * never black. Pure — writes into `out` and returns it; no per-cell
+ * jitter (the core is a uniform structural fill).
  */
 export function coreCellColor(base: Color, kind: string, out: Color): Color {
   out.copy(base)
   if (kind === 'wall') out.lerp(CORE_GYPSUM, 0.35)
-  else if (kind === 'roof') out.lerp(CORE_DECK, 0.35)
-  return out.offsetHSL(0, -0.08, -0.18)
+  else if (kind === 'roof') out.lerp(CORE_DECK, 0.8)
+  out.getHSL(_coreHsl)
+  return out.setHSL(
+    _coreHsl.h,
+    Math.max(0, _coreHsl.s - 0.08),
+    Math.max(_coreHsl.l - 0.18, _coreHsl.l * 0.6),
+  )
 }
 
 /**
@@ -268,16 +319,28 @@ export function coreCellColor(base: Color, kind: string, out: Color): Color {
  * primedCellColor's floorCore branch (clods, dry dirt, tile flecks) —
  * carving a shelled floor must reveal earth exactly like the unshelled
  * one, and spawnFloorBreach's under-hole decal expects the same rubble
- * family. Every other cell takes the flat kind core tone (coreCellColor).
+ * family. The TOP walking layer joins the same dirt family (S1 QA finish):
+ * the wood surface lives on the SHELL now, so an exposed top core cell is
+ * CUT floor — the old flat slab core tone (darkened wood) clipped to black
+ * in the linear working space and rim cells whose covering fragment died
+ * lingered as "dark dead-fragment rectangles" around every floor breach.
+ * It wears the same two-hash jitter as primedCellColor so the fill never
+ * bands flat. Every other cell takes the kind core tone (coreCellColor).
  * Pure — writes into `out` and returns it.
  */
 export function shellCoreCellColor(out: Color, wall: SkinToneSource, i: number): Color {
-  if (
-    wall.kind === 'slab' &&
-    wall.floorCore === true &&
-    wall.grid.coords[i * 3 + 1]! < (wall.grid.ny ?? 1) - 1
-  ) {
-    return primedCellColor(out, wall, i)
+  if (wall.kind === 'slab' && wall.floorCore === true) {
+    if (wall.grid.coords[i * 3 + 1]! < (wall.grid.ny ?? 1) - 1) {
+      return primedCellColor(out, wall, i)
+    }
+    // Top layer: dirt-rubble too, flecked from the cell's own pattern
+    // sample (or the flat base) exactly like the under-layers.
+    const tone =
+      (!wall.cellColors && wall.toneGrid ? cellPatternTone(_pattern, wall, i) : null) ??
+      wall.baseColor
+    const j1 = ((i * 2654435761) % 97) / 97
+    const j2 = ((i * 1597334677) % 89) / 89
+    return floorDirtBase(out, wall, i, tone).offsetHSL(0, (j2 - 0.5) * 0.04, (j1 - 0.5) * 0.1)
   }
   return coreCellColor(wall.baseColor, wall.kind, out)
 }

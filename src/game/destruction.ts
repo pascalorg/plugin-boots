@@ -410,6 +410,15 @@ export type VoxelTarget = {
    * paints every under-layer as dirt subfloor (skin-tone.ts
    * FLOOR_CORE_HEX) so a carved floor reveals earth. */
   floorCore?: boolean
+  /** Voxel-only member of a SHELLED roof family (the `#residual` target
+   * when the roof shell lane is latched ON): primedCellColor mutes its
+   * cells toward bare structure/trim (skin-tone.ts STRUCTURAL_MUTE) — the
+   * plane siblings wake as pixel-identical shells, so these cube cells
+   * must read as cut sheathing/trim, never the residual material's
+   * near-white siding (S1 QA: white stepped blocks on the roof rim at
+   * wake). Never set on voxel-only sessions — the kill-switch look stays
+   * bit-identical. */
+  structuralMute?: boolean
   /** CEILING-family slab (nodeType 'ceiling'): voxel-walls renders it with
    * the FACE-tinted ceiling geometry (skin-tone.ts CEILING_FACE_TINT) —
    * the attic-side TOP and rim faces mute toward bare structure while the
@@ -1804,8 +1813,11 @@ function buildRoofPlaneTargets(
   // so the first hit used to erase them with nothing in their place (the
   // skeleton showed end-on on intersecting-gable roofs). One extra
   // fine-celled volume member traces exactly those excluded faces; a roof
-  // with no residual faces builds nothing here (zero cost).
-  const residualTarget = buildRoofResidualTarget(nodeId, meshes, residualTris)
+  // with no residual faces builds nothing here (zero cost). Shelled
+  // families mute the residual's cells toward bare structure/trim
+  // (structuralMute) — its siblings wake pixel-identical shells, so white
+  // siding CUBES on the rim would scream (S1 QA item 1).
+  const residualTarget = buildRoofResidualTarget(nodeId, meshes, residualTris, shellOn)
   if (residualTarget) built.push(residualTarget)
 
   // Every plane replica is ready — hide the merged host mesh ONCE, in the
@@ -1878,6 +1890,7 @@ function buildRoofResidualTarget(
   nodeId: string,
   meshes: Mesh[],
   tris: number[],
+  structuralMute: boolean,
 ): VoxelTarget | null {
   if (tris.length === 0) return null
   const geometry = new BufferGeometry()
@@ -1922,6 +1935,10 @@ function buildRoofResidualTarget(
     // (it carries its own pending-retry retint under the member id).
     baseColor: resolveSurfaceTone(residualId, 'volume', residualMaterial, retintTarget(residualId)),
     toneGrid: mapPatternGrid(residualMaterial?.map) ?? undefined,
+    // Shelled family: the residual's awake cubes mute toward bare
+    // structure/trim (see the VoxelTarget field doc) — voxel-only sessions
+    // keep the exact legacy siding tone.
+    structuralMute: structuralMute || undefined,
     segments,
     studs: segments,
     sheets: [],

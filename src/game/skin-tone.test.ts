@@ -840,25 +840,48 @@ describe('per-cell texture patterns', () => {
 })
 
 describe('coreCellColor (conforming-shell core tone)', () => {
-  test('darkened structural read: lightness −0.18, slight desaturation, pure + deterministic', () => {
-    const base = new Color('#c0392b') // saturated brick red
+  test('LIGHT bases keep the shipped wall-core law: exactly offsetHSL(0, −0.08, −0.18)', () => {
+    // Post-lerp L ≥ 0.45 ⇒ the absolute −0.18 wins over the ×0.6 floor —
+    // bit-identical to the pre-fix output (the shipped drywall-core gray).
+    const base = new Color('#e8e2d5') // light drywall family (linear L ≈ 0.63)
     const out = coreCellColor(base, 'slab', new Color())
-    // Non-wall kinds skip the gypsum pull: exactly base.offsetHSL(0, −0.08, −0.18).
     const reference = base.clone().offsetHSL(0, -0.08, -0.18)
     expect(out.r).toBeCloseTo(reference.r, 10)
     expect(out.g).toBeCloseTo(reference.g, 10)
     expect(out.b).toBeCloseTo(reference.b, 10)
-    const hslBase = { h: 0, s: 0, l: 0 }
-    const hslCore = { h: 0, s: 0, l: 0 }
-    base.getHSL(hslBase)
-    out.getHSL(hslCore)
-    expect(hslCore.l).toBeCloseTo(hslBase.l - 0.18, 10)
-    expect(hslCore.s).toBeLessThan(hslBase.s)
     // Base is never mutated; writes into `out` and returns it.
-    expect(base.getHexString()).toBe('c0392b')
+    expect(base.getHexString()).toBe('e8e2d5')
     const again = new Color()
     expect(coreCellColor(base, 'slab', again)).toBe(again)
     expect(again.equals(out)).toBe(true)
+  })
+
+  test('DARK bases never clip to black: the ×0.6 proportional floor takes over', () => {
+    // Textured tones live near L 0.05–0.2 in the linear working space —
+    // the old absolute −0.18 crushed all of them to (0,0,0): the S1 QA
+    // "dark dead-fragment rectangles" at floor-carve edges and the black
+    // roof cores that were meant to read CORE_DECK.
+    const base = new Color('#4a3f38') // resolved wood/shingle family
+    const hslBase = { h: 0, s: 0, l: 0 }
+    base.getHSL(hslBase)
+    expect(hslBase.l).toBeLessThan(0.18) // the old law would have clamped to 0
+    const out = coreCellColor(base, 'slab', new Color())
+    const hslCore = { h: 0, s: 0, l: 0 }
+    out.getHSL(hslCore)
+    expect(hslCore.l).toBeCloseTo(hslBase.l * 0.6, 10)
+    expect(Math.max(out.r, out.g, out.b)).toBeGreaterThan(0.01)
+  })
+
+  test("'roof' cores anchor on the deck brown — warm, readable, never near-black", () => {
+    // 80% CORE_DECK: under the shingles sits plywood, whatever the shingle
+    // tone — a carved roof hole must read as torn wood sheathing.
+    const shingle = new Color('#2e2b28') // dark resolved shingle tone
+    const out = coreCellColor(shingle, 'roof', new Color())
+    expect(out.r).toBeGreaterThan(out.g)
+    expect(out.g).toBeGreaterThan(out.b)
+    expect(out.r).toBeGreaterThan(0.05) // clearly not black
+    // Deterministic.
+    expect(coreCellColor(shingle, 'roof', new Color()).equals(out)).toBe(true)
   })
 
   test("kind tweak: 'wall' cores pull toward the gypsum-gray family, other kinds keep their base", () => {
@@ -880,5 +903,69 @@ describe('coreCellColor (conforming-shell core tone)', () => {
     base.getHSL(hslBase)
     expect(hslWall.l).toBeLessThan(hslBase.l)
     expect(hslSlab.l).toBeLessThan(hslBase.l)
+  })
+})
+
+describe('structuralMute (shelled roof residual — S1 QA white-rim fix)', () => {
+  const muteGrid = { coords: new Int16Array([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]) }
+
+  test('muted tone = tone × CEILING_FACE_TINT, exactly the pre-multiplied-base law', () => {
+    // A muted target's cell must equal an UNMUTED target whose baseColor
+    // was pre-multiplied by the tint — same tone-pick path, same jitter —
+    // so paint coats feather from exactly the tone the skin was primed with.
+    const base = new Color(CEILING_WHITE_HEX)
+    const muted: SkinToneSource = {
+      kind: 'volume',
+      baseColor: base.clone(),
+      structuralMute: true,
+      grid: muteGrid,
+    }
+    const preMultiplied: SkinToneSource = {
+      kind: 'volume',
+      baseColor: base
+        .clone()
+        .multiply(new Color(CEILING_FACE_TINT[0], CEILING_FACE_TINT[1], CEILING_FACE_TINT[2])),
+      grid: muteGrid,
+    }
+    for (let i = 0; i < 4; i++) {
+      const a = primedCellColor(new Color(), muted, i)
+      const b = primedCellColor(new Color(), preMultiplied, i)
+      expect(a.r).toBeCloseTo(b.r, 10)
+      expect(a.g).toBeCloseTo(b.g, 10)
+      expect(a.b).toBeCloseTo(b.b, 10)
+    }
+  })
+
+  test('the interior-white family lands on STRUCTURE_TOP — never light teeth', () => {
+    // CEILING_FACE_TINT is derived so white × tint === STRUCTURE_TOP: the
+    // residual's near-white siding tone mutes to bare structure. Jitter is
+    // ±0.05 lightness, so every cell stays in the structural band.
+    const muted: SkinToneSource = {
+      kind: 'volume',
+      baseColor: new Color(CEILING_WHITE_HEX),
+      structuralMute: true,
+      grid: muteGrid,
+    }
+    const structure = { h: 0, s: 0, l: 0 }
+    new Color(STRUCTURE_TOP_HEX).getHSL(structure)
+    const hsl = { h: 0, s: 0, l: 0 }
+    for (let i = 0; i < 4; i++) {
+      primedCellColor(new Color(), muted, i).getHSL(hsl)
+      expect(Math.abs(hsl.l - structure.l)).toBeLessThan(0.06)
+    }
+  })
+
+  test('mute OFF keeps the legacy siding tone (voxel-only kill-switch parity)', () => {
+    const plain: SkinToneSource = {
+      kind: 'volume',
+      baseColor: new Color(CEILING_WHITE_HEX),
+      grid: muteGrid,
+    }
+    const muted: SkinToneSource = { ...plain, structuralMute: true, baseColor: plain.baseColor }
+    const hslPlain = { h: 0, s: 0, l: 0 }
+    const hslMuted = { h: 0, s: 0, l: 0 }
+    primedCellColor(new Color(), plain, 0).getHSL(hslPlain)
+    primedCellColor(new Color(), muted, 0).getHSL(hslMuted)
+    expect(hslMuted.l).toBeLessThan(hslPlain.l - 0.3)
   })
 })

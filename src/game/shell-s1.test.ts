@@ -535,7 +535,7 @@ describe('slab shells (S1b wiring)', () => {
     }
   })
 
-  test('floorCore core tone: under-layers keep the dirt subfloor read, top layer takes the core tone', () => {
+  test('floorCore core tone: every layer wears the dirt read — under-layers AND the top walking layer', () => {
     setShellFlag('slab', true)
     const world = worldOf([groundSlabCollider()])
     const target = ensureVoxelTarget(world, 'slab-1')!
@@ -556,11 +556,38 @@ describe('slab shells (S1b wiring)', () => {
     expect(shellCoreCellColor(a, target, below).equals(primedCellColor(b, target, below))).toBe(
       true,
     )
-    // Top layer: the flat slab core tone (darkened base, no dirt).
-    expect(
-      shellCoreCellColor(a, target, top).equals(coreCellColor(target.baseColor, 'slab', b)),
-    ).toBe(true)
-    expect(a.equals(primedCellColor(b, target, top))).toBe(false)
+    // Top layer: dirt-rubble TOO (S1 QA finish) — the wood surface lives on
+    // the shell now, so an exposed top core cell is CUT floor. The old flat
+    // slab core tone (darkened wood) clipped to pure black in the linear
+    // working space — the "dark dead-fragment rectangles" around a breach.
+    shellCoreCellColor(a, target, top)
+    expect(a.equals(coreCellColor(target.baseColor, 'slab', b))).toBe(false)
+    expect(a.equals(primedCellColor(b, target, top))).toBe(false) // not the wood surface either
+    expect(Math.max(a.r, a.g, a.b)).toBeGreaterThan(0.02) // never black
+    expect(a.r).toBeGreaterThan(a.b) // warm earth, like the layers below
+    // Deterministic — re-primes and paint coats derive identically.
+    expect(shellCoreCellColor(new Color(), target, top).equals(a)).toBe(true)
+  })
+
+  test('shelled family marks the residual structuralMute; voxel-only sessions never do', () => {
+    // Flag ON: the plane siblings wake pixel-identical shells — the
+    // residual's awake CUBES mute toward bare structure (S1 QA item 1:
+    // white stepped blocks on the roof rim at wake)…
+    setShellFlag('roof', true)
+    prevoxelize(roofWorld(gableShellMesh()))
+    const muted = targets().get('roof-1#residual')!
+    expect(muted.structuralMute).toBe(true)
+    // …and its primed cells sit far below the raw siding tone.
+    const hslMuted = { h: 0, s: 0, l: 0 }
+    const hslRaw = { h: 0, s: 0, l: 0 }
+    primedCellColor(new Color(), muted, 0).getHSL(hslMuted)
+    primedCellColor(new Color(), { ...muted, structuralMute: false }, 0).getHSL(hslRaw)
+    expect(hslMuted.l).toBeLessThan(hslRaw.l)
+    resetDestruction()
+    // Flag OFF: kill-switch parity — the legacy voxel look is untouched.
+    setShellFlag('roof', false)
+    prevoxelize(roofWorld(gableShellMesh()))
+    expect(targets().get('roof-1#residual')!.structuralMute).toBeUndefined()
   })
 
   test('floor-breach census parity: the breach fires identically flag on/off', () => {
