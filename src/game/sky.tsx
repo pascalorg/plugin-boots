@@ -112,6 +112,12 @@ export function GameSky({ world }: { world: GameWorld }) {
     [world],
   )
   const texture = getSkyTexture()
+  // PARITY RULE (same gate as the boots ground disc): a scene with a host
+  // `site` owns its whole presentation — terrain, horizon disc AND sky.
+  // The overcast dome COVERED the editor's blue-gradient sky, the single
+  // hottest delta on every horizon vantage of the parity harness. No site
+  // → the dome stays (it exists for the editor's flat void).
+  if (world.site) return null
   if (!texture) return null
   return (
     <mesh
