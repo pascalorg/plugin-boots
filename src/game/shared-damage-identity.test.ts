@@ -4,6 +4,8 @@ import {
   attachBuildSync,
   detachBuildSync,
   pieceRecordOf,
+  placementRecordOf,
+  publishItem,
   reconcileSharedPieces,
   resetSharedBuild,
 } from './shared-build'
@@ -23,6 +25,7 @@ import {
   cellKey,
   createSharedWorld,
   emptyEffects,
+  ITEM_TARGET_PREFIX,
   localWork,
   PIECE_TARGET_PREFIX,
   snapshotOf,
@@ -256,15 +259,15 @@ describe('publishing a session-built target', () => {
     expect(localWork(world).cells.size).toBe(0)
   })
 
-  test('items and spawn fixtures are refused, and host nodes are untouched', () => {
+  test('spawn fixtures are refused, and host nodes are untouched', () => {
     const { world, sent } = damageLane('me')
     attachBuildSync(world)
 
-    // `__boots-item-<n>` is the same per-client counter story as a piece, but
-    // the build lane keeps the item binding private, so there is no room-wide
-    // name to translate to yet. `__boots-table1` / `__boots-switch` are the
-    // spawn fixtures, which every client builds for itself — they are not the
-    // same object in two browsers at all.
+    // `__boots-table1` / `__boots-switch` are the spawn fixtures, which every
+    // client builds for itself at its own spawn point — they are not the same
+    // object in two browsers at all, so their damage means nothing to anyone
+    // else. `__boots-item-4` is an item nobody published: no record, no name.
+    // `__boots-piece-` is malformed, and must not read as piece number zero.
     for (const id of ['__boots-item-4', '__boots-table1', '__boots-switch', '__boots-piece-']) {
       publishRemovedKeys(id, CELLS)
       publishKilledNode(id)
@@ -394,6 +397,103 @@ describe('applying damage to a session-built target', () => {
   })
 })
 
+// ── placed catalog items ────────────────────────────────────────────────────
+
+describe('a placed item is destructible, so its damage travels too', () => {
+  // destruction.ts keeps `__boots-item-*` out of PREVOXELIZATION only — its own
+  // comment says items re-voxelize "on proxy→GLB swaps and first hits" — so a
+  // player shooting a sofa destroys it locally. Under a wholesale refusal that
+  // destruction reached nobody, which is half of "builds and destruction both
+  // replicate" quietly missing.
+
+  test('a published item is damaged under its record id, never its local number', () => {
+    const { world, sent } = damageLane('me')
+    attachBuildSync(world)
+    const record = publishItem(7, 'sofa-2', [1, 0, 2], 0)
+    expect(record).not.toBeNull()
+    sent.length = 0
+
+    publishRemovedKeys(`${ITEM_TARGET_PREFIX}7`, CELLS)
+    publishKilledNode(`${ITEM_TARGET_PREFIX}7`)
+
+    const named = new Set(sent.flatMap((d) => d.nodes.map((n) => n.nodeId)))
+    expect([...named]).toEqual([`${ITEM_TARGET_PREFIX}${record}`])
+    expect([...localWork(world).cells.keys()]).toEqual([`${ITEM_TARGET_PREFIX}${record}`])
+  })
+
+  test('two clients whose item counters both minted 7 damage two DIFFERENT sofas', () => {
+    const mine = damageLane('me')
+    attachBuildSync(mine.world)
+    const myRecord = publishItem(7, 'sofa-2', [1, 0, 2], 0)
+    mine.sent.length = 0
+    publishRemovedKeys(`${ITEM_TARGET_PREFIX}7`, CELLS)
+
+    setDamageSync(null)
+    detachBuildSync()
+    resetSharedBuild()
+    resetSharedDamage()
+
+    const theirs = damageLane('you')
+    attachBuildSync(theirs.world)
+    // Same number, different piece of furniture, on the far side of the lot.
+    const theirRecord = publishItem(7, 'armchair-1', [40, 0, 9], 90)
+    theirs.sent.length = 0
+    publishRemovedKeys(`${ITEM_TARGET_PREFIX}7`, CELLS)
+
+    expect(myRecord).not.toBe(theirRecord)
+    const nameOf = (sent: SharedDelta[]) => sent[0]!.nodes[0]!.nodeId
+    expect(nameOf(mine.sent)).toBe(`${ITEM_TARGET_PREFIX}${myRecord}`)
+    expect(nameOf(theirs.sent)).toBe(`${ITEM_TARGET_PREFIX}${theirRecord}`)
+    expect(nameOf(mine.sent)).not.toBe(nameOf(theirs.sent))
+  })
+
+  test("a record-named item frame lands on THIS client's item, and a numbered one never does", () => {
+    const { world } = damageLane('me')
+    attachBuildSync(world)
+    const record = publishItem(7, 'sofa-2', [1, 0, 2], 0) as string
+    expect(placementRecordOf(7)).toBe(record)
+
+    const local = `${ITEM_TARGET_PREFIX}7`
+    const grids = new Map<NodeId, DamageGrid>([[local, fakeGrid(2, 2, 1)]])
+    const { runtime, log } = recordingRuntime(grids)
+    setDamageRuntime(runtime)
+
+    const fx = emptyEffects()
+    fx.removedCells.set(`${ITEM_TARGET_PREFIX}${record}`, [cellKey(1, 0, 0)])
+    fx.killedNodes.push(`${ITEM_TARGET_PREFIX}${record}`)
+    expect(applySharedDamage(fx)).toMatchObject({ unresolved: 0, cells: 1, kills: 1 })
+    expect(log.removed.map((r) => r.nodeId)).toEqual([local])
+    expect(log.killed).toEqual([local])
+
+    // The same shot, named by number instead: refused, counted, not applied.
+    const numbered = emptyEffects()
+    numbered.removedCells.set(local, [cellKey(0, 0, 0)])
+    numbered.killedNodes.push(local)
+    const report = applySharedDamage(numbered)
+    expect(report.unresolved).toBe(2)
+    expect(report.cells).toBe(0)
+    expect(grids.get(local)!.alive[0]).toBe(1)
+  })
+
+  test('an item record this client has never installed is dropped, not guessed at', () => {
+    const { world } = damageLane('me')
+    attachBuildSync(world)
+    publishItem(7, 'sofa-2', [1, 0, 2], 0)
+    const grids = new Map<NodeId, DamageGrid>([[`${ITEM_TARGET_PREFIX}7`, fakeGrid(2, 2, 1)]])
+    const { runtime, log } = recordingRuntime(grids)
+    setDamageRuntime(runtime)
+
+    // A peer's sofa, which never arrived here. The tempting wrong answer is to
+    // fall back on the only item we do have.
+    const fx = emptyEffects()
+    fx.removedCells.set(`${ITEM_TARGET_PREFIX}you#3`, [cellKey(0, 0, 0)])
+    const report = applySharedDamage(fx)
+    expect(report.unresolved).toBe(1)
+    expect(log.materialized).toEqual([])
+    expect(grids.get(`${ITEM_TARGET_PREFIX}7`)!.alive[0]).toBe(1)
+  })
+})
+
 // ── the naming contract these two halves share ──────────────────────────────
 
 describe('the id spaces cannot be confused', () => {
@@ -402,7 +502,12 @@ describe('the id spaces cannot be confused', () => {
     // If shared-world ever renames its target prefixes out from under that,
     // this fails here rather than by silently publishing a per-client id.
     expect(PIECE_TARGET_PREFIX.startsWith('__boots')).toBe(true)
+    expect(ITEM_TARGET_PREFIX.startsWith('__boots')).toBe(true)
     expect(PIECE_TARGET_PREFIX).toBe('__boots-piece-')
+    expect(ITEM_TARGET_PREFIX).toBe('__boots-item-')
+    // And they must stay distinguishable from each other by prefix alone.
+    expect(PIECE_TARGET_PREFIX.startsWith(ITEM_TARGET_PREFIX)).toBe(false)
+    expect(ITEM_TARGET_PREFIX.startsWith(PIECE_TARGET_PREFIX)).toBe(false)
   })
 
   test('a record id always carries the `#` a runtime id never can', () => {

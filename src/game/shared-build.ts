@@ -294,6 +294,28 @@ export function pieceRecordOf(runtimeId: number): RecordId | null {
   return pieceRecord.get(runtimeId) ?? null
 }
 
+/**
+ * The same lookup for a placed catalog item or opening, BOTH DIRECTIONS.
+ *
+ * The damage lane needs both. A placed item is destructible — destruction.ts
+ * keeps items out of PREVOXELIZATION only, and voxelizes them on their first
+ * hit — and `__boots-item-<n>` is minted from a per-client counter, so a
+ * player shooting a sofa can only tell anyone about it under the record id
+ * (shared-world's itemTargetId). Inbound, the reverse is needed to find which
+ * sofa in THIS scene a record names.
+ *
+ * Exported as a pair of lookups rather than the maps themselves so the
+ * bindings stay private and nothing outside can bind, unbind or iterate them.
+ */
+export function placementRecordOf(runtimeId: number): RecordId | null {
+  return placementRecord.get(runtimeId) ?? null
+}
+
+/** Record → this client's runtime id for that item/opening, if it has one. */
+export function placementRuntimeOf(id: RecordId): number | null {
+  return placementRuntime.get(id) ?? null
+}
+
 // ── Outgoing frames ─────────────────────────────────────────────────────────
 
 function outgoing(): SharedDelta {

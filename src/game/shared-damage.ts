@@ -49,7 +49,7 @@
  */
 
 import { useBoots } from '../store'
-import { pieceRecordOf } from './shared-build'
+import { pieceRecordOf, placementRecordOf, placementRuntimeOf } from './shared-build'
 import { canonicalCellOrder, canonicalNodeOrder } from './shared-derive'
 import {
   cellIx,
@@ -59,6 +59,8 @@ import {
   CELL_AXIS_MAX,
   emptyDelta,
   isCellKey,
+  itemTargetId,
+  ITEM_TARGET_PREFIX,
   localWork,
   MAX_CELLS_PER_NODE,
   MAX_NODES_PER_FRAME,
@@ -75,6 +77,7 @@ import {
   type LocalWork,
   type NodeDelta,
   type NodeId,
+  type RecordId,
   type SharedDelta,
   type SharedEffects,
   type SharedWorld,
@@ -188,6 +191,42 @@ const SESSION_TARGET_PREFIX = '__boots'
 const RUNTIME_SUFFIX = /^\d+$/
 
 /**
+ * One direction of the translation, shared by the piece and item lanes: a
+ * local `<prefix><number>` becomes `<prefix><record>` via the build lane's
+ * binding, or null when there is no binding to use. The wire name is built by
+ * the contract's own constructor (`pieceTargetId` / `itemTargetId`) so a
+ * change of spelling over there cannot silently diverge from this.
+ */
+function outboundName(
+  nodeId: NodeId,
+  prefix: string,
+  recordOf: (runtimeId: number) => RecordId | null,
+  targetId: (record: RecordId) => NodeId,
+): NodeId | null {
+  const suffix = nodeId.slice(prefix.length)
+  // Already room-wide: pass through, so translating twice is translating once.
+  if (suffix.includes('#')) return nodeId
+  if (!RUNTIME_SUFFIX.test(suffix)) return null
+  const record = recordOf(Number(suffix))
+  return record === null ? null : targetId(record)
+}
+
+/** The inverse: `<prefix><record>` back to this client's `<prefix><number>`. */
+function inboundName(
+  nodeId: NodeId,
+  prefix: string,
+  runtimeOf: (record: RecordId) => number | null,
+): NodeId | null {
+  const record = nodeId.slice(prefix.length)
+  // A target named by NUMBER is refused, never resolved: it is a peer's own
+  // counter or a forgery, and the one thing it is not is a reference to
+  // whatever of mine happens to wear that number.
+  if (!record.includes('#')) return null
+  const runtimeId = runtimeOf(record)
+  return runtimeId === null ? null : `${prefix}${runtimeId}`
+}
+
+/**
  * THE NAME A TARGET TRAVELS UNDER.
  *
  * Host nodes need no translation. Session-built ones do, and getting it wrong
@@ -207,50 +246,61 @@ const RUNTIME_SUFFIX = /^\d+$/
  * The record id is treated as an OPAQUE string: never parsed, never split. What
  * a peer half looks like is the sync core's business, not this bridge's.
  *
+ * Placed catalog items are the same story with a different counter, and they
+ * are genuinely destructible — destruction.ts keeps them out of PREVOXELIZATION
+ * only, and voxelizes them on their first hit — so a shot sofa has to travel
+ * too, under `itemTargetId`.
+ *
  * Returns null for "this target has no room-wide name", which means DO NOT
  * PUBLISH — never publish under a guess:
- *   · a piece with no record binding (placed while solo, or not published yet);
- *   · placed catalog items (`__boots-item-*`), whose runtime→record binding
- *     shared-build keeps privately and does not expose. Their damage stays
- *     local until it does; a per-client id on the wire would be worse.
+ *   · a piece or item with no record binding (placed while solo, or not
+ *     published yet — a legacy piece carries no slot, so it has no record);
  *   · the spawn fixtures (`__boots-table*`, `__boots-switch`), which each
  *     client builds for itself at its own spawn point. They are not the same
  *     object in two browsers and sharing their damage would be meaningless.
  */
 function wireNodeId(nodeId: NodeId): NodeId | null {
   if (!nodeId.startsWith(SESSION_TARGET_PREFIX)) return nodeId
-  if (!nodeId.startsWith(PIECE_TARGET_PREFIX)) return null
-  const suffix = nodeId.slice(PIECE_TARGET_PREFIX.length)
-  // Already room-wide (a piece the build lane named by record): pass through,
-  // so this stays correct if the runtime ever adopts record-keyed ids too.
-  if (suffix.includes('#')) return nodeId
-  if (!RUNTIME_SUFFIX.test(suffix)) return null
-  const record = pieceRecordOf(Number(suffix))
-  return record === null ? null : pieceTargetId(record)
+  if (nodeId.startsWith(PIECE_TARGET_PREFIX)) {
+    return outboundName(nodeId, PIECE_TARGET_PREFIX, pieceRecordOf, pieceTargetId)
+  }
+  if (nodeId.startsWith(ITEM_TARGET_PREFIX)) {
+    return outboundName(nodeId, ITEM_TARGET_PREFIX, placementRecordOf, itemTargetId)
+  }
+  return null
 }
 
 /**
  * The inverse, for an arriving frame: the local target that a room-wide name
  * refers to on THIS client, or null when there is nothing here to damage.
  *
- * shared-build exposes runtime→record but not the reverse, so this is a scan of
- * the pieces this session is holding — tens of entries, walked only when an
- * inbound frame actually names a piece. It is also the more truthful direction
- * of the two: it can only ever return a piece that is in the store right now,
- * where a stale record→runtime map could hand back a piece that has since been
- * shot to bits.
+ * A PIECE is resolved by scanning the pieces this session is holding — tens of
+ * entries, walked only when an inbound frame actually names one. That is the
+ * more truthful direction of the two: it can only return a piece that is in the
+ * store right now, where a record→runtime map could hand one back that has
+ * since been shot to bits. An ITEM goes through the build lane's reverse
+ * binding, because item runtime ids live in a store this bridge has no business
+ * reading; a binding that outlives its object costs nothing, because
+ * `materialize` then finds no target and the effect is counted as deferred.
  *
- * A peer-numbered `__boots-piece-<decimal>` is REFUSED rather than resolved: it
- * is either an old build of a peer or a forgery, and the one thing it certainly
- * is not is a reference to a piece of mine that happens to share the number.
+ * Either way a target named by NUMBER is REFUSED rather than resolved — see
+ * inboundName.
  */
 function localNodeId(nodeId: NodeId): NodeId | null {
   if (!nodeId.startsWith(SESSION_TARGET_PREFIX)) return nodeId
-  if (!nodeId.startsWith(PIECE_TARGET_PREFIX)) return null
-  const record = nodeId.slice(PIECE_TARGET_PREFIX.length)
-  if (!record.includes('#')) return null
+  if (nodeId.startsWith(PIECE_TARGET_PREFIX)) {
+    return inboundName(nodeId, PIECE_TARGET_PREFIX, pieceRuntimeOf)
+  }
+  if (nodeId.startsWith(ITEM_TARGET_PREFIX)) {
+    return inboundName(nodeId, ITEM_TARGET_PREFIX, placementRuntimeOf)
+  }
+  return null
+}
+
+/** Which piece in the store, if any, was published as `record`. */
+function pieceRuntimeOf(record: RecordId): number | null {
   for (const piece of useBoots.getState().placed) {
-    if (pieceRecordOf(piece.id) === record) return `${PIECE_TARGET_PREFIX}${piece.id}`
+    if (pieceRecordOf(piece.id) === record) return piece.id
   }
   return null
 }
