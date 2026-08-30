@@ -1217,6 +1217,189 @@ export function buildSiteSnapshot(
 }
 
 // ---------------------------------------------------------------------------
+// The lot edge — walkable ground past the parcel
+// ---------------------------------------------------------------------------
+
+/**
+ * The off-lot ground, once it exists: the host's OWN horizon plate made solid.
+ *
+ * The parcel polygon is where the terrain is, not where the world ends. Past
+ * it the session had ground you could see and not stand on: SiteRenderer draws
+ * a 400 m+ disc at y = −0.07 under every site, isPresentationStrip keeps it
+ * out of collectMeshes (as it must — an unconditional 800 m floor collider
+ * would answer every XZ probe on the map), and so a player who walked off a
+ * sculpted lot sank through the visible grass onto the collision backstop
+ * (−5.61 m on the owner's project) and stood under the world.
+ *
+ * The fix adopts the plate the host already renders instead of synthesizing an
+ * apron: same geometry, same height, so solid and visible agree by
+ * construction. It is only ever adopted when the plate is PROVEN holed over
+ * the terrain (see plateHasTerrainHole) — the host punches the terrain
+ * footprint out of the disc precisely so the two never overlap, and adopting
+ * an unholed plate would seal every excavation at −0.07.
+ *
+ * `min/max` is the terrain field rect the hole is punched for: inside it the
+ * terrain is the ground, outside it this plate is. The analytic probe needs
+ * that boundary because the host's terrain field CLAMPS to its border height
+ * out of range (a sculpted border would otherwise report metres of phantom
+ * ground over the flat plate).
+ */
+export type LotEdge = {
+  /** World Y of the plate — the ground off the lot. */
+  y: number
+  minX: number
+  maxX: number
+  minZ: number
+  maxZ: number
+}
+
+/** The host's disc is a flat ShapeGeometry. Anything with real thickness is
+ * some other 'strip'-tagged mesh, not the apron. */
+const PLATE_MAX_THICKNESS = 0.05
+/** …and the apron SURROUNDS the terrain: the host's disc is 400 m+ across, so
+ * demand real reach past the field rect on all four sides. A strip-tagged
+ * mesh sitting inside the lot is decoration, not ground. */
+const PLATE_MIN_REACH = 20
+/** Where plateHasTerrainHole samples (fractions of the field rect). The hole
+ * is the field rect inset by half a cell, so a 3 × 3 grid at the quarter
+ * points is comfortably inside it — no sample can graze the plate's inner rim
+ * and refuse a perfectly good apron. */
+const PLATE_HOLE_FRACTIONS = [0.25, 0.5, 0.75]
+
+/**
+ * The meshes collectMeshes deliberately drops as presentation-only backdrop:
+ * the same walk, the same fence, the same invisible/degenerate/boots-owned
+ * filters — only isPresentationStrip is inverted.
+ */
+function collectPresentationStrips(root: Object3D, stopAt?: ReadonlySet<Object3D>): Mesh[] {
+  const meshes: Mesh[] = []
+  const walk = (obj: Object3D): void => {
+    if (obj !== root && stopAt?.has(obj)) return
+    const mesh = obj as Mesh
+    if (
+      mesh.isMesh &&
+      mesh.visible &&
+      !(mesh.userData as { __boots?: boolean }).__boots &&
+      isPresentationStrip(mesh) &&
+      !isMaterialInvisible(mesh) &&
+      (mesh.geometry?.getAttribute?.('position')?.count ?? 0) >= 3
+    ) {
+      meshes.push(mesh)
+    }
+    for (const child of obj.children) walk(child)
+  }
+  walk(root)
+  return meshes
+}
+
+/** XZ union of the site colliders collected so far — the terrain field rect
+ * (surface + edge skirt; nothing else is a 'site' mesh). Null when there are
+ * none, or when the union is degenerate. */
+function siteColliderRect(
+  colliders: ReadonlyArray<ColliderEntry>,
+): { minX: number; maxX: number; minZ: number; maxZ: number } | null {
+  let minX = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  for (const collider of colliders) {
+    if (collider.nodeType !== 'site' || collider.disabled) continue
+    const box = collider.worldBox
+    if (box.min.x < minX) minX = box.min.x
+    if (box.max.x > maxX) maxX = box.max.x
+    if (box.min.z < minZ) minZ = box.min.z
+    if (box.max.z > maxZ) maxZ = box.max.z
+  }
+  if (!Number.isFinite(minX) || maxX - minX < 1e-6 || maxZ - minZ < 1e-6) return null
+  return { minX, maxX, minZ, maxZ }
+}
+
+/**
+ * Is this candidate plate punched open over the terrain? Nine downward probes
+ * across the field rect must ALL miss it. One hit means the plate spans the
+ * terrain, and adopting it would lay a flat lid at −0.07 over every basement,
+ * pond and cut on the lot — refuse it and leave the edge as it was rather
+ * than break the parcel to fix its border.
+ */
+function plateHasTerrainHole(
+  plate: ColliderEntry,
+  rect: { minX: number; maxX: number; minZ: number; maxZ: number },
+): boolean {
+  const probe = [plate]
+  for (const fx of PLATE_HOLE_FRACTIONS) {
+    for (const fz of PLATE_HOLE_FRACTIONS) {
+      const x = rect.minX + (rect.maxX - rect.minX) * fx
+      const z = rect.minZ + (rect.maxZ - rect.minZ) * fz
+      if (siteGroundYAt({ colliders: probe }, x, z) !== null) return false
+    }
+  }
+  return true
+}
+
+/**
+ * Make the ground off the lot walkable by adopting the host's horizon plate as
+ * a 'site' collider, and report where the terrain stops. Mutates `colliders`
+ * (one entry at most) and returns null when nothing was adopted.
+ *
+ * A 'site' entry is the right shape for it: outside damage dispatch, out of
+ * buildingAabb, not in PAD_KINDS (never a road footprint), eligible for spawn
+ * probes — indistinguishable from the terrain colliders it continues, under
+ * the same nodeId.
+ *
+ * Only sculpted sites qualify. A FLAT site has no hole punched (nothing to
+ * punch one for) and needs none: its polygon fill sits at −0.05 and off it the
+ * backstop already holds bodies at FLAT_LOT_Y = 0, five centimetres of
+ * seamless — while a void lot has no site node at all and keeps the
+ * infinite-grass horizon rig (horizon.ts) untouched.
+ */
+export function adoptLotPlate(
+  colliders: ColliderEntry[],
+  site: SiteSnapshot | null,
+  fence?: ReadonlySet<Object3D>,
+): LotEdge | null {
+  if (!site?.hasTerrain) return null
+  const rect = siteColliderRect(colliders)
+  if (!rect) return null
+
+  let best: ColliderEntry | null = null
+  let bestArea = 0
+  const bounds = new Box3()
+  for (const mesh of collectPresentationStrips(site.root, fence)) {
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+    bounds.copy(mesh.geometry.boundingBox!).applyMatrix4(mesh.matrixWorld)
+    if (bounds.max.y - bounds.min.y > PLATE_MAX_THICKNESS) continue
+    if (
+      bounds.min.x > rect.minX - PLATE_MIN_REACH ||
+      bounds.max.x < rect.maxX + PLATE_MIN_REACH ||
+      bounds.min.z > rect.minZ - PLATE_MIN_REACH ||
+      bounds.max.z < rect.maxZ + PLATE_MIN_REACH
+    ) {
+      continue
+    }
+    const area = (bounds.max.x - bounds.min.x) * (bounds.max.z - bounds.min.z)
+    if (best && area <= bestArea) continue
+    const candidate: ColliderEntry = {
+      mesh,
+      get bvh() {
+        return bvhFor(this.mesh)
+      },
+      inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+      worldBox: bounds.clone(),
+      root: site.root,
+      nodeId: site.nodeId,
+      nodeType: 'site',
+    }
+    if (!plateHasTerrainHole(candidate, rect)) continue
+    best = candidate
+    bestArea = area
+  }
+  if (!best) return null
+
+  colliders.push(best)
+  return { y: best.worldBox.max.y, minX: rect.minX, maxX: rect.maxX, minZ: rect.minZ, maxZ: rect.maxZ }
+}
+
+// ---------------------------------------------------------------------------
 // The session's ground authority (see ground.ts)
 // ---------------------------------------------------------------------------
 
@@ -1270,7 +1453,10 @@ const LOT_FLOOR_MARGIN = 0.5
  * not guessed, and clamped to ≤ 0 by setLotFloorY so a site that sits
  * entirely on high ground can never raise the floor into the scene.
  */
-export function installGroundProbes(world: Pick<GameWorld, 'colliders' | 'site'>): boolean {
+export function installGroundProbes(
+  world: Pick<GameWorld, 'colliders' | 'site'>,
+  lotEdge?: LotEdge | null,
+): boolean {
   if (!world.site?.hasTerrain) {
     resetGround()
     return false
@@ -1280,8 +1466,18 @@ export function installGroundProbes(world: Pick<GameWorld, 'colliders' | 'site'>
   let probe: GroundSurfaceProbe
   if (analytic) {
     probe = (x, z) => {
+      // Past the terrain field the apron is the ground, and the host's field
+      // must not be asked: surfaceHeightAt CLAMPS to its border height out of
+      // range, so a sculpted lot edge would report its own height metres above
+      // (or below) the flat plate bodies actually rest on.
+      if (
+        lotEdge &&
+        (x < lotEdge.minX || x > lotEdge.maxX || z < lotEdge.minZ || z > lotEdge.maxZ)
+      ) {
+        return lotEdge.y
+      }
       const y = analytic(x, z)
-      return Number.isFinite(y) ? y : FLAT_LOT_Y
+      return Number.isFinite(y) ? y : (lotEdge?.y ?? FLAT_LOT_Y)
     }
   } else {
     // BVH fallback: quantize and memoize, one raycast per 0.25 m cell.
@@ -1293,10 +1489,10 @@ export function installGroundProbes(world: Pick<GameWorld, 'colliders' | 'site'>
       const hit = cache.get(key)
       if (hit !== undefined) return hit
       const y = siteGroundYAt(world, cx * GROUND_CACHE_CELL, cz * GROUND_CACHE_CELL)
-      // Off the lot there is no ground to stand on; the flat plane is the
-      // documented last resort (the analytic path never gets here — the host
-      // field clamps to its edge height instead).
-      const value = y === null ? FLAT_LOT_Y : y
+      // With an apron adopted the probe answers everywhere the plate reaches
+      // (400 m+), so this is the beyond-the-horizon case: the apron's own
+      // height, else the flat plane as the documented last resort.
+      const value = y === null ? (lotEdge?.y ?? FLAT_LOT_Y) : y
       if (cache.size >= GROUND_CACHE_MAX) cache.clear()
       cache.set(key, value)
       return value
@@ -2049,12 +2245,18 @@ export function collectWorld(): GameWorld {
   // polygon (scatter clamp) and the analytic height (drape) off this —
   // never off the registry at render time.
   const site = buildSiteSnapshot(sitePick)
+  // The lot edge, before the ground authority reads the collider set: the
+  // host's horizon plate becomes solid ground past the parcel, so walking off
+  // a sculpted lot steps onto the grass you can see instead of sinking metres
+  // onto the collision backstop. Refuses itself on flat sites and does nothing
+  // at all on a void lot (no site node → no plate → horizon.ts as before).
+  const lotEdge = adoptLotPlate(colliders, site, siteFence ?? undefined)
   // …and the ground authority adopts it FIRST: the hard-surface mask and the
   // spawn settle below both ask ground.ts for the dirt under a point, and a
   // stale (or absent) probe would put a driveway's height ceiling and the
   // lot floor back on the y = 0 plane. Everything that used to assume y = 0
   // reads from here on (game-root resets it on teardown).
-  installGroundProbes({ colliders, site })
+  installGroundProbes({ colliders, site }, lotEdge)
   const roadFootprints = collectRoadFootprints(colliders)
   const hostTrees = collectHostTrees(nodes)
   // The build lattice adopts the building's frame — identity when nothing
