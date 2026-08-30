@@ -29,6 +29,7 @@ import {
   mergeDelta,
   noteLocalKill,
   noteLocalRemoval,
+  noteLocalReset,
   noteLocalSegments,
   snapshotOf,
   type SharedWorld,
@@ -280,6 +281,71 @@ describe("a stranger's rubble cannot reach Save", () => {
     expect(captureDemolition()).toBe(1)
     expect(useDemolition.getState().foreign).toBe(0)
     expect(useDemolition.getState().mine).toEqual(['wall-1'])
+  })
+
+  test('no inbound frame can ADD to what this peer owns, whatever it claims', () => {
+    // The gate rests on one property of the frozen model: dmg.mine /
+    // dmg.mySegments / dmg.killedByMe are written ONLY by the noteLocal* author
+    // path. mergeDelta never adds to them — it can only CLEAR them on a higher
+    // epoch. Reading that out of shared-world.ts is not the same as holding it,
+    // so hold it here: an adversarial peer claims cells, sticks, a kill and a
+    // fresh epoch on both walls, and this client's ownership record stays empty.
+    const mine = createSharedWorld('me')
+    setDamageSync({ world: mine, publish: () => {} })
+    const world = makeWorld()
+    prevoxelize(world)
+
+    const them = peer()
+    for (const nodeId of ['wall-1', 'wall-2']) {
+      noteLocalRemoval(them, nodeId, allCellsOf(nodeId))
+      noteLocalSegments(them, nodeId, allSegmentsOf(nodeId))
+      noteLocalKill(them, nodeId)
+    }
+    receive(mine, them)
+    // A second peer, and a reset that bumps the epoch past everything above.
+    const other = createSharedWorld('other')
+    noteLocalReset(other, 'wall-1')
+    noteLocalRemoval(other, 'wall-1', allCellsOf('wall-1'))
+    receive(mine, other)
+
+    const work = localWork(mine)
+    expect(work.cells.size).toBe(0)
+    expect(work.segments.size).toBe(0)
+    expect(work.killed).toEqual([])
+    // Nothing to give away, so nothing is offered and nothing is deleted.
+    expect(captureDemolition()).toBe(0)
+    expect(deleteDestroyed()).toBe(0)
+    expect(Object.keys(scene.getState().nodes).sort()).toEqual(['wall-1', 'wall-2'])
+  })
+
+  test('a remote epoch bump erases my ownership, and withholding is the safe direction', () => {
+    // I level a wall entirely — it is unambiguously mine. Then a peer restores
+    // it, which is the one non-monotone operation: a higher epoch clears the
+    // whole node, my ownership record included. Whether the local runtime
+    // revives the grid or not, the answer must be the same — the node is NOT
+    // offered for deletion. Losing a legitimate Save offer is acceptable;
+    // deleting a node whose ownership we can no longer prove is not.
+    const mine = createSharedWorld('me')
+    setDamageSync({ world: mine, publish: () => {} })
+    const world = makeWorld()
+    prevoxelize(world)
+    for (const id of allSegmentsOf('wall-1')) {
+      damageSegment(world, 'wall-1', id, 9999, new Vector3(0, 1.35, 0))
+    }
+    collapseWholeTarget('wall-1')
+    expect(localWork(mine).cells.get('wall-1')?.length).toBe(
+      useDestruction.getState().targets.get('wall-1')!.grid.count,
+    )
+
+    const them = peer()
+    noteLocalReset(them, 'wall-1')
+    receive(mine, them)
+
+    expect(localWork(mine).cells.get('wall-1')).toBeUndefined()
+    expect(localWork(mine).killed).toEqual([])
+    expect(captureDemolition()).toBe(0)
+    expect(deleteDestroyed()).toBe(0)
+    expect(scene.getState().nodes['wall-1']).toBeDefined()
   })
 
   test('the allow-list is re-checked at click time, not trusted from capture', () => {
