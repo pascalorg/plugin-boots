@@ -1,4 +1,17 @@
 import {
+  type CollabParticipant,
+  forgetSender,
+  type NetMessage,
+  netAvailable,
+  onFrame,
+  onParticipants,
+  participantName as netParticipantName,
+  publishFrame,
+  registerFrameKind,
+  startNet,
+  stopNet,
+} from './net'
+import {
   createRing,
   isStale,
   latestSnapshot,
@@ -11,15 +24,20 @@ import {
 } from './presence-interp'
 
 /**
- * Co-presence bus adapter — the ONLY module that talks to the host's
- * collaboration bus (`globalThis.__pascalCollabBus`). Everything is
- * FEATURE-DETECTED: with no bus (solo app, older hosts, :3002) every
- * function no-ops and the game is byte-for-byte unaffected.
+ * Co-presence — the AVATAR layer. One frame kind ('pose') on the generic
+ * Boots transport (net.ts, which owns the host bus, the envelope, sequence
+ * numbers and the late-join hook). Nothing here knows about the wire; net.ts
+ * knows nothing about poses.
  *
- * What flows over the wire is PRESENCE ONLY — pose frames (protocol v1,
- * presence-interp.ts). No game state, no destruction, no scene writes:
- * each peer's world snapshot stays frozen and local (the non-destructive
- * invariant is per-client; see docs/MULTIPLAYER.md).
+ * FEATURE-DETECTED through net.ts: with no bus (solo app, older hosts,
+ * :3002, or the host's NEXT_PUBLIC_PLUGIN_COLLAB off) every function no-ops
+ * and the game is byte-for-byte unaffected.
+ *
+ * What flows over the wire HERE is presence only — pose frames (protocol v1,
+ * presence-interp.ts). No game state, no destruction, no scene writes: this
+ * module imports neither the scene store nor any Save bridge, and a test
+ * pins that (presence-hostile.test.ts). Destruction and build sync are
+ * separate kinds owned elsewhere on the same bus.
  *
  * Publish policy (pure, test-pinned):
  * - 12 Hz base; 10 Hz once MORE THAN 4 remotes are live (crowd back-off).
@@ -35,45 +53,15 @@ import {
  * explicit 'editor'-phase frame (instant — the peer pressed Esc),
  * staleness (>3 s silent), or a roster drop from onParticipants. Leave
  * removes the entry; remote-players.tsx re-renders off rosterVersion.
+ *
+ * Crowd ceiling: the registry is HARD-CAPPED at MAX_REMOTE_AVATARS. A
+ * public lobby is unbounded — a hostile or merely popular one must cost a
+ * bounded amount, so past the cap the FARTHEST peers lose their slot
+ * instead of everyone losing frame rate (admitRemote, pure).
  */
 
-// ── Host bus interface (shipped by the host separately) ─────────────────────
-
-export type CollabParticipant = {
-  userId: string
-  name: string
-  sessions: Array<{ sessionId: string; clientId: string }>
-}
-
-export type CollabBusMessage = {
-  event: string
-  data: unknown
-  sessionId: string
-  clientId: string
-  userId: string
-  sentAt: number
-}
-
-export type CollabBus = {
-  version: number
-  projectId: string
-  sessionId: string
-  clientId: string
-  userId: string
-  publish(pluginId: string, event: string, data: unknown): 'sent' | 'deferred' | 'suppressed'
-  subscribe(pluginId: string, handler: (msg: CollabBusMessage) => void): () => void
-  getParticipants(): CollabParticipant[]
-  onParticipants(handler: (participants: CollabParticipant[]) => void): () => void
-}
-
-export const PLUGIN_ID = 'pascal:boots'
-export const PLAYER_EVENT = 'player'
-
-/** Feature detection — protocol v1 only; anything else reads as "no bus". */
-export function getCollabBus(): CollabBus | null {
-  const bus = (globalThis as { __pascalCollabBus?: CollabBus }).__pascalCollabBus
-  return bus && bus.version === 1 ? bus : null
-}
+/** Our frame kind on the Boots transport. */
+export const POSE_KIND = 'pose' as const
 
 // ── Publish policy (pure) ───────────────────────────────────────────────────
 
@@ -175,6 +163,73 @@ export function buildFrame(local: LocalPose, out: PresenceFrame): PresenceFrame 
   return out
 }
 
+// ── Crowd ceiling (pure) ─────────────────────────────────────────────────────
+
+/**
+ * HARD maximum simultaneously rendered remote avatars. The open lobby has no
+ * roster limit of its own, so this is the plugin's own bound: 12 rigs ≈ 130
+ * primitives + 12 name-tag textures, which measured flat against solo. Past
+ * it the farthest peers are culled — a packed lobby costs what a full one
+ * costs, and nobody's frame rate pays for the twentieth stranger.
+ */
+export const MAX_REMOTE_AVATARS = 12
+
+/**
+ * A newcomer must be at least this much closer (m) than the farthest
+ * rendered peer to take its slot. Hysteresis: two strangers at similar range
+ * would otherwise trade the last slot every frame, and each swap is a
+ * roster bump (React re-render + rig mount).
+ */
+export const CROWD_SWAP_MARGIN_M = 2
+
+/** One rendered remote as the cap policy sees it. */
+export type CrowdSlot = {
+  sessionId: string
+  /** Squared distance to the local player; Infinity when unknown. */
+  distSq: number
+  /** Local clock of the last accepted frame (tie-break). */
+  lastReceivedAt: number
+}
+
+/**
+ * Admission decision for a would-be newcomer at the ceiling (pure, so the
+ * whole policy is pinned by tests):
+ * - under the cap → admit, evict nothing;
+ * - at the cap → the newcomer must be CROWD_SWAP_MARGIN_M closer than the
+ *   farthest slot to displace it, otherwise it is culled (never entered in
+ *   the registry at all, so a rejected peer costs one comparison and never
+ *   churns the roster);
+ * - unknown distance (no local pose yet, or an unpositioned slot) ranks as
+ *   farthest, with the oldest-heard slot losing ties; when NOTHING has a
+ *   distance the fallback is pure recency, so the cap still holds.
+ */
+export function admitRemote(
+  slots: CrowdSlot[],
+  incoming: { distSq: number },
+  max = MAX_REMOTE_AVATARS,
+): { admit: boolean; evict: string | null } {
+  if (slots.length < max) return { admit: true, evict: null }
+  if (slots.length === 0) return { admit: false, evict: null } // max <= 0
+  let worst = slots[0]!
+  for (const slot of slots) {
+    if (
+      slot.distSq > worst.distSq ||
+      (slot.distSq === worst.distSq && slot.lastReceivedAt < worst.lastReceivedAt)
+    ) {
+      worst = slot
+    }
+  }
+  // No reference point anywhere: fall back to recency (the oldest goes) so a
+  // pre-sampler burst of joins cannot blow past the ceiling.
+  if (!Number.isFinite(worst.distSq) && !Number.isFinite(incoming.distSq)) {
+    return { admit: true, evict: worst.sessionId }
+  }
+  if (Math.sqrt(incoming.distSq) < Math.sqrt(worst.distSq) - CROWD_SWAP_MARGIN_M) {
+    return { admit: true, evict: worst.sessionId }
+  }
+  return { admit: false, evict: null }
+}
+
 // ── Remote registry ──────────────────────────────────────────────────────────
 
 export type RemotePlayer = {
@@ -203,7 +258,6 @@ export type PresenceEvent = {
 
 type PresenceState = {
   active: boolean
-  bus: CollabBus | null
   getLocal: (() => LocalPose) | null
   unsubscribe: (() => void) | null
   offParticipants: (() => void) | null
@@ -216,6 +270,8 @@ type PresenceState = {
   lastSentFrame: PresenceFrame | null
   published: number
   received: number
+  /** Valid frames refused by the crowd ceiling (QA observability). */
+  culled: number
 }
 
 const emptyFrame = (): PresenceFrame => ({
@@ -232,7 +288,6 @@ const emptyFrame = (): PresenceFrame => ({
 
 const state: PresenceState = {
   active: false,
-  bus: null,
   getLocal: null,
   unsubscribe: null,
   offParticipants: null,
@@ -243,6 +298,7 @@ const state: PresenceState = {
   lastSentFrame: null,
   published: 0,
   received: 0,
+  culled: 0,
 }
 
 /** Reused publish scratch — the tick never allocates while idle. */
@@ -268,13 +324,7 @@ function emit(type: 'join' | 'leave', remote: RemotePlayer): void {
 
 /** Display name for a userId off the live roster; 'builder' when unknown. */
 export function participantName(userId: string): string {
-  const participants = state.bus?.getParticipants()
-  if (participants) {
-    for (const participant of participants) {
-      if (participant.userId === userId && participant.name) return participant.name
-    }
-  }
-  return 'builder'
+  return netParticipantName(userId) ?? 'builder'
 }
 
 /** LIVE internal map — remote-players.tsx's render feed. Everything handed
@@ -287,28 +337,29 @@ export function getRosterVersion(): number {
   return state.rosterVersion
 }
 
-export function presenceCounters(): { published: number; received: number } {
-  return { published: state.published, received: state.received }
+export function presenceCounters(): { published: number; received: number; culled: number } {
+  return { published: state.published, received: state.received, culled: state.culled }
 }
 
 function dropRemote(remote: RemotePlayer, announce: boolean): void {
   state.remotes.delete(remote.sessionId)
   state.rosterVersion++
+  // Release the transport's per-sender sequence tracker with the avatar, so a
+  // long lobby session never accumulates dead senders.
+  forgetSender(remote.sessionId)
   if (announce && remote.ph === 'game') emit('leave', remote)
 }
 
 /**
- * Bus-message ingestion (exported for tests; the subscription calls it with
- * Date.now()). Validates, drops self-echo, feeds the ring, and runs the
- * join/leave edge detection.
+ * Pose-frame ingestion (exported for tests; net.ts's dispatcher calls it with
+ * Date.now()). The envelope, self-echo, sequence ordering and payload
+ * validation are ALREADY done by net.ts — `msg.data` is a normalized
+ * PresenceFrame. This function owns only the avatar semantics: the crowd
+ * ceiling, the interpolation ring, and the join/leave edges.
  */
-export function ingestBusMessage(msg: CollabBusMessage, now: number): void {
-  if (!state.active || !state.bus) return
-  if (msg.event !== PLAYER_EVENT) return
-  if (msg.sessionId === state.bus.sessionId) return // self-echo
-  if (typeof msg.sentAt !== 'number' || !Number.isFinite(msg.sentAt)) return
-  const frame = validateFrame(msg.data)
-  if (!frame) return
+export function ingestPoseFrame(msg: NetMessage<PresenceFrame>, now: number): void {
+  if (!state.active) return
+  const frame = msg.data
   state.received++
 
   let remote = state.remotes.get(msg.sessionId)
@@ -320,6 +371,19 @@ export function ingestBusMessage(msg: CollabBusMessage, now: number): void {
   }
 
   if (!remote) {
+    // Crowd ceiling FIRST: a culled newcomer is never entered in the
+    // registry, so it costs one comparison and never bumps the roster.
+    const decision = admitRemote(crowdSlots(), { distSq: distSqToLocal(frame) })
+    if (!decision.admit) {
+      state.culled++
+      return
+    }
+    if (decision.evict) {
+      const evicted = state.remotes.get(decision.evict)
+      // announce:false — a culled peer did NOT leave (it is still in the
+      // project); claiming "X left" in the HUD would be a lie.
+      if (evicted) dropRemote(evicted, false)
+    }
     remote = {
       sessionId: msg.sessionId,
       clientId: msg.clientId,
@@ -349,6 +413,41 @@ export function ingestBusMessage(msg: CollabBusMessage, now: number): void {
   pushSnapshot(remote.ring, msg.sentAt, frame)
 }
 
+/** Squared distance from a wire frame to the local eye; Infinity with no
+ * local pose sampler yet (pre-first-frame joins). */
+function distSqToLocal(frame: PresenceFrame): number {
+  const local = state.getLocal?.()
+  if (!local) return Number.POSITIVE_INFINITY
+  const dx = frame.p[0] - local.x
+  const dy = frame.p[1] - local.y
+  const dz = frame.p[2] - local.z
+  return dx * dx + dy * dy + dz * dz
+}
+
+/** Snapshot the rendered crowd for the cap policy. Reuses one scratch array
+ * so a flood of rejected joins allocates nothing per frame. */
+const crowdScratch: CrowdSlot[] = []
+function crowdSlots(): CrowdSlot[] {
+  crowdScratch.length = 0
+  const local = state.getLocal?.()
+  for (const remote of state.remotes.values()) {
+    const snap = latestSnapshot(remote.ring)
+    let distSq = Number.POSITIVE_INFINITY
+    if (local && snap) {
+      const dx = snap.x - local.x
+      const dy = snap.y - local.y
+      const dz = snap.z - local.z
+      distSq = dx * dx + dy * dy + dz * dz
+    }
+    crowdScratch.push({
+      sessionId: remote.sessionId,
+      distSq,
+      lastReceivedAt: remote.lastReceivedAt,
+    })
+  }
+  return crowdScratch
+}
+
 /** Roster reconciliation (exported for tests): a remote whose sessionId no
  * longer appears in the participant list dropped without a goodbye frame. */
 export function reconcileRoster(participants: CollabParticipant[]): void {
@@ -367,7 +466,7 @@ export function reconcileRoster(participants: CollabParticipant[]): void {
  * Date.now()): staleness sweep, then the policy-gated publish.
  */
 export function presenceTick(now: number): void {
-  if (!state.active || !state.bus) return
+  if (!state.active) return
 
   // Staleness: a peer silent >3s despawns (crash, tab close, network gone).
   for (const remote of state.remotes.values()) {
@@ -388,9 +487,9 @@ export function presenceTick(now: number): void {
   ) {
     return
   }
-  // A fresh plain object per accepted attempt — the bus may serialize
+  // A fresh plain object per accepted attempt — the transport may serialize
   // asynchronously, so it never gets a live reference to the scratch.
-  const result = state.bus.publish(PLUGIN_ID, PLAYER_EVENT, wireCopy(scratchFrame))
+  const result = publishFrame(POSE_KIND, wireCopy(scratchFrame))
   state.lastPublishAt = now // 'deferred'/'suppressed' → skip, not queue
   if (result === 'sent') {
     state.published++
@@ -434,21 +533,24 @@ function copyFrame(from: PresenceFrame, to: PresenceFrame): void {
  * (never despawns the live registry or re-announces the local player).
  */
 export function startPresence(getLocal: () => LocalPose): boolean {
-  const bus = getCollabBus()
-  if (!bus) return false
+  // The transport decides whether co-presence exists at all (no bus = the
+  // host flag is off) — nothing below runs when it says no.
+  if (!startNet()) return false
   if (state.active) {
     state.getLocal = getLocal
     return true
   }
   state.active = true
-  state.bus = bus
   state.getLocal = getLocal
   state.lastPublishAt = 0
   state.lastSentFrame = null
   state.published = 0
   state.received = 0
-  state.unsubscribe = bus.subscribe(PLUGIN_ID, (msg) => ingestBusMessage(msg, Date.now()))
-  state.offParticipants = bus.onParticipants((participants) => reconcileRoster(participants))
+  state.culled = 0
+  // Our payload validator IS the pose trust boundary (presence-interp).
+  registerFrameKind(POSE_KIND, validateFrame)
+  state.unsubscribe = onFrame<PresenceFrame>(POSE_KIND, (msg) => ingestPoseFrame(msg, Date.now()))
+  state.offParticipants = onParticipants((participants) => reconcileRoster(participants))
   state.timer = setInterval(() => presenceTick(Date.now()), TICK_MS)
   return true
 }
@@ -462,18 +564,14 @@ export function startPresence(getLocal: () => LocalPose): boolean {
  */
 export function stopPresence(): void {
   if (!state.active) return
-  const bus = state.bus
-  if (bus) {
+  if (netAvailable()) {
     const local = state.getLocal?.()
     if (local) buildFrame(local, scratchFrame)
     else copyFrame(emptyFrame(), scratchFrame)
     scratchFrame.ph = 'editor' // the goodbye — regardless of the store phase
     scratchFrame.s = 0
-    try {
-      bus.publish(PLUGIN_ID, PLAYER_EVENT, wireCopy(scratchFrame))
-    } catch {
-      // A tearing-down bus must never break session exit.
-    }
+    // publishFrame never throws (a tearing-down bus reads as 'unavailable').
+    publishFrame(POSE_KIND, wireCopy(scratchFrame))
   }
   if (state.timer) clearInterval(state.timer)
   state.timer = null
@@ -484,9 +582,12 @@ export function stopPresence(): void {
   state.remotes.clear()
   state.rosterVersion++
   state.active = false
-  state.bus = null
   state.getLocal = null
   state.lastSentFrame = null
+  // Close the transport last: presence is currently its only user, and a
+  // session that ended should leave no subscription behind. When destruction
+  // and build kinds land, this becomes the session owner's call instead.
+  stopNet()
 }
 
 /** Plain-data QA dump for `__boots.presence()` — copies, never live refs. */
@@ -494,6 +595,8 @@ export function presenceDebug(): {
   remotes: Array<{ sessionId: string; name: string; p: [number, number, number]; w: string; ageMs: number }>
   published: number
   received: number
+  culled: number
+  cap: number
 } {
   const now = Date.now()
   const remotes: Array<{
@@ -513,5 +616,11 @@ export function presenceDebug(): {
       ageMs: now - remote.lastReceivedAt,
     })
   }
-  return { remotes, published: state.published, received: state.received }
+  return {
+    remotes,
+    published: state.published,
+    received: state.received,
+    culled: state.culled,
+    cap: MAX_REMOTE_AVATARS,
+  }
 }

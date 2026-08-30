@@ -270,9 +270,23 @@ const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Num
  * Rejects (returns null): non-objects, wrong protocol version, unknown
  * phase, malformed/NaN/oversize positions or angles, non-boolean flags,
  * oversize weapon ids. Clamps `s` into [0,1] (a soft field — never worth
- * dropping a frame over). Returns a NORMALIZED copy, never the input.
+ * dropping a frame over). Returns a NORMALIZED copy, never the input — so
+ * no attacker-owned object, prototype or getter is ever retained, and only
+ * the nine fields below can exist downstream.
+ *
+ * TOTAL by construction: any throw while reading the payload (a hostile
+ * getter — impossible through JSON transport, but the boundary owes nothing
+ * to the sender's good behaviour) reads as an invalid frame.
  */
 export function validateFrame(data: unknown): PresenceFrame | null {
+  try {
+    return readFrame(data)
+  } catch {
+    return null
+  }
+}
+
+function readFrame(data: unknown): PresenceFrame | null {
   if (typeof data !== 'object' || data === null) return null
   const f = data as Record<string, unknown>
   if (f.v !== 1) return null
