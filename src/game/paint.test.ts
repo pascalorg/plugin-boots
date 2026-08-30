@@ -3,6 +3,8 @@ import {
   COAT_ADD,
   coatBaseStrength,
   coatRadiusFor,
+  coatReachFor,
+  coveredSplatIndices,
   currentPaintColor,
   currentPaintIndex,
   cyclePaintColor,
@@ -18,10 +20,14 @@ import {
   paintPrompt,
   paintStrengthOf,
   paintValue,
+  NEAREST_COAT_REACH,
+  nearestCoatCell,
   selectSplatCells,
   shouldDrip,
   SPLAT_COALESCE_FRAC,
   SPLAT_CORE_FRAC,
+  SPLAT_COVER_FRAC,
+  type SplatSlot,
   SPLAT_FAR_DIST,
   SPLAT_FAR_RADIUS,
   SPLAT_NEAR_DIST,
@@ -49,27 +55,26 @@ const row = (count: number, spacing: number, dead: number[] = []) => {
 }
 
 describe('splatRadiusAt (the spray cone)', () => {
-  test('anchors pinned: generous near pass close, full fan far', () => {
-    // The near floor is the owner's "larger area" call: 0.25 m strokes
-    // still WRITE against 0.15 m cells, but a close pass feels like paint.
-    expect(SPLAT_NEAR_RADIUS).toBe(0.25)
+  test('anchors pinned: 0.6 × the phase-11 cone (owner: "40% smaller")', () => {
+    // Near floor 0.15 m — a true one-cell writing stroke at the nose.
+    expect(SPLAT_NEAR_RADIUS).toBe(0.15)
     expect(splatRadiusAt(0)).toBe(SPLAT_NEAR_RADIUS)
-    expect(splatRadiusAt(0.4)).toBe(0.25)
-    expect(splatRadiusAt(SPLAT_NEAR_DIST)).toBe(0.25)
-    // ≥ 8 m the fan is fully open.
+    expect(splatRadiusAt(0.4)).toBe(0.15)
+    expect(splatRadiusAt(SPLAT_NEAR_DIST)).toBe(0.15)
+    // ≥ 8 m the fan is fully open at 0.84 m (was 1.4).
     expect(splatRadiusAt(SPLAT_FAR_DIST)).toBe(SPLAT_FAR_RADIUS)
-    expect(splatRadiusAt(8)).toBe(1.4)
-    expect(splatRadiusAt(12)).toBe(1.4)
+    expect(splatRadiusAt(8)).toBe(0.84)
+    expect(splatRadiusAt(12)).toBe(0.84)
   })
 
   test('mid values pinned — quadratic ease, not linear', () => {
     // Writing range stays tight: 2 m has barely opened.
-    expect(splatRadiusAt(2)).toBeCloseTo(0.27347, 4)
+    expect(splatRadiusAt(2)).toBeCloseTo(0.16408, 4)
     // Halfway (4.5 m) sits at the t² midpoint…
-    expect(splatRadiusAt(4.5)).toBeCloseTo(0.5375, 10)
-    // …well under the LINEAR midpoint 0.825: the cone blooms late.
-    expect(splatRadiusAt(4.5)).toBeLessThan((0.25 + 1.4) / 2)
-    expect(splatRadiusAt(6.5)).toBeCloseTo(0.95995, 4)
+    expect(splatRadiusAt(4.5)).toBeCloseTo(0.3225, 10)
+    // …well under the LINEAR midpoint 0.495: the cone blooms late.
+    expect(splatRadiusAt(4.5)).toBeLessThan((0.15 + 0.84) / 2)
+    expect(splatRadiusAt(6.5)).toBeCloseTo(0.57597, 4)
   })
 
   test('monotonic non-decreasing across the reach', () => {
@@ -99,12 +104,12 @@ describe('selectSplatCells (the paint splat)', () => {
 
   test('cone ends on real 0.15 m wall cells: 3-cell dab close, broad far', () => {
     const wall = row(21, 0.15)
-    // Nose against the wall: the generous 0.25 m pass is a 3-cell dab —
-    // still narrow enough to write with, no longer a pencil point.
+    // Nose against the wall: the 0.15 m pass is a 3-cell dab (the hit cell
+    // plus both neighbours at exactly one radius, inclusive).
     expect(selectSplatCells(wall, 1.5, 0, 0, splatRadiusAt(1))).toEqual([9, 10, 11])
-    // Fully open fan blankets a ~2.8 m run of the row.
+    // Fully open fan blankets a ~1.7 m run of the row.
     const far = selectSplatCells(wall, 1.5, 0, 0, splatRadiusAt(SPLAT_FAR_DIST))
-    expect(far.length).toBeGreaterThanOrEqual(17)
+    expect(far.length).toBeGreaterThanOrEqual(11)
   })
 
   test('dead cells never take paint', () => {
@@ -333,17 +338,108 @@ describe('solid coverage constants (phase 11)', () => {
     expect(SPLAT_COALESCE_FRAC).toBeLessThan(SWATH_SPACING_FRAC)
   })
 
-  test('ledger coats hide UNDER the opaque core, floored at r/2', () => {
-    // The stamp is opaque out to SPLAT_CORE_FRAC × r; a coated 0.15 m wall
-    // cell's square reaches its center + 0.075 m. Keeping center + half-cell
-    // ≤ the CORE means no saturated square can show through the soft rim.
-    expect(SPLAT_CORE_FRAC).toBeCloseTo(0.86, 10)
-    expect(coatRadiusFor(0.25)).toBeCloseTo(0.14, 10)
-    expect(coatRadiusFor(0.25) + 0.075).toBeLessThanOrEqual(SPLAT_CORE_FRAC * 0.25 + 1e-12)
-    expect(coatRadiusFor(1.4)).toBeCloseTo(1.129, 10)
-    expect(coatRadiusFor(1.4) + 0.075).toBeLessThanOrEqual(SPLAT_CORE_FRAC * 1.4)
+  test('ledger coats stay INSIDE the disc, under the core once cells allow it', () => {
+    // Airbrush core (spray-polish round): opaque to 60% of the radius,
+    // smoothstep falloff + grain on the outer 40%.
+    expect(SPLAT_CORE_FRAC).toBeCloseTo(0.6, 10)
+    // The r/2 floor rules until r ≥ 0.75 (0.15 m cells are simply bigger
+    // than the small discs' cores): a coated square may poke into the
+    // GRAINY falloff band there, but NEVER past the disc radius — the
+    // no-square-halo contract (center + half-cell ≤ r for all r ≥ 0.15).
+    expect(coatRadiusFor(0.15)).toBeCloseTo(0.075, 10)
+    expect(coatRadiusFor(0.15) + 0.075).toBeLessThanOrEqual(0.15 + 1e-12)
+    expect(coatRadiusFor(0.3)).toBeCloseTo(0.15, 10)
+    expect(coatRadiusFor(0.3) + 0.075).toBeLessThanOrEqual(0.3 + 1e-12)
+    // From the crossover out, coats hide fully under the opaque core.
+    expect(coatRadiusFor(0.75)).toBeCloseTo(0.375, 10)
+    expect(coatRadiusFor(0.75) + 0.075).toBeLessThanOrEqual(SPLAT_CORE_FRAC * 0.75 + 1e-12)
+    expect(coatRadiusFor(0.84)).toBeCloseTo(0.429, 10)
+    expect(coatRadiusFor(0.84) + 0.075).toBeLessThanOrEqual(SPLAT_CORE_FRAC * 0.84 + 1e-12)
     // Tiny radii floor at half — a coat always lands SOMETHING.
     expect(coatRadiusFor(0.1)).toBeCloseTo(0.05, 10)
+  })
+})
+
+describe('nearestCoatCell (writing-range rescue)', () => {
+  test('REGRESSION: a corner hit at the near radius still lands its cell', () => {
+    // r = 0.15 → coatRadiusFor = 0.075; a hit at a 0.15 m cell corner sits
+    // 0.075·√2 ≈ 0.106 lateral from every neighbour center — splatCoat
+    // finds nothing and the tick used to abort (nose spraying painted
+    // NOTHING after the 0.6 shrink). The reach covers the worst case
+    // (√3 × 0.075 ≈ 0.13 < 0.14).
+    expect(NEAREST_COAT_REACH).toBe(0.14)
+    expect(NEAREST_COAT_REACH).toBeGreaterThan(Math.sqrt(3) * 0.075)
+    const grid = row(5, 0.15)
+    const corner = 0.15 * 2 + 0.075 // between cells 2 and 3
+    expect(splatCoat(grid, corner, 0.075, 0, coatRadiusFor(0.15))).toEqual([])
+    const cell = nearestCoatCell(grid, corner, 0.075, 0)
+    expect([2, 3]).toContain(cell)
+  })
+
+  test('true 3D nearest among ALIVE cells; out of reach → −1', () => {
+    const grid = row(5, 0.15, [2])
+    // Nearest to x = 0.35 is dead cell 2 (0.30) — the rescue takes 3 (0.45).
+    expect(nearestCoatCell(grid, 0.35, 0, 0)).toBe(3)
+    // Nothing within reach: a far miss stays a miss.
+    expect(nearestCoatCell(grid, 9, 9, 9)).toBe(-1)
+    // Custom reach is honored.
+    expect(nearestCoatCell(grid, 0.35, 0, 0, 0.01)).toBe(-1)
+  })
+
+  test('coatReachFor opens with the grid: fine grids keep the floor, coarse grids reach their corners', () => {
+    // 0.15 m sandwich wall: half-diagonal ≈ 0.108 — the floor rules.
+    expect(coatReachFor({ cellX: 0.15, cellY: 0.15, cellZ: 0.04 })).toBe(NEAREST_COAT_REACH)
+    // A coarse 0.25 m grid: corner→center is 0.5·√(3·0.25²) ≈ 0.217 — the
+    // reach must cover it or nose-range spraying goes dead again.
+    const coarse = coatReachFor({ cellX: 0.25, cellY: 0.25, cellZ: 0.25 })
+    expect(coarse).toBeGreaterThan(0.5 * Math.hypot(0.25, 0.25, 0.25))
+    expect(coarse).toBeCloseTo(0.2265, 3)
+  })
+})
+
+describe('coveredSplatIndices (the blink fix — newer coat retires the old)', () => {
+  /** Minimal live slot at (x, y, z) facing `n`, painted `color`. */
+  const slot = (x: number, color: number, nz = 1, alive = true): SplatSlot => ({
+    alive,
+    dirty: false,
+    nodeId: 'wall',
+    x,
+    y: 0,
+    z: 0,
+    nx: 0,
+    ny: 0,
+    nz,
+    roll: 0,
+    size: 0.3,
+    color,
+  })
+
+  test('cover distance pinned at 0.6 × radius, different colors only', () => {
+    expect(SPLAT_COVER_FRAC).toBe(0.6)
+    const slots = [slot(0, 2), slot(0.1, 4), slot(0.2, 4)]
+    // A red (3) stamp at x = 0.05, radius 0.25 → cover reach 0.15: the
+    // blue (2) at 0 and the teal (4) at 0.1 are covered; 0.2 sits outside.
+    expect(coveredSplatIndices(slots, [0, 1, 2], 0.05, 0, 0, 0, 0, 1, 3, 0.25)).toEqual([0, 1])
+    // The SAME color never retires — coalescing/economy owns that lane.
+    expect(coveredSplatIndices(slots, [0, 1, 2], 0.05, 0, 0, 0, 0, 1, 4, 0.25)).toEqual([0])
+  })
+
+  test('opposite-facing sprites survive (the two faces of one wall)', () => {
+    // Same nodeId, same spot, but the OTHER face: normal dot = −1 ≤ 0.5.
+    const slots = [slot(0, 2, -1)]
+    expect(coveredSplatIndices(slots, [0], 0, 0, 0, 0, 0, 1, 3, 0.25)).toEqual([])
+    // Facing the same way it retires.
+    const facing = [slot(0, 2, 1)]
+    expect(coveredSplatIndices(facing, [0], 0, 0, 0, 0, 0, 1, 3, 0.25)).toEqual([0])
+  })
+
+  test('dead slots and 3D distance are respected', () => {
+    const slots = [slot(0, 2, 1, false), slot(0, 2)]
+    expect(coveredSplatIndices(slots, [0, 1], 0, 0, 0, 0, 0, 1, 3, 0.25)).toEqual([1])
+    // 3D: 0.1 in x AND 0.12 in y is √0.0244 ≈ 0.156 out, past the 0.15 reach.
+    const offset = [slot(0, 2)]
+    offset[0]!.y = 0.12
+    expect(coveredSplatIndices(offset, [0], 0.1, 0, 0, 0, 0, 1, 3, 0.25)).toEqual([])
   })
 })
 
@@ -385,8 +481,8 @@ describe('swathPoints (drag continuity — phase 11)', () => {
   })
 
   test('per-tick work is capped at SWATH_MAX_STEPS', () => {
-    // radius 0.2 → spacing 0.1; a 2.4 m jump wants 23 bridges, gets 20.
-    const points = swathPoints({ x: 0, y: 0, z: 0 }, 2.4, 0, 0, 0.2)
+    // radius 0.1 → spacing 0.05; a 2.4 m jump wants 47 bridges, gets 34.
+    const points = swathPoints({ x: 0, y: 0, z: 0 }, 2.4, 0, 0, 0.1)
     expect(points.length).toBe(SWATH_MAX_STEPS)
     // The cap covers SWATH_MAX_GAP at the NEAR radius exactly (no gaps in
     // any bridgeable drag at the tight end of the cone).

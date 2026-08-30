@@ -8,6 +8,7 @@ import {
   decalCensus,
   decalEligibleTris,
   decalMaterialFor,
+  decalRenderOrders,
   convertDecalsForNode,
   flushRetiredDecalGeometries,
   getDecalVotesByNode,
@@ -95,6 +96,28 @@ describe('spawnPaintDecal (pristine hosts, P5)', () => {
       }
     }
     expect(decalCensus()).toBe(DECAL_CAP)
+  })
+})
+
+describe('decal renderOrder (the blink fix — newer coat draws later)', () => {
+  test('every spawn takes a strictly increasing renderOrder, across nodes and reuse', () => {
+    const mesh = wallMesh()
+    // Two coats of different colors on the same spot — the exact repro:
+    // coplanar decals with depthWrite=false z-fought under camera motion.
+    expect(spawnPaintDecal(mesh, 'wall_o', at(0), N, 0.3, 2)).toBe(true)
+    expect(spawnPaintDecal(mesh, 'wall_o', at(0.02), N, 0.3, 3)).toBe(true)
+    const orders = decalRenderOrders('wall_o')
+    expect(orders.length).toBe(2)
+    expect(orders[1]!).toBeGreaterThan(orders[0]!) // red draws AFTER blue
+    // The serial is monotonic across nodes too…
+    expect(spawnPaintDecal(mesh, 'wall_p', at(1), N, 0.3, 4)).toBe(true)
+    expect(decalRenderOrders('wall_p')[0]!).toBeGreaterThan(orders[1]!)
+    // …and a recycled slot keeps climbing (never inherits a stale order).
+    for (let i = 0; i < DECAL_NODE_CAP; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_o', at((i % 12) * 0.25 - 1.5), N, 0.2, 2)).toBe(true)
+    }
+    const after = decalRenderOrders('wall_o')
+    for (let i = 1; i < after.length; i++) expect(after[i]!).toBeGreaterThan(after[i - 1]!)
   })
 })
 

@@ -76,9 +76,11 @@ import type { GameWorld } from './world'
  * via instanceColor over ONE module-cached SOLID-DISC texture.
  *
  * Phase 11 (owner: "no blobs/splats — a normal spray FULLY colors a round
- * area, tight close, wide far"): the stamp is a fully-filled disc with only
- * a soft ~14% falloff rim (no wobble, no satellite droplets, no scale
- * jitter — the quad side IS the 2 × splatRadiusAt(distance) diameter), and
+ * area, tight close, wide far"), softened in the spray-polish round: the
+ * stamp is a filled disc — opaque to SPLAT_CORE_FRAC, then an airbrush
+ * smoothstep falloff with overspray grain inside the band (no wobble, no
+ * satellite droplets, no scale jitter — the quad side IS the
+ * 2 × splatRadiusAt(distance) diameter), and
  * a held DRAG paints a continuous swath: the module STROKE anchor bridges
  * this tick's hit to the last one with intermediate stamps spaced ≤
  * radius/2 (swathPoints), each feeding the cell ledger/decal votes exactly
@@ -129,18 +131,18 @@ const PAINT_RANGE = 9
 
 /** Inside this distance (m) the splat stays at its narrowest. */
 export const SPLAT_NEAR_DIST = 1
-/** Narrow-end radius (m) — a generous close-range pass (owner call: "I
- * liked the paint before better, larger area"), still tight enough that
- * 0.25 m strokes WRITE legibly against 0.15 m wall cells. */
-export const SPLAT_NEAR_RADIUS = 0.25
+/** Narrow-end radius (m) — spray-polish round (owner: "40% smaller"): the
+ * phase-11 anchors scaled by 0.6. A close pass is a true writing stroke
+ * against 0.15 m wall cells (one cell wide at the nose). */
+export const SPLAT_NEAR_RADIUS = 0.15
 /** Beyond this distance (m) the cone is fully open. */
 export const SPLAT_FAR_DIST = 8
-/** Broad-end radius (m) — one splat covers most of a wall face. */
-export const SPLAT_FAR_RADIUS = 1.4
+/** Broad-end radius (m) — 0.6 × the phase-11 fan (1.4 → 0.84). */
+export const SPLAT_FAR_RADIUS = 0.84
 
 /** Pure cone curve: hit distance (m) → splat radius (m). Clamped quadratic
  * ease-in between the near/far anchors — flat narrow plateau ≤ 1 m, slow
- * growth through writing range, late bloom to 1.4 m at ≥ 8 m. */
+ * growth through writing range, late bloom to 0.84 m at ≥ 8 m. */
 export function splatRadiusAt(distance: number): number {
   const span = SPLAT_FAR_DIST - SPLAT_NEAR_DIST
   const t = Math.min(Math.max((distance - SPLAT_NEAR_DIST) / span, 0), 1)
@@ -258,8 +260,8 @@ export const lastSprayHitDistance = (): number | null => lastHitDistance
  * guarantees solid overlap between consecutive full discs). */
 export const SWATH_SPACING_FRAC = 0.5
 /** Per-tick cap on bridge stamps — covers SWATH_MAX_GAP even at the tight
- * near radius (2.5 / (0.25 × 0.5) − 1 = 19), bounds the tick's work. */
-export const SWATH_MAX_STEPS = 20
+ * near radius (ceil(2.5 / (0.15 × 0.5)) − 1 = 33), bounds the tick's work. */
+export const SWATH_MAX_STEPS = 34
 /** A jump longer than this (m) is a new stroke, not a drag — never bridge
  * across a doorway or a wall edge the aim skipped over. */
 export const SWATH_MAX_GAP = 2.5
@@ -335,20 +337,24 @@ function advanceStroke(nodeId: string, x: number, y: number, z: number): void {
 /** Strength a splat's CENTER adds per tick — saturates in ~2–3 coats. */
 export const COAT_ADD = 0.45
 
-/** Fraction of the stamp radius that is fully OPAQUE — the soft falloff
- * rim occupies the remaining ~14% (owner: "solid disc, soft edge only").
- * Shared by the sprite/decal textures and the ledger inset below. */
-export const SPLAT_CORE_FRAC = 0.86
+/** Fraction of the stamp radius that is fully OPAQUE. Spray-polish round
+ * (owner: "the edge reads like a hard sticker"): the airbrush read — solid
+ * to ~60% of the radius, then a smoothstep alpha falloff to 0 at the rim
+ * with speckle grain inside the band (overspray dust). Shared by the
+ * sprite/decal textures and the ledger inset below. */
+export const SPLAT_CORE_FRAC = 0.6
 /** Half of a 0.15 m wall cell — the farthest a coated cell's square can
  * reach past its own center. */
 const COAT_HALF_CELL = 0.075
 
-/** The ledger radius for a disc of `radius`: coated cells must hide UNDER
- * the disc's opaque core (cell center + half-cell ≤ core radius), floored
- * at half the radius so a coat always lands something. Saturated square
- * cells poking through the translucent rim were the blocky halo the owner
- * rejected. Applied at the sprayPaint/convertDecals call sites; splatCoat
- * itself stays the pure radius rule. */
+/** The ledger radius for a disc of `radius`: coated cells hide UNDER the
+ * disc's opaque core (cell center + half-cell ≤ core radius) wherever the
+ * 0.15 m cell size allows it, floored at half the radius so a coat always
+ * lands something. With the 0.6 core the floor rules until r ≥ 0.75 — a
+ * cell square can poke into the FALLOFF band there (never past the disc:
+ * r/2 + half-cell ≤ r for every r ≥ 0.15), where the grain reads as
+ * overspray, not the blocky halo the owner rejected. Applied at the
+ * sprayPaint/convertDecals call sites; splatCoat stays the pure rule. */
 export const coatRadiusFor = (radius: number): number =>
   Math.max(radius * 0.5, radius * SPLAT_CORE_FRAC - COAT_HALF_CELL)
 
@@ -387,6 +393,51 @@ export function splatCoat(
     if (add > 0) out.push({ cell: i, add })
   }
   return out
+}
+
+/** The farthest a surface hit can sit from the CENTER of the very cell it
+ * touches: half a 0.15 m cell across all three axes is √3 × 0.075 ≈ 0.13
+ * (thinner sandwich layers only shrink it). The writing-range rescue reach
+ * below. */
+export const NEAREST_COAT_REACH = 0.14
+
+/**
+ * Nearest alive cell within `reach` of the hit (3D) — the writing-range
+ * rescue: the 0.6-scaled near disc (r = 0.15) insets its ledger coat to
+ * 0.075 (coatRadiusFor), which MISSES every cell center when the spray
+ * lands at a cell corner (lateral half-cell diagonal ≈ 0.106) — the tick
+ * used to abort with nothing landed, so nose-range spraying painted
+ * NOTHING. The rescue coats the one cell the crosshair actually touches.
+ * Pure — exported for tests; −1 when nothing is in reach.
+ */
+/** The rescue reach for a REAL grid: at least NEAREST_COAT_REACH, opened
+ * to the cell half-diagonal (+1 cm slack) on coarser grids — a corner hit
+ * must always reach the center of the cell it touches. Pure. */
+export function coatReachFor(cell: { cellX: number; cellY: number; cellZ: number }): number {
+  return Math.max(NEAREST_COAT_REACH, 0.5 * Math.hypot(cell.cellX, cell.cellY, cell.cellZ) + 0.01)
+}
+
+export function nearestCoatCell(
+  grid: { count: number; alive: ArrayLike<number>; centers: ArrayLike<number> },
+  x: number,
+  y: number,
+  z: number,
+  reach: number = NEAREST_COAT_REACH,
+): number {
+  let best = -1
+  let bestD2 = reach * reach
+  for (let i = 0; i < grid.count; i++) {
+    if (!grid.alive[i]) continue
+    const dx = (grid.centers[i * 3] ?? 0) - x
+    const dy = (grid.centers[i * 3 + 1] ?? 0) - y
+    const dz = (grid.centers[i * 3 + 2] ?? 0) - z
+    const d2 = dx * dx + dy * dy + dz * dz
+    if (d2 <= bestD2) {
+      best = i
+      bestD2 = d2
+    }
+  }
+  return best
 }
 
 /**
@@ -727,6 +778,50 @@ export function splatSpriteSize(radius: number, rand: number): number {
   return 2 * radius * (SPLAT_SPRITE_JITTER_MIN + (SPLAT_SPRITE_JITTER_MAX - SPLAT_SPRITE_JITTER_MIN) * rand)
 }
 
+/** A new stamp RETIRES older DIFFERENT-color sprites parked within this ×
+ * radius of its center on the same node + facing (the blink fix): three
+ * sorts transparent render items back-to-front by camera depth with ties
+ * broken by object id — coplanar two-color stacks with depthWrite=false
+ * have no stable "newer wins", so overlaps flickered between coats as the
+ * camera moved (and the 192-ring wrap even put OLD sprites over new ones
+ * within the pool's fixed instance draw order). Retiring the covered coat
+ * is deterministic: the cell LEDGER keeps the coat truth, the pool sheds
+ * dead quads. */
+export const SPLAT_COVER_FRAC = 0.6
+
+/**
+ * Pure cover scan — exported for tests. Which of the node's live sprites a
+ * fresh stamp at (x,y,z) retires: DIFFERENT color, center within
+ * SPLAT_COVER_FRAC × radius (3D), and the SAME facing (normal dot > 0.5 —
+ * the two faces of a 0.12 m wall share a nodeId and can sit closer than
+ * the cover distance; painting one face must never strip the other). */
+export function coveredSplatIndices(
+  slots: readonly SplatSlot[],
+  indices: readonly number[],
+  x: number,
+  y: number,
+  z: number,
+  nx: number,
+  ny: number,
+  nz: number,
+  color: number,
+  radius: number,
+): number[] {
+  const max = SPLAT_COVER_FRAC * radius
+  const max2 = max * max
+  const out: number[] = []
+  for (const index of indices) {
+    const s = slots[index]
+    if (!s || !s.alive || s.color === color) continue
+    if (s.nx * nx + s.ny * ny + s.nz * nz <= 0.5) continue
+    const dx = s.x - x
+    const dy = s.y - y
+    const dz = s.z - z
+    if (dx * dx + dy * dy + dz * dz <= max2) out.push(index)
+  }
+  return out
+}
+
 /** Pure coalescing rule: stamp unless the node's PREVIOUS sprite has the
  * same color and sits closer than SPLAT_COALESCE_FRAC × radius (3D). */
 export function shouldStampSplat(
@@ -837,6 +932,8 @@ let splatCursor = 0
 let splatsDirty = false
 /** nodeId → slot indices in stamp order (drop/collapse eviction). */
 const nodeSplats = new Map<string, number[]>()
+/** Shared empty list — the cover scan on a node with no sprites yet. */
+const _noSplats: number[] = []
 /** nodeId → the node's LAST stamped sprite (the coalescing rule).
  * Records are reused in place — one allocation per node per session. */
 const lastSplatByNode = new Map<string, { x: number; y: number; z: number; color: number }>()
@@ -912,6 +1009,23 @@ export function stampSplat(
 ): boolean {
   const prev = lastSplatByNode.get(nodeId)
   if (!shouldStampSplat(prev, x, y, z, color, radius)) return false
+  // BLINK FIX: this stamp covers the node's older different-color sprites
+  // at ~the same spot on the same facing — retire them (deterministic
+  // "newer coat wins"; the cell ledger keeps the coat truth). Linear over
+  // the node's live list, which the 192-ring bounds.
+  const covered = coveredSplatIndices(
+    splatSlots,
+    nodeSplats.get(nodeId) ?? _noSplats,
+    x,
+    y,
+    z,
+    nx,
+    ny,
+    nz,
+    color,
+    radius,
+  )
+  for (const old of covered) releaseSplatSlot(old)
   const index = splatCursor
   splatCursor = (splatCursor + 1) % SPLAT_SPRITE_CAP
   releaseSplatSlot(index)
@@ -946,27 +1060,69 @@ export function stampSplat(
   return true
 }
 
-/** ONE cached SOLID-DISC stamp texture — white (instanceColor carries the
- * palette): fully opaque out to ~86% of the radius, soft falloff on the
- * last ~14% only (phase 11, owner: "a normal spray FULLY colors a round
- * area" — no wobble, no satellite droplets). The disc's diameter spans the
- * whole quad, so the stamp truly is 2 × splatRadiusAt(distance) wide.
- * 128², module lifetime (the dust idiom). */
+/** ONE cached AIRBRUSH stamp texture — white (instanceColor / the decal
+ * material color carries the palette). The games-airbrush read the owner
+ * asked for: fully opaque out to SPLAT_CORE_FRAC of the radius, then a
+ * SMOOTHSTEP alpha falloff to 0 at the rim, with speckle grain inside the
+ * falloff band only (overspray dust — erased pinholes + faint flecks,
+ * denser toward the rim, every speck inside the disc). The disc's diameter
+ * spans the whole quad, so the stamp truly is 2 × splatRadiusAt(distance)
+ * wide. 256², module lifetime (the dust idiom); the decal lane shares it. */
 let splatTexture: CanvasTexture | null = null
 function getSplatTexture(): CanvasTexture | null {
   if (splatTexture) return splatTexture
   if (typeof document === 'undefined') return null
+  const size = 256
+  const c = size / 2
   const canvas = document.createElement('canvas')
-  canvas.width = 128
-  canvas.height = 128
+  canvas.width = size
+  canvas.height = size
   const g = canvas.getContext('2d')
   if (!g) return null
-  const fill = g.createRadialGradient(64, 64, 0, 64, 64, 64)
+  // Opaque core, then smoothstep-shaped stops across the falloff band —
+  // canvas gradients interpolate linearly between stops, so 8 stops trace
+  // the curve (no visible banding at 256²).
+  const fill = g.createRadialGradient(c, c, 0, c, c, c)
   fill.addColorStop(0, 'rgba(255,255,255,1)')
   fill.addColorStop(SPLAT_CORE_FRAC, 'rgba(255,255,255,1)')
+  const stops = 8
+  for (let i = 1; i < stops; i++) {
+    const t = i / stops
+    const a = 1 - t * t * (3 - 2 * t) // 1 − smoothstep(t)
+    fill.addColorStop(SPLAT_CORE_FRAC + (1 - SPLAT_CORE_FRAC) * t, `rgba(255,255,255,${a.toFixed(4)})`)
+  }
   fill.addColorStop(1, 'rgba(255,255,255,0)')
   g.fillStyle = fill
-  g.fillRect(0, 0, 128, 128)
+  g.fillRect(0, 0, size, size)
+  // Overspray grain, pass 1: pinholes ERASED inside the falloff band,
+  // larger + stronger toward the rim (the dusty dissolve).
+  g.fillStyle = '#ffffff'
+  g.globalCompositeOperation = 'destination-out'
+  for (let i = 0; i < 340; i++) {
+    const t = Math.sqrt(Math.random()) // bias the dust toward the rim
+    const speck = 0.8 + 1.9 * t * Math.random()
+    const d = Math.min((SPLAT_CORE_FRAC + (1 - SPLAT_CORE_FRAC) * t) * c, c - speck)
+    const angle = Math.random() * Math.PI * 2
+    g.globalAlpha = 0.25 + 0.55 * t
+    g.beginPath()
+    g.arc(c + Math.cos(angle) * d, c + Math.sin(angle) * d, speck, 0, Math.PI * 2)
+    g.fill()
+  }
+  // Pass 2: faint positive flecks over the outer half of the band — dust
+  // that LANDED, breaking the gradient's evenness without ever leaving
+  // the disc.
+  g.globalCompositeOperation = 'source-over'
+  for (let i = 0; i < 150; i++) {
+    const t = 0.5 + 0.5 * Math.random()
+    const speck = 0.6 + 1.0 * Math.random()
+    const d = Math.min((SPLAT_CORE_FRAC + (1 - SPLAT_CORE_FRAC) * t) * c, c - speck)
+    const angle = Math.random() * Math.PI * 2
+    g.globalAlpha = 0.12 + 0.22 * Math.random()
+    g.beginPath()
+    g.arc(c + Math.cos(angle) * d, c + Math.sin(angle) * d, speck, 0, Math.PI * 2)
+    g.fill()
+  }
+  g.globalAlpha = 1
   splatTexture = new CanvasTexture(canvas)
   return splatTexture
 }
@@ -1098,6 +1254,12 @@ type DecalSlot = {
   y: number
   z: number
   radius: number
+  /** Monotonic stamp serial → the mesh's renderOrder (the blink fix):
+   * three sorts transparent items by renderOrder BEFORE camera depth, and
+   * each decal's depth key is its own bounding-sphere center — coplanar
+   * two-color overlaps flipped draw order as the camera moved. The serial
+   * pins "newer coat draws later" deterministically. */
+  order: number
 }
 
 const decalSlots: DecalSlot[] = Array.from({ length: DECAL_CAP }, () => ({
@@ -1110,8 +1272,19 @@ const decalSlots: DecalSlot[] = Array.from({ length: DECAL_CAP }, () => ({
   y: 0,
   z: 0,
   radius: 0.1,
+  order: 0,
 }))
 let decalCursor = 0
+/** Monotonic decal stamp serial (module lifetime — plain number, never
+ * recycled; renderOrder only needs relative order among live decals). */
+let decalStampOrder = 0
+
+/** Alive renderOrders for one node in spawn order (tests/QA). */
+export function decalRenderOrders(nodeId: string): number[] {
+  const indices = nodeDecals.get(nodeId)
+  if (!indices) return []
+  return indices.filter((i) => decalSlots[i]!.alive).map((i) => decalSlots[i]!.order)
+}
 /** nodeId → slot indices in spawn order (per-node cap + conversion). */
 const nodeDecals = new Map<string, number[]>()
 let decalVersion = 0
@@ -1213,26 +1386,11 @@ export function getDecalVotesByNode(): Map<string, Map<number, number>> {
   return out
 }
 
-/** One cached solid-disc alpha texture — white, tinted by the material.
- * Same phase-11 read as the sprite stamp: fully opaque to ~86% of the
- * radius, soft rim on the last ~14% only, no overspray blobs. */
-let decalTexture: CanvasTexture | null = null
+/** The decal lane wears the SAME airbrush stamp as the sprite pool (one
+ * cached texture: opaque core, smoothstep rim, overspray grain) — white,
+ * tinted by the per-color material. */
 function getDecalTexture(): CanvasTexture | null {
-  if (decalTexture) return decalTexture
-  if (typeof document === 'undefined') return null
-  const canvas = document.createElement('canvas')
-  canvas.width = 128
-  canvas.height = 128
-  const g = canvas.getContext('2d')
-  if (!g) return null
-  const core = g.createRadialGradient(64, 64, 0, 64, 64, 64)
-  core.addColorStop(0, 'rgba(255,255,255,1)')
-  core.addColorStop(SPLAT_CORE_FRAC, 'rgba(255,255,255,1)')
-  core.addColorStop(1, 'rgba(255,255,255,0)')
-  g.fillStyle = core
-  g.fillRect(0, 0, 128, 128)
-  decalTexture = new CanvasTexture(canvas)
-  return decalTexture
+  return getSplatTexture()
 }
 
 /** Palette-index → shared decal material (≤ PAINT_PALETTE.length, module
@@ -1323,6 +1481,7 @@ export function spawnPaintDecal(
   s.y = point.y
   s.z = point.z
   s.radius = radius
+  s.order = ++decalStampOrder // newer coat always draws later (blink fix)
   emitDecals()
   return true
 }
@@ -1391,7 +1550,17 @@ function PaintDecals() {
         return (
           // Geometry lifetime is the ring's (disposed on reuse/reset), the
           // materials are module-cached — R3F must dispose neither.
-          <mesh dispose={null} geometry={slot.geometry} key={`${i}:${slot.gen}`} material={material} />
+          // renderOrder = the monotonic stamp serial: transparent sorting
+          // takes renderOrder before depth, so a newer coat of another
+          // color draws OVER the old one on every frame (no camera-angle
+          // z-sort flips between coplanar decals — the blink fix).
+          <mesh
+            dispose={null}
+            geometry={slot.geometry}
+            key={`${i}:${slot.gen}`}
+            material={material}
+            renderOrder={slot.order}
+          />
         )
       })}
     </group>
@@ -1543,11 +1712,20 @@ export function sprayPaint(world: GameWorld): boolean {
   // so paint-keep's strength-weighted votes track the whole band.
   const bridge = strokeBridge(nodeId, _point.x, _point.y, _point.z, radius)
   const coatRadius = coatRadiusFor(radius) // cells stay under the disc
-  const coats = splatCoat(target.grid, _point.x, _point.y, _point.z, coatRadius)
+  let coats = splatCoat(target.grid, _point.x, _point.y, _point.z, coatRadius)
   const bridgeCoats = bridge.map((p) => splatCoat(target.grid, p.x, p.y, p.z, coatRadius))
   let landed = coats.length
   for (const c of bridgeCoats) landed += c.length
-  if (landed === 0) return false
+  if (landed === 0) {
+    // Writing-range rescue (see nearestCoatCell): the tiny inset missed
+    // every cell center — coat the one cell under the crosshair so the
+    // stamp still lands (and the sprite below still draws). A true grid
+    // miss (wrong roof member) finds nothing in reach and aborts as before.
+    const cell = nearestCoatCell(target.grid, _point.x, _point.y, _point.z, coatReachFor(target.grid))
+    if (cell < 0) return false
+    coats = [{ cell, add: COAT_ADD }]
+    landed = 1
+  }
   let painted = paintedByNode.get(nodeId)
   if (!painted) {
     painted = new Map()
@@ -1770,23 +1948,46 @@ export function paintLabelTexture(hex: string): CanvasTexture | null {
   if (cached) return cached
   if (typeof document === 'undefined') return null // SSR/tests: color-only band
   const canvas = document.createElement('canvas')
-  canvas.width = 512
-  canvas.height = 128
+  // 2× the old resolution — the print is SMALLER now (spray-polish round:
+  // "smaller and easier to read"), so the texels have to be crisper.
+  canvas.width = 1024
+  canvas.height = 256
   const g = canvas.getContext('2d')
   if (!g) return null
   g.fillStyle = hex
-  g.fillRect(0, 0, 512, 128)
-  const ink = paintLabelInk(hex)
-  g.strokeStyle = ink
-  g.lineWidth = 4
-  g.strokeRect(150, 20, 212, 88)
-  g.fillStyle = ink
-  g.font = 'bold 44px system-ui, sans-serif'
+  g.fillRect(0, 0, 1024, 256)
+  // Contrast pill: dark plate on light coats / light plate on dark coats,
+  // print in the opposite ink — readable on every palette entry (the old
+  // hairline box + 44px type read as a smudge). Centered at u=0.5 — the
+  // band mesh spins π so this faces the camera (cylinder UVs put u=0 at
+  // +Z, which is also the seam).
+  const plate = paintLabelInk(hex)
+  const ink = plate === INK_DARK ? INK_LIGHT : INK_DARK
+  const w = 300
+  const h = 104
+  const x = (1024 - w) / 2
+  const y = (256 - h) / 2
+  const r = 30
+  g.fillStyle = plate
+  g.beginPath()
+  g.moveTo(x + r, y)
+  g.arcTo(x + w, y, x + w, y + h, r)
+  g.arcTo(x + w, y + h, x, y + h, r)
+  g.arcTo(x, y + h, x, y, r)
+  g.arcTo(x, y, x + w, y, r)
+  g.closePath()
+  g.fill()
   g.textAlign = 'center'
   g.textBaseline = 'middle'
-  // Centered at u=0.5 — the band mesh spins π so this faces the camera
-  // (cylinder UVs put u=0 at +Z, which is also the seam).
-  g.fillText('PRESS R', 256, 66)
+  g.fillStyle = ink
+  // Half the old physical type size (44/128 → 40/256), clean 600 weight.
+  g.font = '600 40px system-ui, sans-serif'
+  g.fillText('PRESS R', 512, 256 / 2 - 14)
+  // The small second line says what R does.
+  g.globalAlpha = 0.78
+  g.font = '500 21px system-ui, sans-serif'
+  g.fillText('NEXT COLOR', 512, 256 / 2 + 22)
+  g.globalAlpha = 1
   const texture = new CanvasTexture(canvas)
   labelTextures.set(hex, texture)
   return texture

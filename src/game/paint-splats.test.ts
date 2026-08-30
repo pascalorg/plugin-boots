@@ -176,11 +176,44 @@ describe('stampSplat pool (ring cap, reuse, node eviction)', () => {
     // 0.05 m < 0.3 × 0.25 — swallowed, no slot claimed.
     expect(stamp('wall_c', 0.05)).toBe(false)
     expect(splatSpriteCensus()).toBe(1)
-    // A color change stamps regardless…
+    // A color change stamps regardless — and RETIRES the covered old coat
+    // (0.05 m < 0.6 × 0.25, same facing — the blink fix).
     expect(stamp('wall_c', 0.05, 3)).toBe(true)
-    // …and the SAME color past the distance stamps again.
+    expect(splatSpriteCensus('wall_c')).toBe(1)
+    // The SAME color past the economy distance stamps again (no retire).
     expect(stamp('wall_c', 0.13, 3)).toBe(true)
-    expect(splatSpriteCensus('wall_c')).toBe(3)
+    expect(splatSpriteCensus('wall_c')).toBe(2)
+  })
+
+  test('BLINK FIX: a new coat retires covered different-color sprites', () => {
+    // Blue (2) pass: three stamps along x.
+    expect(stamp('wall_b2', 0)).toBe(true)
+    expect(stamp('wall_b2', 0.1)).toBe(true)
+    expect(stamp('wall_b2', 0.2)).toBe(true)
+    expect(splatSpriteCensus('wall_b2')).toBe(3)
+    // Red (3) over the middle: cover reach 0.6 × 0.25 = 0.15 from x = 0.1
+    // retires ALL three blues (0, 0.1, 0.2 are within 0.15 ± lift) — the
+    // circle can never z-flicker between two coats.
+    expect(stamp('wall_b2', 0.1, 3)).toBe(true)
+    expect(splatSpriteCensus('wall_b2')).toBe(1)
+    const live = splatSpriteSlots().filter((s) => s.alive && s.nodeId === 'wall_b2')
+    expect(live.length).toBe(1)
+    expect(live[0]!.color).toBe(3)
+  })
+
+  test('BLINK FIX: the other face of the wall keeps its coat', () => {
+    // Blue on the +Z face…
+    expect(stampSplat('wall_f', 0, 0, 0, 0, 0, 1, 0.25, 2)).toBe(true)
+    // …red on the −Z face at the same (x, y): normals oppose, no retire.
+    expect(stampSplat('wall_f', 0, 0, -0.12, 0, 0, -1, 0.25, 3)).toBe(true)
+    expect(splatSpriteCensus('wall_f')).toBe(2)
+  })
+
+  test('BLINK FIX: a distant different color is NOT retired', () => {
+    expect(stamp('wall_d2', 0)).toBe(true)
+    // 0.5 m away at radius 0.25 — far outside the 0.15 cover reach.
+    expect(stamp('wall_d2', 0.5, 3)).toBe(true)
+    expect(splatSpriteCensus('wall_d2')).toBe(2)
   })
 
   test('ring cap holds at SPLAT_SPRITE_CAP; overflow reuses the oldest', () => {
