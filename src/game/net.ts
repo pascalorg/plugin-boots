@@ -7,9 +7,9 @@
  * builds: it moves bounded, validated, ordered frames of ANY registered
  * `kind` and leaves every semantic decision to that kind's owner.
  *
- *   presence.ts        → kind 'pose'          (avatar co-presence)
- *   <sync-core>        → kind 'destruction'   (grow-only removed-cell sets)
- *   <sync-core>        → kind 'build'         (placed-piece add/remove sets)
+ *   presence.ts        → kind 'pose'              (avatar co-presence)
+ *   shared-world.ts    → kind 'boots/world'       (SharedDelta, lattice join)
+ *   shared-world.ts    → kind 'boots/world-snap'  (SharedDelta kind 'snapshot')
  *   any state owner    → 'state-request' / 'state-snapshot' (late join)
  *
  * FEATURE-DETECTED END TO END: with no bus (solo app, older hosts, :3002, or
@@ -22,13 +22,25 @@
  * One host event per kind (see WHY below), so the host's own per-(pluginId,
  * event) coalescing never lets one kind eat another's frames.
  *
+ * ── The sender is HOST-STAMPED, never payload-supplied ──────────────────────
+ * `NetMessage.sessionId` / `.clientId` / `.userId` are copied from the host's
+ * own bus envelope, which the host fills in from the connection. They are the
+ * ONLY trustworthy identity on an inbound frame. A payload field claiming
+ * authorship (`delta.from`, and anything like it) is attacker-controlled and
+ * must be overwritten with `msg.sessionId` before use — that is what makes
+ * shared-world's authorship gate mean anything.
+ *
  * ── Sequence semantics ──────────────────────────────────────────────────────
  * Outbound: one monotonic counter per kind, starting at 1, per session.
- * Inbound: the newest accepted seq is remembered per (senderSession, kind);
- * anything at or below it is a duplicate/reorder and is DROPPED. Delivered
- * messages carry `skipped` — how many sequence numbers went missing before
- * this frame (0 = contiguous). Poses ignore it; a state-carrying kind should
- * treat `skipped > 0` as "I lost frames, ask for a snapshot".
+ * Inbound, ORDERED kinds (the default): the newest accepted seq is remembered
+ * per (senderSession, kind); anything at or below it is a duplicate/reorder
+ * and is DROPPED. Register with `{ ordered: false }` for a CONVERGENT kind —
+ * one whose merge is a lattice join, where a duplicate is a no-op and a
+ * reordered frame still carries information that would otherwise be thrown
+ * away. Either way, delivered messages carry `skipped` — how many sequence
+ * numbers went missing before this frame (0 = contiguous). Poses ignore it; a
+ * state-carrying kind should treat `skipped > 0` as "I lost frames, expect a
+ * snapshot to heal it".
  *
  * ── Bounds (the trust boundary) ─────────────────────────────────────────────
  * The host rejects any plugin frame over PLUGIN_FRAME_MAX_SERIALIZED_LENGTH
@@ -38,6 +50,13 @@
  * validator normalizes the payload; anything unexpected is dropped without a
  * handler call. A frame from a stranger can therefore only ever become a
  * value the receiving subsystem asked for.
+ *
+ * The host cap is 8 000 SERIALIZED CHARS, not a megabyte. The bus is a
+ * JSON channel: `publish` hands `data` to the host, which measures
+ * `JSON.stringify(data).length`. Binary payloads must therefore travel as
+ * text (base64, ×1.333) — a Uint8Array would serialize to `{"0":…,"1":…}` and
+ * blow the budget on a few hundred bytes. Anything past
+ * MAX_PAYLOAD_SERIALIZED must be chunked with `{part, parts}`.
  */
 
 // ── Host bus interface (shipped by the host separately — PR #446) ────────────
@@ -86,13 +105,19 @@ export function getCollabBus(): CollabBus | null {
  *
  * WHY one host event per kind: the host coalesces to the LATEST value per
  * (pluginId, event) every 66 ms. Sharing one event would let a 12 Hz pose
- * stream silently swallow a destruction frame. Per-kind events mean each
- * stream only ever coalesces against itself.
+ * stream silently swallow a world frame. Per-kind events mean each stream
+ * only ever coalesces against itself.
+ *
+ * That is also why deltas and snapshots of the SAME state get two kinds:
+ * `'boots/world'` for the incremental stream and `'boots/world-snap'` for the
+ * periodic/on-join full state. Sharing one event would let a 5 kB snapshot
+ * coalesce away the shot that happened 20 ms later — a loss the lattice can
+ * only heal on the NEXT snapshot. Two events, two independent 66 ms slots.
  */
 export const FRAME_KINDS = [
   'pose',
-  'destruction',
-  'build',
+  'boots/world',
+  'boots/world-snap',
   'state-request',
   'state-snapshot',
 ] as const
@@ -210,6 +235,24 @@ export function readEnvelope(data: unknown): BootsEnvelope | null {
 type KindEntry = {
   validate: FrameValidator
   handlers: Set<(msg: NetMessage) => void>
+  /** false = convergent kind: duplicates and reorders are DELIVERED. */
+  ordered: boolean
+}
+
+/** Per-kind delivery policy — see registerFrameKind. */
+export type FrameKindOptions = {
+  /**
+   * Drop frames whose seq is at or below the newest already accepted from
+   * that sender (default true — right for a stream of poses, where an old
+   * frame is strictly worse than the one you already drew).
+   *
+   * Set false when the kind's merge is a LATTICE JOIN: idempotent,
+   * commutative, associative. Then a duplicate costs one no-op merge and a
+   * reordered frame still carries records you would otherwise have thrown
+   * away, so ordering is not a service worth paying for. `skipped` is still
+   * reported off the highest seq seen.
+   */
+  ordered?: boolean
 }
 
 type NetState = {
@@ -243,16 +286,22 @@ const state: NetState = {
 
 /**
  * Declare a kind and how to validate its payload. Registering twice replaces
- * the validator (dev hot-reload). A kind with no validator is never
- * delivered — that is deliberate: an unvalidated payload must not exist.
+ * the validator and the policy (dev hot-reload). A kind with no validator is
+ * never delivered — that is deliberate: an unvalidated payload must not exist.
  */
-export function registerFrameKind<P>(kind: BootsFrameKind, validate: FrameValidator<P>): void {
+export function registerFrameKind<P>(
+  kind: BootsFrameKind,
+  validate: FrameValidator<P>,
+  options?: FrameKindOptions,
+): void {
+  const ordered = options?.ordered ?? true
   const entry = state.kinds.get(kind)
   if (entry) {
     entry.validate = validate as FrameValidator
+    entry.ordered = ordered
     return
   }
-  state.kinds.set(kind, { validate: validate as FrameValidator, handlers: new Set() })
+  state.kinds.set(kind, { validate: validate as FrameValidator, handlers: new Set(), ordered })
 }
 
 /** Subscribe to a kind. Returns the unsubscribe. Safe before startNet(). */
@@ -261,7 +310,7 @@ export function onFrame<P>(kind: BootsFrameKind, handler: (msg: NetMessage<P>) =
   if (!entry) {
     // Handler before validator: hold the slot, stay undeliverable until a
     // validator lands (never deliver an unvalidated payload).
-    entry = { validate: () => null, handlers: new Set() }
+    entry = { validate: () => null, handlers: new Set(), ordered: true }
     state.kinds.set(kind, entry)
   }
   const typed = handler as (msg: NetMessage) => void
@@ -328,7 +377,8 @@ function trackSeq(key: string, seq: number): void {
 /**
  * Ingest one host bus message (exported for tests; the subscription calls it).
  * Drops: self-echo, unknown kinds, bad envelopes, unregistered kinds,
- * payloads their validator rejects, duplicates and reorders.
+ * payloads their validator rejects, and — for ORDERED kinds only —
+ * duplicates and reorders.
  */
 export function ingestBusMessage(msg: CollabBusMessage): void {
   if (!state.active || !state.bus) return
@@ -353,12 +403,14 @@ export function ingestBusMessage(msg: CollabBusMessage): void {
   }
   const key = seqKey(msg.sessionId, envelope.kind)
   const last = state.inSeq.get(key)
-  if (last !== undefined && envelope.seq <= last) {
-    state.dropped++ // duplicate or reorder — the stream never rewinds
+  if (entry.ordered && last !== undefined && envelope.seq <= last) {
+    state.dropped++ // duplicate or reorder — an ordered stream never rewinds
     return
   }
-  const skipped = last === undefined ? 0 : envelope.seq - last - 1
-  trackSeq(key, envelope.seq)
+  // `skipped` is measured off the HIGHEST seq seen either way, so a convergent
+  // kind still learns that frames went missing (its cue to expect a snapshot).
+  const skipped = last === undefined ? 0 : Math.max(0, envelope.seq - last - 1)
+  trackSeq(key, last === undefined ? envelope.seq : Math.max(last, envelope.seq))
   state.received++
   const delivered: NetMessage = {
     kind: envelope.kind,
@@ -394,21 +446,34 @@ export function forgetSender(sessionId: string): void {
  * already half gone must be told what happened before they arrived.
  *
  * The shape, deliberately minimal and owner-driven:
- *  1. joiner calls `requestState('destruction')`;
- *  2. every peer's `onStateRequest` fires; exactly ONE answers —
- *     `shouldAnswerStateRequest` elects the lowest live sessionId, so N peers
- *     do not stampede a newcomer with N copies;
- *  3. the elected peer calls `sendStateSnapshot('destruction', requester,
+ *  1. joiner calls `requestState('boots/world')`;
+ *  2. every peer's `onStateRequest` fires;
+ *  3. each answerer calls `sendStateSnapshot('boots/world', requester,
  *     state)`, chunking with `{part, parts}` if it exceeds
  *     MAX_PAYLOAD_SERIALIZED;
- *  4. the joiner's `onStateSnapshot('destruction')` merges, ignoring
+ *  4. the joiner's `onStateSnapshot('boots/world')` merges, ignoring
  *     snapshots addressed to somebody else.
  *
+ * WHO ANSWERS — two strategies, and the state owner must pick deliberately:
+ *
+ *  - EVERY PEER ANSWERS WITH ITS OWN RECORDS. Correct whenever the receiver
+ *    gates records by author, because a snapshot that aggregates several
+ *    peers' records cannot pass a per-frame authorship check: only the
+ *    sender's own records would survive it anyway. N answers for N peers,
+ *    bounded by the roster, each independently attributable. THIS IS WHAT
+ *    shared-world.ts USES — see MULTIPLAYER.md.
+ *  - ONE PEER ANSWERS FOR THE ROOM (`shouldAnswerStateRequest`, below).
+ *    Cheaper, but the answer is an aggregate, so it is only sound where the
+ *    transport VOUCHES for the relay (a server-mediated or otherwise trusted
+ *    aggregator). This bus does not vouch: the host stamps who sent a frame,
+ *    which is exactly enough to attribute that peer's OWN records and not one
+ *    byte more. Do not use it for authorship-gated state.
+ *
  * Snapshots are BROADCAST (the host bus has no direct addressing), hence the
- * `for` field and the single-responder election. Transport orders the chunks
- * and reports loss via `skipped`; MERGING IS THE OWNER'S JOB — only they know
- * whether their state is a grow-only set (idempotent, re-merge freely) or a
- * sequence that must be applied in order.
+ * `for` field. Transport orders the chunks and reports loss via `skipped`;
+ * MERGING IS THE OWNER'S JOB — only they know whether their state is a
+ * lattice (idempotent, re-merge freely) or a sequence that must be applied in
+ * order.
  */
 export type StateRequestPayload = { of: BootsFrameKind }
 export type StateSnapshotPayload = { of: BootsFrameKind; for: string; state: unknown }
@@ -460,7 +525,9 @@ export function sendStateSnapshot(
   )
 }
 
-/** Fires when a peer asks for state. Answer only if elected (see above). */
+/** Fires when a peer asks for state. `from` is HOST-STAMPED — it is the
+ * sender's real session id, safe to use as the reply address and as the
+ * authorship key. Answer with your OWN records (see "WHO ANSWERS"). */
 export function onStateRequest(
   handler: (req: { of: BootsFrameKind; from: string; msg: NetMessage }) => void,
 ): () => void {
@@ -486,6 +553,11 @@ export function onStateSnapshot(
  * roster answers. Deterministic, needs no coordination, and every peer
  * reaches the same verdict from the same roster. The requester never answers
  * itself.
+ *
+ * ONLY for state whose receiver does NOT gate records by author (see "WHO
+ * ANSWERS" above). An authorship-gated receiver must let every peer answer
+ * with its own records instead, because this bus stamps senders but does not
+ * vouch for relays.
  */
 export function shouldAnswerStateRequest(
   mySessionId: string,

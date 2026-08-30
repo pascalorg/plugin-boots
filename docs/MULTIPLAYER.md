@@ -11,8 +11,8 @@ Two layers, and the split matters:
   touches the host bus. It moves bounded, validated, ordered frames of any
   registered `kind` and owns the late-join handshake.
 - **kind owners.** `presence.ts` owns `'pose'` (this document's second half).
-  The shared-world/sync core owns `'destruction'` and `'build'`. Neither
-  knows anything about the other.
+  `shared-world.ts` owns `'boots/world'` and `'boots/world-snap'` (Part 3).
+  Neither knows anything about the other.
 
 Every function in both layers is feature-detected: with no bus (solo app,
 older hosts, `:3002`, or the host's `NEXT_PUBLIC_PLUGIN_COLLAB` off),
@@ -40,7 +40,7 @@ Every Boots frame on the wire is the same shape, whatever it carries:
 ```jsonc
 {
   "v": 1,            // envelope protocol — anything else is dropped
-  "kind": "pose",    // 'pose' | 'destruction' | 'build'
+  "kind": "pose",    // 'pose' | 'boots/world' | 'boots/world-snap'
                      //   | 'state-request' | 'state-snapshot'
   "seq": 41,         // per (sender, kind), monotonic, starts at 1
   "part": 1,         // OPTIONAL chunk markers; absent = a whole frame
@@ -48,6 +48,10 @@ Every Boots frame on the wire is the same shape, whatever it carries:
   "data": { }        // the kind owner's payload
 }
 ```
+
+The host adds `sessionId` / `clientId` / `userId` / `sentAt` around it, from
+the connection. **Those four are the only trustworthy identity on an inbound
+frame**; a payload field claiming authorship is attacker-controlled.
 
 Adding a kind is additive and safe — older clients drop unknown kinds at
 `readEnvelope`, so a peer on last week's pin ignores what it cannot
@@ -57,22 +61,33 @@ understand. **Renaming** a kind is breaking, and a test pins the list.
 
 Frames publish as `(pluginId: 'pascal:boots', event: <kind>)`. The host
 coalesces to the **latest value per `(pluginId, event)` every 66 ms**. If
-every kind shared one event, a 12 Hz pose stream would silently swallow
-destruction frames. Per-kind events mean each stream only ever coalesces
-against itself.
+every kind shared one event, a 12 Hz pose stream would silently swallow world
+frames. Per-kind events mean each stream only ever coalesces against itself.
+
+The same rule is why deltas and snapshots of the *same* state get **two**
+kinds. On one event, a 6 kB snapshot would coalesce away the shot that landed
+20 ms later, and a lattice only heals that on the next snapshot. Two events,
+two independent 66 ms slots.
 
 ## Sequence semantics
 
 - **Outbound**: one counter per kind, starting at 1. It advances on every
   publish **attempt**, including attempts the host defers or suppresses — so
   a receiver's gap count reflects real loss instead of reading as contiguous.
-- **Inbound**: the newest accepted `seq` is remembered per
-  `(senderSession, kind)`. Anything at or below it is a duplicate or a late
-  reorder and is dropped — a stream never rewinds.
+- **Inbound, ordered kinds (the default)**: the newest accepted `seq` is
+  remembered per `(senderSession, kind)`. Anything at or below it is a
+  duplicate or a late reorder and is dropped — the stream never rewinds.
+  Right for poses, where an old frame is strictly worse than the one you
+  already drew.
+- **Inbound, convergent kinds** (`registerFrameKind(kind, validate,
+  { ordered: false })`): duplicates and reorders are **delivered**. Correct
+  when the merge is a lattice join — a duplicate costs one no-op and a
+  reordered frame still carries records that ordering would have discarded.
 - Delivered messages carry **`skipped`**: how many sequence numbers went
-  missing immediately before this frame (`0` = contiguous). Poses ignore it.
-  **A state-carrying kind must treat `skipped > 0` as "I lost frames — ask
-  for a snapshot"**, because a lost delta never comes back.
+  missing before this frame, measured off the highest `seq` seen (`0` =
+  contiguous). Poses ignore it. **A state-carrying kind should treat
+  `skipped > 0` as "I lost frames — a snapshot will heal it"**, because a lost
+  delta never comes back.
 - Inbound trackers are bounded at `SEQ_TRACK_MAX` (256) senders, recycled
   oldest-first, so fabricated session ids cannot grow memory. The trade: a
   long-silent sender may replay one sequence number. `forgetSender()`
@@ -92,10 +107,14 @@ against itself.
 
 ## Bounds (the trust boundary)
 
-- The host rejects any plugin frame over 8 000 serialized chars. We refuse
-  oversize payloads **before** publishing (`MAX_PAYLOAD_SERIALIZED` = 8 000
-  − 120 envelope reserve; `payloadFits()` checks it) rather than letting the
-  host drop them silently.
+- The host rejects any plugin frame over 8 000 **serialized chars** — not a
+  megabyte, and not bytes. The bus is a JSON channel: the host measures
+  `JSON.stringify(data).length`. We refuse oversize payloads **before**
+  publishing (`MAX_PAYLOAD_SERIALIZED` = 8 000 − 120 envelope reserve;
+  `payloadFits()` checks it) rather than letting the host drop them silently.
+- **Binary must travel as text.** A `Uint8Array` serializes to
+  `{"0":12,"1":250,…}`, roughly 6 chars per byte, so ~1.3 kB of state already
+  blows a frame. Base64 costs ×1.333 and is the only viable encoding here.
 - Anything bigger must be **chunked** with `{part, parts}`. The transport
   orders chunks and reports loss; **reassembly and merging are the state
   owner's job** — only they know whether their state is an idempotent
@@ -116,16 +135,20 @@ Poses do not need it — the next tick fixes everything. Accumulated state
 does: a visitor walking into a lobby whose walls are already half gone must
 be told what happened before they arrived. The handshake:
 
-1. the joiner calls `requestState('destruction')`;
-2. every peer's `onStateRequest` fires;
-3. exactly ONE answers — `shouldAnswerStateRequest` (pure) elects the lowest
-   live `sessionId`, so N peers do not stampede a newcomer with N copies,
-   and the requester never answers itself;
-4. the elected peer calls `sendStateSnapshot('destruction', requester,
+1. the joiner calls `requestState('boots/world')`;
+2. every peer's `onStateRequest` fires, with a **host-stamped** `from`;
+3. the answerers reply with `sendStateSnapshot('boots/world', requester,
    state)`, chunking if it exceeds the payload budget;
-5. the joiner's `onStateSnapshot('destruction')` merges. Snapshots are
+4. the joiner's `onStateSnapshot('boots/world')` merges. Snapshots are
    **broadcast** (the host bus has no direct addressing), hence the `for`
    field — snapshots addressed to somebody else are ignored for you.
+
+**Who answers** is a deliberate choice, not a detail:
+
+| Strategy | When it is sound |
+| --- | --- |
+| **Every peer answers with its OWN records** | Whenever the receiver gates records by author. An aggregate snapshot cannot pass a per-frame authorship check, so only the sender's own records would survive anyway. N answers for N peers, bounded by the roster. **This is what `shared-world.ts` uses.** |
+| One peer answers for the room (`shouldAnswerStateRequest`, pure — lowest live `sessionId`, requester never answers itself) | Only where the transport **vouches** for the relay. This bus stamps who sent a frame; it does not vouch that a peer faithfully relayed others' records. Never use it for authorship-gated state. |
 
 The two late-join kinds are owned by the **transport**, not by a kind owner,
 and are always registered: you ask for state precisely because you have
@@ -292,3 +315,54 @@ omission — these belong to the shared-world kinds on the same bus:
    calm lease info line, ZERO invariant errors, world stays frozen until Esc.
 9. Solo regression: on `:3002` (no bus) everything above is absent and
    `presence()` reads empty/zero — the game is untouched.
+
+# Part 3 — the shared world on this bus
+
+`shared-world.ts` / `shared-wire.ts` / `shared-derive.ts` are a pure
+convergent model with no networking. This is how they meet the transport —
+the answers are decisions, not suggestions.
+
+**Kinds.** `'boots/world'` carries `SharedDelta` with `kind: 'delta'`;
+`'boots/world-snap'` carries `SharedDelta` with `kind: 'snapshot'`
+(`snapshotOf(world)`). `SharedDelta.kind` already distinguishes them, but they
+get separate host events anyway, for the coalescing reason above.
+
+**Encoding.** `encodeDeltaText` / `decodeDeltaText` (base64), **not**
+`encodeDelta` / `decodeDelta`. The bus is JSON; a `Uint8Array` does not
+survive it.
+
+**Ordering.** Both kinds register with `{ ordered: false }`. The merge is a
+lattice join, so reorder, duplicate and drop are all safe, and dropping a
+reordered frame would throw away records for nothing.
+
+**The sender.** `mergeDelta(world, delta, sender)` must be called with
+`sender = msg.sessionId` — the host-stamped envelope field — never
+`delta.from`. Host session ids are `isSafePeerId`-shaped in practice (short,
+`#`-free); if a host ever hands over one that is not, `mergeDelta` drops the
+whole frame, which is the correct failure. `#` is the record-id separator, so
+a peer id containing it would be an identity forgery.
+
+**Byte ceiling.** The transport's is **8 000 serialized chars**, ~130× tighter
+than `shared-wire`'s own `MAX_FRAME_BYTES` (1 MiB). Measured: a rifle shot's
+delta ~100 B binary → ~136 B base64, comfortable; a 28-node / 10.7 k-dead-cell
+snapshot 4.7 kB → ~6.2 kB base64, which fits the 7 880-char budget **but only
+just**. A bigger lobby must chunk — `{part, parts}` is reserved for exactly
+this, one node per chunk being the natural split. `payloadFits()` before
+publishing, and `'too-large'` if you skip the check.
+
+**Coalescing is the real hazard, not loss.** The host keeps only the latest
+value per event per 66 ms. A burst of deltas inside one window is *lost*, not
+queued. So: accumulate locally and flush **one** delta per ~66 ms tick (a
+delta is itself a union, so batching is free and exact), and publish a full
+snapshot periodically as the healing channel. `publishFrame` returns the host
+verdict verbatim — `'deferred'` / `'suppressed'` mean *that frame is gone*.
+
+**Late join.** Every peer answers a `requestState('boots/world')` with its
+**own** records (see the table above). Snapshots are therefore ingested with
+the real `sender`, never `null`: this bus does not vouch for relays, so a
+snapshot aggregating other peers' records would be a forgery vector. `null`
+is reserved for replaying our own state locally.
+
+**Roster.** `onParticipants` / `getParticipants` are available if the model
+ever wants join/leave edges; the model has no roster of its own, and none is
+required.

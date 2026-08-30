@@ -210,7 +210,7 @@ function hostileEnvelopes(): Array<{ why: string; msg: CollabBusMessage }> {
     },
     {
       why: 'a host event that disagrees with the kind (spoof)',
-      msg: wrap({ v: 1, kind: POSE_KIND, seq: 1, data: good }, { event: 'destruction' }),
+      msg: wrap({ v: 1, kind: POSE_KIND, seq: 1, data: good }, { event: 'boots/world' }),
     },
     { why: 'a NaN sentAt', msg: wrap({ v: 1, kind: POSE_KIND, seq: 1, data: good }, { sentAt: Number.NaN }) },
     {

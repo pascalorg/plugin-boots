@@ -177,8 +177,8 @@ describe('feature detection — no bus is a total no-op', () => {
       delivered++
     })
     expect(publishFrame('pose', { hello: 'world' })).toBe('unavailable')
-    expect(requestState('destruction')).toBe('unavailable')
-    expect(sendStateSnapshot('destruction', 'session-a', { cells: [] })).toBe('unavailable')
+    expect(requestState('boots/world')).toBe('unavailable')
+    expect(sendStateSnapshot('boots/world', 'session-a', { cells: [] })).toBe('unavailable')
     // Even a well-formed inbound frame cannot be delivered: there is no wire.
     ingestBusMessage(inbound(frame('pose', 1, { x: 1 })))
     expect(delivered).toBe(0)
@@ -201,7 +201,7 @@ describe('feature detection — no bus is a total no-op', () => {
   test('one subscription serves every kind, under the plugin id', () => {
     const bus = installBus()
     registerFrameKind('pose', echo)
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     const subscribe = spyOn(bus, 'subscribe')
     expect(startNet()).toBe(true)
     expect(startNet()).toBe(true) // idempotent — a remount keeps the wire
@@ -219,10 +219,10 @@ describe('feature detection — no bus is a total no-op', () => {
 
 describe('envelope codec — readEnvelope', () => {
   test('a well-formed envelope round-trips, part/parts default to 1', () => {
-    const read = readEnvelope(frame('destruction', 7, { cells: [1, 2] }))
+    const read = readEnvelope(frame('boots/world', 7, { cells: [1, 2] }))
     expect(read).toEqual({
       v: NET_PROTOCOL,
-      kind: 'destruction',
+      kind: 'boots/world',
       seq: 7,
       part: 1,
       parts: 1,
@@ -269,13 +269,133 @@ describe('envelope codec — readEnvelope', () => {
     for (const kind of FRAME_KINDS) expect(isFrameKind(kind)).toBe(true)
     for (const junk of ['exec', '', 'Pose', null, 7, {}]) expect(isFrameKind(junk)).toBe(false)
     // Pinned deliberately: adding a kind is additive, RENAMING one is breaking.
+    // 'boots/world' + 'boots/world-snap' are the shared-world contract; the
+    // delta stream and the snapshot stream are SEPARATE kinds on purpose, so
+    // the host's per-event 66 ms coalescing cannot let a snapshot swallow a
+    // delta that happened just after it.
     expect([...FRAME_KINDS]).toEqual([
       'pose',
-      'destruction',
-      'build',
+      'boots/world',
+      'boots/world-snap',
       'state-request',
       'state-snapshot',
     ])
+  })
+})
+
+// ── The authenticated sender ─────────────────────────────────────────────────
+
+describe('the sender is host-stamped, never payload-supplied', () => {
+  test('a payload claiming another author cannot change who the frame is from', () => {
+    installBus()
+    registerFrameKind('boots/world', echo)
+    startNet()
+    const { got, off } = collect('boots/world')
+    // The classic forgery: the delta names itself as somebody else's.
+    ingestBusMessage(
+      inbound(frame('boots/world', 1, { v: 1, kind: 'delta', from: 'session-victim', lamport: 9 }), {
+        sessionId: 'session-attacker',
+        clientId: 'client-attacker',
+        userId: 'user-attacker',
+      }),
+    )
+    expect(got.length).toBe(1)
+    // Identity comes from the host envelope, full stop. A receiver that gates
+    // records by author must use msg.sessionId and OVERWRITE the payload's
+    // claim — that is the only reason the authorship gate means anything.
+    expect(got[0]!.sessionId).toBe('session-attacker')
+    expect(got[0]!.userId).toBe('user-attacker')
+    expect(got[0]!.clientId).toBe('client-attacker')
+    // The transport does not silently rewrite payloads either: the lie is
+    // still visible in the data, so a receiver that trusts it is visibly wrong.
+    expect((got[0]!.data as { from: string }).from).toBe('session-victim')
+    off()
+  })
+
+  test('late-join requests carry the same host-stamped identity', () => {
+    installBus()
+    startNet()
+    const seen: Array<{ of: string; from: string }> = []
+    const off = onStateRequest((req) => seen.push({ of: req.of, from: req.from }))
+    ingestBusMessage(
+      inbound(frame('state-request', 1, { of: 'boots/world' }), { sessionId: 'session-joiner' }),
+    )
+    expect(seen).toEqual([{ of: 'boots/world', from: 'session-joiner' }])
+    off()
+  })
+})
+
+// ── Convergent (unordered) kinds ─────────────────────────────────────────────
+
+describe('convergent kinds — ordered:false delivers duplicates and reorders', () => {
+  test('a lattice kind keeps frames an ordered kind would throw away', () => {
+    installBus()
+    // The merge is idempotent/commutative/associative, so a duplicate costs a
+    // no-op and a reordered frame still carries records worth having.
+    registerFrameKind('boots/world', echo, { ordered: false })
+    startNet()
+    const { got, off } = collect('boots/world')
+    for (const seq of [5, 5, 3, 9, 1]) {
+      ingestBusMessage(inbound(frame('boots/world', seq, { s: seq })))
+    }
+    expect(got.map((m) => m.seq)).toEqual([5, 5, 3, 9, 1])
+    // `skipped` is still measured off the HIGHEST seq seen, so the receiver
+    // learns that frames went missing and can expect a snapshot to heal it.
+    expect(got.map((m) => m.skipped)).toEqual([0, 0, 0, 3, 0])
+    off()
+  })
+
+  test('the same stream registered ordered (the default) drops them', () => {
+    installBus()
+    registerFrameKind('boots/world', echo)
+    startNet()
+    const { got, off } = collect('boots/world')
+    for (const seq of [5, 5, 3, 9, 1]) {
+      ingestBusMessage(inbound(frame('boots/world', seq, { s: seq })))
+    }
+    expect(got.map((m) => m.seq)).toEqual([5, 9])
+    off()
+  })
+
+  test('re-registering flips the policy (kinds are owned, not global)', () => {
+    installBus()
+    registerFrameKind('boots/world', echo, { ordered: false })
+    registerFrameKind('boots/world', echo) // owner changed its mind
+    startNet()
+    const { got, off } = collect('boots/world')
+    ingestBusMessage(inbound(frame('boots/world', 4, { s: 4 })))
+    ingestBusMessage(inbound(frame('boots/world', 4, { s: 4 })))
+    expect(got.length).toBe(1)
+    off()
+  })
+})
+
+// ── The byte budget a state owner actually has ───────────────────────────────
+
+describe('the payload budget in shared-world terms', () => {
+  test('base64 text is the only viable binary encoding on a JSON bus', () => {
+    // A Uint8Array does not survive JSON: it serializes to {"0":..,"1":..},
+    // ~6 chars per byte, so 1.3 kB of state would already blow an 8 kB frame.
+    const bytes = new Uint8Array(1000)
+    expect(serializedLength(bytes)).toBeGreaterThan(MAX_PAYLOAD_SERIALIZED)
+    // The same bytes as base64 cost 1.333x plus quotes — that fits.
+    const base64 = 'A'.repeat(Math.ceil(1000 / 3) * 4)
+    expect(payloadFits({ b: base64 })).toBe(true)
+  })
+
+  test('a measured full-world snapshot fits; a megabyte one is refused', () => {
+    const bus = installBus()
+    registerFrameKind('boots/world-snap', echo, { ordered: false })
+    startNet()
+    // shared-wire measured a 28-node / 10.7k-dead-cell snapshot at 4.7 kB
+    // binary => ~6.2 kB base64. Inside the 7 880-char budget, but only just:
+    // a bigger lobby MUST chunk with {part, parts}.
+    const measured = { of: 'boots/world', b: 'A'.repeat(6200) }
+    expect(payloadFits(measured)).toBe(true)
+    expect(publishFrame('boots/world-snap', measured)).toBe('sent')
+    // shared-wire's own MAX_FRAME_BYTES is 1 MiB — ~130x what this bus takes.
+    expect(publishFrame('boots/world-snap', { b: 'A'.repeat(1 << 20) })).toBe('too-large')
+    expect(bus.publishes.length).toBe(1)
   })
 })
 
@@ -285,12 +405,12 @@ describe('publish — sequencing, host verdicts, the payload cap', () => {
   test('each kind gets its OWN host event and its own monotonic counter', () => {
     const bus = installBus()
     registerFrameKind('pose', echo)
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
     publishFrame('pose', { a: 1 })
-    publishFrame('destruction', { b: 1 })
+    publishFrame('boots/world', { b: 1 })
     publishFrame('pose', { a: 2 })
-    expect(bus.publishes.map((p) => p.event)).toEqual(['pose', 'destruction', 'pose'])
+    expect(bus.publishes.map((p) => p.event)).toEqual(['pose', 'boots/world', 'pose'])
     expect(bus.publishes.every((p) => p.pluginId === PLUGIN_ID)).toBe(true)
     const seqs = bus.publishes.map((p) => (p.data as BootsEnvelope).seq)
     // Per-kind counters: the destruction stream is not perturbed by poses.
@@ -317,22 +437,22 @@ describe('publish — sequencing, host verdicts, the payload cap', () => {
   test('an unregistered kind is refused loudly, never silently dropped', () => {
     installBus()
     startNet()
-    expect(publishFrame('build', { pieces: [] })).toBe('unregistered')
+    expect(publishFrame('boots/world-snap', { pieces: [] })).toBe('unregistered')
   })
 
   test('an oversize payload is refused here, never truncated or left to the host', () => {
     const bus = installBus()
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
     const fat = { blob: 'x'.repeat(MAX_PAYLOAD_SERIALIZED + 1) }
     expect(payloadFits(fat)).toBe(false)
-    expect(publishFrame('destruction', fat)).toBe('too-large')
+    expect(publishFrame('boots/world', fat)).toBe('too-large')
     expect(bus.publishes.length).toBe(0)
     // Just inside the budget still goes out — the cap is a real budget, not a
     // guess: chunk with {part, parts} when a snapshot outgrows it.
     const snug = { blob: 'x'.repeat(MAX_PAYLOAD_SERIALIZED - 20) }
     expect(payloadFits(snug)).toBe(true)
-    expect(publishFrame('destruction', snug)).toBe('sent')
+    expect(publishFrame('boots/world', snug)).toBe('sent')
   })
 
   test('chunk markers ride the envelope only when parts > 1', () => {
@@ -350,12 +470,12 @@ describe('publish — sequencing, host verdicts, the payload cap', () => {
 
   test('serializedLength survives the unserializable; a cyclic payload cannot be sent', () => {
     installBus()
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
     const cyclic: Record<string, unknown> = {}
     cyclic.self = cyclic
     expect(serializedLength(cyclic)).toBe(Number.POSITIVE_INFINITY)
-    expect(publishFrame('destruction', cyclic)).toBe('too-large')
+    expect(publishFrame('boots/world', cyclic)).toBe('too-large')
   })
 
   test('a throwing bus never breaks a caller', () => {
@@ -389,11 +509,11 @@ describe('inbound — sequence semantics', () => {
 
   test('a gap reports how much was lost; the stream never rewinds', () => {
     installBus()
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
-    const { got, off } = collect('destruction')
+    const { got, off } = collect('boots/world')
     for (const seq of [1, 2, 6, 7]) {
-      ingestBusMessage(inbound(frame('destruction', seq, { s: seq })))
+      ingestBusMessage(inbound(frame('boots/world', seq, { s: seq })))
     }
     expect(got.map((m) => m.seq)).toEqual([1, 2, 6, 7])
     // 3,4,5 went missing — the signal a state-carrying kind uses to decide it
@@ -404,13 +524,13 @@ describe('inbound — sequence semantics', () => {
 
   test('duplicates and reorders are dropped, not applied twice', () => {
     installBus()
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
-    const { got, off } = collect('destruction')
-    ingestBusMessage(inbound(frame('destruction', 5, { s: 5 })))
-    ingestBusMessage(inbound(frame('destruction', 5, { s: 5 }))) // duplicate
-    ingestBusMessage(inbound(frame('destruction', 3, { s: 3 }))) // late reorder
-    ingestBusMessage(inbound(frame('destruction', 6, { s: 6 })))
+    const { got, off } = collect('boots/world')
+    ingestBusMessage(inbound(frame('boots/world', 5, { s: 5 })))
+    ingestBusMessage(inbound(frame('boots/world', 5, { s: 5 }))) // duplicate
+    ingestBusMessage(inbound(frame('boots/world', 3, { s: 3 }))) // late reorder
+    ingestBusMessage(inbound(frame('boots/world', 6, { s: 6 })))
     expect(got.map((m) => m.seq)).toEqual([5, 6])
     off()
   })
@@ -418,15 +538,15 @@ describe('inbound — sequence semantics', () => {
   test('sequence state is per (sender, kind) — senders and kinds never collide', () => {
     installBus()
     registerFrameKind('pose', echo)
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
     const poses = collect('pose')
-    const demo = collect('destruction')
+    const demo = collect('boots/world')
     ingestBusMessage(inbound(frame('pose', 9, 'a-pose'), { sessionId: 'session-a' }))
     // Same seq from a different sender: independent stream, delivered.
     ingestBusMessage(inbound(frame('pose', 9, 'b-pose'), { sessionId: 'session-b' }))
     // Same sender, same seq, different kind: also independent.
-    ingestBusMessage(inbound(frame('destruction', 9, 'a-demo'), { sessionId: 'session-a' }))
+    ingestBusMessage(inbound(frame('boots/world', 9, 'a-demo'), { sessionId: 'session-a' }))
     expect(poses.got.map((m) => m.data)).toEqual(['a-pose', 'b-pose'])
     expect(demo.got.map((m) => m.data)).toEqual(['a-demo'])
     poses.off()
@@ -482,15 +602,15 @@ describe('inbound — the trust boundary and routing', () => {
   test('a host event that disagrees with the envelope kind is a spoof — dropped', () => {
     installBus()
     registerFrameKind('pose', echo)
-    registerFrameKind('destruction', echo)
+    registerFrameKind('boots/world', echo)
     startNet()
     const poses = collect('pose')
-    const demo = collect('destruction')
+    const demo = collect('boots/world')
     // A destruction frame smuggled under the pose event, or vice versa: the
     // host's coalescing key and the payload's kind must agree or neither is
     // trustworthy.
-    ingestBusMessage({ ...inbound(frame('destruction', 1, 'x')), event: 'pose' })
-    ingestBusMessage({ ...inbound(frame('pose', 1, 'y')), event: 'destruction' })
+    ingestBusMessage({ ...inbound(frame('boots/world', 1, 'x')), event: 'pose' })
+    ingestBusMessage({ ...inbound(frame('pose', 1, 'y')), event: 'boots/world' })
     expect(poses.got.length).toBe(0)
     expect(demo.got.length).toBe(0)
     poses.off()
@@ -530,11 +650,11 @@ describe('inbound — the trust boundary and routing', () => {
     startNet()
     // Subscribing before the owner registers its validator must NOT open a
     // hole: an unvalidated payload is never allowed to exist.
-    const { got, off } = collect('build')
-    ingestBusMessage(inbound(frame('build', 1, { anything: true })))
+    const { got, off } = collect('boots/world-snap')
+    ingestBusMessage(inbound(frame('boots/world-snap', 1, { anything: true })))
     expect(got.length).toBe(0)
-    registerFrameKind('build', echo) // the owner catches up
-    ingestBusMessage(inbound(frame('build', 2, { anything: true })))
+    registerFrameKind('boots/world-snap', echo) // the owner catches up
+    ingestBusMessage(inbound(frame('boots/world-snap', 2, { anything: true })))
     expect(got.length).toBe(1)
     off()
   })
@@ -633,10 +753,10 @@ describe('late join — request, election, snapshot', () => {
     // The whole point: a subsystem asks for state precisely because it has
     // none, so the late-join kinds are owned by the transport and always
     // registered. This must never return 'unregistered'.
-    expect(requestState('destruction')).toBe('sent')
+    expect(requestState('boots/world')).toBe('sent')
     const envelope = bus.publishes[0]!.data as BootsEnvelope
     expect(bus.publishes[0]!.event).toBe('state-request')
-    expect(envelope.data).toEqual({ of: 'destruction' })
+    expect(envelope.data).toEqual({ of: 'boots/world' })
   })
 
   test('a peer sees the request with the requester’s session id', () => {
@@ -645,9 +765,9 @@ describe('late join — request, election, snapshot', () => {
     const seen: Array<{ of: BootsFrameKind; from: string }> = []
     const off = onStateRequest(({ of, from }) => seen.push({ of, from }))
     ingestBusMessage(
-      inbound(frame('state-request', 1, { of: 'destruction' }), { sessionId: 'session-joiner' }),
+      inbound(frame('state-request', 1, { of: 'boots/world' }), { sessionId: 'session-joiner' }),
     )
-    expect(seen).toEqual([{ of: 'destruction', from: 'session-joiner' }])
+    expect(seen).toEqual([{ of: 'boots/world', from: 'session-joiner' }])
     // A malformed request never reaches the owner.
     ingestBusMessage(inbound(frame('state-request', 2, { of: 'exec' })))
     ingestBusMessage(inbound(frame('state-request', 3, 'nonsense')))
@@ -659,14 +779,14 @@ describe('late join — request, election, snapshot', () => {
     const bus = installBus()
     startNet()
     const mine: unknown[] = []
-    const off = onStateSnapshot('destruction', ({ state }) => mine.push(state))
+    const off = onStateSnapshot('boots/world', ({ state }) => mine.push(state))
     const snap = (over: Record<string, unknown>, seq: number) =>
-      ingestBusMessage(inbound(frame('state-snapshot', seq, { of: 'destruction', ...over })))
+      ingestBusMessage(inbound(frame('state-snapshot', seq, { of: 'boots/world', ...over })))
     snap({ for: bus.sessionId, state: { cells: [1] } }, 1)
     snap({ for: 'session-somebody-else', state: { cells: [2] } }, 2)
     // Right addressee, wrong kind of state — belongs to another subscriber.
     ingestBusMessage(
-      inbound(frame('state-snapshot', 3, { of: 'build', for: bus.sessionId, state: 'x' })),
+      inbound(frame('state-snapshot', 3, { of: 'boots/world-snap', for: bus.sessionId, state: 'x' })),
     )
     snap({ state: { cells: [3] } }, 4) // no addressee at all → invalid
     expect(mine).toEqual([{ cells: [1] }])
@@ -676,15 +796,15 @@ describe('late join — request, election, snapshot', () => {
   test('sendStateSnapshot addresses the requester and can be chunked', () => {
     const bus = installBus()
     startNet()
-    expect(sendStateSnapshot('destruction', 'session-joiner', { cells: [1, 2, 3] })).toBe('sent')
+    expect(sendStateSnapshot('boots/world', 'session-joiner', { cells: [1, 2, 3] })).toBe('sent')
     const envelope = bus.publishes[0]!.data as BootsEnvelope
     expect(bus.publishes[0]!.event).toBe('state-snapshot')
     expect(envelope.data).toEqual({
-      of: 'destruction',
+      of: 'boots/world',
       for: 'session-joiner',
       state: { cells: [1, 2, 3] },
     })
-    sendStateSnapshot('destruction', 'session-joiner', 'part-two', { part: 2, parts: 2 })
+    sendStateSnapshot('boots/world', 'session-joiner', 'part-two', { part: 2, parts: 2 })
     const chunk = bus.publishes[1]!.data as BootsEnvelope
     expect(chunk.part).toBe(2)
     expect(chunk.parts).toBe(2)
@@ -734,21 +854,21 @@ describe('late join — request, election, snapshot', () => {
     // We are the elected responder; a joiner asks and we answer with state we
     // own. (The joiner side is the same code path with the ids swapped.)
     const offRequest = onStateRequest(({ of, from }) => {
-      if (of !== 'destruction') return
+      if (of !== 'boots/world') return
       if (!shouldAnswerStateRequest(bus.sessionId, from, bus.participants)) return
-      sendStateSnapshot('destruction', from, { removed: ['cell-1', 'cell-2'] })
+      sendStateSnapshot('boots/world', from, { removed: ['cell-1', 'cell-2'] })
     })
     bus.participants = [
       { userId: 'user-me', name: 'Me', sessions: [{ sessionId: 'session-me', clientId: 'c' }] },
       { userId: 'user-j', name: 'Joiner', sessions: [{ sessionId: 'session-zz', clientId: 'c' }] },
     ]
     bus.handler!(
-      inbound(frame('state-request', 1, { of: 'destruction' }), { sessionId: 'session-zz' }),
+      inbound(frame('state-request', 1, { of: 'boots/world' }), { sessionId: 'session-zz' }),
     )
     const envelope = bus.publishes[0]!.data as BootsEnvelope
     expect(envelope.kind).toBe('state-snapshot')
     expect(envelope.data).toEqual({
-      of: 'destruction',
+      of: 'boots/world',
       for: 'session-zz',
       state: { removed: ['cell-1', 'cell-2'] },
     })
