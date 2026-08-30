@@ -1,0 +1,755 @@
+/**
+ * shared-build.ts — the BUILD LANE's half of the convergent world.
+ *
+ * shared-world.ts holds the model (OR-Sets of pieces, items, apertures and
+ * paint strokes) and shared-derive.ts the projections over it. Neither knows
+ * this game exists. This module is the seam: it publishes what THIS player
+ * builds into those record lanes, and it turns records that arrive from
+ * elsewhere into pieces, furniture, openings and paint the player can see,
+ * walk on, shoot and paint over.
+ *
+ * WHAT THIS MODULE IS RESPONSIBLE FOR, precisely:
+ *
+ *   1. MINT. Every local build becomes a record, quantized on mint (the
+ *      shared-world addLocal* helpers do the quantizing — that is where the
+ *      lattice lives, and doing it anywhere else would make the author and
+ *      its receivers disagree about a record's canonical string).
+ *   2. RECONCILE. The runtime stores are the truth for what the player did;
+ *      the record set follows them. `reconcileSharedPieces` diffs
+ *      `useBoots.placed` against the records it has minted — appearances
+ *      publish, edits re-mint (an F-edit REPLACES a piece: tombstone + new
+ *      record, because a record is immutable once published), disappearances
+ *      tombstone. One diff covers every removal path there is (U undo, the
+ *      support cascade, a voxel replica dying, the registry refusing a
+ *      claim) without a hook at each site.
+ *   3. ELECT. Two players can claim one slot in the same tick and both
+ *      records are legitimate. `electSlots` names the winner identically on
+ *      every client; the loser is REMOVED FROM THE RUNTIME and its owner is
+ *      TOLD (hud.presenceToast) instead of watching a wall evaporate.
+ *   4. APPLY. Remote records become real: pieces through the slot registry
+ *      (so they support, collapse and voxelize exactly like local ones),
+ *      items and apertures through the catalog stores, paint through
+ *      `foldCoats` — folded, never replayed, so a late joiner's coats land
+ *      where a client who watched them land already has them.
+ *   5. ATTRIBUTE. Every runtime object it installs is remembered as FOREIGN,
+ *      and that is what keeps a stranger's build out of this player's Save
+ *      (keep.ts / item-keep.ts / paint-keep.ts ask their own lane module,
+ *      which asks here — a Save bridge may not import a shared module for
+ *      anything but `localWork`, and that fence is a test).
+ *
+ * WHAT IT DELIBERATELY IS NOT:
+ *
+ *   - NOT a transport. It imports nothing from net.ts and knows no peer
+ *     roster. Outgoing frames go to an injected sink (`setBuildSyncSink`)
+ *     and incoming ones arrive through `receiveBuildDelta`, which is also
+ *     how the tests drive the whole lane with no network at all.
+ *   - NOT a scene writer. Nothing here can reach `useScene`; play never
+ *     writes the host document (shared-invariant.test.ts asserts it with the
+ *     sentinel armed, and this module is in that storm).
+ *   - NOT ALWAYS ON. With no world attached, every entry point returns
+ *     immediately and the game behaves exactly as it did before sync
+ *     existed. That is the property `shared-build.test.ts` pins: with sync
+ *     off, the stores, the slot registry, the paint ledger and the Save
+ *     bridges are byte-identical to single-player.
+ *
+ * THE PIECE LANE IS HANDLED HERE, THE OTHER TWO HAND US AN APPLIER. Placed
+ * pieces live in the root store (`useBoots.placed`) and their pose comes from
+ * grid.ts, so this module can own that lane outright. Items and paint keep
+ * their state module-private inside item-place.tsx and paint.tsx, so those
+ * two install an applier at mount (`setBuildAppliers`) — which also keeps the
+ * import graph a tree instead of a cycle.
+ */
+
+import { useBoots, type BuildPiece, type PlacedPiece } from '../store'
+import { parseSlotId, slotPose } from './grid'
+import { onPieceRemoved, registerPlacement } from './piece-slots'
+import { getSession } from './session'
+import { canonicalRecordOrder, electSlots, gridStamp } from './shared-derive'
+import {
+  addLocalAperture,
+  addLocalItem,
+  addLocalPiece,
+  addLocalStroke,
+  type ApertureRec,
+  emptyDelta,
+  emptyEffects,
+  isAuthoredBy,
+  type ItemRec,
+  killRecord,
+  liveRecords,
+  mergeDelta,
+  type PeerId,
+  type PieceRec,
+  type RecordId,
+  setGridStamp,
+  type SharedDelta,
+  type SharedEffects,
+  type SharedWorld,
+  type StrokeRec,
+} from './shared-world'
+
+// ── The appliers the two store-owning lanes install ──────────────────────────
+
+/**
+ * What item-place.tsx and paint.tsx hand us at mount. Each returns the
+ * runtime id it created (so removals can find it again) or null when it
+ * could not make the thing — an unknown catalog id, a wall this client does
+ * not have, a node with no voxel grid to coat.
+ */
+export type BuildAppliers = {
+  /** Spawn a remote catalog item; null = catalog lookup failed. */
+  spawnItem?: (rec: ItemRec) => number | null
+  /** Spawn a remote door/window stand-in; null = unknown opening or wall. */
+  spawnAperture?: (rec: ApertureRec) => number | null
+  /** Drop a placement this module previously spawned. */
+  removePlacement?: (runtimeId: number) => void
+  /** Fold remote strokes into the local coat ledger (paint.tsx owns it). */
+  foldStrokes?: (strokes: readonly StrokeRec[]) => void
+}
+
+let appliers: BuildAppliers = {}
+
+/** Install (or clear, with `{}`) the lane appliers. Mount/unmount paired. */
+export function setBuildAppliers(patch: BuildAppliers): void {
+  appliers = { ...appliers, ...patch }
+}
+
+/** Forget every applier — session teardown, and the test reset. */
+export function clearBuildAppliers(): void {
+  appliers = {}
+}
+
+// ── Session state ───────────────────────────────────────────────────────────
+
+/** Where outgoing frames go. The transport installs one; tests capture it. */
+export type DeltaSink = (delta: SharedDelta) => void
+/** One short line for the player. Defaults to the HUD presence toast. */
+export type NoticeSink = (text: string) => void
+
+type BuildSync = {
+  world: SharedWorld
+  sink: DeltaSink | null
+  notice: NoticeSink | null
+  /** Records accumulated since the last flush (one frame's worth). */
+  pending: SharedDelta | null
+}
+
+let sync: BuildSync | null = null
+
+/**
+ * THE GATE. Every call site in builder.tsx, item-place.tsx and paint.tsx
+ * starts with this, and every function here re-checks it. False = the game
+ * is single-player and not one line of this module runs.
+ */
+export function buildSyncOn(): boolean {
+  return sync !== null
+}
+
+/** The attached world, or null. Read-only convenience for the lane modules
+ * and the QA handle; nobody outside may mutate it. */
+export function buildSyncWorld(): SharedWorld | null {
+  return sync?.world ?? null
+}
+
+/**
+ * Turn the build lane on against `world`. The copresence layer calls this
+ * when it has a shared world for the session; a test calls it with a world
+ * it made itself and drives everything through `receiveBuildDelta`.
+ */
+export function attachBuildSync(
+  world: SharedWorld,
+  opts?: { sink?: DeltaSink; notice?: NoticeSink },
+): void {
+  sync = {
+    world,
+    sink: opts?.sink ?? null,
+    notice: opts?.notice ?? null,
+    pending: null,
+  }
+  resetRegistries()
+}
+
+/** Turn it off and forget every binding (session exit). The world itself is
+ * not reset — its owner decides that (resetSharedWorld keeps the peer id). */
+export function detachBuildSync(): void {
+  sync = null
+  resetRegistries()
+}
+
+export function setBuildSyncSink(sink: DeltaSink | null): void {
+  if (sync) sync.sink = sink
+}
+
+export function setBuildSyncNotice(notice: NoticeSink | null): void {
+  if (sync) sync.notice = notice
+}
+
+function say(text: string): void {
+  const custom = sync?.notice
+  if (custom) {
+    custom(text)
+    return
+  }
+  getSession()?.hud.presenceToast(text)
+}
+
+/**
+ * Publish this client's build-grid fingerprint. Slot ids are addresses
+ * RELATIVE to grid.ts's module anchor and storey ladder, so a peer whose
+ * stamp differs is speaking a different coordinate system and mergeDelta
+ * refuses its slot-addressed pieces (raising `refusedGrid`, which we surface
+ * as a line the player can read). Called from PlacedPieces the moment the
+ * anchor and ladder are installed, which is the only moment they change.
+ */
+export function publishGridStamp(
+  anchorX: number,
+  anchorZ: number,
+  storeyYs: readonly number[],
+): number {
+  if (!sync) return 0
+  const stamp = gridStamp(anchorX, anchorZ, storeyYs)
+  setGridStamp(sync.world, stamp)
+  return stamp
+}
+
+// ── Registries (authorship, and runtime ↔ record) ────────────────────────────
+
+/** PlacedPiece.id → the record that piece IS. */
+const pieceRecord = new Map<number, RecordId>()
+/** …and back, so an arriving tombstone can find the runtime piece. */
+const pieceRuntime = new Map<RecordId, number>()
+/** Runtime pieces this client did not author. Save skips them. */
+const foreignPieces = new Set<number>()
+/**
+ * What we last published about a runtime piece, so an F-edit is detected as
+ * a change rather than re-published every frame.
+ */
+const piecePublished = new Map<number, string>()
+/**
+ * Records that LOST their slot to a canonically-later claim. Permanently
+ * excluded from installation: the contract's rule is that a deposed piece
+ * never comes back, not even if the winner is later destroyed (a slot going
+ * empty is exactly what happens in single-player when a wall dies, and a
+ * zombie wall popping into a hole nobody dug is worse than an empty slot).
+ * Every client computes this set from the same records by the same rule.
+ */
+const deposedPieces = new Set<RecordId>()
+
+/** useItems id → record, for both furniture and openings. */
+const placementRecord = new Map<number, RecordId>()
+const placementRuntime = new Map<RecordId, number>()
+const foreignPlacements = new Set<number>()
+
+function resetRegistries(): void {
+  pieceRecord.clear()
+  pieceRuntime.clear()
+  foreignPieces.clear()
+  piecePublished.clear()
+  deposedPieces.clear()
+  placementRecord.clear()
+  placementRuntime.clear()
+  foreignPlacements.clear()
+}
+
+/**
+ * Is this placed piece somebody else's? False whenever sync is off, so the
+ * single-player Save path is untouched. keep.ts reaches this through
+ * builder.tsx (a Save bridge may not import a shared module for anything but
+ * localWork — shared-invariant.test.ts enforces it).
+ */
+export function isForeignPiece(runtimeId: number): boolean {
+  return foreignPieces.has(runtimeId)
+}
+
+/** Is this catalog placement somebody else's? */
+export function isForeignPlacement(runtimeId: number): boolean {
+  return foreignPlacements.has(runtimeId)
+}
+
+/** The record a placed piece was published as, if any (QA + tests). */
+export function pieceRecordOf(runtimeId: number): RecordId | null {
+  return pieceRecord.get(runtimeId) ?? null
+}
+
+// ── Outgoing frames ─────────────────────────────────────────────────────────
+
+function outgoing(): SharedDelta {
+  const s = sync!
+  if (!s.pending) s.pending = emptyDelta(s.world.self)
+  s.pending.gridStamp = s.world.gridStamp
+  s.pending.lamport = s.world.clock
+  return s.pending
+}
+
+/**
+ * Hand the accumulated records to the transport. Called at the end of every
+ * publish path, so a turbo burst that stamped six walls in one frame leaves
+ * as one frame. With no sink installed the records simply stay in the local
+ * world, which is all the Save path and the tests need.
+ */
+export function flushBuildSync(): void {
+  const s = sync
+  if (!s || !s.pending) return
+  const delta = s.pending
+  s.pending = null
+  delta.lamport = s.world.clock
+  delta.gridStamp = s.world.gridStamp
+  s.sink?.(delta)
+}
+
+// ── The piece lane: publish ─────────────────────────────────────────────────
+
+/** The fields of a placed piece that a record carries — the change key. */
+function pieceFingerprint(p: PlacedPiece): string {
+  const corners = p.corners ? p.corners.join(',') : '-'
+  return `${p.piece}|${p.slotId ?? ''}|${p.mask}|${p.yaw}|${p.height ?? 0}|${corners}`
+}
+
+function bindPiece(runtimeId: number, id: RecordId, foreign: boolean): void {
+  pieceRecord.set(runtimeId, id)
+  pieceRuntime.set(id, runtimeId)
+  if (foreign) foreignPieces.add(runtimeId)
+}
+
+function unbindPiece(runtimeId: number): RecordId | null {
+  const id = pieceRecord.get(runtimeId) ?? null
+  pieceRecord.delete(runtimeId)
+  piecePublished.delete(runtimeId)
+  foreignPieces.delete(runtimeId)
+  if (id !== null) pieceRuntime.delete(id)
+  return id
+}
+
+function mintPiece(p: PlacedPiece): PieceRec | null {
+  const s = sync!
+  // Legacy pieces carry no slot. A record without one has no address any
+  // other client could resolve, so it stays local-only (it still renders,
+  // still collides, still saves — it is simply not shared).
+  if (!p.slotId) return null
+  const rec = addLocalPiece(s.world, {
+    kind: p.piece,
+    slot: p.slotId,
+    mask: p.mask,
+    yaw: p.yaw,
+    height: p.height ?? 0,
+    corners: p.corners ?? null,
+  })
+  if (!rec) return null
+  bindPiece(p.id, rec.id, false)
+  piecePublished.set(p.id, pieceFingerprint(p))
+  outgoing().pieces.push(rec)
+  return rec
+}
+
+function tombstonePiece(runtimeId: number): void {
+  const s = sync!
+  const id = unbindPiece(runtimeId)
+  if (id === null) return
+  if (killRecord(s.world, 'pieces', id)) outgoing().deadPieces.push(id)
+}
+
+/** Re-entrancy guard: installing pieces writes the store, which re-runs the
+ * effect that called us. The second pass is a no-op, but the guard keeps the
+ * first one from tripping over its own writes. */
+let reconciling = false
+
+/**
+ * Diff the placed-piece store against what we have published, then install
+ * whatever the election says should be standing. Called from PlacedPieces on
+ * every change to `useBoots.placed` (and once when the grid is installed),
+ * which is every path that can add, edit or remove a piece.
+ */
+export function reconcileSharedPieces(): void {
+  const s = sync
+  if (!s || reconciling) return
+  reconciling = true
+  try {
+    const placed = useBoots.getState().placed
+    const alive = new Set<number>()
+    for (const p of placed) {
+      alive.add(p.id)
+      if (foreignPieces.has(p.id)) continue // somebody else's — never ours to publish
+      const known = pieceRecord.get(p.id)
+      if (known === undefined) {
+        mintPiece(p)
+        continue
+      }
+      // An F-edit (mask, corners) or an exit transform (kind, yaw) REPLACES
+      // the piece: records are immutable, so the old one is tombstoned and a
+      // new one minted. Both peers see the carve, and the slot claim moves
+      // with it (the new record has a later lamport, so it wins its own
+      // slot outright).
+      if (piecePublished.get(p.id) !== pieceFingerprint(p)) {
+        tombstonePiece(p.id)
+        mintPiece(p)
+      }
+    }
+    // Gone from the store = gone from the world. Undo, the support cascade, a
+    // replica shot to bits and the registry's rollback all land here.
+    for (const runtimeId of [...pieceRecord.keys()]) {
+      if (alive.has(runtimeId)) continue
+      if (foreignPieces.has(runtimeId)) {
+        unbindPiece(runtimeId) // theirs: our screen lost it, their record stands
+        continue
+      }
+      tombstonePiece(runtimeId)
+    }
+    installPieces()
+    flushBuildSync()
+  } finally {
+    reconciling = false
+  }
+}
+
+/**
+ * Save/Discard resolved the pending placements: the store is cleared, but the
+ * records must SURVIVE. On this screen the game pieces become real scene
+ * walls; on every other screen they are still the walls they always were,
+ * and tombstoning them would delete a peer's view of a building that very
+ * much still exists. So we forget the bindings instead — the reconcile above
+ * must not read the now-empty store as a demolition.
+ */
+export function forgetSharedPieces(): void {
+  if (!sync) return
+  for (const runtimeId of [...pieceRecord.keys()]) {
+    if (foreignPieces.has(runtimeId)) continue
+    unbindPiece(runtimeId)
+  }
+}
+
+// ── The piece lane: elect and install ───────────────────────────────────────
+
+/**
+ * One piece per slot, agreed by everyone.
+ *
+ * `electSlots` keys winners by `kind|slot`, which is one notch weaker than
+ * the runtime's own authority: piece-slots.ts registers by SLOT ID alone, and
+ * stairs and floors share the `F:` slots. So the election is narrowed here by
+ * the same canonical rule (ascending (lamport, id) — the later record wins),
+ * which keeps the projection derived, total and order-free while matching
+ * what the registry will actually accept.
+ */
+function electedPieces(): { desired: Map<RecordId, PieceRec>; losers: PieceRec[] } {
+  const s = sync!
+  const { winners, losers } = electSlots(liveRecords(s.world.pieces))
+  const bySlot = new Map<string, PieceRec>()
+  const deposed: PieceRec[] = [...losers]
+  for (const rec of canonicalRecordOrder([...winners.values()])) {
+    const prior = bySlot.get(rec.slot)
+    if (prior) deposed.push(prior)
+    bySlot.set(rec.slot, rec)
+  }
+  const desired = new Map<RecordId, PieceRec>()
+  for (const rec of bySlot.values()) {
+    if (deposedPieces.has(rec.id)) continue // lost once, gone for good
+    desired.set(rec.id, rec)
+  }
+  return { desired, losers: deposed }
+}
+
+/** Human name for a piece kind, for the one line the loser gets to read. */
+const PIECE_NOUN: Record<BuildPiece, string> = {
+  wall: 'wall',
+  floor: 'floor',
+  stairs: 'stairs',
+  roof: 'roof',
+}
+
+/**
+ * Bring the runtime in line with the election: uninstall anything standing
+ * that should not be, then install everything that should be and is not.
+ * Order matters — the slot registry holds one piece per slot, so the loser
+ * must leave before the winner can claim.
+ */
+function installPieces(): void {
+  const s = sync!
+  const { desired, losers } = electedPieces()
+
+  for (const rec of losers) deposedPieces.add(rec.id)
+
+  for (const [id, runtimeId] of [...pieceRuntime]) {
+    if (desired.has(id)) continue
+    const mine = isAuthoredBy(id, s.world.self)
+    const piece = useBoots.getState().placed.find((p) => p.id === runtimeId)
+    unbindPiece(runtimeId)
+    if (piece) {
+      useBoots.getState().removePlaced(runtimeId)
+      if (piece.slotId) onPieceRemoved(piece.slotId)
+      // THE LOSER IS TOLD. Silently deleting a wall the player just built is
+      // the one outcome this whole election exists to avoid.
+      if (mine && deposedPieces.has(id)) {
+        say(`Another builder claimed that ${PIECE_NOUN[piece.piece]} slot`)
+      }
+    }
+  }
+
+  for (const rec of desired.values()) {
+    if (pieceRuntime.has(rec.id)) continue
+    // Our own records are bound at mint. One that is not bound any more was
+    // resolved into the document by Save (forgetSharedPieces) — re-spawning
+    // it would double the wall the player just saved.
+    if (isAuthoredBy(rec.id, s.world.self)) continue
+    spawnRemotePiece(rec)
+  }
+}
+
+/**
+ * Materialize one remote piece. The pose is DERIVED from the slot, not
+ * replicated: `slotPose` is pure and both clients hold the same anchor (that
+ * is exactly what the grid stamp guarantees), so the piece lands to the
+ * millimetre without a single coordinate on the wire. Only the yaw travels,
+ * because a stair's ascent quarter and a wall's flip are choices, not
+ * geometry.
+ */
+function spawnRemotePiece(rec: PieceRec): number | null {
+  const slot = parseSlotId(rec.slot)
+  if (!slot) return null
+  const pose = slotPose(slot)
+  const stored = useBoots.getState().addPlaced({
+    piece: rec.kind,
+    position: [pose.position[0], pose.position[1], pose.position[2]],
+    yaw: rec.yaw,
+    slotId: rec.slot,
+    mask: rec.mask,
+    ...(rec.height > 0 ? { height: rec.height } : {}),
+    ...(rec.corners
+      ? {
+          corners: [rec.corners[0], rec.corners[1], rec.corners[2], rec.corners[3]] satisfies [
+            number,
+            number,
+            number,
+            number,
+          ],
+        }
+      : {}),
+  })
+  // The registry is the single occupancy authority and it wins: if it refuses
+  // (a local piece still holds the slot this frame), roll the append back and
+  // leave the record alone — the next reconcile tries again.
+  if (!registerPlacement(rec.slot, stored.id)) {
+    useBoots.getState().removePlaced(stored.id)
+    return null
+  }
+  bindPiece(stored.id, rec.id, true)
+  return stored.id
+}
+
+// ── The item + aperture lanes: publish ──────────────────────────────────────
+
+function bindPlacement(runtimeId: number, id: RecordId, foreign: boolean): void {
+  placementRecord.set(runtimeId, id)
+  placementRuntime.set(id, runtimeId)
+  if (foreign) foreignPlacements.add(runtimeId)
+}
+
+function unbindPlacement(runtimeId: number): RecordId | null {
+  const id = placementRecord.get(runtimeId) ?? null
+  placementRecord.delete(runtimeId)
+  foreignPlacements.delete(runtimeId)
+  if (id !== null) placementRuntime.delete(id)
+  return id
+}
+
+/** Publish a locally dropped catalog item. */
+export function publishItem(
+  runtimeId: number,
+  catalogId: string,
+  position: readonly [number, number, number],
+  yaw: number,
+): RecordId | null {
+  const s = sync
+  if (!s || placementRecord.has(runtimeId)) return null
+  const rec = addLocalItem(s.world, {
+    catalogId,
+    x: position[0],
+    y: position[1],
+    z: position[2],
+    yaw,
+  })
+  if (!rec) return null
+  bindPlacement(runtimeId, rec.id, false)
+  outgoing().items.push(rec)
+  flushBuildSync()
+  return rec.id
+}
+
+/** Publish a locally placed door/window. Host-relative by construction, so
+ * it survives a peer whose grid anchor differs entirely. */
+export function publishAperture(
+  runtimeId: number,
+  catalogId: string,
+  host: string,
+  u: number,
+  v: number,
+  width: number,
+  height: number,
+): RecordId | null {
+  const s = sync
+  if (!s || placementRecord.has(runtimeId)) return null
+  const rec = addLocalAperture(s.world, { catalogId, host, u, v, width, height })
+  if (!rec) return null
+  bindPlacement(runtimeId, rec.id, false)
+  outgoing().apertures.push(rec)
+  flushBuildSync()
+  return rec.id
+}
+
+/**
+ * Save/Discard resolved the catalog placements — same reasoning as
+ * forgetSharedPieces: the records outlive this screen's stand-ins.
+ */
+export function forgetSharedPlacements(): void {
+  if (!sync) return
+  for (const runtimeId of [...placementRecord.keys()]) {
+    if (foreignPlacements.has(runtimeId)) continue
+    unbindPlacement(runtimeId)
+  }
+}
+
+// ── The paint lane: publish ─────────────────────────────────────────────────
+
+/**
+ * Publish one spray stamp. `radius` is the COAT radius (paint.tsx's
+ * `coatRadiusFor` applied), which is what StrokeRec documents and what the
+ * receiver expands against its own grid — the stroke carries the ball, never
+ * a cell list, so it cannot go stale and it costs ~20 bytes.
+ */
+export function publishStroke(
+  node: string,
+  color: number,
+  x: number,
+  y: number,
+  z: number,
+  radius: number,
+): RecordId | null {
+  const s = sync
+  if (!s) return null
+  const rec = addLocalStroke(s.world, { node, color, x, y, z, radius })
+  if (!rec) return null
+  outgoing().strokes.push(rec)
+  return rec.id
+}
+
+// ── Receive ─────────────────────────────────────────────────────────────────
+
+/**
+ * THE LOCAL INJECTION POINT. The transport calls this with the frame body and
+ * the sender's id FROM THE BUS ENVELOPE (never from the payload — that is the
+ * whole authorship defence); a test calls it with a delta it built by hand.
+ * Merging is idempotent, so re-delivery, a snapshot after a delta and a
+ * delta after a snapshot are all the same operation.
+ */
+export function receiveBuildDelta(delta: SharedDelta, sender: PeerId | null): SharedEffects {
+  const s = sync
+  if (!s) return emptyEffects()
+  const fx = mergeDelta(s.world, delta, sender)
+  applyBuildEffects(fx)
+  return fx
+}
+
+/**
+ * Apply merged effects to the running game. Separate from the merge so a
+ * transport that merges several frames before a frame boundary can apply once
+ * — and so the tests can assert the model and the runtime independently.
+ */
+export function applyBuildEffects(fx: SharedEffects): void {
+  const s = sync
+  if (!s) return
+  // Installing pieces writes the store, and the store's subscribers include
+  // the effect that calls reconcileSharedPieces. Hold the guard across the
+  // whole apply so an arrival cannot recurse into a diff of a half-applied
+  // world (the diff would read a piece as vanished mid-install).
+  const outer = reconciling
+  reconciling = true
+  try {
+    applyEffectsInner(s, fx)
+  } finally {
+    reconciling = outer
+  }
+}
+
+function applyEffectsInner(s: BuildSync, fx: SharedEffects): void {
+  // THE GRID REFUSAL IS A PLAYER-VISIBLE EVENT, not a dropped packet. A peer
+  // whose anchor differs has its slot-addressed pieces refused wholesale, and
+  // a player wondering where a friend's walls went deserves the reason.
+  if (fx.refusedGrid && !refusedGridSaid) {
+    refusedGridSaid = true
+    say('A builder is on a different lot grid — their pieces are hidden')
+  }
+
+  // Records that died elsewhere: drop their runtime object here. Pieces go
+  // through the same path as the election's losers.
+  for (const id of fx.deadPieces) {
+    const runtimeId = pieceRuntime.get(id)
+    if (runtimeId === undefined) continue
+    const piece = useBoots.getState().placed.find((p) => p.id === runtimeId)
+    unbindPiece(runtimeId)
+    if (!piece) continue
+    useBoots.getState().removePlaced(runtimeId)
+    if (piece.slotId) onPieceRemoved(piece.slotId)
+  }
+  for (const id of [...fx.deadItems, ...fx.deadApertures]) {
+    const runtimeId = placementRuntime.get(id)
+    if (runtimeId === undefined) continue
+    unbindPlacement(runtimeId)
+    appliers.removePlacement?.(runtimeId)
+  }
+
+  // Additions. Pieces are installed by the election (an arrival can depose a
+  // piece that is already standing, so the whole projection is recomputed
+  // rather than the new records appended).
+  if (fx.addedPieces.length > 0) installPieces()
+
+  for (const rec of fx.addedItems) {
+    if (placementRuntime.has(rec.id)) continue
+    if (isAuthoredBy(rec.id, s.world.self)) continue
+    const runtimeId = appliers.spawnItem?.(rec)
+    if (runtimeId !== null && runtimeId !== undefined) bindPlacement(runtimeId, rec.id, true)
+  }
+  for (const rec of fx.addedApertures) {
+    if (placementRuntime.has(rec.id)) continue
+    if (isAuthoredBy(rec.id, s.world.self)) continue
+    const runtimeId = appliers.spawnAperture?.(rec)
+    if (runtimeId !== null && runtimeId !== undefined) bindPlacement(runtimeId, rec.id, true)
+  }
+
+  // Paint folds; a stroke of ours coming back (it cannot, the authorship gate
+  // stops it) would double-coat, so filter by author anyway.
+  if (fx.addedStrokes.length > 0 && appliers.foldStrokes) {
+    const theirs = fx.addedStrokes.filter((rec) => !isAuthoredBy(rec.id, s.world.self))
+    if (theirs.length > 0) appliers.foldStrokes(theirs)
+  }
+}
+
+/** One grid-mismatch line per session is plenty. */
+let refusedGridSaid = false
+
+// ── QA ──────────────────────────────────────────────────────────────────────
+
+/** Plain-data dump for the `__boots` family of handles. Copies, never refs. */
+export function sharedBuildDebug(): {
+  on: boolean
+  self: string
+  pieces: { bound: number; foreign: number; deposed: number }
+  placements: { bound: number; foreign: number }
+  gridStamp: number
+} {
+  return {
+    on: sync !== null,
+    self: sync?.world.self ?? '',
+    pieces: {
+      bound: pieceRecord.size,
+      foreign: foreignPieces.size,
+      deposed: deposedPieces.size,
+    },
+    placements: { bound: placementRecord.size, foreign: foreignPlacements.size },
+    gridStamp: sync?.world.gridStamp ?? 0,
+  }
+}
+
+/** Test/teardown reset: forget the session AND the once-per-session notices. */
+export function resetSharedBuild(): void {
+  detachBuildSync()
+  clearBuildAppliers()
+  refusedGridSaid = false
+}
