@@ -392,7 +392,12 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
   return (
     // Non-solid, non-shootable by construction (see the anti-goal above);
     // __boots tags every surface for identifyAim attribution.
-    <group ref={rootRef} scale={0.001} userData={{ __boots: true }}>
+    <group
+      name={`boots-remote-${remote.sessionId}`}
+      ref={rootRef}
+      scale={0.001}
+      userData={{ __boots: true, __bootsRemote: remote.sessionId }}
+    >
       {/* Legs: pivots at the hip so the gait swings them; boots ride along. */}
       <group ref={legLRef} position={[-0.11, 0.85, 0]}>
         <mesh geometry={LIMB_GEO} material={trim} position={[0, -0.4, 0]} />
