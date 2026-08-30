@@ -189,3 +189,76 @@ describe('arsenal tear data', () => {
     expect(WEAPONS.minigun.rate).toBeGreaterThanOrEqual(24)
   })
 })
+
+/**
+ * BULLETS SEE THE LEAF (owner report 2026-08-29: "when in open position,
+ * if I shoot it, it doesn't break"): an OPEN door's colliders are
+ * `disabled` for movement but flagged `ballistic` by interact.tsx — the
+ * hitscan loop must still test them, so the leaf voxelizes instead of the
+ * round sailing through the doorway into whatever stands behind (live
+ * repro: 3 rifle shots on the open warner-2 west door all carved the wall
+ * 5 m behind while the door target stayed pristine at 98/98 cells).
+ */
+describe('ballistic colliders — open doors still eat the shot', () => {
+  function doorWorld(): GameWorld {
+    const door = boxCollider('door-1', 'door', [1, 2.1, 0.08], [0, 1.05, 0])
+    const backWall = boxCollider('wall-1', 'wall', [4, 2.7, 0.12], [0, 1.35, -3])
+    const colliders = [door, backWall]
+    const buildingAabb = new Box3()
+    for (const c of colliders) buildingAabb.union(c.worldBox)
+    return {
+      colliders,
+      walls: new Map([
+        [
+          'wall-1',
+          {
+            node: { id: 'wall-1', start: [-2, -3], end: [2, -3], height: 2.7, thickness: 0.12 },
+            root: backWall.root,
+            meshes: [backWall.mesh],
+          },
+        ],
+      ]),
+      glass: [],
+      doors: [],
+      overlayRoots: [],
+      buildingAabb,
+      spawn: new Vector3(6, 0, 6),
+      spawnYaw: 0,
+      levelId: null,
+    }
+  }
+
+  test('disabled WITHOUT ballistic: the round flies through and hits the wall behind (the bug)', () => {
+    resetDestruction()
+    const world = doorWorld()
+    world.colliders[0]!.disabled = true
+    aimFrom(0, 1.35, 5)
+    expect(fire(world, GUN)).toBe('wall')
+    expect(useDestruction.getState().targets.has('door-1')).toBe(false)
+    expect(useDestruction.getState().targets.has('wall-1')).toBe(true)
+  })
+
+  test('disabled + ballistic: the open leaf takes the hit and voxelizes (the fix)', () => {
+    resetDestruction()
+    const world = doorWorld()
+    world.colliders[0]!.disabled = true
+    world.colliders[0]!.ballistic = true
+    aimFrom(0, 1.35, 5)
+    expect(fire(world, GUN)).toBe('wall') // door is DESTRUCTIBLE → carve lane
+    expect(useDestruction.getState().targets.has('door-1')).toBe(true)
+    expect(useDestruction.getState().targets.has('wall-1')).toBe(false)
+    const target = useDestruction.getState().targets.get('door-1')!
+    expect(target.grid.count - target.grid.aliveCount).toBeGreaterThan(0)
+  })
+
+  test('walkOnly stays bullet-transparent even when ballistic is set (voxels own those rays)', () => {
+    resetDestruction()
+    const world = doorWorld()
+    world.colliders[0]!.walkOnly = true
+    world.colliders[0]!.ballistic = true
+    aimFrom(0, 1.35, 5)
+    expect(fire(world, GUN)).toBe('wall')
+    expect(useDestruction.getState().targets.has('door-1')).toBe(false)
+    expect(useDestruction.getState().targets.has('wall-1')).toBe(true)
+  })
+})

@@ -72,6 +72,17 @@ export type ColliderEntry = {
    * once the piece's voxel target loses more than WALK_ONLY_MAX_DAMAGE of
    * its cells (destruction.settleWalkOnly): holes become real. */
   walkOnly?: boolean
+  /** BULLETS SEE THE LEAF (open doors — the walkOnly inverse): set TOGETHER
+   * WITH `disabled` by interact.tsx while a door / out-swing window stands
+   * open. Movement keeps skipping the entry (every `disabled` consumer is
+   * untouched: capsule sweeps, bot door logic, spawn/support probes), but
+   * hitscan still tests it (shooting.ts), so an open door leaf can be shot
+   * and voxelized at its true swung pose instead of letting rounds fly
+   * through the doorway untouched. interact.tsx clears it when the door
+   * shuts (with the `disabled` re-latch) and stands down once the node
+   * voxelizes — destruction owns the grid then and the hidden host leaf
+   * must not answer rays. Host collection never sets it. */
+  ballistic?: boolean
 }
 
 export type GlassPane = {

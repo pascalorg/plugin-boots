@@ -7,7 +7,8 @@ import { useEffect, useRef } from 'react'
 import { Box3, Matrix4, type Object3D, Quaternion, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { useDestruction } from './destruction'
+import { registerPassage, unregisterPassage } from './collision'
+import { dropTarget, useDestruction } from './destruction'
 import { armoryStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
@@ -41,11 +42,31 @@ import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world
  *   lerped by openScale (a local 10-line re-implementation of the host's
  *   poseCabinetMovingParts — no @pascal-app/nodes dependency).
  *
- * Colliders: doors go non-solid while open or mid-swing (players and
- * bullets pass through the opening). Windows only when the sash actually
- * LEAVES the frame volume (casement/awning/hopper swing out); sliding and
- * hung sashes stay inside the frame, so their colliders stay on. Cabinet
- * colliders always stay on — an open drawer still stops a shoulder.
+ * Colliders: doors go non-solid TO MOVEMENT while open or mid-swing (the
+ * capsule passes through the opening) but stay BALLISTIC — their entries
+ * flip `disabled` + `ballistic` together, so hitscan still tests them and
+ * an open leaf can be shot and broken where it actually stands (owner
+ * report 2026-08-29). To make that pose true, every animation step
+ * re-snapshots the moving colliders' inverse/worldBox from the live
+ * meshes. Windows go passable only when the sash actually LEAVES the frame
+ * volume (casement/awning/hopper swing out); sliding and hung sashes stay
+ * inside the frame, so their colliders stay on. Cabinet colliders always
+ * stay on — an open drawer still stops a shoulder.
+ *
+ * Passage relief: while a passable operable stands open, its doorway prism
+ * (collider-group AABB at mount pose, thin axis padded) is registered with
+ * collision.ts — foreign colliders authored ACROSS the opening (the repro
+ * house's window rails spanning the front door, a perpendicular wall's end
+ * corner) stop pinching the capsule inside it, while ground contacts keep
+ * carrying it. Closing (or exit) retires the prism with the collider
+ * re-latch.
+ *
+ * Stale prebuilds: prevoxelize bakes a door's dormant voxel grid at
+ * BUILD-time pose (world-space centers) — waking it after a swing would
+ * materialize a phantom closed voxel door across the open doorway. Every
+ * toggle (and every settle, catching mid-swing rebuilds) drops the DORMANT
+ * prebuild via dropTarget; the next hit voxelizes from the live transform.
+ * Awake targets are never dropped — destruction owns them.
  *
  * Restore on exit, per kind: hinged doors restore the ledgered root pose;
  * operation doors / windows / cabinets are NAME-DRIVEN poses, so unmount
@@ -195,6 +216,15 @@ export type OperableState = {
   center: Vector3
   /** Colliders drop while open (doors, out-swing windows). */
   passable: boolean
+  /** Doorway prism for passage relief (passable kinds only): collider-group
+   * AABB at mount pose, thin axis padded — registered with collision.ts
+   * while open, retired on the close settle / unmount. The SAME instance
+   * both ways (identity-keyed registry). */
+  passage: Box3 | null
+  /** True while the colliders carry the `ballistic` flag (open + shootable).
+   * Cleared with the close re-latch, and by the voxelize stand-down (the
+   * hidden host leaf must stop answering rays once the grid owns the node). */
+  ballistic: boolean
   /** Pose value 0 (closed) → 1 (open); hinged maps it onto ±OPEN_ANGLE. */
   value: number
   open: boolean
@@ -250,6 +280,76 @@ function isVoxelized(nodeId: string): boolean {
 function easeOutCubic(k: number): number {
   const inv = 1 - k
   return 1 - inv * inv * inv
+}
+
+/** Thin-axis padding (m) on the passage prism: door boxes are ~0.12 m deep
+ * while overlapping-window sills/rails overhang a few cm past the wall face
+ * and the capsule brushes them capsule-radius early — a bit over
+ * PLAYER_CAPSULE.radius keeps every crossing bar relieved for the whole
+ * pass without widening the OPENING axis (jamb walls must keep pushing). */
+const PASSAGE_SLACK = 0.35
+
+/**
+ * The doorway prism of a passable operable: union of its colliders' world
+ * boxes at MOUNT pose (the frame's location — the swung leaf never widens
+ * it) with the thin horizontal axis (the wall-thickness direction) padded
+ * by PASSAGE_SLACK each way. No floor exclusion needed: collision.ts only
+ * relieves NON-GROUND contacts inside the prism, so floors and thresholds
+ * keep carrying the capsule. Exported for tests.
+ */
+export function buildPassageBox(colliders: readonly ColliderEntry[]): Box3 | null {
+  const box = new Box3()
+  for (const collider of colliders) box.union(collider.worldBox)
+  if (box.isEmpty()) return null
+  if (box.max.x - box.min.x <= box.max.z - box.min.z) {
+    box.min.x -= PASSAGE_SLACK
+    box.max.x += PASSAGE_SLACK
+  } else {
+    box.min.z -= PASSAGE_SLACK
+    box.max.z += PASSAGE_SLACK
+  }
+  return box
+}
+
+/** Drop a STALE dormant prebuild (grid baked at another pose) — see the
+ * header block. Awake targets are destruction's; never touched. */
+function dropStalePrebuild(nodeId: string): void {
+  const target = useDestruction.getState().targets.get(nodeId)
+  if (target?.dormant) dropTarget(nodeId)
+}
+
+/** Re-snapshot the state's collider transforms from the LIVE meshes — the
+ * swing moved them (hinged: the whole root; operation doors/windows: named
+ * child parts). inverse + worldBox track the leaf so hitscan (shooting.ts)
+ * and the aim pick meet the door where it actually stands. */
+function refreshColliderTransforms(state: OperableState): void {
+  state.root.updateWorldMatrix(false, true)
+  for (const collider of state.colliders) {
+    collider.inverse.copy(collider.mesh.matrixWorld).invert()
+    if (!collider.mesh.geometry.boundingBox) collider.mesh.geometry.computeBoundingBox()
+    collider.worldBox.copy(collider.mesh.geometry.boundingBox!).applyMatrix4(collider.mesh.matrixWorld)
+  }
+}
+
+/** Open (or open-at-start) collider posture: pass-through for movement,
+ * live for bullets, passage prism active. */
+function setOpenColliders(state: OperableState): void {
+  for (const collider of state.colliders) {
+    collider.disabled = true
+    collider.ballistic = true
+  }
+  state.ballistic = true
+  if (state.passage) registerPassage(state.passage)
+}
+
+/** Voxelize stand-down for the ballistic lane: destruction hid the host
+ * meshes and owns the node's collision — the ghost leaf must stop
+ * answering rays. `disabled` stays (destruction set it too); the passage
+ * prism stays active while the doorway stands open (foreign crossers keep
+ * their relief; the door can never close again). */
+function clearBallistic(state: OperableState): void {
+  state.ballistic = false
+  for (const collider of state.colliders) collider.ballistic = false
 }
 
 function clamp01(value: unknown): number {
@@ -310,8 +410,11 @@ export function toggleOperable(state: OperableState): void {
       tmpVec.copy(playerRig.position).applyMatrix4(state.hinged.inverse0)
       state.hinged.sign = tmpVec.z >= 0 ? 1 : -1
     }
-    if (state.passable) for (const collider of state.colliders) collider.disabled = true
+    if (state.passable) setOpenColliders(state)
   }
+  // The pose is about to change — a dormant prebuild baked at the old pose
+  // would wake wrong (see the header block).
+  dropStalePrebuild(state.nodeId)
   sfx.doorCreak()
 }
 
@@ -324,14 +427,26 @@ export function advanceOperables(states: Iterable<OperableState>, dt: number): v
     const k = Math.min(1, state.animT / state.duration)
     state.value = state.from + (state.to - state.from) * easeOutCubic(k)
     applyPose(state)
+    // Colliders ride the swing: bullets/aim must meet the leaf mid-arc too.
+    refreshColliderTransforms(state)
     if (state.animT >= state.duration) {
       state.value = state.to
       applyPose(state)
+      refreshColliderTransforms(state)
       if (!state.open && state.passable && !isVoxelized(state.nodeId)) {
-        // Fully shut: solid again, latch catches.
-        for (const collider of state.colliders) collider.disabled = false
+        // Fully shut: solid again, latch catches; the passage prism and the
+        // ballistic exception retire with the re-latch.
+        for (const collider of state.colliders) {
+          collider.disabled = false
+          collider.ballistic = false
+        }
+        state.ballistic = false
+        if (state.passage) unregisterPassage(state.passage)
         sfx.doorLatch()
       }
+      // A prevoxelize rebuild that landed MID-SWING baked a mid-arc pose —
+      // drop it so the next build/hit uses the settled one.
+      dropStalePrebuild(state.nodeId)
     }
   }
 }
@@ -416,6 +531,8 @@ function buildState(
     colliders: picked.colliders,
     center: picked.center,
     passable,
+    passage: passable ? buildPassageBox(picked.colliders) : null,
+    ballistic: false,
     value: kind === 'door-hinged' ? 0 : restoreValue,
     open,
     from: 0,
@@ -426,8 +543,9 @@ function buildState(
     hinged,
   }
   // A node that starts open is already non-solid to walk through — its
-  // collider snapshot has the leaf posed aside anyway.
-  if (open && passable) for (const collider of state.colliders) collider.disabled = true
+  // collider snapshot has the leaf posed aside anyway (and still shootable,
+  // exactly like a door opened mid-session).
+  if (open && passable) setOpenColliders(state)
   return state
 }
 
@@ -488,7 +606,12 @@ export function unmountInteract(states: Map<string, OperableState>): void {
   }
   namedPoseLedger.clear()
   for (const state of states.values()) {
-    for (const collider of state.colliders) collider.disabled = false
+    for (const collider of state.colliders) {
+      collider.disabled = false
+      collider.ballistic = false
+    }
+    state.ballistic = false
+    if (state.passage) unregisterPassage(state.passage)
   }
   if (activeStates === states) activeStates = null
 }
@@ -499,9 +622,11 @@ export function unmountInteract(states: Map<string, OperableState>): void {
 
 /**
  * The operable under the crosshair: cast origin→direction against every
- * state's collider BVHs (in their snapshot frames — an open door's ghost
- * closed pose still answers, which is exactly how you close it through the
- * empty doorway) and take the nearest hit within maxDist. Disabled colliders
+ * state's collider BVHs — in their LIVE frames: the swing refreshes each
+ * collider's inverse/worldBox (refreshColliderTransforms), so an open door
+ * answers at its actual swung pose, exactly where the bullet lane tests it.
+ * Closing through the empty doorway still works via the point-blank door
+ * fallback below. Nearest hit within maxDist wins. Disabled colliders
  * still answer here: disabled means "not solid", not "not interactive".
  * Voxelized nodes never answer. Pure — exported for tests.
  */
@@ -598,6 +723,13 @@ export function Interact({ world }: { world: GameWorld }) {
     const dt = Math.min(rawDt, 1 / 30)
 
     advanceOperables(states.values(), dt)
+
+    // Ballistic stand-down: a node that voxelized while open (bullets broke
+    // the leaf) hands its rays to the grid — the hidden host leaf must stop
+    // answering (see clearBallistic). One boolean per settled state.
+    for (const state of states.values()) {
+      if (state.ballistic && isVoxelized(state.nodeId)) clearBallistic(state)
+    }
 
     // What is the crosshair on? (yaw/pitch → forward, YXZ like the camera.)
     const cp = Math.cos(playerRig.pitch)

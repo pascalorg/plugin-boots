@@ -18,6 +18,21 @@ import type { ColliderEntry } from './world'
  *   (with headroom) lifts the capsule and continues WITHOUT speed loss, so
  *   real sawtooth stairs climb at run speed instead of grinding on every
  *   riser. Zero per-frame allocations — module temps only.
+ *
+ * OPEN-DOORWAY PASSAGE RELIEF (owner report 2026-08-29, "door opens but I
+ * can't go through"): real scenes author OTHER nodes across a doorway — the
+ * repro house has window_living_a's frame rails (5 cm bars at y 0.60 and
+ * 1.75) spanning the front door's opening, so the capsule stopped exactly
+ * capsule-radius short of them while the door stood visibly open. While a
+ * door (or out-swing window) is open, interact.tsx registers its PASSAGE
+ * volume — the collider-group AABB at mount pose, thin axis padded — and
+ * collideCapsule ignores any NON-GROUND triangle contact whose closest
+ * point lies inside a registered passage. Ground contacts (normal.y ≥
+ * WALKABLE_NORMAL_Y) always keep resolving — floors and thresholds carry
+ * the capsule through the opening — while wall corners crossing the prism
+ * (the QA house's wall_e END inside the front doorway, contacts at bottom-
+ * sphere height y ≈ 0.33) and the rails stop pinching. Contacts OUTSIDE
+ * the prism keep pushing (the jamb walls, the same rails past the frame).
  */
 
 export type CapsuleConfig = { radius: number; height: number }
@@ -53,6 +68,77 @@ const _localBox = new Box3()
 const _triPoint = new Vector3()
 const _capsulePoint = new Vector3()
 const _normal = new Vector3()
+const _passagePoint = new Vector3()
+
+// ---------------------------------------------------------------------------
+// Open-doorway passage volumes (see the header block)
+// ---------------------------------------------------------------------------
+
+/** Live passage volumes, registered BY IDENTITY (interact.tsx keeps one Box3
+ * per open passable operable and hands the same instance back to
+ * unregister). Usually empty; one entry per door standing open. */
+const passages: Box3[] = []
+
+/** Make `box` an active passage: capsule contacts whose closest point lies
+ * inside it are ignored. Idempotent per instance. */
+export function registerPassage(box: Box3): void {
+  if (!passages.includes(box)) passages.push(box)
+}
+
+/** Retire a passage registered with the SAME Box3 instance. No-op when
+ * absent. */
+export function unregisterPassage(box: Box3): void {
+  const index = passages.indexOf(box)
+  if (index !== -1) passages.splice(index, 1)
+}
+
+/** Drop every passage (session unmount / test isolation). */
+export function clearPassages(): void {
+  passages.length = 0
+}
+
+/** Live passage count — QA / test introspection. */
+export function passageCount(): number {
+  return passages.length
+}
+
+/** Colliders no taller than this read as CROSSING BARS (window rails,
+ * thresholds, sill overhangs — the repro rails are 5 cm): their contacts
+ * test against the prism padded horizontally by PASSAGE_BAR_SLACK. The
+ * capsule brushing a bar contacts it across ±radius of its own axis, so an
+ * on-the-jamb-line pass otherwise wedges on the bar's tail past the frame
+ * (live QA: the front-door walk stopped at z 4.31 with the exact prism —
+ * off-axis rail contacts at x < the 4.6 opening edge kept pushing). Jamb
+ * walls, posts and mullions are far taller and keep the exact prism. */
+const THIN_BAR_MAX_HEIGHT = 0.3
+const PASSAGE_BAR_SLACK = 0.45
+
+/** Horizontal boundary tolerance for EVERY collider: jamb-corner contacts
+ * resolve exactly ON the prism face (the QA front door's west jamb reported
+ * x 4.59 against a 4.60 prism edge) and their diagonal push nudged the
+ * walker off line all the way through. Far below capsule radius, so no
+ * body can actually enter the jamb through it. */
+const PASSAGE_EDGE_EPS = 0.02
+
+/** Is this WORLD-space contact point inside any active passage, with `pad`
+ * of horizontal slack (0 for full-height colliders, PASSAGE_BAR_SLACK for
+ * crossing bars)? The Y band is never padded — headers keep their height
+ * and nothing above the frame is relieved. */
+function inPassage(point: Vector3, pad: number): boolean {
+  for (const box of passages) {
+    if (
+      point.y >= box.min.y &&
+      point.y <= box.max.y &&
+      point.x >= box.min.x - pad &&
+      point.x <= box.max.x + pad &&
+      point.z >= box.min.z - pad &&
+      point.z <= box.max.z + pad
+    ) {
+      return true
+    }
+  }
+  return false
+}
 
 function refreshSegments(pos: Vector3, cfg: CapsuleConfig, collider: ColliderEntry): void {
   _segment.start.set(pos.x, pos.y + cfg.radius, pos.z)
@@ -90,6 +176,12 @@ export function collideCapsule(
     for (const collider of colliders) {
       if (collider.disabled) continue
       if (!collider.worldBox.intersectsBox(_worldBox)) continue
+      // Passage relief pad for this collider (see THIN_BAR_MAX_HEIGHT).
+      const passagePad =
+        passages.length > 0 &&
+        collider.worldBox.max.y - collider.worldBox.min.y <= THIN_BAR_MAX_HEIGHT
+          ? PASSAGE_BAR_SLACK
+          : PASSAGE_EDGE_EPS
       refreshSegments(pos, cfg, collider)
       _localBox.makeEmpty()
       _localBox.expandByPoint(_localSegment.start)
@@ -106,6 +198,19 @@ export function collideCapsule(
           _normal.subVectors(_capsulePoint, _triPoint)
           if (_normal.lengthSq() < 1e-12) return false
           _normal.normalize().transformDirection(collider.mesh.matrixWorld)
+          // Passage relief: a NON-GROUND contact standing inside an open
+          // doorway's registered prism is a phantom blocker (overlapping
+          // window rail, a perpendicular wall's end corner) — the open door
+          // promised passage. Ground-normal contacts always resolve (the
+          // floor carries the capsule through; the height-band variant
+          // failed live: wall-corner contacts report at bottom-sphere
+          // height y ≈ radius and wedged under any floor band). World-space
+          // test on the TRIANGLE-side contact point; anything outside the
+          // prism (jamb wall faces, the rail beyond the frame) still pushes.
+          if (passages.length > 0 && _normal.y < WALKABLE_NORMAL_Y) {
+            _passagePoint.copy(_triPoint).applyMatrix4(collider.mesh.matrixWorld)
+            if (inPassage(_passagePoint, passagePad)) return false
+          }
           if (_normal.y >= WALKABLE_NORMAL_Y) {
             // WALKABLE GROUND: resolve the embed VERTICALLY (depth / n.y) —
             // the classic character-controller ground resolve. Push-out

@@ -464,7 +464,14 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
   for (const collider of world.colliders) {
     // walkOnly planks are capsule-only (FEET SEE THE PLANE) — bullets see
     // the voxel grid, so shots keep opening real holes in placed ramps.
-    if (collider.disabled || collider.walkOnly) continue
+    // `ballistic` is the exact inverse (BULLETS SEE THE LEAF): an OPEN
+    // door's colliders are disabled for movement but stay live for hitscan
+    // — interact.tsx refreshes their inverse/worldBox to the swung pose, so
+    // the round hits the leaf where it actually stands and the carve below
+    // voxelizes the door instead of sailing through the doorway (owner
+    // report 2026-08-29: "when in open position, if I shoot it, it doesn't
+    // break").
+    if ((collider.disabled && !collider.ballistic) || collider.walkOnly) continue
     const entry = _worldRay.intersectBox(collider.worldBox, _boxHit)
     if (entry === null || entry.distanceTo(_origin) > bestDist) continue
     _inverse.copy(collider.inverse)

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Group, Matrix4, Mesh, Vector3 } from 'three'
-import { resetDestruction, useDestruction } from './destruction'
+import { clearPassages, passageCount } from './collision'
+import { ensureVoxelTarget, resetDestruction, useDestruction } from './destruction'
 import {
   AIM_RANGE,
+  buildPassageBox,
   classifyOperable,
   mountInteract,
   nearestDoorFallback,
@@ -117,6 +119,7 @@ afterEach(() => {
   resetDestruction()
   // Clear any ledgers a test left mounted — module state must not leak.
   unmountInteract(new Map())
+  clearPassages()
 })
 
 describe('classifyOperable — kind classifiers', () => {
@@ -446,5 +449,133 @@ describe('aim-pick priority', () => {
     // And out of fallback range the door stops answering too.
     expect(nearestDoorFallback(states.values(), new Vector3(0, 1.6, 2.5))).toBeNull()
     unmountInteract(states)
+  })
+})
+
+/**
+ * Open-door combat + passage (owner report 2026-08-29: "when I open the
+ * door I can't go through / if I shoot it, it doesn't break"): while open,
+ * door colliders flip disabled + ballistic TOGETHER (movement passes,
+ * bullets still test them), their transforms ride the swing so hitscan
+ * meets the leaf at its true pose, the doorway prism registers for passage
+ * relief, and stale DORMANT prebuilds (grid baked at another pose) drop on
+ * every toggle.
+ */
+describe('open-door combat + passage relief', () => {
+  test('open: disabled + ballistic + passage registered; close settle retires all three', () => {
+    const door = buildOperable('door-p', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
+    const world = makeWorld({
+      doors: [{ built: door, nodeId: 'door-p', node: { doorType: 'hinged', openingKind: 'door' } }],
+    })
+    const states = mountInteract(world)
+    const state = states.get('door-p')!
+    expect(passageCount()).toBe(0)
+    expect(state.passage).not.toBeNull()
+
+    toggleOperable(state)
+    // Flags flip AT the toggle (mid-swing already passable + shootable).
+    expect(door.collider.disabled).toBe(true)
+    expect(door.collider.ballistic).toBe(true)
+    expect(passageCount()).toBe(1)
+    settle(states)
+    expect(door.collider.ballistic).toBe(true)
+
+    toggleOperable(state) // close — prism holds until the latch
+    expect(passageCount()).toBe(1)
+    settle(states)
+    expect(door.collider.disabled).toBe(false)
+    expect(door.collider.ballistic).toBe(false)
+    expect(passageCount()).toBe(0)
+    unmountInteract(states)
+  })
+
+  test('unmount retires passages and ballistic flags mid-open', () => {
+    const door = buildOperable('door-q', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
+    const world = makeWorld({
+      doors: [{ built: door, nodeId: 'door-q', node: { doorType: 'hinged', openingKind: 'door' } }],
+    })
+    const states = mountInteract(world)
+    toggleOperable(states.get('door-q')!)
+    settle(states)
+    expect(passageCount()).toBe(1)
+    unmountInteract(states)
+    expect(passageCount()).toBe(0)
+    expect(door.collider.disabled).toBe(false)
+    expect(door.collider.ballistic).toBe(false)
+  })
+
+  test('the swing refreshes collider inverse + worldBox to the LIVE pose', () => {
+    const door = buildOperable('door-r', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
+    const world = makeWorld({
+      doors: [{ built: door, nodeId: 'door-r', node: { doorType: 'hinged', openingKind: 'door' } }],
+    })
+    const states = mountInteract(world)
+    const state = states.get('door-r')!
+    const closedCenter = door.collider.worldBox.getCenter(new Vector3())
+
+    toggleOperable(state)
+    settle(states)
+    // The box tracked the ±100° swing about the hinge edge…
+    const openCenter = door.collider.worldBox.getCenter(new Vector3())
+    expect(openCenter.distanceTo(closedCenter)).toBeGreaterThan(0.5)
+    // …and inverse is the exact inverse of the CURRENT matrixWorld.
+    const composed = new Matrix4().multiplyMatrices(
+      door.collider.inverse,
+      door.collider.mesh.matrixWorld,
+    )
+    const identity = new Matrix4()
+    for (let i = 0; i < 16; i++) {
+      expect(composed.elements[i]!).toBeCloseTo(identity.elements[i]!, 5)
+    }
+    // The aim pick therefore answers at the swung pose: a ray down the OLD
+    // leaf plane from the side no longer hits at the closed slab location.
+    const picked = pickAimedOperable(
+      states.values(),
+      new Vector3(0, 1.05, 1),
+      new Vector3(0, 0, -1),
+    )
+    // Hinge at local -X: the leaf swung out of the crosshair line through
+    // the closed pose center — the pick follows the LIVE colliders.
+    expect(picked?.nodeId ?? null).toBe(null)
+    unmountInteract(states)
+  })
+
+  test('toggling drops a STALE dormant prebuild; awake targets are never touched', () => {
+    const door = buildOperable('door-s', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
+    const world = makeWorld({
+      doors: [{ built: door, nodeId: 'door-s', node: { doorType: 'hinged', openingKind: 'door' } }],
+    })
+    const states = mountInteract(world)
+    const state = states.get('door-s')!
+
+    // Session-start prevoxelize: a real dormant prebuild at the CLOSED pose.
+    ensureVoxelTarget(world, 'door-s', { dormant: true })
+    expect(useDestruction.getState().targets.get('door-s')?.dormant).toBe(true)
+
+    toggleOperable(state) // pose changes — the stale prebuild must go
+    expect(useDestruction.getState().targets.has('door-s')).toBe(false)
+    settle(states)
+
+    // Awake target (bullets broke the leaf): destruction owns it — a close
+    // toggle must NOT drop it.
+    ensureVoxelTarget(world, 'door-s')
+    expect(useDestruction.getState().targets.get('door-s')?.dormant).toBeFalsy()
+    toggleOperable(state)
+    settle(states)
+    expect(useDestruction.getState().targets.has('door-s')).toBe(true)
+    unmountInteract(states)
+  })
+
+  test('buildPassageBox: full frame height, thin axis padded, opening axis exact', () => {
+    const door = buildOperable('door-t', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
+    const box = buildPassageBox([door.collider])!
+    expect(box.min.y).toBeCloseTo(0)
+    expect(box.max.y).toBeCloseTo(2.1)
+    // Opening axis (x) stays the frame's exact span…
+    expect(box.min.x).toBeCloseTo(-0.5)
+    expect(box.max.x).toBeCloseTo(0.5)
+    // …the thin axis (z) pads past sills/rails that overhang the wall face.
+    expect(box.min.z).toBeLessThan(-0.3)
+    expect(box.max.z).toBeGreaterThan(0.3)
   })
 })
