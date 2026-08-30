@@ -41,10 +41,13 @@ import {
   segmentHitsBox,
   resetBotProbeBudget,
   resetBots,
+  RING_MIN,
+  RING_SPAN,
   setDoorApproach,
   settleGroundBot,
   spawnBot,
   tickWaveDirector,
+  waveSpawnXZ,
   waveState,
 } from './enemies-state'
 import { perfEvent } from './perf-monitor'
@@ -150,7 +153,21 @@ const _chest = new Vector3()
 const _meleeDir = new Vector3()
 const _doorCenter = new Vector3()
 
-/** Spawn the next wave in a ring around the building. */
+/** Scratch for the ring placement below — one pair, reused per spawn. */
+const _ringXZ: [number, number] = [0, 0]
+
+/**
+ * Spawn the next wave in a ring around the building — CLAMPED TO THE LOT.
+ *
+ * The ring's radius is a guess about a parcel it knows nothing about, so on a
+ * real project part of the ring lands off the lot polygon, where the site
+ * carries no terrain: those bots used to be born over the void and settle
+ * onto the session's backstop plane metres under the world, then walk in from
+ * below it. `waveSpawnXZ` shortens each radius along its own bearing until the
+ * point is on the parcel (perimeter walk as the bounded fallback for a small
+ * lot) — the wave keeps its spread, and every point it returns has terrain
+ * under it for `spawnGroundY` to probe.
+ */
 function spawnWave(world: GameWorld): void {
   perfEvent('wave-spawn')
   waveState.wave++
@@ -160,10 +177,19 @@ function spawnWave(world: GameWorld): void {
     ? _center.set(0, 0, 0)
     : world.buildingAabb.getCenter(_center)
   for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2
-    const radius = 22 + Math.random() * 12
-    const x = center.x + Math.cos(angle) * radius
-    const z = center.z + Math.sin(angle) * radius
+    waveSpawnXZ(
+      world.site?.polygon,
+      center.x,
+      center.z,
+      Math.random() * Math.PI * 2,
+      RING_MIN + Math.random() * RING_SPAN,
+      // Perimeter fraction for the fallback: evenly spread by bot index, so a
+      // cramped lot gets a ring of attackers instead of a pile.
+      (i + 0.5) / count,
+      _ringXZ,
+    )
+    const x = _ringXZ[0]
+    const z = _ringXZ[1]
     // Ring points spawn ON the ground, hill or excavation — spawnGroundY
     // probes the (solid) terrain and falls back to the heightfield off-lot.
     // It no longer clamps to ≥ 0: that clamp put a whole wave five metres in

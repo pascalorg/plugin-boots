@@ -947,6 +947,164 @@ export function pointInPolygonXZ(
   return inside
 }
 
+/**
+ * How far inside the lot boundary a clamped spawn point lands (m). Roughly a
+ * bot capsule diameter plus slack: a point ON the boundary is a coin flip
+ * between the terrain triangle and nothing at all (the polygon edge is where
+ * the site mesh ends), and a droid's 0.45 m radius must fit entirely over
+ * ground or the capsule pass shoves it off the lot on its first tick.
+ */
+export const LOT_SPAWN_INSET = 1.5
+
+/**
+ * The radius along a ray that keeps a point ON THE LOT, as close to `desired`
+ * as the parcel allows — the deterministic half of the wave-spawn clamp
+ * (enemies.tsx spawnWave). The ray is the ring's own direction, so a clamp
+ * only ever SHORTENS the radius and the wave keeps its angular spread; a bot
+ * that can't stand 30 m out on that bearing stands as far out as the lot goes
+ * on that same bearing.
+ *
+ * Every crossing of the ray with the polygon is collected and sorted, which
+ * makes the inside/outside runs explicit: correct for a CONCAVE parcel (an
+ * L-shaped lot's ray can leave and re-enter, and the naive "first crossing
+ * wins" answer would refuse the whole far arm) and for a ring center that is
+ * itself off the lot (the runs then start OUTSIDE). Each run is inset at both
+ * ends; a run too thin to inset degenerates to its midpoint rather than being
+ * dropped, so a narrow strip of a lot still spawns bots instead of falling
+ * through to the fallback. Among the surviving runs, the one whose clamp lands
+ * nearest `desired` wins (ties → the larger radius, i.e. further from the
+ * player). Returns null only when the ray never crosses into the polygon at
+ * all — the caller's cue to use lotPerimeterPoint instead.
+ *
+ * `polygon` shorter than 3 points is NOT a lot: `desired` passes through
+ * untouched, which is exactly the pre-existing behaviour on a void or flat
+ * scene (no site node → no polygon → the ring is what it always was).
+ * Pure; no allocation beyond one crossings array per call (called `count`
+ * times per wave, never per frame).
+ */
+export function lotRadiusAlong(
+  polygon: ReadonlyArray<readonly [number, number]>,
+  originX: number,
+  originZ: number,
+  dirX: number,
+  dirZ: number,
+  desired: number,
+  inset = LOT_SPAWN_INSET,
+): number | null {
+  if (polygon.length < 3) return desired
+  const dirLen = Math.hypot(dirX, dirZ)
+  if (dirLen < 1e-9) return null
+  const dx = dirX / dirLen
+  const dz = dirZ / dirLen
+
+  // Ray × edge crossings. O + t·D = A + u·E, u ∈ [0, 1], t ≥ 0.
+  const crossings: number[] = []
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const ax = polygon[j]![0]
+    const az = polygon[j]![1]
+    const ex = polygon[i]![0] - ax
+    const ez = polygon[i]![1] - az
+    const den = dx * ez - dz * ex
+    if (Math.abs(den) < 1e-12) continue // parallel — the run bounds come from its neighbours
+    const wx = ax - originX
+    const wz = az - originZ
+    const u = (wx * dz - wz * dx) / den
+    if (u < 0 || u > 1) continue
+    const t = (wx * ez - wz * ex) / den
+    if (t >= 0) crossings.push(t)
+  }
+  crossings.sort((a, b) => a - b)
+
+  let inside = pointInPolygonXZ(polygon, originX, originZ)
+  let best: number | null = null
+  let bestError = Number.POSITIVE_INFINITY
+  const consider = (lo: number, hi: number): void => {
+    // Inset both ends; a run thinner than 2·inset collapses to its midpoint.
+    const a = lo + inset
+    const b = hi - inset
+    const value = a > b ? (lo + hi) / 2 : desired < a ? a : desired > b ? b : desired
+    if (value < 0) return
+    const error = Math.abs(value - desired)
+    if (error < bestError || (error === bestError && best !== null && value > best)) {
+      bestError = error
+      best = value
+    }
+  }
+  let cursor = 0
+  for (const t of crossings) {
+    if (inside) consider(cursor, t)
+    cursor = t
+    inside = !inside
+  }
+  // A closed polygon always ends OUTSIDE; an unpaired tail is numerical noise
+  // (the ray grazed a vertex) and is deliberately dropped rather than treated
+  // as an unbounded run.
+  return best
+}
+
+/**
+ * A point ON the lot at `fraction` of the way around its perimeter, pushed
+ * `inset` inward — the BOUNDED FALLBACK for wave spawning when the ring
+ * itself cannot be clamped (a ring center off the lot on a bearing that
+ * misses the parcel, or a lot so small the clamp lands in the player's lap).
+ * Walking the perimeter keeps the wave SPREAD — the whole point of the ring —
+ * where a "give up and use the centroid" fallback would stack the wave on one
+ * point, which is worse than the bug being fixed.
+ *
+ * Inward is found by TESTING both edge normals against the polygon, so it
+ * needs no winding convention (the host's polygon points arrive in whatever
+ * order the parcel was drawn). If neither side is inside — a lot thinner than
+ * 2·inset — the boundary point itself is returned: still the parcel's own
+ * ground, which is the best a sliver offers. Null only for a degenerate
+ * polygon (< 3 points, or zero perimeter). Pure.
+ */
+export function lotPerimeterPoint(
+  polygon: ReadonlyArray<readonly [number, number]>,
+  fraction: number,
+  inset = LOT_SPAWN_INSET,
+): [number, number] | null {
+  if (polygon.length < 3) return null
+  let perimeter = 0
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    perimeter += Math.hypot(polygon[i]![0] - polygon[j]![0], polygon[i]![1] - polygon[j]![1])
+  }
+  if (perimeter < 1e-6) return null
+  const wrapped = fraction - Math.floor(fraction)
+  let remaining = wrapped * perimeter
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const ax = polygon[j]![0]
+    const az = polygon[j]![1]
+    const ex = polygon[i]![0] - ax
+    const ez = polygon[i]![1] - az
+    const len = Math.hypot(ex, ez)
+    if (len < 1e-9) continue
+    if (remaining > len && i !== polygon.length - 1) {
+      remaining -= len
+      continue
+    }
+    // Stay `inset` clear of BOTH endpoints: at a vertex, the inward offset
+    // along one edge's normal slides along the OTHER edge and lands exactly
+    // on the boundary, where an even-odd test is a coin flip (it read the
+    // parcel's own corners as off-lot). An edge shorter than 2·inset has no
+    // such room and answers with its midpoint.
+    const margin = len > inset * 2 ? inset / len : 0.5
+    const t = Math.min(1 - margin, Math.max(margin, Math.min(1, remaining / len)))
+    const px = ax + ex * t
+    const pz = az + ez * t
+    // Both edge normals, then keep the one that lands inside.
+    const nx = -ez / len
+    const nz = ex / len
+    if (pointInPolygonXZ(polygon, px + nx * inset, pz + nz * inset)) {
+      return [px + nx * inset, pz + nz * inset]
+    }
+    if (pointInPolygonXZ(polygon, px - nx * inset, pz - nz * inset)) {
+      return [px - nx * inset, pz - nz * inset]
+    }
+    return [px, pz]
+  }
+  return null
+}
+
 const _siteRay = new Ray()
 const _siteHitPoint = new Vector3()
 

@@ -3,7 +3,7 @@ import { sfx } from './audio'
 import { spawnDebris } from './debris'
 import { probeLandingY } from './destruction'
 import { groundSurfaceY } from './ground'
-import type { DoorEntry, GameWorld } from './world'
+import { type DoorEntry, type GameWorld, lotPerimeterPoint, lotRadiusAlong } from './world'
 
 /**
  * The horde, as data: humanoid droids that march, robot dogs that lope,
@@ -362,6 +362,84 @@ export function spawnBot(
     doorT: 0,
     visual: botVisualParams(id, kind, waveState.wave),
   })
+}
+
+// --- WAVE RING PLACEMENT: every spawn point stands on walkable ground -------
+
+/** Ring distance from the building center (m): nearest, and the random span
+ * above it. Unchanged from the original ring — the clamp below only ever
+ * SHORTENS a radius, so an ample lot spawns exactly where it always did. */
+export const RING_MIN = 22
+export const RING_SPAN = 12
+
+/**
+ * A ring point clamped closer than this to the building center (m) is not a
+ * siege any more — it is a droid materialising in the kitchen. Past this the
+ * placement gives up on the bearing and walks the lot's PERIMETER instead,
+ * which is both on-lot and as far out as the parcel goes.
+ */
+export const RING_MIN_ON_LOT = 8
+
+/**
+ * Where one wave bot stands. The ring is the design — bots converge from
+ * every bearing — but a ring radius is a guess about a lot it knows nothing
+ * about, and off the lot polygon there is no terrain: a bot born out there
+ * fell to the session's backstop plane and walked in from under the world
+ * (observed on the owner's real project at (−4.46, −35.35) and (−29.64,
+ * 1.32), both metres outside the parcel).
+ *
+ * So the ring is CLAMPED, deterministically, in this order:
+ *
+ * 1. No lot polygon (void or flat scene, no site node) → the raw ring point.
+ *    Byte-identical to the behaviour before this function existed.
+ * 2. `lotRadiusAlong` shortens the radius along the bot's OWN bearing until
+ *    the point is inside the parcel (inset by a capsule's worth of slack).
+ *    The bearing is never rotated, so the wave keeps its angular spread —
+ *    which is the whole point of a ring, and why "re-roll until a point
+ *    lands on the lot" was rejected: it is unbounded and it biases the
+ *    bearings toward whichever direction the lot happens to be long in.
+ * 3. If that lands inside RING_MIN_ON_LOT (a small parcel, or a ring center
+ *    off the lot on a bearing that misses it), the BOUNDED fallback walks the
+ *    lot perimeter to `fraction` of the way round — evenly spread by the
+ *    caller's bot index, so a cramped lot still gets a ring of attackers and
+ *    never a stack of bots on one point.
+ *
+ * Writes into `out` ([x, z]) — pure, allocation-free, no world access, and
+ * called `count` times per wave, never per frame.
+ */
+export function waveSpawnXZ(
+  polygon: ReadonlyArray<readonly [number, number]> | undefined,
+  centerX: number,
+  centerZ: number,
+  angle: number,
+  desired: number,
+  fraction: number,
+  out: [number, number],
+): void {
+  const dirX = Math.cos(angle)
+  const dirZ = Math.sin(angle)
+  out[0] = centerX + dirX * desired
+  out[1] = centerZ + dirZ * desired
+  if (!polygon || polygon.length < 3) return
+
+  const radius = lotRadiusAlong(polygon, centerX, centerZ, dirX, dirZ, desired)
+  if (radius !== null && radius >= RING_MIN_ON_LOT) {
+    out[0] = centerX + dirX * radius
+    out[1] = centerZ + dirZ * radius
+    return
+  }
+  const edge = lotPerimeterPoint(polygon, fraction)
+  if (edge) {
+    out[0] = edge[0]
+    out[1] = edge[1]
+    return
+  }
+  // Degenerate polygon (zero perimeter): the clamp's answer if it had one,
+  // else the raw ring point. Both are the best available; neither can stack.
+  if (radius !== null) {
+    out[0] = centerX + dirX * radius
+    out[1] = centerZ + dirZ * radius
+  }
 }
 
 // --- BOTS LEARN DOORWAYS: pure bookkeeping + candidate selection ------------
