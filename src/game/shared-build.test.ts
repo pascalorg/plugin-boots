@@ -32,12 +32,13 @@ import {
   spawnPaintDecal,
 } from './paint'
 import { applyPaint, capturePaint, usePaintKeep } from './paint-keep'
-import { pieceAt, registerPlacement, resetPieceSlots } from './piece-slots'
+import { onPieceRemoved, pieceAt, registerPlacement, resetPieceSlots } from './piece-slots'
 import { armSceneWriteSentinel } from './session'
 import {
   attachBuildSync,
   buildSyncOn,
   detachBuildSync,
+  forgetSharedPieces,
   isForeignPiece,
   isForeignPlacement,
   pieceRecordOf,
@@ -63,6 +64,7 @@ import {
   localWork,
   type PieceRec,
   quantYaw,
+  rekeySharedWorld,
   type SharedDelta,
   type SharedWorld,
 } from './shared-world'
@@ -1000,5 +1002,70 @@ describe('a world full of other people’s work yields nothing to Save', () => {
       floors: 0,
     })
     expect(applyItems()).toEqual({ kept: 0, skipped: 0, doors: 0, windows: 0 })
+  })
+})
+
+// ── A rename mid-session ────────────────────────────────────────────────────
+
+describe('the host renames us mid-session', () => {
+  test('a wall we built under the old name does not come back as a stranger’s', () => {
+    const h = boot()
+    installAppliers()
+    const id = myWall(WALL_SLOT)
+    const ours = pieceRecordOf(id)!
+    expect(ours.startsWith('me#')).toBe(true)
+
+    // The rename keeps every record in place and remembers the old name. It
+    // reports our wall as a stale mint because this harness drives the lane
+    // through a sink, which never drains the journal — the transport's
+    // takePending is what empties it. So the residue the model warns about is
+    // exactly this: work published under a name no peer will vouch for again.
+    expect(rekeySharedWorld(h.mine, 'me-2')).toEqual([ours])
+    expect(h.mine.self).toBe('me-2')
+    expect(h.mine.formerSelves).toEqual(['me'])
+    expect(liveRecords(h.mine.pieces).map((r) => r.id)).toContain(ours)
+
+    // Save resolved that wall into the document: the record is released and
+    // the game piece is gone from the store, exactly as keep.ts leaves it.
+    forgetSharedPieces()
+    useBoots.getState().removePlaced(id)
+    onPieceRemoved(WALL_SLOT) // the slot is free again, as after any removal
+    expect(pieceRecordOf(id)).toBeNull()
+
+    // Now a stranger builds somewhere else, which re-runs the election over
+    // every live record — including the one we published under our old name.
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(theirWall(h, OTHER_SLOT))), 'them')
+
+    const placed = useBoots.getState().placed
+    expect(placed).toHaveLength(1) // theirs only
+    expect(placed[0]!.slotId).toBe(OTHER_SLOT)
+    // The wall we just made real is NOT standing next to itself as somebody
+    // else's work: no piece in the store carries the record we published under
+    // our old name. `isAuthoredBy(id, world.self)` would have re-spawned it as
+    // a remote piece the moment our name changed.
+    for (const piece of placed) expect(pieceRecordOf(piece.id)).not.toBe(ours)
+    expect(isForeignPiece(id)).toBe(false)
+  })
+
+  test('our own catalog item and our own paint survive the rename unduplicated', () => {
+    const h = boot()
+    installAppliers()
+    const item = publishItem(41, ITEM.id, [1, 0, 2], 0)
+    expect(item).not.toBeNull()
+    publishStroke('wall-1', 3, 0, 0, 0, 0.3)
+    rekeySharedWorld(h.mine, 'me-2')
+
+    // A snapshot from a peer that carries our pre-rename work back to us. The
+    // records are already in our world, so the model adds nothing — and the
+    // author gate is what keeps the strokes from folding a second time even
+    // when a reset makes them look new.
+    const echo = frame(h, 'them', (d) => {
+      for (const rec of liveRecords(h.mine.items)) d.items.push(rec)
+      for (const rec of liveRecords(h.mine.strokes)) d.strokes.push(rec)
+    })
+    const fx = receiveBuildDelta(echo, 'them')
+    expect(fx.addedItems).toHaveLength(0)
+    expect(fx.addedStrokes).toHaveLength(0)
+    expect(useItems.getState().items).toHaveLength(0) // never spawned a copy
   })
 })

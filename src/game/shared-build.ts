@@ -72,7 +72,7 @@ import {
   type ApertureRec,
   emptyDelta,
   emptyEffects,
-  isAuthoredBy,
+  isOurs,
   type ItemRec,
   killRecord,
   liveRecords,
@@ -515,16 +515,15 @@ function installPieces(): void {
 
   for (const [id, runtimeId] of [...pieceRuntime]) {
     if (desired.has(id)) continue
-    // "Is this record ours?" asked of our CURRENT identity, deliberately. The
-    // host can re-key a live collab session, and the transport answers by
-    // re-minting our pieces under the new prefix — which deposes the old
-    // records in every peer that saw both. Those losers are ours in spirit but
-    // not by prefix, so `mine` is false and the notice below stays silent. That
-    // is the outcome we want: nobody claimed anything, we renamed ourselves.
-    // If this is ever widened to "was ever mine" (net.ts has wasLocalSession
-    // for exactly that question), the notice must be narrowed in the same
-    // breath, or a re-key starts blaming strangers for walls nobody touched.
-    const mine = isAuthoredBy(id, s.world.self)
+    // THE PLAYER'S QUESTION, NOT THE WIRE'S. `isOurs` spans the names this tab
+    // has published under, because the human who built this wall is the same
+    // human after the host re-keys their session — and they are the one the
+    // notice below is for. Asking `isAuthoredBy(id, world.self)` here would go
+    // quiet the moment we were renamed, so a wall built before the rename could
+    // be deposed by a stranger and vanish without a word. The wire's narrow
+    // question stays where it belongs: mergeDelta vouches for a frame by its
+    // envelope sender, and this module never second-guesses it.
+    const mine = isOurs(s.world, id)
     const piece = useBoots.getState().placed.find((p) => p.id === runtimeId)
     unbindPiece(runtimeId)
     if (piece) {
@@ -542,8 +541,10 @@ function installPieces(): void {
     if (pieceRuntime.has(rec.id)) continue
     // Our own records are bound at mint. One that is not bound any more was
     // resolved into the document by Save (forgetSharedPieces) — re-spawning
-    // it would double the wall the player just saved.
-    if (isAuthoredBy(rec.id, s.world.self)) continue
+    // it would double the wall the player just saved. `isOurs`, not
+    // `isAuthoredBy`: a rename must not turn our own released work into a
+    // stranger's wall standing on top of the one we just made real.
+    if (isOurs(s.world, rec.id)) continue
     spawnRemotePiece(rec)
   }
 }
@@ -763,23 +764,28 @@ function applyEffectsInner(s: BuildSync, fx: SharedEffects): void {
   // rather than the new records appended).
   if (fx.addedPieces.length > 0) installPieces()
 
+  // `isOurs` on both lanes for the same reason as the pieces: our own work,
+  // published under any name this tab has worn, is already in the scene.
   for (const rec of fx.addedItems) {
     if (placementRuntime.has(rec.id)) continue
-    if (isAuthoredBy(rec.id, s.world.self)) continue
+    if (isOurs(s.world, rec.id)) continue
     const runtimeId = appliers.spawnItem?.(rec)
     if (runtimeId !== null && runtimeId !== undefined) bindPlacement(runtimeId, rec.id, true)
   }
   for (const rec of fx.addedApertures) {
     if (placementRuntime.has(rec.id)) continue
-    if (isAuthoredBy(rec.id, s.world.self)) continue
+    if (isOurs(s.world, rec.id)) continue
     const runtimeId = appliers.spawnAperture?.(rec)
     if (runtimeId !== null && runtimeId !== undefined) bindPlacement(runtimeId, rec.id, true)
   }
 
   // Paint folds; a stroke of ours coming back (it cannot, the authorship gate
-  // stops it) would double-coat, so filter by author anyway.
+  // stops it) would double-coat, so filter by author anyway. Strokes have no
+  // runtime binding to fall back on — the coat ledger is the only record that
+  // they landed — so this filter is the ONLY thing standing between a rename
+  // and our own paint being folded over itself, twice as strong.
   if (fx.addedStrokes.length > 0 && appliers.foldStrokes) {
-    const theirs = fx.addedStrokes.filter((rec) => !isAuthoredBy(rec.id, s.world.self))
+    const theirs = fx.addedStrokes.filter((rec) => !isOurs(s.world, rec.id))
     if (theirs.length > 0) appliers.foldStrokes(theirs)
   }
 }
