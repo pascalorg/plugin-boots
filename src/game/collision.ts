@@ -98,9 +98,27 @@ export function clearPassages(): void {
   passages.length = 0
 }
 
+/** Is THIS Box3 instance an active passage? (identity, like the registry) */
+export function isPassageRegistered(box: Box3): boolean {
+  return passages.includes(box)
+}
+
 /** Live passage count — QA / test introspection. */
 export function passageCount(): number {
   return passages.length
+}
+
+/** The live passage volumes as PLAIN DATA (never live refs) — the census
+ * `__boots.doors.census()` reads to prove a prism is actually registered and
+ * where it stands. */
+export function passageBoxes(): Array<{
+  min: [number, number, number]
+  max: [number, number, number]
+}> {
+  return passages.map((box) => ({
+    min: [box.min.x, box.min.y, box.min.z] as [number, number, number],
+    max: [box.max.x, box.max.y, box.max.z] as [number, number, number],
+  }))
 }
 
 /** Colliders no taller than this read as CROSSING BARS (window rails,
@@ -139,6 +157,75 @@ function inPassage(point: Vector3, pad: number): boolean {
     }
   }
   return false
+}
+
+const _passageCell = new Vector3()
+
+/**
+ * THE VOXEL LANE'S PASSAGE RELIEF (owner report 2026-08-30: "i still cant
+ * enter a door because i see voxels when it's open through it and i can open
+ * with E but not walk into it").
+ *
+ * The prism above only relieves HOST BVH TRIANGLES, because `inPassage` is
+ * consulted from exactly one place: collideCapsule's `intersectsTriangle`.
+ * But the player is resolved against voxel grids in a SECOND, separate pass
+ * (destruction.collideVoxelTargets, run from player.tsx right after
+ * moveCapsule), and that pass knew nothing about doorways. Every scene
+ * authors neighbouring geometry across its openings — the QA house's `wall_e`
+ * END stands inside the front doorway, and a wall's voxel grid does not carve
+ * the door aperture — so while those grids were DORMANT the host triangles
+ * were relieved and the door walked fine, and the instant gunfire WOKE the
+ * grid the very same geometry re-solidified as cubes with no relief at all:
+ * the door still opened (interact owns the node), the leaf still swung, the
+ * prism was still registered, every door collider was still disabled, and the
+ * capsule was still stopped dead in the opening. Measured on the flat QA
+ * house: front door open-walk advance 20.63 m pristine → 1.61 m once `wall_e`
+ * woke, with 22 of its cells standing in the aperture at capsule height.
+ *
+ * So the voxel lane asks the same question the triangle lane does — with one
+ * difference, because a cube has no normal. The triangle lane keeps resolving
+ * WALKABLE-NORMAL contacts so floors carry the capsule through the opening;
+ * the obvious voxel translation (keep resolving whichever cells push mostly
+ * UPWARD) is WRONG, and measurably so: `collideVoxelTargets` clamps the
+ * contact to the capsule's core segment, which starts a radius above the feet,
+ * so a WALL's bottom row reads as strongly vertical too (measured in the
+ * regression rig: feet at y 0.037, cell center y 0.075, dy/dist = 0.715 — well
+ * past WALKABLE_NORMAL_Y) and that one row alone kept sealing the doorway.
+ *
+ * The discriminator is the FEET PLANE, not the push direction. A floor the
+ * capsule stands on has its cells BELOW the feet; a wall row that blocks the
+ * walk stands AT OR ABOVE them. So a cell inside the prism at or above `feetY`
+ * is the blocker the open door promised away and is dropped, while anything
+ * below the feet keeps resolving — a voxel floor or threshold still carries the
+ * capsule across the opening and nobody falls through a shot-out slab standing
+ * in a doorway. (The prism's Y band is a second guard on the same invariant:
+ * it starts at the door leaf's sill, so floor cells are usually already out of
+ * the band before the feet test ever runs.)
+ */
+export function passageRelievesCell(x: number, y: number, z: number, feetY: number): boolean {
+  _reliefCalls++
+  if (passages.length === 0) return false
+  if (y < feetY) return false
+  _passageCell.set(x, y, z)
+  const relieved = inPassage(_passageCell, PASSAGE_EDGE_EPS)
+  if (relieved) _reliefGrants++
+  return relieved
+}
+
+/** How often the VOXEL lane actually consulted this module, and how often it
+ * was told "relieved" — two ints, so QA can tell "the relief said no" from
+ * "the relief was never asked" (a second module instance, or a voxel pass that
+ * does not route through here) without reading a screenshot. */
+let _reliefCalls = 0
+let _reliefGrants = 0
+
+export function passageReliefStats(): { calls: number; grants: number; passages: number } {
+  return { calls: _reliefCalls, grants: _reliefGrants, passages: passages.length }
+}
+
+export function resetPassageReliefStats(): void {
+  _reliefCalls = 0
+  _reliefGrants = 0
 }
 
 function refreshSegments(pos: Vector3, cfg: CapsuleConfig, collider: ColliderEntry): void {

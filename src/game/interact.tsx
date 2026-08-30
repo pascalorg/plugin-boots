@@ -7,7 +7,15 @@ import { useEffect, useRef } from 'react'
 import { Box3, Matrix4, type Object3D, Quaternion, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { registerPassage, unregisterPassage } from './collision'
+import {
+  isPassageRegistered,
+  passageBoxes,
+  passageRelievesCell,
+  passageReliefStats,
+  registerPassage,
+  resetPassageReliefStats,
+  unregisterPassage,
+} from './collision'
 import { dropTarget, restoreOperableTarget, useDestruction } from './destruction'
 import { armoryStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
@@ -837,6 +845,31 @@ export function Interact({ world }: { world: GameWorld }) {
   return null
 }
 
+/** Is `root` — or any ancestor — hidden? destruction's hideHostNode flips the
+ * host leaf invisible when a voxel target takes the node over, so a census
+ * reading hostHidden with a live grid means the GRID owns this doorway. */
+function rootHidden(root: Object3D): boolean {
+  let node: Object3D | null = root
+  while (node) {
+    if (!node.visible) return true
+    node = node.parent
+  }
+  return false
+}
+
+const boxData = (box: Box3) => ({
+  min: [+box.min.x.toFixed(3), +box.min.y.toFixed(3), +box.min.z.toFixed(3)] as [
+    number,
+    number,
+    number,
+  ],
+  max: [+box.max.x.toFixed(3), +box.max.y.toFixed(3), +box.max.z.toFixed(3)] as [
+    number,
+    number,
+    number,
+  ],
+})
+
 /** Manager wiring for __boots: inspect/flip operables headlessly. */
 export const interactDebug = {
   list: (): Array<{ nodeId: string; kind: OperableKind; open: boolean }> =>
@@ -853,4 +886,123 @@ export const interactDebug = {
     // door handback), so bots fumbling a lightly-shot door open it too.
     if (state) toggleOperable(state)
   },
+  /** Every live passage prism as plain data (what collision.ts is relieving). */
+  passages: () => passageBoxes(),
+  /** Would the VOXEL lane relieve a cell centered here for a capsule whose feet
+   * are at `feetY`? (collision.ts::passageRelievesCell — the exact predicate
+   * collideVoxelTargets consults.) Lets QA prove, cell by cell, that the
+   * blockers standing in an open doorway are the ones being dropped. */
+  relievesCell: (x: number, y: number, z: number, feetY: number): boolean =>
+    passageRelievesCell(x, y, z, feetY),
+  /** Did the VOXEL lane actually ask this module for relief, and was it
+   * granted? Distinguishes "relief said no" from "relief was never consulted". */
+  reliefStats: () => passageReliefStats(),
+  resetReliefStats: (): void => resetPassageReliefStats(),
+  /**
+   * Alive voxel cells standing inside a WORLD-space AABB, grouped by the node
+   * that owns them — the numeric answer to "why do I see blocks in this open
+   * doorway, and what is stopping me walking in". Grid centers are world-space
+   * (collideVoxelTargets compares them straight against the capsule), so no
+   * basis work is needed here. Read-only over destruction's store.
+   */
+  occupancy: (
+    min: [number, number, number],
+    max: [number, number, number],
+  ): Array<{
+    nodeId: string
+    kind: string
+    dormant: boolean
+    cells: number
+    cell: number
+    /** AABB of the MATCHED cell centers — proves whether they stand on the
+     * walk line or only rim the jamb reveal. */
+    box: { min: [number, number, number]; max: [number, number, number] }
+  }> => {
+    const out: Array<{
+      nodeId: string
+      kind: string
+      dormant: boolean
+      cells: number
+      cell: number
+      box: { min: [number, number, number]; max: [number, number, number] }
+    }> = []
+    for (const target of useDestruction.getState().targets.values()) {
+      const grid = target.grid
+      if (!grid) continue
+      let cells = 0
+      const lo: [number, number, number] = [Infinity, Infinity, Infinity]
+      const hi: [number, number, number] = [-Infinity, -Infinity, -Infinity]
+      for (let i = 0; i < grid.alive.length; i++) {
+        if (!grid.alive[i]) continue
+        const x = grid.centers[i * 3]!
+        const y = grid.centers[i * 3 + 1]!
+        const z = grid.centers[i * 3 + 2]!
+        if (x < min[0] || x > max[0] || y < min[1] || y > max[1] || z < min[2] || z > max[2]) {
+          continue
+        }
+        cells++
+        if (x < lo[0]) lo[0] = x
+        if (y < lo[1]) lo[1] = y
+        if (z < lo[2]) lo[2] = z
+        if (x > hi[0]) hi[0] = x
+        if (y > hi[1]) hi[1] = y
+        if (z > hi[2]) hi[2] = z
+      }
+      if (cells > 0) {
+        out.push({
+          nodeId: target.nodeId,
+          kind: String(target.kind),
+          dormant: target.dormant === true,
+          cells,
+          cell: grid.cell,
+          box: { min: lo, max: hi },
+        })
+      }
+    }
+    return out
+  },
+  /**
+   * THE EVIDENCE DUMP for "the door is open but I can't walk in / I see
+   * voxels in the opening". Per operable: the pose, the collider posture,
+   * the doorway prism AND whether collision.ts actually holds it, whether
+   * the host leaf is hidden, and the voxel target that may be standing in
+   * the doorway instead. Plain data — never live refs.
+   */
+  census: () =>
+    activeStates
+      ? Array.from(activeStates.values(), (state) => {
+          const target = useDestruction.getState().targets.get(state.nodeId)
+          const group = new Box3()
+          for (const collider of state.colliders) group.union(collider.worldBox)
+          return {
+            nodeId: state.nodeId,
+            kind: state.kind,
+            open: state.open,
+            value: +state.value.toFixed(4),
+            passable: state.passable,
+            settled: state.animT >= state.duration,
+            ballistic: state.ballistic,
+            hostHidden: rootHidden(state.root),
+            /** Collider group AABB in the LIVE pose — follows the swing. */
+            liveBox: group.isEmpty() ? null : boxData(group),
+            /** Mount-pose doorway prism (the promise of passage). */
+            passage: state.passage ? boxData(state.passage) : null,
+            passageRegistered: state.passage ? isPassageRegistered(state.passage) : false,
+            colliders: state.colliders.map((collider) => ({
+              disabled: collider.disabled === true,
+              ballistic: collider.ballistic === true,
+              walkOnly: collider.walkOnly === true,
+            })),
+            /** The voxel replica, if destruction has one for this node. */
+            target: target
+              ? {
+                  dormant: target.dormant === true,
+                  walkOnly: target.walkOnly === true,
+                  aliveCount: target.grid.aliveCount,
+                  totalCount: target.grid.alive.length,
+                }
+              : null,
+          }
+        })
+      : [],
 }

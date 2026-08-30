@@ -15,6 +15,7 @@ import {
 import { create } from 'zustand'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { passageRelievesCell } from './collision'
 import { spawnFloorBreach } from './craters'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
@@ -5098,6 +5099,17 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
           const dist = Math.hypot(dx, dy, dz)
           const minDist = radius + r
           if (dist >= minDist || dist < 1e-6) continue
+          // OPEN-DOORWAY RELIEF: a cell standing inside an open door's
+          // registered passage prism, at or above the feet, is the blocker that
+          // door promised away (see collision.ts::passageRelievesCell — cells
+          // BELOW the feet keep resolving, so a voxel floor still carries the
+          // capsule across the threshold). Without this, waking a wall whose
+          // grid crosses a doorway re-solidifies the very geometry the prism
+          // relieves in the triangle lane, and the open door stops admitting
+          // the player.
+          if (passageRelievesCell(_voxelCenter.x, _voxelCenter.y, _voxelCenter.z, pos.y)) {
+            continue
+          }
           const push = (minDist - dist) / dist
           pos.x += dx * push
           pos.y += dy * push
