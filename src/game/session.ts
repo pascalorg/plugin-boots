@@ -10,6 +10,7 @@ import { GameInput } from './input'
 import { closeItemMenu, isItemMenuOpen } from './inventory'
 import { placedItemCount } from './item-keep'
 import { capturePaint } from './paint-keep'
+import { stopWorldSync } from './net-world'
 import { stopPresence } from './presence'
 import { captureDemolition } from './save-demolition'
 
@@ -705,6 +706,12 @@ export function exitGame(): void {
   // peers despawn our avatar instantly, then the adapter tears down. Runs
   // before the session teardown/restore below (feature-detected inside:
   // without a collab bus this is a no-op).
+  //
+  // The shared world releases the bus BEFORE presence does, because
+  // stopPresence closes the transport as its last act. There is no goodbye to
+  // send for the world: records are grow-only, so what we built stays built in
+  // every peer that saw it. Leaving removes our avatar, not our fort.
+  stopWorldSync()
   stopPresence()
 
   useBoots.getState().setPhase('editor')

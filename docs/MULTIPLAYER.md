@@ -345,12 +345,21 @@ a peer id containing it would be an identity forgery.
 **Byte ceiling.** The transport's is **8 000 serialized chars**, ~130× tighter
 than `shared-wire`'s own `MAX_FRAME_BYTES` (1 MiB). Measured: a rifle shot's
 delta ~100 B binary → ~136 B base64, comfortable; a 28-node / 10.7 k-dead-cell
-snapshot 4.7 kB → ~6.2 kB base64, which fits the 7 878-char budget **but only
-just**. Anything bigger is chunked by `wireParts(delta, MAX_TEXT_CHARS)`, which
-splits per node / per record group and stamps `{part, parts}`; each part is a
-complete, independently mergeable delta, so there is no transport-level
-reassembly. `payloadFits()` before publishing, and `'too-large'` if you skip the
-check.
+snapshot 4.7 kB → 6 220 base64 chars, i.e. **79 % of one frame**; a lot four
+times as damaged measures 21 520 chars, which is 4 parts with the largest at
+7 860. So chunking is load-bearing at sizes this game actually reaches, not a
+safety margin. `wireParts(delta, MAX_TEXT_CHARS)` splits per node / per record
+group and stamps `{part, parts}`; each part is a complete, independently
+mergeable delta, so there is no transport-level reassembly. `payloadFits()`
+before publishing, and `'too-large'` if you skip the check.
+
+The budget itself is fenced in `shared-invariant.test.ts`, which reads `net.ts`
+as text: `MAX_FRAME_SERIALIZED` 8 000, envelope reserve 120, so
+`MAX_TEXT_CHARS` = 8 000 − 120 − 2 = **7 878**, and `MAX_WIRE_PARTS` 1 024
+matching `net.ts`'s `parts > 1024` refusal. `shared-wire.ts` may not import
+`net.ts`, so the number is derived twice on purpose; `net-world.test.ts` asserts
+its own `MAX_WIRE_TEXT` equals `MAX_TEXT_CHARS` so the two cannot drift apart in
+silence.
 
 **Coalescing is the real hazard, not loss.** The host keeps only the latest
 value per event per 66 ms. A burst of deltas inside one window is *lost*, not
@@ -458,6 +467,24 @@ learn the world within the next heal period" into "you will learn it in a few
 hundred milliseconds". Answers are jittered (`SNAP_JITTER_MS`) so N peers do not
 publish inside one 66 ms window, and rate-limited (`SNAP_MIN_GAP_MS`) so a
 replayed request cannot make a peer shout — this is a public lobby.
+
+**Operational notes, so a healthy system is not misread as a broken one.** A
+66 ms tick against a 66 ms window drifts in and out of phase, so `'deferred'`
+and a rising `requeued` are *normal*; the frame goes out on the next tick. A
+4-part snapshot takes ~264 ms to drain at one part per tick, during which a
+joiner has a correct but incomplete world — that is the design, since each part
+merges alone. `SNAP_MIN_GAP_MS` (3 s) is comfortably longer than that drain, so
+two snapshots cannot overlap. If parts ever need to leave faster, publish them on
+**alternating kinds** rather than shrinking the tick: the window is per
+(plugin, event), so a smaller tick buys nothing. The pair worth putting on a HUD
+is `unsent` + `overflow` — together they are the whole "are we desynced"
+question.
+
+**Where it is wired.** `startWorldSync()` sits beside `startPresence()` in
+`game-root.tsx`'s co-presence effect; `stopWorldSync()` runs in `exitGame()`
+**before** `stopPresence()`, because that call closes the transport as its last
+act. There is no goodbye frame for the world: records are grow-only, so leaving
+removes our avatar, not our fort. `__boots.worldSync()` is the QA handle.
 
 **What is still not handled, stated rather than hidden.** A frame lost to the
 outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a

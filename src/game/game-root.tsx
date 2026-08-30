@@ -38,6 +38,7 @@ import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
 import { MOVE } from './movement'
+import { startWorldSync, stopWorldSync, worldSyncDebug } from './net-world'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
 import { Player, playerDebug, playerRig } from './player'
 import {
@@ -576,6 +577,12 @@ function ActiveGame() {
   useEffect(() => {
     const serial = getSessionSerial()
     startPresence(sampleLocalPose) // feature-detected: no bus → no-op
+    // The shared world rides the same transport: avatars are one kind of frame,
+    // builds and destruction are another. Also feature-detected, also
+    // idempotent, and it refuses to start if the host cannot name us with an id
+    // we could author records under. exitGame owns the stop, before
+    // stopPresence closes the transport.
+    startWorldSync()
     const offEvents = onPresenceEvent((event) => {
       const hud = getSession()?.hud as unknown as
         | { presenceToast?: (text: string) => void }
@@ -586,7 +593,10 @@ function ActiveGame() {
       offEvents()
       // Same-session remounts keep the adapter alive; a stale unmount
       // (session ended or a new one started) must not stop the new one.
-      if (useBoots.getState().phase !== 'game' && getSessionSerial() === serial) stopPresence()
+      if (useBoots.getState().phase !== 'game' && getSessionSerial() === serial) {
+        stopWorldSync() // before stopPresence: that call closes the transport
+        stopPresence()
+      }
     }
   }, [])
 
@@ -805,6 +815,8 @@ function ActiveGame() {
       // ({sessionId, name, p, w, ageMs}) + the {published, received}
       // counters. Empty remotes + zero counters on a bus-less host.
       presence: () => presenceDebug(),
+      // `unsent` + `overflow` together are the whole "are we desynced" question.
+      worldSync: () => worldSyncDebug(),
       // Host post-tuning census (host-post.ts, perf fix 5): is the shadow
       // throttle + outline guard live, how many lights are frozen, how
       // often the outline guard had to re-clear. Plain data.
