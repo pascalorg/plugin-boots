@@ -488,19 +488,20 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         </mesh>
       ))}
       {/* the guns, LINED UP vertically — PERMANENT displays: they never
-       * flip to taken (unlimited, the next player collects too). */}
+       * flip to taken (unlimited, the next player collects too). The
+       * MINIGUN is the exception (owner: it hung badly on the rack, and
+       * "the gatling looked nice rotating horizontally") — it gets its own
+       * showcase pedestal, lying flat and slowly turning. */}
       <group position={[-1.25, 1.2, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={1.3}>
         <PistolModel />
       </group>
       <group position={[-0.45, 1.2, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={1.15}>
         <RifleModel />
       </group>
-      <group position={[0.45, 1.25, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={0.95}>
-        <MinigunModel />
-      </group>
-      <group position={[1.35, 1.25, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={0.8}>
+      <group position={[0.45, 1.25, -1.02]} rotation={[Math.PI / 2, 0, 0]} scale={0.8}>
         {ExternalWarhammer ? <ExternalWarhammer /> : <HammerModel />}
       </group>
+      <MinigunShowcase />
       {/* work boots on the floor mat, toes toward the player walking up */}
       <mesh position={[0, 0.135, 0.4]}>
         <boxGeometry args={[0.85, 0.03, 0.55]} />
@@ -532,6 +533,43 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       ))}
       <SirenBeacon position={[3.12, 2.2, -0.45]} primary />
       <SirenBeacon position={[3.12, 2.2, 0.45]} />
+    </group>
+  )
+}
+
+/** Turntable speed for the minigun showcase (rad/s) — slow and steady. */
+const SHOWCASE_SPIN = 0.45
+
+/**
+ * The minigun's showcase: it never hung right on the wall rack (owner —
+ * "the gatling looked nice rotating horizontally"), so it lies FLAT on a
+ * squat steel pedestal in the armory bay, slowly turning like a dealership
+ * turntable. Purely decorative — no collider (like the other displays),
+ * dt clamped the same way the drone rotors are so a hitch never spins it.
+ */
+function MinigunShowcase() {
+  const spinRef = useRef<Group>(null)
+  useFrame((_, rawDt) => {
+    const g = spinRef.current
+    if (g) g.rotation.y += SHOWCASE_SPIN * Math.min(rawDt, 1 / 30)
+  })
+  return (
+    <group position={[1.35, 0, -0.55]}>
+      {/* squat steel pedestal + cap plate */}
+      <mesh castShadow position={[0, 0.36, 0]}>
+        <boxGeometry args={[0.42, 0.72, 0.42]} />
+        <meshStandardMaterial color={STEEL} metalness={0.45} roughness={0.55} />
+      </mesh>
+      <mesh position={[0, 0.735, 0]}>
+        <boxGeometry args={[0.5, 0.03, 0.5]} />
+        <meshStandardMaterial color={CASTING} metalness={0.5} roughness={0.5} />
+      </mesh>
+      {/* the gatling, flat, turning */}
+      <group position={[0, 0.86, 0]} ref={spinRef}>
+        <group scale={0.95}>
+          <MinigunModel />
+        </group>
+      </group>
     </group>
   )
 }
