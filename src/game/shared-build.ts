@@ -702,7 +702,15 @@ function applyEffectsInner(s: BuildSync, fx: SharedEffects): void {
   // THE GRID REFUSAL IS A PLAYER-VISIBLE EVENT, not a dropped packet. A peer
   // whose anchor differs has its slot-addressed pieces refused wholesale, and
   // a player wondering where a friend's walls went deserves the reason.
-  if (fx.refusedGrid && !refusedGridSaid) {
+  //
+  // ONE EXCEPTION, AND IT IS ABOUT US, NOT THEM: our own stamp is 0 until the
+  // grid effect publishes it, and the transport attaches earlier than the piece
+  // tree mounts — so a frame arriving in that window is refused because WE do
+  // not know our lot yet. That is not "a builder is on a different lot", and
+  // saying so would blame a stranger for our own startup order. Refusing the
+  // frame stays correct (records are grow-only, the next frame lands); the
+  // notice waits until we have a lot of our own to disagree about.
+  if (fx.refusedGrid && !refusedGridSaid && s.world.gridStamp !== 0) {
     refusedGridSaid = true
     say('A builder is on a different lot grid — their pieces are hidden')
   }

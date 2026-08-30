@@ -623,7 +623,7 @@ describe('a builder on a different lot grid', () => {
     expect(isForeignPlacement(useItems.getState().items[0]!.id)).toBe(true)
   })
 
-  test('a stamp we have not published yet refuses everyone’s slots', () => {
+  test('a stamp we have not published yet refuses everyone’s slots, in silence', () => {
     setGridAnchor({ x: 0, z: 0, yaw: 0 })
     setStoreyLadder(LADDER)
     const mine = createSharedWorld('me')
@@ -643,7 +643,17 @@ describe('a builder on a different lot grid', () => {
     delta.pieces.push(rec)
     expect(receiveBuildDelta(delta, 'them').refusedGrid).toBe(true)
     expect(useBoots.getState().placed).toHaveLength(0)
-    expect(notices).toHaveLength(1)
+    // The transport attaches before the piece tree publishes our stamp, so this
+    // window is REAL in a live session. Refusing is right; blaming a stranger's
+    // lot for our own startup order is not — the player cannot act on it, and
+    // the next frame lands anyway.
+    expect(notices).toEqual([])
+
+    // Once we know our own lot, the very same frame is a real disagreement and
+    // the player hears about it.
+    publishGridStamp(0, 0, [gridTerrainY(), ...LADDER])
+    expect(receiveBuildDelta(delta, 'them').refusedGrid).toBe(true)
+    expect(notices).toEqual(['A builder is on a different lot grid — their pieces are hidden'])
   })
 })
 
