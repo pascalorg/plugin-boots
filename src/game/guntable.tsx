@@ -175,6 +175,38 @@ export function armoryStationPosition(world: GameWorld): Vector3 {
   return depotLocalToWorld(world, ARMORY_STATION_LOCAL[0], ARMORY_STATION_LOCAL[1])
 }
 
+/**
+ * The deck height for the container — the MAX of the footprint's four
+ * corners and its center, not one probe at the middle.
+ *
+ * The depot is a rigid 6 × 2.5 m box. On sculpted ground a single center
+ * probe seats it at the average height, which buries the uphill end (the
+ * owner's lots drop metres across a yard); taking the highest corner keeps
+ * every doorway clear and leaves the gap at the low end, hidden by the
+ * skirt. Pure and exported so the sweep tests can seat it on a slope.
+ */
+export function depotSeatY(world: GameWorld): number {
+  const hx = DEPOT_SIZE[0] / 2
+  const hz = DEPOT_SIZE[2] / 2
+  const colliders = world.colliders ?? []
+  let best = Number.NEGATIVE_INFINITY
+  for (const [lx, lz] of DEPOT_SEAT_SAMPLES) {
+    const p = depotLocalToWorld(world, lx * hx, lz * hz)
+    const y = spawnGroundY(colliders, p.x, p.z)
+    if (y > best) best = y
+  }
+  return Number.isFinite(best) ? best : 0
+}
+
+/** Footprint samples in half-extents: four corners plus the center. */
+const DEPOT_SEAT_SAMPLES: ReadonlyArray<readonly [number, number]> = [
+  [0, 0],
+  [-1, -1],
+  [-1, 1],
+  [1, -1],
+  [1, 1],
+]
+
 /** The industrial breaker on the +x end wall: the ONLY combat trigger. */
 export function breakerPosition(world: GameWorld): Vector3 {
   return depotLocalToWorld(world, BREAKER_LOCAL[0], BREAKER_LOCAL[1])
@@ -301,15 +333,13 @@ const RUST_PATCHES: Array<{
  */
 function SpawnDepot({ world }: { world: GameWorld }) {
   const center = useMemo(() => depotPosition(world), [world])
-  // Seat the container on whatever actually stands at its center — the
-  // same probe that settles the player (spawnGroundY skips '__boots'
+  // Seat the container on whatever actually stands under its footprint —
+  // the same probe that settles the player (spawnGroundY skips '__boots'
   // colliders, so the depot never stands on itself). On lots whose yard
   // is a raised site slab (warner-2: top at y≈0.69) a hardcoded y=0 left
-  // the container embedded waist-deep in the terrain.
-  const groundY = useMemo(
-    () => spawnGroundY(world.colliders ?? [], center.x, center.z),
-    [world, center],
-  )
+  // the container embedded waist-deep in the terrain; on sculpted ground a
+  // single center probe buries the uphill end, hence depotSeatY.
+  const groundY = useMemo(() => depotSeatY(world), [world])
   const armoryAt = useMemo(() => armoryStationPosition(world), [world])
   const geared = useBoots((s) => s.owned.includes('rifle'))
   const solidRefs = useRef<(Mesh | null)[]>([])

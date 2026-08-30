@@ -7,6 +7,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT, moveCapsule, PLAYER_CAPSULE } from './collision'
 import { collideVoxelWalls } from './destruction'
+import { groundSurfaceY, lotFloorY } from './ground'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
 import { getSession } from './session'
@@ -245,6 +246,9 @@ export type PlayerSample = {
   speed: number
 }
 
+/** How far under the lot floor counts as "fell out of the world". */
+const FALL_OUT_DEPTH = 30
+
 /**
  * Dev-only handle (used by headless E2E): teleport the player rig, hurt the
  * player like a bot would, drain queued knockback (tests), and sample the
@@ -269,8 +273,10 @@ export const playerDebug: {
 /**
  * Pure teleport application — the session-scoped playerDebug.teleport closure
  * delegates here with its live feet/vel refs. `y` is optional (multi-storey
- * E2E lands the rig on an upper floor); the default keeps the historical
- * ground-teleport behavior.
+ * E2E lands the rig on an upper floor); omitted, the feet land on the GROUND
+ * at (x, z) — a literal 0 dropped QA five metres into an excavated yard, or
+ * buried the rig in a hill until the capsule shoved it out sideways. Flat
+ * lots have no probe installed, so the default is still exactly 0 there.
  */
 export function applyTeleport(
   feet: Vector3,
@@ -279,7 +285,7 @@ export function applyTeleport(
   z: number,
   yaw: number,
   pitch = 0,
-  y = 0,
+  y = groundSurfaceY(x, z),
 ): void {
   // QA teleports jump the camera across the map — the culling/BVH work the
   // next frame pays is not a gameplay spike, so let the perf log name it.
@@ -344,7 +350,8 @@ export function Player({ world }: { world: GameWorld }) {
     regenPool = 0
     camera.fov = GAME_FOV
     camera.updateProjectionMatrix()
-    playerDebug.teleport = (x, z, yaw, pitch = 0, y = 0) =>
+    // y left undefined on purpose: applyTeleport's default probes the ground.
+    playerDebug.teleport = (x, z, yaw, pitch = 0, y) =>
       applyTeleport(feet.current, vel.current, x, z, yaw, pitch, y)
     playerDebug.sample = () => {
       const s = useBoots.getState()
@@ -605,8 +612,11 @@ export function Player({ world }: { world: GameWorld }) {
     )
 
     // Fall off the world guard. Re-settle: the ground at the spawn XZ may
-    // have changed since the snapshot (voxelized away, pieces placed).
-    if (feet.current.y < -30) {
+    // have changed since the snapshot (voxelized away, pieces placed). The
+    // trip line hangs BELOW the lot floor, not below an absolute −30: a yard
+    // excavated deeper than that used to respawn the player for standing in
+    // his own pit.
+    if (feet.current.y < lotFloorY() - FALL_OUT_DEPTH) {
       feet.current.copy(world.spawn)
       settleSpawnFeet(world.colliders, feet.current, PLAYER_CAPSULE)
       vel.current.set(0, 0, 0)

@@ -25,6 +25,12 @@ import {
   bots as liveBots,
 } from './enemies-state'
 import {
+  DEPOT_SIZE,
+  depotLocalToWorld,
+  depotPosition,
+  depotSeatY,
+} from './guntable'
+import {
   FLAT_LOT_Y,
   groundSurfaceY,
   hasGroundSurfaceProbe,
@@ -34,6 +40,7 @@ import {
   setLotFloorY,
 } from './ground'
 import { itemDropY, itemProbeFromY } from './item-place'
+import { applyTeleport } from './player'
 import {
   bvhFor,
   type ColliderEntry,
@@ -409,6 +416,65 @@ describe('debris rests on the ground before its probe lands', () => {
     const piece = debrisDump()[0]!
     expect(piece.ground).toBeGreaterThan(0)
     expect(piece.ground).toBeLessThan(0.3)
+  })
+})
+
+describe('the QA teleport lands on the ground', () => {
+  test('no explicit y puts the feet on the terrain, not on the lot plane', () => {
+    useRampTerrain()
+    const feet = new Vector3(9, 9, 9)
+    const vel = new Vector3(1, -8, 2)
+    applyTeleport(feet, vel, 9, 20, 0)
+    expect(feet.y).toBe(-5)
+    // …and uphill, over the bench instead of inside it.
+    applyTeleport(feet, vel, -5, 0, 0)
+    expect(feet.y).toBe(2)
+  })
+
+  test('an explicit y still wins (multi-storey E2E)', () => {
+    useRampTerrain()
+    const feet = new Vector3()
+    applyTeleport(feet, new Vector3(), 9, 20, 0, 0, 2.8)
+    expect(feet.y).toBe(2.8)
+  })
+
+  test('flat lot: the default is exactly 0, as it always was', () => {
+    const feet = new Vector3(9, 9, 9)
+    applyTeleport(feet, new Vector3(), 3, -4, 0)
+    expect(feet.toArray()).toEqual([3, 0, -4])
+  })
+})
+
+describe('the depot deck clears the ground under its whole footprint', () => {
+  // spawn at the origin puts the 6 m container across the ramp: one end on
+  // the +2 bench, the other in the −2 basin.
+  const depotWorld = (): GameWorld => {
+    const world = makeWorld([])
+    world.spawn.set(0, 0, 0)
+    return world
+  }
+
+  test('the seat is the HIGHEST footprint sample, not the center probe', () => {
+    useRampTerrain()
+    const world = depotWorld()
+    const center = depotPosition(world)
+    const seat = depotSeatY(world)
+    expect(seat).toBe(2)
+    // A center probe seated it at −0.5 — the uphill end buried 2.5 m deep.
+    expect(seat).toBeGreaterThan(spawnGroundY([], center.x, center.z))
+    // The invariant: no ground under the deck pokes through it.
+    const hx = DEPOT_SIZE[0] / 2
+    const hz = DEPOT_SIZE[2] / 2
+    for (const lx of [-hx, 0, hx]) {
+      for (const lz of [-hz, 0, hz]) {
+        const p = depotLocalToWorld(world, lx, lz)
+        expect(rampTerrain(p.x, p.z)).toBeLessThanOrEqual(seat + 1e-9)
+      }
+    }
+  })
+
+  test('flat lot: the depot still sits at 0', () => {
+    expect(depotSeatY(depotWorld())).toBe(0)
   })
 })
 
