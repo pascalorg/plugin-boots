@@ -1,5 +1,6 @@
 'use client'
 
+import { DropGate } from './drop-gate'
 import { GameRoot } from './game-root'
 
 /**
@@ -8,5 +9,10 @@ import { GameRoot } from './game-root'
  * matter). It renders nothing until Jump in flips the phase.
  */
 export default function BootsSystem() {
-  return <GameRoot />
+  return (
+    <>
+      <DropGate />
+      <GameRoot />
+    </>
+  )
 }
