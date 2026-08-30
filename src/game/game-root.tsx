@@ -8,6 +8,7 @@ import { type Object3D, Raycaster, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { GameBoundary } from './boundary'
 import { Builder, PlacedPieces } from './builder'
+import { craterSlots } from './craters'
 import { clearDebris, Debris, debrisDump, setDebrisGroundProbe } from './debris'
 import {
   collapseWholeTarget,
@@ -29,7 +30,7 @@ import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
-import { resetGround } from './ground'
+import { groundSurfaceY, resetGround } from './ground'
 import { GunTable } from './guntable'
 import { HostPostTuning, hostPostDebug } from './host-post'
 import { GameItems } from './item-place'
@@ -724,6 +725,21 @@ function ActiveGame() {
       // (debris.tsx debrisDump; floors-for-things QA reads settle heights
       // straight off this instead of traversing instance matrices).
       debris: () => debrisDump(),
+      // Crater census — the live patches with the ground height under each
+      // one, so QA can assert a blast on a hill cut the hill (dy ≈ 0) rather
+      // than floating a decal at the lot plane. Plain data, never a live ref.
+      craters: () =>
+        craterSlots()
+          .filter((slot) => slot.alive)
+          .map((slot) => ({
+            x: slot.x,
+            y: slot.y,
+            z: slot.z,
+            radius: slot.radius,
+            breach: slot.breach,
+            groundY: groundSurfaceY(slot.x, slot.z),
+            dy: slot.y - groundSurfaceY(slot.x, slot.z),
+          })),
       // Glass plate-shard census (owner round 5: panes shatter into flat
       // plates, never cubes) — live count / mean vy / sliver thickness.
       glassShards: () => glassShardCensus(),
