@@ -327,6 +327,180 @@ export function passageHidesCell(x: number, y: number, z: number): boolean {
 }
 
 /**
+ * THE SAME QUESTION FOR A STICK, NOT A CUBE — the member lanes' passage test
+ * (framing segments, joists, rafters, drywall sheets: everything voxel-walls.tsx
+ * draws as a MemberLayer rather than a grid cell).
+ *
+ * `passageHidesCell` asks whether a CENTRE stands inside the opening, and for a
+ * cell that is the whole question: a cube 0.15 m on a side in a 0.8 m doorway is
+ * majority-inside the moment its centre is, so centre-in and stands-in are the
+ * same predicate to within half a cell. A framing member is not that shape. A
+ * stud line splits into sticks up to ~0.9 m long and a plate into ~1.2 m runs
+ * (destruction.ts buildSegments), so a stick can cross the full width of a 0.8 m
+ * doorway with its CENTRE comfortably outside the prism — the centre test would
+ * leave exactly the bar across the opening this lane exists to remove, and it
+ * would leave it on the worst members, the long ones.
+ *
+ * So a member is tested as its CENTRE LINE: the segment through its centre along
+ * its longest local axis, rotated into world space by the same composition the
+ * matrix writer uses (voxel-walls.tsx beginMemberRotation — one composition, two
+ * readers, so the axis we test is the axis we draw). Hidden when that line enters
+ * the prism.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO, on both sides:
+ *
+ *  - NO PRISM PAD — like `passageHidesCell` and for exactly its reason (every
+ *    direction a pad could grow in removes geometry the player is looking
+ *    straight at), and one step stricter: not even that lane's PASSAGE_EDGE_EPS,
+ *    for the reason spelled out at the loop below. Here the stakes are higher
+ *    than on the skin, because the
+ *    door's OWN framing is parked a mere OPENING_PAD (0.02 m, destruction.ts)
+ *    clear of its aperture: the trimmer studs flanking the opening and the
+ *    header plate over it are the geometry a pad reaches FIRST. Pad this by a
+ *    fifth of a metre and an open door loses its jambs and its header — a
+ *    conspicuously worse artefact than the bar it was removing.
+ *  - NO CROSS-SECTION. The two minor axes are ignored, so a stick that only
+ *    grazes the prism with a corner keeps drawing. That under-relieves by at
+ *    most half the member's cross-section — 0.019 m on a 2×4's width, 0.045 m on
+ *    its depth, 0.118 m on a 2×10 joist — all at or below the half-cell the skin
+ *    lane already accepts, and all of it lumber inside a wall cavity rather than
+ *    in open air. Erring this way is also what keeps the 0.02 m jamb clearance
+ *    meaningful: an OBB test would spend most of that clearance on the stick's
+ *    own half-width.
+ *
+ * The under-relief bound is the member's cross-section, NOT its length, which is
+ * why testing the line rather than the point matters: length is the dimension
+ * that varies from 0.09 m to 1.2 m across the layer, and it is now exact.
+ *
+ * (A wide SHEET member — `boards`, the drywall-plate layer voxel-walls.tsx can
+ * render but destruction.ts does not populate today — would need its medial
+ * RECTANGLE rather than a single line, since a plate can cross a doorway off
+ * both of its own axes. Pinned by test so the day boards land, they land loud.)
+ */
+export function passageHidesSegment(
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+): boolean {
+  if (passages.length === 0) return false
+  for (const box of passages) {
+    // THE EXACT PRISM — not even PASSAGE_EDGE_EPS, which the cell lanes carry.
+    // That eps is a COLLISION tolerance (jamb-corner contacts resolving exactly
+    // on a prism face pushed the walker off line), and on the skin it is free:
+    // 0.02 m against a half-cell of 0.075 m is noise. Against framing it is not
+    // noise, it is most of the budget. Measured on the harness wall — a 4 m wall
+    // with a 0.9 m hosted door, the shape stud-openings.test.ts pins — the
+    // clipped bottom plate stops 0.026 m short of the prism (OPENING_PAD 0.02
+    // plus the segment's own 0.006 end shrink). An 0.02 m eps would spend 77 %
+    // of that on nothing, leaving 6 mm between "correct" and hiding the plate
+    // the doorway stands on. The eps has no job here — a stick whose centre line
+    // lands exactly on the prism face is arbitrary either way, and there is no
+    // resolution loop for it to destabilise.
+    if (
+      segmentTouchesBox(
+        ax,
+        ay,
+        az,
+        bx,
+        by,
+        bz,
+        box.min.x,
+        box.min.y,
+        box.min.z,
+        box.max.x,
+        box.max.y,
+        box.max.z,
+      )
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Does segment A→B intersect the axis-aligned box? Slab clipping on the
+ * parameter t ∈ [0, 1] — allocation-free, and it answers for the whole stick at
+ * once instead of sampling it.
+ *
+ * A degenerate axis (the segment is flat in x, y or z — the common case, since
+ * most framing runs parallel to a world axis) is handled by an inside test
+ * rather than a division: with dx exactly 0 the two slab roots are ±Infinity,
+ * which clips correctly, but `0/0` on a segment that also STARTS on the slab
+ * plane is NaN and every comparison against it is false, so the clip would fail
+ * open. Testing the coordinate instead is both exact and cheaper.
+ */
+function segmentTouchesBox(
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+  minX: number,
+  minY: number,
+  minZ: number,
+  maxX: number,
+  maxY: number,
+  maxZ: number,
+): boolean {
+  let t0 = 0
+  let t1 = 1
+  // x
+  const dx = bx - ax
+  if (dx === 0) {
+    if (ax < minX || ax > maxX) return false
+  } else {
+    let ta = (minX - ax) / dx
+    let tb = (maxX - ax) / dx
+    if (ta > tb) {
+      const swap = ta
+      ta = tb
+      tb = swap
+    }
+    if (ta > t0) t0 = ta
+    if (tb < t1) t1 = tb
+    if (t0 > t1) return false
+  }
+  // y
+  const dy = by - ay
+  if (dy === 0) {
+    if (ay < minY || ay > maxY) return false
+  } else {
+    let ta = (minY - ay) / dy
+    let tb = (maxY - ay) / dy
+    if (ta > tb) {
+      const swap = ta
+      ta = tb
+      tb = swap
+    }
+    if (ta > t0) t0 = ta
+    if (tb < t1) t1 = tb
+    if (t0 > t1) return false
+  }
+  // z
+  const dz = bz - az
+  if (dz === 0) {
+    if (az < minZ || az > maxZ) return false
+  } else {
+    let ta = (minZ - az) / dz
+    let tb = (maxZ - az) / dz
+    if (ta > tb) {
+      const swap = ta
+      ta = tb
+      tb = swap
+    }
+    if (ta > t0) t0 = ta
+    if (tb < t1) t1 = tb
+    if (t0 > t1) return false
+  }
+  return true
+}
+
+/**
  * Could any open doorway possibly touch this sphere? The render lane's cheap
  * bail-out: a voxel replica whose whole grid is nowhere near a doorway must not
  * walk its cells just because a door opened on the far side of the lot.

@@ -18,7 +18,12 @@ import {
   Sphere,
   Vector3,
 } from 'three'
-import { passageGeneration, passageHidesCell, passagesTouchSphere } from './collision'
+import {
+  passageGeneration,
+  passageHidesCell,
+  passageHidesSegment,
+  passagesTouchSphere,
+} from './collision'
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
 import {
@@ -313,6 +318,8 @@ function refreshFrozenChildren(parent: Object3D): void {
 const _matrix = new Matrix4()
 const _pos = new Vector3()
 const _scale = new Vector3()
+/** A member's centre-line half-vector (memberStandsInPassage). */
+const _axis = new Vector3()
 const _quat = new Quaternion()
 const _color = new Color()
 const ZERO = new Matrix4().makeScale(0, 0, 0)
@@ -509,6 +516,83 @@ function isGone(m: SandwichMember): boolean {
   return m.broken === true || m.torn === true
 }
 
+/**
+ * Load `_quat` with member `m`'s local→world rotation and hand it back. Factored
+ * out for the same reason `beginCellTransform` was: TWO readers now need it — the
+ * matrix writer and the open-doorway test — and the axis we test a stick along
+ * has to be the axis we draw it along, or a door would hide the wrong sticks.
+ *
+ * Pitched roof members are Ry(−yaw)·Rz(pitch) (roof-framing.ts conventions);
+ * absent/0 pitch keeps the yaw-only path, yaw 0 keeps identity.
+ */
+function beginMemberRotation(m: SandwichMember): Quaternion {
+  if (m.pitch) {
+    _quat.setFromAxisAngle(UP, -m.yaw).multiply(_qz.setFromAxisAngle(Z_AXIS, m.pitch))
+  } else if (m.yaw === 0) _quat.identity()
+  else _quat.setFromAxisAngle(UP, -m.yaw)
+  return _quat
+}
+
+/**
+ * Does this member stand in an OPEN DOORWAY? (collision.ts::passageHidesSegment.)
+ *
+ * The second half of the owner's "i see voxels when it's open through it": hiding
+ * the skin cubes in the aperture (98a8fe3) is what EXPOSED these. Framing lives
+ * in the cavity between the two drywall skins, invisible while the skins are
+ * intact — so the moment the crossing wall's cells stopped drawing in the
+ * doorway, the sticks that were behind them became the thing standing in the
+ * open door. The browser census measured 8-16 of them per doorway on the flat QA
+ * house and 20 across 11 doors on the sculpted lot.
+ *
+ * A member is its CENTRE LINE here, not its centre point — see the predicate's
+ * header for why the cell lane's point test does not transfer to a 1.2 m stick,
+ * and for what the unpadded prism buys (the door's own jambs and header sit
+ * 0.02 m clear of the aperture, so they are the first thing a pad would eat).
+ */
+export function memberStandsInPassage(m: SandwichMember): boolean {
+  const rot = beginMemberRotation(m)
+  const [sx, sy, sz] = m.size
+  // The longest LOCAL axis is the stick's length; the other two are its
+  // cross-section, deliberately ignored (the predicate's under-relief bound).
+  _axis.set(0, 0, 0)
+  if (sx >= sy && sx >= sz) _axis.x = sx / 2
+  else if (sy >= sz) _axis.y = sy / 2
+  else _axis.z = sz / 2
+  _axis.applyQuaternion(rot)
+  const cx = m.center[0]
+  const cy = m.center[1]
+  const cz = m.center[2]
+  return passageHidesSegment(
+    cx - _axis.x,
+    cy - _axis.y,
+    cz - _axis.z,
+    cx + _axis.x,
+    cy + _axis.y,
+    cz + _axis.z,
+  )
+}
+
+/** Could any open doorway reach this member layer at all? The cheap bail-out —
+ * a door opening across the lot must not walk every wall's framing. The layer's
+ * bounding sphere is mount-time and members never move, so this is one
+ * sphere-vs-prism test per layer per door toggle. */
+function passagesReachLayer(mesh: InstancedMesh): boolean {
+  const sphere = mesh.boundingSphere
+  if (sphere === null || sphere.radius < 0) return false
+  return passagesTouchSphere(sphere.center.x, sphere.center.y, sphere.center.z, sphere.radius)
+}
+
+/** One member layer's look. Module constants (below), so the component's call
+ * site and the tests' can never drift apart on inset, jitter or pinch. */
+type MemberStyle = {
+  base: Color
+  damaged: Color
+  jitter: number
+  inset: number
+  pinch: boolean
+  material: MeshStandardMaterial
+}
+
 /** Cheap dirty signal over a member layer — plain arithmetic, no allocs.
  * Changes whenever any member's hp moves or its broken/torn flag flips. */
 function layerChecksum(members: SandwichMember[]): number {
@@ -520,21 +604,40 @@ function layerChecksum(members: SandwichMember[]): number {
   return h
 }
 
-/** Write every member's matrix + color. Gone members get the zero matrix. */
-function uploadLayer(
+/**
+ * Write every member's matrix + color. Gone members get the zero matrix, and so
+ * do members standing in an OPEN DOORWAY — the same "hidden, never killed"
+ * mechanism the skin lane uses, on the same registry.
+ *
+ * Returns whether a doorway is hiding anything here as of this write. The caller
+ * keeps that as a LATCH: once the door closes its prism is gone, so
+ * `passagesReachLayer` goes false and the sweep that has to put the sticks BACK
+ * would never run without it.
+ *
+ * The passage gate is computed HERE rather than passed in on purpose. Three call
+ * sites re-upload this layer — mount, a chip changing the checksum, and a door
+ * toggle — and if any one of them wrote matrices without consulting the registry,
+ * a single chip anywhere in the wall would put the doorway's sticks back on
+ * screen. Deriving it inside the one writer makes that class of bug unreachable.
+ */
+function uploadMemberLayer(
   mesh: InstancedMesh,
   members: SandwichMember[],
-  base: Color,
-  damaged: Color,
-  jitter: number,
-  inset: number,
-  pinch: boolean,
+  style: MemberStyle,
   maxHp: number,
-): void {
+): boolean {
+  const { base, damaged, jitter, inset, pinch } = style
+  const hidePassages = passagesReachLayer(mesh)
+  let holes = false
   for (let i = 0; i < members.length; i++) {
     const m = members[i]!
     if (isGone(m)) {
       mesh.setMatrixAt(i, ZERO)
+      continue
+    }
+    if (hidePassages && memberStandsInPassage(m)) {
+      mesh.setMatrixAt(i, ZERO)
+      holes = true
       continue
     }
     const [sx, sy, sz] = m.size
@@ -556,11 +659,8 @@ function uploadLayer(
         _scale.y *= p
       }
     }
-    if (m.pitch) {
-      // Pitched roof member: local→world = Ry(−yaw)·Rz(pitch).
-      _quat.setFromAxisAngle(UP, -m.yaw).multiply(_qz.setFromAxisAngle(Z_AXIS, m.pitch))
-    } else if (m.yaw === 0) _quat.identity()
-    else _quat.setFromAxisAngle(UP, -m.yaw)
+    // Same composition `memberStandsInPassage` tested the stick's axis with.
+    beginMemberRotation(m)
     _pos.set(m.center[0], m.center[1], m.center[2])
     _matrix.compose(_pos, _quat, _scale)
     mesh.setMatrixAt(i, _matrix)
@@ -574,29 +674,69 @@ function uploadLayer(
   }
   mesh.instanceMatrix.needsUpdate = true
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+  return holes
 }
 
-/** One sandwich layer (boards or segments) as a single InstancedMesh. */
+/** Drywall PLATES: flat sheets behind the voxels, faint per-plate jitter, ~1%
+ * inset for the hairline seam read. destruction.ts does not populate `boards`
+ * today — the layer mounts only if it ever does. */
+const BOARD_STYLE: MemberStyle = {
+  base: BOARD_BASE,
+  damaged: BOARD_DAMAGED,
+  jitter: 0.05,
+  inset: 0.99,
+  pinch: false,
+  material: BOARD_MATERIAL,
+}
+
+/** FRAMING lumber: charcoal sticks at true section, ~1% inset so break points
+ * articulate, cross-section pinched when chipped (the dent). */
+const SEGMENT_STYLE: MemberStyle = {
+  base: WOOD_BASE,
+  damaged: WOOD_DAMAGED,
+  jitter: 0.1,
+  inset: 0.99,
+  pinch: true,
+  material: WOOD_MATERIAL,
+}
+
+/**
+ * Write a FRAMING layer's matrices, open doorways included — the member lane's
+ * counterpart to the skin lane's `syncPassageHoles`, and the same reason it
+ * exists: the regression suite has to drive the REAL writer. A test that
+ * re-implemented the sweep would pin its own copy, and the copy is exactly the
+ * thing that drifts. Returns the caller's restore latch (see `uploadMemberLayer`).
+ */
+export function syncMemberLayer(
+  mesh: InstancedMesh,
+  members: SandwichMember[],
+  maxHp = 1,
+): boolean {
+  return uploadMemberLayer(mesh, members, SEGMENT_STYLE, maxHp)
+}
+
+/** One sandwich layer (boards or segments) as a single InstancedMesh. `layer`
+ * is the QA census tag — the browser probe counts drawn instances per doorway
+ * and has to be able to name which layer each one belongs to. */
 function MemberLayer({
   members,
-  base,
-  damaged,
-  jitter,
-  inset,
-  pinch,
-  material,
+  style,
+  layer,
 }: {
   members: SandwichMember[]
-  base: Color
-  damaged: Color
-  jitter: number
-  inset: number
-  pinch: boolean
-  material: MeshStandardMaterial
+  style: MemberStyle
+  layer: string
 }) {
   const meshRef = useRef<InstancedMesh>(null!)
   const checksum = useRef(Number.NaN)
   const maxHp = useRef(1)
+  /** Last passage generation these matrices reflect. -1 so the first frame always
+   * reconciles (a door may already have been standing open at mount). */
+  const passageGen = useRef(-1)
+  /** Whether an open doorway is hiding members here — the latch that makes a door
+   * CLOSING put the sticks back, since by then no prism reaches this layer and
+   * the cheap sphere test would skip the restore. */
+  const passageHoles = useRef(false)
   const gl = useThree((s) => s.gl)
 
   useLayoutEffect(() => {
@@ -608,6 +748,8 @@ function MemberLayer({
     // (A dormant replica's warm draw renders underground, where this layer
     // culls away and skips its first upload — at ≤ ~100 instances that's a
     // few KB on the wake frame, not worth plumbing the warm-draw latch in.)
+    // The sphere is also the passage early-out's input, so it must be set
+    // BEFORE the first upload consults the registry.
     mesh.boundingSphere = membersBoundingSphere(members, mesh.boundingSphere ?? undefined)
     mesh.frustumCulled = true
     // Full hp = the healthiest member at voxelize time (fresh members are
@@ -615,9 +757,10 @@ function MemberLayer({
     let max = 1
     for (const m of members) if ((m.hp ?? 1) > max) max = m.hp ?? 1
     maxHp.current = max
-    uploadLayer(mesh, members, base, damaged, jitter, inset, pinch, max)
+    passageHoles.current = uploadMemberLayer(mesh, members, style, max)
+    passageGen.current = passageGeneration()
     checksum.current = layerChecksum(members)
-  }, [members, base, damaged, jitter, inset, pinch, gl])
+  }, [members, style, gl])
 
   useFrame(() => {
     const mesh = meshRef.current
@@ -627,15 +770,37 @@ function MemberLayer({
     // frame): members BY CONTRACT can't change while dormant (damage paths
     // always wake first), so skip the O(members) checksum entirely.
     if (mesh.parent && mesh.parent.visible === false) return
-    // Chips (hp loss without break) never bump revision, so poll the cheap
-    // checksum every frame and re-upload the whole small layer on change.
+    // Two things dirty this layer, and ONE full re-upload answers both — the
+    // layer is ≤ a few hundred instances, so folding them together is cheaper
+    // than tracking which members each one touched, and it guarantees a chip
+    // can never re-draw a stick a doorway is hiding.
+    //   - a CHIP: hp loss without a break never bumps revision, so poll the
+    //     cheap allocation-free checksum every frame.
+    //   - a DOOR TOGGLE: the registry stamps a generation on every change, so
+    //     the steady state is one integer compare, and the sweep only touches
+    //     layers a prism actually reaches (or ones still holding sticks hidden,
+    //     which have to restore them).
     const h = layerChecksum(members)
-    if (h === checksum.current) return
+    const gen = passageGeneration()
+    let passageDirty = false
+    if (passageGen.current !== gen) {
+      passageGen.current = gen
+      passageDirty = passageHoles.current || passagesReachLayer(mesh)
+    }
+    if (h === checksum.current && !passageDirty) return
     checksum.current = h
-    uploadLayer(mesh, members, base, damaged, jitter, inset, pinch, maxHp.current)
+    const t0 = performance.now()
+    passageHoles.current = uploadMemberLayer(mesh, members, style, maxHp.current)
+    if (passageDirty) perfSection('passage-members', performance.now() - t0)
   })
 
-  return <instancedMesh args={[VOXEL_GEOMETRY, material, members.length]} ref={meshRef} />
+  return (
+    <instancedMesh
+      args={[VOXEL_GEOMETRY, style.material, members.length]}
+      ref={meshRef}
+      userData={{ __boots: true, __bootsLayer: layer }}
+    />
+  )
 }
 
 /** CORE MODE inset: the fraction of the thickness-axis cell size shaved
@@ -1010,6 +1175,7 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
             : [VOXEL_GEOMETRY, SKIN_MATERIAL, wall.grid.count]
         }
         ref={meshRef}
+        userData={{ __boots: true, __bootsLayer: 'skin' }}
       />
       {underlay && (
         <mesh
@@ -1020,26 +1186,10 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
         />
       )}
       {boards && boards.length > 0 && (
-        <MemberLayer
-          base={BOARD_BASE}
-          damaged={BOARD_DAMAGED}
-          inset={0.99}
-          jitter={0.05}
-          material={BOARD_MATERIAL}
-          members={boards}
-          pinch={false}
-        />
+        <MemberLayer layer="boards" members={boards} style={BOARD_STYLE} />
       )}
       {segments.length > 0 && (
-        <MemberLayer
-          base={WOOD_BASE}
-          damaged={WOOD_DAMAGED}
-          inset={0.99}
-          jitter={0.1}
-          material={WOOD_MATERIAL}
-          members={segments}
-          pinch={true}
-        />
+        <MemberLayer layer="segments" members={segments} style={SEGMENT_STYLE} />
       )}
     </group>
   )
