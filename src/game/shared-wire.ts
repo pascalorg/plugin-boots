@@ -87,8 +87,33 @@ export const CELLS_MASK = 2
 
 /** Hard ceiling on a frame we will even look at. A full snapshot of a
  * completely obliterated large lot measures well under this; anything bigger
- * is a bug or an attack. The transport should cap lower for deltas. */
+ * is a bug or an attack. The transport caps far lower — see MAX_TEXT_CHARS. */
 export const MAX_FRAME_BYTES = 1 << 20
+
+/**
+ * THE REAL CEILING, and it is not counted in bytes.
+ *
+ * The host bus is a JSON channel with a cap on the SERIALIZED LENGTH of a
+ * frame: net.ts's MAX_FRAME_SERIALIZED is 8000 characters, of which it
+ * reserves 120 for the envelope (`{v,kind,seq,part,parts,data}`), leaving
+ * MAX_PAYLOAD_SERIALIZED = 7880 for the payload. Our payload is a bare JSON
+ * string, so it costs its own length plus two quotes — base64's alphabet needs
+ * no escaping, which is the other reason base64 is the encoding of choice.
+ *
+ * 7878 characters of base64 is 5908 BYTES. That is the number this module is
+ * really designed against, and it is ~130× tighter than MAX_FRAME_BYTES: a
+ * snapshot of a thoroughly wrecked lot measures 6220 base64 characters, which
+ * does not fit. Hence splitDelta/wireParts below — chunking is not an
+ * optimisation here, it is a requirement.
+ *
+ * Not imported from net.ts on purpose: this module has no transport
+ * dependency, and shared-invariant.test.ts asserts the arithmetic still
+ * matches the transport's constants.
+ */
+export const MAX_TEXT_CHARS = 7878
+
+/** Frames one delta may be split into. net.ts refuses `parts > 1024`. */
+export const MAX_WIRE_PARTS = 1024
 
 /** Words in the table, and the longest word we accept. */
 const MAX_WORDS = 8192
@@ -319,6 +344,30 @@ export function cellModeFor(cells: readonly CellKey[]): {
 }
 
 /**
+ * Broken framing sticks, spelled as gaps for the same reason cells are — and
+ * defended for the same reason too, only more urgently: a gap list writes
+ * `id - prev - 1`, and a repeated id asks the writer for -1, which a varint
+ * cannot say. It would go out as 127 and decode as a DIFFERENT stick. Sorting a
+ * copy costs nothing on the two-element lists this normally sees.
+ */
+function writeSegments(w: Writer, input: readonly number[]): void {
+  let ascending = true
+  for (let i = 1; i < input.length; i++) {
+    if ((input[i] as number) <= (input[i - 1] as number)) {
+      ascending = false
+      break
+    }
+  }
+  const ids = ascending ? input : [...new Set(input)].sort((a, b) => a - b)
+  w.varint(ids.length)
+  let prev = -1
+  for (const id of ids) {
+    w.varint(id - prev - 1)
+    prev = id
+  }
+}
+
+/**
  * Pick and write the cheaper of the two spellings.
  *
  * The gap encoding needs an ascending list. Everything the model produces is
@@ -453,12 +502,7 @@ export function encodeDelta(delta: SharedDelta): Uint8Array {
     body.varint(nd.epoch)
     body.u8((nd.killed ? 1 : 0) | (nd.reset ? 2 : 0))
     writeCells(body, nd.removed)
-    body.varint(nd.segments.length)
-    let prevSeg = -1
-    for (const id of nd.segments) {
-      body.varint(id - prevSeg - 1)
-      prevSeg = id
-    }
+    writeSegments(body, nd.segments)
   }
 
   body.varint(delta.pieces.length)
@@ -789,3 +833,270 @@ export function measureDelta(delta: SharedDelta): WireSize {
     bytesPerCell: cells > 0 ? bytes.length / cells : 0,
   }
 }
+
+// ── Chunking: one frame per coalescing window ───────────────────────────────
+
+/**
+ * WHY CHUNKING IS NOT OPTIONAL. A snapshot of a wrecked lot is ~6.2 kB of
+ * base64 against a 7878-character ceiling: it fits today and will not fit
+ * tomorrow. And the transport cannot help — it coalesces to the latest value
+ * per kind per 66 ms window and drops the rest of a burst, so there is no
+ * "send it in three frames back to back" either.
+ *
+ * So a delta too big for one frame is split into parts that are each a VALID
+ * DELTA ON THEIR OWN. Nothing reassembles them: every part merges
+ * independently, in any order, with any of them missing, because merge is a
+ * lattice join. `{part, parts}` rides along for QA only. That is the whole
+ * reason the split is safe — a reassembly buffer at a trust boundary would be
+ * a peer-controlled allocation, and there is no need for one.
+ *
+ * The split is a recursive halving of the frame's ATOMS (one node entry, one
+ * record, one tombstone). Halving rather than greedy packing because it needs
+ * no size model of the encoder: it asks the encoder. A node that alone
+ * exceeds the budget is halved by CELLS — legal for the same reason, a
+ * removed-cell set is grow-only, so any subset is a valid statement about it —
+ * with the epoch and the killed/reset flags repeated on every half, since they
+ * are idempotent and cost one byte.
+ */
+
+type Atom =
+  | { t: 'node'; nd: NodeDelta }
+  | { t: 'piece'; rec: PieceRec }
+  | { t: 'item'; rec: ItemRec }
+  | { t: 'aperture'; rec: ApertureRec }
+  | { t: 'stroke'; rec: StrokeRec }
+  | { t: 'deadPieces' | 'deadItems' | 'deadApertures' | 'deadStrokes'; id: RecordId }
+
+/** base64 length of n bytes, without building the string. */
+const base64Len = (bytes: number): number => Math.ceil(bytes / 3) * 4
+
+const atomsOf = (delta: SharedDelta): Atom[] => {
+  const out: Atom[] = []
+  for (const nd of delta.nodes) out.push({ t: 'node', nd })
+  for (const rec of delta.pieces) out.push({ t: 'piece', rec })
+  for (const rec of delta.items) out.push({ t: 'item', rec })
+  for (const rec of delta.apertures) out.push({ t: 'aperture', rec })
+  for (const rec of delta.strokes) out.push({ t: 'stroke', rec })
+  for (const id of delta.deadPieces) out.push({ t: 'deadPieces', id })
+  for (const id of delta.deadItems) out.push({ t: 'deadItems', id })
+  for (const id of delta.deadApertures) out.push({ t: 'deadApertures', id })
+  for (const id of delta.deadStrokes) out.push({ t: 'deadStrokes', id })
+  return out
+}
+
+function assemble(source: SharedDelta, atoms: readonly Atom[]): SharedDelta {
+  const out = emptyDelta(source.from, source.kind)
+  out.lamport = source.lamport
+  out.gridStamp = source.gridStamp
+  for (const atom of atoms) {
+    if (atom.t === 'node') out.nodes.push(atom.nd)
+    else if (atom.t === 'piece') out.pieces.push(atom.rec)
+    else if (atom.t === 'item') out.items.push(atom.rec)
+    else if (atom.t === 'aperture') out.apertures.push(atom.rec)
+    else if (atom.t === 'stroke') out.strokes.push(atom.rec)
+    else out[atom.t].push(atom.id)
+  }
+  return out
+}
+
+/** Halve a node entry by its cells, then by its sticks. Null when indivisible. */
+function halveNode(nd: NodeDelta): [NodeDelta, NodeDelta] | null {
+  const flags = { epoch: nd.epoch, killed: nd.killed, reset: nd.reset }
+  if (nd.removed.length > 1) {
+    const at = nd.removed.length >> 1
+    return [
+      { nodeId: nd.nodeId, ...flags, removed: nd.removed.slice(0, at), segments: [] },
+      { nodeId: nd.nodeId, ...flags, removed: nd.removed.slice(at), segments: nd.segments },
+    ]
+  }
+  if (nd.segments.length > 1) {
+    const at = nd.segments.length >> 1
+    return [
+      { nodeId: nd.nodeId, ...flags, removed: nd.removed, segments: nd.segments.slice(0, at) },
+      { nodeId: nd.nodeId, ...flags, removed: [], segments: nd.segments.slice(at) },
+    ]
+  }
+  return null
+}
+
+/**
+ * Split a delta into frames that each encode within `budget` BASE64
+ * CHARACTERS. Every element of the result is a complete, independently
+ * mergeable SharedDelta with the source's kind, author, lamport and grid
+ * stamp.
+ *
+ * Returns [] — refusing the whole frame — when the split would need more than
+ * MAX_WIRE_PARTS parts, or when a single atom cannot be made to fit at all.
+ * Refusing loudly beats truncating silently; the periodic snapshot is what
+ * limits the damage. Under the model's caps this is unreachable for any real
+ * lot: the largest atom is one node's flags, which is a handful of bytes.
+ */
+export function splitDelta(delta: SharedDelta, budget = MAX_TEXT_CHARS): SharedDelta[] {
+  const fits = (part: SharedDelta): boolean => base64Len(encodeDelta(part).length) <= budget
+  if (fits(delta)) return [delta]
+
+  const out: SharedDelta[] = []
+  let refused = false
+
+  const pack = (atoms: readonly Atom[]): void => {
+    if (refused || atoms.length === 0) return
+    const part = assemble(delta, atoms)
+    if (fits(part)) {
+      out.push(part)
+      return
+    }
+    if (atoms.length > 1) {
+      const at = atoms.length >> 1
+      pack(atoms.slice(0, at))
+      pack(atoms.slice(at))
+      return
+    }
+    const only = atoms[0] as Atom
+    if (only.t === 'node') {
+      const halves = halveNode(only.nd)
+      if (halves) {
+        pack([{ t: 'node', nd: halves[0] }])
+        pack([{ t: 'node', nd: halves[1] }])
+        return
+      }
+    }
+    // One indivisible atom that still does not fit: the budget is smaller than
+    // a single record. Nothing sensible left to do but refuse the frame.
+    refused = true
+  }
+
+  pack(atomsOf(delta))
+  if (refused || out.length === 0 || out.length > MAX_WIRE_PARTS) return []
+  return out
+}
+
+/** One publishable frame: exactly the arguments publishFrame() wants. */
+export type WireFrame = {
+  /** Routes to 'boots/world' or 'boots/world-snap' — two kinds, two 66 ms
+   * slots, so a 6 kB snapshot cannot swallow the shot fired 20 ms later. */
+  kind: SharedDelta['kind']
+  /** base64 payload, guaranteed within the budget it was split for. */
+  text: string
+  part: number
+  parts: number
+}
+
+/**
+ * A delta as publishable frames. One element for anything that fits (the
+ * common case: a tick's worth of shooting is ~140 characters), several for a
+ * snapshot. Empty when the delta could not be split — see splitDelta.
+ */
+export function wireParts(delta: SharedDelta, budget = MAX_TEXT_CHARS): WireFrame[] {
+  const parts = splitDelta(delta, budget)
+  return parts.map((part, i) => ({
+    kind: part.kind,
+    text: encodeDeltaText(part),
+    part: i + 1,
+    parts: parts.length,
+  }))
+}
+
+// ── The outbox: one frame per tick, and losses stay visible ──────────────────
+
+/** Frames held while the coalescing window drains. Two seconds of ticks. */
+export const OUTBOX_CAP = 32
+
+/**
+ * A bounded queue of frames waiting for their turn on the wire.
+ *
+ * The transport gives one slot per kind per ~66 ms and silently drops the rest
+ * of a burst, so a multi-part snapshot must go out one part per tick rather
+ * than all at once. That scheduling is a queue, and a queue at a public lobby's
+ * edge needs a cap and counters, so it lives here rather than being reinvented
+ * per lane.
+ *
+ * Every drop is counted. Nothing here retransmits on a timer: loss heals when
+ * the next snapshot goes out.
+ */
+export type WireOutbox = {
+  budget: number
+  cap: number
+  queue: WireFrame[]
+  /** Frames enqueued. */
+  queued: number
+  /** Frames handed to the publisher. */
+  taken: number
+  /** Frames handed back because the publish did not happen. */
+  requeued: number
+  /** Frames dropped because a newer snapshot already says everything. */
+  superseded: number
+  /** Frames dropped because the queue was full — the visible desync risk. */
+  overflow: number
+  /** Deltas that could not be split within MAX_WIRE_PARTS. */
+  oversize: number
+}
+
+export function createOutbox(budget = MAX_TEXT_CHARS, cap = OUTBOX_CAP): WireOutbox {
+  return {
+    budget: budget > 0 ? budget : MAX_TEXT_CHARS,
+    cap: cap > 0 ? cap : OUTBOX_CAP,
+    queue: [],
+    queued: 0,
+    taken: 0,
+    requeued: 0,
+    superseded: 0,
+    overflow: 0,
+    oversize: 0,
+  }
+}
+
+/**
+ * Queue a delta's frames. Returns how many were queued (0 = refused, and
+ * `oversize` moved).
+ *
+ * A SNAPSHOT SUPERSEDES THE QUEUE: it is this peer's whole state, so anything
+ * of ours still waiting is contained in it — and the queue only ever holds our
+ * own frames, because the journal only ever holds our own ops. Dropping them
+ * is a pure saving, and it is what stops a stalled window from turning into an
+ * unbounded backlog of increments.
+ */
+export function queueDelta(box: WireOutbox, delta: SharedDelta): number {
+  const frames = wireParts(delta, box.budget)
+  if (frames.length === 0) {
+    box.oversize++
+    return 0
+  }
+  if (delta.kind === 'snapshot' && box.queue.length > 0) {
+    box.superseded += box.queue.length
+    box.queue.length = 0
+  }
+  for (const frame of frames) box.queue.push(frame)
+  box.queued += frames.length
+  trim(box)
+  return frames.length
+}
+
+/** The next frame to publish, or null. Call once per tick. */
+export function takeWireFrame(box: WireOutbox): WireFrame | null {
+  const frame = box.queue.shift()
+  if (!frame) return null
+  box.taken++
+  return frame
+}
+
+/**
+ * Put a frame back after a publish that did not happen ('deferred',
+ * 'suppressed', 'too-large'). It goes to the FRONT: the oldest state is the
+ * state a peer is most likely missing.
+ */
+export function requeueWireFrame(box: WireOutbox, frame: WireFrame): void {
+  box.queue.unshift(frame)
+  box.requeued++
+  trim(box)
+}
+
+/** Drop the oldest frames when the queue is over its cap, and say so. */
+function trim(box: WireOutbox): void {
+  while (box.queue.length > box.cap) {
+    box.queue.shift()
+    box.overflow++
+  }
+}
+
+/** Frames still waiting. */
+export const outboxDepth = (box: WireOutbox): number => box.queue.length

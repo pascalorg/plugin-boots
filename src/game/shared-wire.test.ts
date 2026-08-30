@@ -15,12 +15,21 @@ import {
   cellModeFor,
   CELLS_GAPS,
   CELLS_MASK,
+  createOutbox,
   decodeDelta,
   decodeDeltaText,
   encodeDelta,
   encodeDeltaText,
   measureDelta,
   MAX_FRAME_BYTES,
+  MAX_TEXT_CHARS,
+  MAX_WIRE_PARTS,
+  outboxDepth,
+  queueDelta,
+  requeueWireFrame,
+  splitDelta,
+  takeWireFrame,
+  wireParts,
   WIRE_MAGIC,
   WIRE_VERSION,
 } from './shared-wire'
@@ -36,6 +45,7 @@ import {
   noteLocalRemoval,
   noteLocalSegments,
   removedCells,
+  takePending,
   quantPos,
   quantYaw,
   setGridStamp,
@@ -135,13 +145,17 @@ const shotFrame = (nodeId: string, cells: CellKey[]): SharedDelta => {
  * A lot after a serious session: 24 nodes touched, four of them nearly gone,
  * three collapsed outright, plus the built pieces, dropped items, cut
  * openings and paint that a couple of players leave behind.
+ *
+ * Scalable on purpose. The default is the reference measurement quoted in
+ * shared-wire.ts's header; a bigger `walls`/`strokeCount` is a longer session on
+ * a bigger house, which is exactly what has to survive the frame ceiling.
  */
-function wreckedLot(): SharedDelta {
+function wreckedLot(walls = 24, strokeCount = 60): SharedDelta {
   const d = emptyDelta('9f2c41ab-7e10-4d3b-88aa-1c2d3e4f5a6b', 'snapshot')
   d.gridStamp = STAMP
   d.lamport = 98765
 
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < walls; i++) {
     const nodeId = `__boots-node-${(0x3f2a + i * 977).toString(16)}`
     const heavy = i % 6 === 0
     const removed = heavy ? wreckedWall(i + 1, 0.62) : rifleShot(i + 1)
@@ -210,11 +224,11 @@ function wreckedLot(): SharedDelta {
     }
     d.apertures.push(rec)
   }
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < strokeCount; i++) {
     const rec: StrokeRec = {
       id: `${peers[i % 2]}#${100 + i}`,
       lamport: 400 + i,
-      node: `__boots-node-${(0x3f2a + (i % 24) * 977).toString(16)}`,
+      node: `__boots-node-${(0x3f2a + (i % walls) * 977).toString(16)}`,
       color: i % 8,
       x: quantPos(rand() * 8),
       y: quantPos(rand() * 2.7),
@@ -418,6 +432,15 @@ describe('hostile bytes', () => {
     expect(back?.nodes[0]?.removed).toEqual([3, 12, 90, 4000])
   })
 
+  test('an unsorted segment list is normalised rather than mis-encoded', () => {
+    // A repeat would ask the writer for a gap of -1, which a varint spells as
+    // 127: the frame would decode cleanly and break a DIFFERENT stick.
+    const d = emptyDelta('p')
+    d.nodes.push(nodeDelta({ nodeId: 'n', segments: [9, 2, 9, 0, 2] }))
+    const back = decodeDelta(encodeDelta(d))
+    expect(back?.nodes[0]?.segments).toEqual([0, 2, 9])
+  })
+
   test('trailing garbage is refused', () => {
     const good = encodeDelta(shotFrame('n', [1, 2, 3]))
     const padded = new Uint8Array(good.length + 3)
@@ -550,5 +573,300 @@ describe('late join', () => {
     }
     expect(liveRecords(joiner.pieces).length).toBe(1)
     console.log(`\nlate-join snapshot for 13 damaged nodes: ${bytes.length} B binary`)
+  })
+})
+
+// ── Chunking against the REAL transport ceiling ─────────────────────────────
+
+/**
+ * The bus caps a frame at 8000 SERIALIZED CHARACTERS, of which the payload gets
+ * 7880 and our base64 string spends two on quotes: 7878 characters, or 5908
+ * bytes.
+ *
+ * The reference lot above encodes to about 6.2 k characters, so it fits — with
+ * a fifth of the frame to spare and no more. That is the whole reason this
+ * section exists: "fits today" is not a property of a codec, it is a property of
+ * one house, and the next house is bigger. `bigLot` is that next house, and
+ * these tests are what keeps late join working on the transport that exists.
+ */
+
+const worldAt = (self: string): SharedWorld => {
+  const w = createSharedWorld(self)
+  setGridStamp(w, STAMP)
+  return w
+}
+
+/** Two worlds are equal when their canonical snapshots encode identically. */
+const sameWorld = (a: SharedWorld, b: SharedWorld): void => {
+  expect(encodeDeltaText(snapshotOf(a))).toBe(encodeDeltaText(snapshotOf(b)))
+}
+
+const AUTHOR = '9f2c41ab-7e10-4d3b-88aa-1c2d3e4f5a6b'
+
+/**
+ * A longer session on a bigger house: four times the damaged walls and four
+ * times the paint of the reference lot. Nothing exotic — a full two-storey
+ * build fought over for a while — and it is several frames wide.
+ */
+const bigLot = (): SharedDelta => wreckedLot(96, 240)
+
+const shuffle = (n: number, seed: number): number[] => {
+  const rand = mulberry32(seed)
+  const out = Array.from({ length: n }, (_, i) => i)
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1))
+    ;[out[i], out[j]] = [out[j] as number, out[i] as number]
+  }
+  return out
+}
+
+describe('chunking for an 8000-character bus', () => {
+  test('the ceiling is what the transport says it is', () => {
+    // 8000 (frame) - 120 (envelope) - 2 (JSON quotes) characters of base64.
+    expect(MAX_TEXT_CHARS).toBe(7878)
+    const payloadBytes = Math.floor((MAX_TEXT_CHARS / 4) * 3)
+    expect(payloadBytes).toBe(5908)
+
+    // The reference lot fits, and this is how little room is left: it spends
+    // more than two thirds of the frame on its own. Anyone who reads that as
+    // "chunking is not needed" should read the next line.
+    const reference = encodeDeltaText(wreckedLot()).length
+    expect(reference).toBeLessThan(MAX_TEXT_CHARS)
+    expect(reference).toBeGreaterThan(MAX_TEXT_CHARS * 0.66)
+
+    // And the thing this whole section exists for: a real lot exceeds it.
+    expect(encodeDeltaText(bigLot()).length).toBeGreaterThan(MAX_TEXT_CHARS)
+    console.log(
+      `\nframe ceiling ${MAX_TEXT_CHARS} chars (${payloadBytes} B): reference lot ${reference} chars (${Math.round((reference / MAX_TEXT_CHARS) * 100)}% of one frame), bigger lot ${encodeDeltaText(bigLot()).length} chars`,
+    )
+  })
+
+  test("a tick's worth of shooting goes out as one whole frame", () => {
+    const frames = wireParts(shotFrame('__boots-node-3f2a', rifleShot(7)))
+    expect(frames.length).toBe(1)
+    expect(frames[0]?.part).toBe(1)
+    expect(frames[0]?.parts).toBe(1)
+    expect(frames[0]?.kind).toBe('delta')
+    expect(frames[0]?.text.length).toBeLessThan(200)
+  })
+
+  test('a snapshot is split, and every part fits the budget', () => {
+    const snap = bigLot()
+    const frames = wireParts(snap)
+    expect(frames.length).toBeGreaterThan(1)
+    expect(frames.length).toBeLessThanOrEqual(MAX_WIRE_PARTS)
+    for (const frame of frames) {
+      expect(frame.text.length).toBeLessThanOrEqual(MAX_TEXT_CHARS)
+      // Routing: a snapshot part must never land on the delta event.
+      expect(frame.kind).toBe('snapshot')
+      expect(frame.parts).toBe(frames.length)
+      const back = decodeDeltaText(frame.text)
+      expect(back).not.toBeNull()
+      expect(back?.kind).toBe('snapshot')
+      expect(back?.from).toBe(snap.from)
+      expect(back?.lamport).toBe(snap.lamport)
+      expect(back?.gridStamp).toBe(snap.gridStamp)
+    }
+    console.log(
+      `\nsnapshot chunking at the real ceiling: ${encodeDeltaText(snap).length} chars → ${frames.length} parts, largest ${Math.max(...frames.map((f) => f.text.length))} chars`,
+    )
+  })
+
+  test('the parts converge to the same world, in any order', () => {
+    const snap = bigLot()
+    const whole = worldAt('receiver')
+    mergeDelta(whole, snap, AUTHOR)
+
+    const parts = splitDelta(snap)
+    for (const seed of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) {
+      const piecemeal = worldAt('receiver')
+      for (const i of shuffle(parts.length, seed)) {
+        mergeDelta(piecemeal, parts[i] as SharedDelta, AUTHOR)
+      }
+      sameWorld(piecemeal, whole)
+    }
+    // Duplicates too: a part is a delta, so re-merging it is a no-op.
+    const twice = worldAt('receiver')
+    for (const part of [...parts, ...parts]) mergeDelta(twice, part, AUTHOR)
+    sameWorld(twice, whole)
+  })
+
+  test('a lost part costs only its own content — nothing is reassembled', () => {
+    // No buffer, no partial-frame state, no way for a peer to make us hold
+    // memory waiting for a part that never comes.
+    const snap = bigLot()
+    const parts = splitDelta(snap)
+    expect(parts.length).toBeGreaterThan(2)
+    const full = worldAt('receiver')
+    mergeDelta(full, snap, AUTHOR)
+
+    for (const skip of [0, 1, parts.length - 1]) {
+      const gappy = worldAt('receiver')
+      parts.forEach((part, i) => {
+        if (i !== skip) mergeDelta(gappy, part, AUTHOR)
+      })
+      // Strictly a subset: every cell it knows, the full world knows.
+      for (const nodeId of damagedNodes(gappy)) {
+        const mine = new Set(removedCells(gappy, nodeId))
+        for (const key of mine) expect(removedCells(full, nodeId)).toContain(key)
+      }
+      // And the missing part heals on the next whole snapshot.
+      mergeDelta(gappy, snap, AUTHOR)
+      sameWorld(gappy, full)
+    }
+  })
+
+  test('one huge node is split by cells, and not one cell is lost', () => {
+    const cells = wreckedWall(3, 0.95)
+    expect(cells.length).toBeGreaterThan(2000)
+    const frame = shotFrame('__boots-node-huge', cells)
+    // A budget far below one node forces the cell halving.
+    const parts = splitDelta(frame, 400)
+    expect(parts.length).toBeGreaterThan(4)
+    const union = new Set<CellKey>()
+    for (const part of parts) {
+      expect(encodeDeltaText(part).length).toBeLessThanOrEqual(400)
+      expect(part.nodes.length).toBe(1)
+      expect(part.nodes[0]?.nodeId).toBe('__boots-node-huge')
+      for (const key of part.nodes[0]?.removed ?? []) union.add(key)
+    }
+    expect([...union].sort((a, b) => a - b)).toEqual(cells)
+  })
+
+  test('the epoch and the kill flag ride on every half of a split node', () => {
+    // Otherwise a receiver would apply half a node's cells at epoch 0 and
+    // discard them the moment the reset arrived.
+    const frame = shotFrame('__boots-node-epoch', wreckedWall(9, 0.8))
+    const nd = frame.nodes[0] as NodeDelta
+    nd.epoch = 4
+    nd.killed = true
+    nd.segments = [1, 2, 3, 4, 5, 6, 7, 8]
+    for (const part of splitDelta(frame, 300)) {
+      expect(part.nodes[0]?.epoch).toBe(4)
+      expect(part.nodes[0]?.killed).toBe(true)
+    }
+  })
+
+  test('a budget smaller than a single record refuses the frame outright', () => {
+    // Refusing loudly beats truncating silently. Unreachable in production —
+    // the smallest atom is a few bytes — but the branch must be total.
+    expect(splitDelta(wreckedLot(), 8)).toEqual([])
+    expect(wireParts(wreckedLot(), 8)).toEqual([])
+  })
+
+  test('an empty delta needs no frame at all', () => {
+    const empty = emptyDelta(AUTHOR)
+    expect(wireParts(empty).length).toBe(1)
+    expect(splitDelta(empty, 8)).toEqual([])
+  })
+})
+
+// ── The outbox: one frame per coalescing window ──────────────────────────────
+
+describe('the outbox', () => {
+  test('a chunked snapshot drains one frame per tick', () => {
+    const box = createOutbox()
+    const queued = queueDelta(box, bigLot())
+    expect(queued).toBeGreaterThan(1)
+    expect(outboxDepth(box)).toBe(queued)
+    const seen: string[] = []
+    for (let tick = 0; tick < queued; tick++) {
+      const frame = takeWireFrame(box)
+      expect(frame).not.toBeNull()
+      seen.push(frame?.text as string)
+    }
+    expect(takeWireFrame(box)).toBeNull()
+    expect(box.taken).toBe(queued)
+    expect(new Set(seen).size).toBe(queued)
+  })
+
+  test('a failed publish is recoverable: the frame comes back first', () => {
+    const box = createOutbox()
+    queueDelta(box, shotFrame('__boots-node-a', rifleShot(1)))
+    queueDelta(box, shotFrame('__boots-node-b', rifleShot(2)))
+    const first = takeWireFrame(box)
+    expect(first).not.toBeNull()
+    // publishFrame said 'deferred' — the host coalesced it away.
+    requeueWireFrame(box, first as NonNullable<typeof first>)
+    expect(box.requeued).toBe(1)
+    expect(takeWireFrame(box)?.text).toBe(first?.text)
+  })
+
+  test('a newer snapshot supersedes everything still waiting', () => {
+    // It contains all of it, so publishing the backlog would be paying twice.
+    const box = createOutbox()
+    queueDelta(box, shotFrame('__boots-node-a', rifleShot(1)))
+    queueDelta(box, shotFrame('__boots-node-b', rifleShot(2)))
+    expect(outboxDepth(box)).toBe(2)
+    const parts = queueDelta(box, bigLot())
+    expect(parts).toBeGreaterThan(1)
+    expect(box.superseded).toBe(2)
+    expect(outboxDepth(box)).toBe(parts)
+    for (let i = 0; i < parts; i++) expect(takeWireFrame(box)?.kind).toBe('snapshot')
+  })
+
+  test('the queue is capped, and every drop is counted', () => {
+    const box = createOutbox(MAX_TEXT_CHARS, 4)
+    for (let i = 0; i < 12; i++) queueDelta(box, shotFrame(`__boots-node-${i}`, rifleShot(i + 1)))
+    expect(outboxDepth(box)).toBe(4)
+    expect(box.overflow).toBe(8)
+    expect(box.queued).toBe(12)
+  })
+
+  test('an unsplittable delta queues nothing and says so', () => {
+    const box = createOutbox(8)
+    expect(queueDelta(box, wreckedLot())).toBe(0)
+    expect(box.oversize).toBe(1)
+    expect(outboxDepth(box)).toBe(0)
+  })
+
+  test('the tick loop, end to end: journal, take, split, drain, converge', () => {
+    // The shape the wiring layer is meant to have. Sixty ops across four
+    // ticks, published once per tick, some ticks coalesced away by the host
+    // and recovered, then one heal snapshot — and the receiver ends up
+    // holding exactly what the author holds.
+    const author = worldAt('author-peer')
+    const receiver = worldAt('receiver-peer')
+    const box = createOutbox()
+    let dropped = 0
+
+    const tick = (coalesced: boolean): void => {
+      const out = takePending(author)
+      if (!out) return
+      queueDelta(box, out)
+      const frame = takeWireFrame(box)
+      if (!frame) return
+      if (coalesced) {
+        // publishFrame → 'deferred'. The frame is GONE, not queued.
+        dropped++
+        return
+      }
+      const back = decodeDeltaText(frame.text)
+      expect(back).not.toBeNull()
+      mergeDelta(receiver, back as SharedDelta, 'author-peer')
+    }
+
+    for (let t = 0; t < 4; t++) {
+      for (let s = 0; s < 15; s++) {
+        noteLocalRemoval(author, `__boots-node-${(t * 15 + s) % 5}`, rifleShot(t * 15 + s + 1))
+      }
+      noteLocalSegments(author, `__boots-node-${t}`, [t, t + 4, t + 8])
+      if (t === 2) noteLocalKill(author, '__boots-node-2')
+      tick(t === 1)
+    }
+    expect(dropped).toBe(1)
+    // The lost tick shows up as a real difference...
+    expect(encodeDeltaText(snapshotOf(receiver))).not.toBe(encodeDeltaText(snapshotOf(author)))
+    // ...and the heal snapshot closes it, chunked across as many ticks as it
+    // takes. Note the sender is the real peer id: nothing is relayed.
+    const parts = queueDelta(box, snapshotOf(author))
+    expect(parts).toBeGreaterThan(0)
+    for (let i = 0; i < parts; i++) {
+      const frame = takeWireFrame(box)
+      mergeDelta(receiver, decodeDeltaText(frame?.text as string) as SharedDelta, 'author-peer')
+    }
+    for (const nodeId of damagedNodes(author)) {
+      expect(removedCells(receiver, nodeId)).toEqual(removedCells(author, nodeId))
+    }
   })
 })
