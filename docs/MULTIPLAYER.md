@@ -366,3 +366,57 @@ is reserved for replaying our own state locally.
 **Roster.** `onParticipants` / `getParticipants` are available if the model
 ever wants join/leave edges; the model has no roster of its own, and none is
 required.
+
+# Part 4 — the adapter (`net-world.ts`)
+
+Part 3 is the contract; this is the code that honours it. `net-world.ts` is the
+ONLY arrow from the transport into the model, and the only module that imports
+both sides. The two lane bridges each expose an injection point rather than
+reaching for a wire, so this is where they get wired.
+
+| | |
+|---|---|
+| `startWorldSync()` | Creates the session's `SharedWorld` keyed on `localSessionId()`, registers both kinds `{ ordered: false }`, attaches both lanes, starts the heal timer, and calls `requestState('boots/world')`. Returns **false**, having changed nothing, when there is no bus or when the host's session id is not `isSafePeerId` (a peer that could never author a record must not pretend to be in a session). Idempotent. |
+| `stopWorldSync()` | `detachBuildSync()` + `setDamageSync(null)` — which also unwires the Save-side ownership gate — plus every subscription and timer. Restores exact single-player behaviour mid-session. Does **not** stop the transport; the avatar layer may still be on it. |
+| `worldSyncWorld()` | The session's world, or null. Read-only: the lanes own every mutation. |
+| `publishWorldSnapshot()` | Force a heal broadcast (QA / debug HUD). |
+| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / rejected / snapshots / throttled / applyErrors`, plus `active` and `self`. |
+
+**Inbound is one merge, then two appliers**:
+
+```ts
+const fx = mergeDelta(world, delta, msg.sessionId)  // the authorship gate
+applyBuildEffects(fx)
+applySharedDamage(fx)
+```
+
+Never `receiveBuildDelta` — that entry point merges internally AND applies the
+build lane, so pairing it with a second `applyBuildEffects` double-coats remote
+paint strokes, and it no-ops entirely when the build lane is detached, which
+would silently starve the damage lane. Both appliers are self-gated, so the
+merge stays unconditional and the lanes turn on and off independently. Each
+applier is wrapped in its own try/catch: this runs inside the host's subscribe
+callback, which swallows throws, so an exception would otherwise vanish.
+
+**Outbound is one sink for both lanes**, routed by `delta.kind` so a snapshot
+never lands on the delta event. A payload over `MAX_WIRE_TEXT`
+(`MAX_PAYLOAD_SERIALIZED - 2`, the two JSON quotes) is counted as `oversize`
+and dropped loudly rather than truncated silently; the heal broadcast is what
+limits the damage. The sink tolerates being called several times per frame —
+the damage lane's per-node cell cap splits a big explosion into several frames.
+
+**Late join answers on `'boots/world-snap'`, not the addressed channel.** A
+peer can only ever answer with its own records, and a snapshot of one peer's own
+records is equally useful to every peer, so a broadcast beats a unicast reply
+and needs no addressing. The request channel is still used, to turn "you will
+learn the world within the next heal period" into "you will learn it in a few
+hundred milliseconds". Answers are jittered (`SNAP_JITTER_MS`) so N peers do not
+publish inside one 66 ms window, and rate-limited (`SNAP_MIN_GAP_MS`) so a
+replayed request cannot make a peer shout — this is a public lobby.
+
+**Known gap, stated rather than hidden:** a snapshot larger than the transport
+budget is dropped, not chunked. `{part, parts}` is reserved for it and one node
+per chunk is the natural split (each node's records merge independently, so no
+transport-level reassembly is needed — that is the lattice paying off). The
+measured 28-node / 10.7 k-dead-cell snapshot is ~6.2 kB base64 against a 7 878
+char budget, so this bites only in a lobby bigger than v1 aims at.
