@@ -4,6 +4,7 @@ import { useFrame } from '@react-three/fiber'
 import { type ComponentType, useEffect, useMemo, useRef, useState } from 'react'
 import {
   CanvasTexture,
+  type Color,
   type Group,
   type InstancedMesh,
   Matrix4,
@@ -772,6 +773,22 @@ function SirenBeacon({
     if (on !== activeRef.current) {
       activeRef.current = on
       setActive(on)
+      // BOTH beacons GLOW (owner: "only 1 of the 2 gyros turns on") — the
+      // single pointLight stays primary-only (adding a light mid-session
+      // recompiles pipelines), but the head material's emissive is free:
+      // flip it on every beacon so the secondary reads lit, not dead.
+      const head = headRef.current
+      if (head) {
+        head.traverse((obj) => {
+          const material = (obj as Mesh).material as
+            | { emissive?: Color; emissiveIntensity?: number }
+            | undefined
+          if (material?.emissive) {
+            material.emissive.set(on ? '#ff2222' : '#000000')
+            material.emissiveIntensity = on ? 1.6 : 0
+          }
+        })
+      }
       if (primary) {
         if (on) {
           if (!sirenResolved.current) {

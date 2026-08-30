@@ -174,7 +174,10 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   // into state change-gated (an unchanged setState is a React no-op).
   const ghostArmed = useItems((s) => s.armed !== null)
   const [itemMenuOpen, setItemMenuOpen] = useState(false)
-  const displayed: ToolId = ghostArmed && !itemMenuOpen ? 'builder' : weapon
+  // Owner ask: the hammer shows the moment I opens the catalog — browsing
+  // is already a building gesture, so the hand swaps immediately (menu
+  // open OR ghost armed), not only once an item is picked.
+  const displayed: ToolId = ghostArmed || itemMenuOpen ? 'builder' : weapon
 
   // Animation state.
   const prevWeapon = useRef(weapon)
@@ -326,7 +329,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // menu flag mirrored so the two halves agree across menu open/close.
     const menuOpenNow = isItemMenuOpen()
     if (menuOpenNow !== itemMenuOpen) setItemMenuOpen(menuOpenNow)
-    const shown: ToolId = itemGhostActive() ? 'builder' : current
+    const shown: ToolId = itemGhostActive() || isItemMenuOpen() ? 'builder' : current
     // Weapon droop while staggered — slow lerp both ways so the arm sags
     // and recovers smoothly instead of snapping.
     droop.current += ((staggered ? 1 : 0) - droop.current) * Math.min(1, dt * 6)
