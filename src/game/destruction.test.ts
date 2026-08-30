@@ -1073,6 +1073,49 @@ describe('island checks ride the shared settle drain (perf night 3)', () => {
   })
 })
 
+describe('a leveled wall takes its hosted apertures with it', () => {
+  test('window/door colliders on the dead wall drop; neighbors survive', () => {
+    const world = makeWorld()
+    // A window frame + a door hosted by wall-1 (one via parentId, one via
+    // the schema's wallId mirror), plus a window on wall-2 as the control.
+    const frame = boxCollider('window-a', 'window', [1.2, 1.2, 0.1], [0, 1.5, 0])
+    const leaf = boxCollider('door-a', 'door', [0.9, 2.1, 0.05], [0.6, 1.05, 0])
+    const other = boxCollider('window-b', 'window', [1.2, 1.2, 0.1], [5, 1.5, 0])
+    const base = world.colliders.length
+    world.colliders.push(frame, leaf, other)
+    ;(world as { operables?: unknown[] }).operables = [
+      {
+        nodeId: 'window-a',
+        kind: 'window',
+        root: frame.root,
+        colliderIndices: [base],
+        node: { id: 'window-a', parentId: 'wall-1' },
+      },
+      {
+        nodeId: 'window-b',
+        kind: 'window',
+        root: other.root,
+        colliderIndices: [base + 2],
+        node: { id: 'window-b', parentId: 'wall-2' },
+      },
+    ]
+    world.doors.push({
+      nodeId: 'door-a',
+      root: leaf.root,
+      colliderIndices: [base + 1],
+      node: { id: 'door-a', wallId: 'wall-1' },
+    })
+    ensureVoxelTarget(world, 'wall-1') // stamps sessionWorld
+    collapseWholeTarget('wall-1')
+    // The dead wall's hosted frame AND leaf stop colliding — the exact
+    // invisible chest-height rails of the owner's walk-in report…
+    expect(frame.disabled).toBe(true)
+    expect(leaf.disabled).toBe(true)
+    // …while the intact wall keeps its window solid.
+    expect(other.disabled).toBeUndefined()
+  })
+})
+
 describe('skeleton snap (cladding gone → bare frame falls)', () => {
   test('a wall carved to zero live voxels snaps every segment within ~1.5 s', async () => {
     const world = makeWorld()

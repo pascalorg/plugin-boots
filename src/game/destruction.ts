@@ -3780,7 +3780,52 @@ const PLACED_PIECE_PREFIX = '__boots-piece-'
 const SCENE_SUPPORT_SETTLE_MS = 160
 let sceneSupportTimer: ReturnType<typeof setTimeout> | null = null
 
+/**
+ * A LEVELED wall takes its hosted apertures with it. Windows and doors are
+ * SEPARATE nodes riding the wall (schema parentId/wallId mirrors); their
+ * host colliders — sill, rails, jambs — stay enabled until the node itself
+ * is damaged, so a fully-destroyed wall used to leave an INVISIBLE frame
+ * barring the gap at chest and head height (the owner's "can't walk in
+ * even when 1 wall is missing", A/B-proven: 1.64 m advance wedged vs
+ * 14.81 m with the window's colliders dropped). Hosted apertures with a
+ * voxel target collapse through the normal lane (wake → hide host →
+ * collision moves to the now-empty grid); a targetless child just drops
+ * its colliders. Reentrancy-safe: children are door/window kinds, and the
+ * cascade only fires for kind 'wall'.
+ */
+function collapseHostedApertures(world: GameWorld, wallId: string): void {
+  const hosted = (node: Record<string, unknown> | undefined): boolean =>
+    !!node && (node.parentId === wallId || node.wallId === wallId)
+  const targets = useDestruction.getState().targets
+  const bury = (childId: string, colliderIndices: number[]) => {
+    const child = targets.get(childId)
+    if (child && child.grid.aliveCount > 0) {
+      collapseWholeTarget(childId)
+      return
+    }
+    if (child) return // already leveled — colliders belong to the grid now
+    for (const index of colliderIndices) {
+      const collider = world.colliders[index]
+      if (collider) collider.disabled = true
+    }
+  }
+  for (const door of world.doors) {
+    if (hosted(door.node)) bury(door.nodeId, door.colliderIndices)
+  }
+  for (const operable of world.operables ?? []) {
+    if (operable.kind === 'window' && hosted(operable.node)) {
+      bury(operable.nodeId, operable.colliderIndices)
+    }
+  }
+}
+
 function settleSupportAfterRemoval(target: VoxelTarget): void {
+  // The aperture cascade rides the shared removal hook: EVERY lane that can
+  // zero a wall (whole collapse, island crumble, avalanche, fly-offs) lands
+  // here, so the frame can never outlive its wall no matter how it died.
+  if (target.kind === 'wall' && target.grid.aliveCount === 0 && sessionWorld) {
+    collapseHostedApertures(sessionWorld, target.nodeId)
+  }
   if (target.nodeId.startsWith(PLACED_PIECE_PREFIX)) {
     // Piece-as-unit death (phase 9 support lane): a placed piece dies as a
     // WHOLE once its replica drops under the alive-fraction floor — long
