@@ -11,7 +11,9 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   HEAL_PERIOD_MS,
   MAX_WIRE_TEXT,
+  PUBLISH_TICK_MS,
   publishWorldSnapshot,
+  pumpWorldSync,
   resetWorldSyncCounters,
   SNAP_MIN_GAP_MS,
   startWorldSync,
@@ -37,7 +39,7 @@ import {
   resetSharedDamage,
 } from './shared-damage'
 import { buildSyncOn, resetSharedBuild } from './shared-build'
-import { bytesToBase64, encodeDeltaText } from './shared-wire'
+import { bytesToBase64, decodeDeltaText, encodeDeltaText, MAX_TEXT_CHARS } from './shared-wire'
 import { cellKey, emptyDelta, type SharedDelta } from './shared-world'
 
 /**
@@ -51,6 +53,8 @@ import { cellKey, emptyDelta, type SharedDelta } from './shared-world'
 type FakeBus = CollabBus & {
   publishes: Array<{ event: string; data: unknown }>
   handler: ((msg: CollabBusMessage) => void) | null
+  /** What the host says next. 'deferred' is the coalescing window refusing us. */
+  result: 'sent' | 'deferred' | 'suppressed'
 }
 
 const g = globalThis as { __pascalCollabBus?: CollabBus }
@@ -64,7 +68,9 @@ function installBus(sessionId = 'session-me'): FakeBus {
     userId: 'user-me',
     publishes: [],
     handler: null,
+    result: 'sent',
     publish(_pluginId, event, data) {
+      if (bus.result !== 'sent') return bus.result
       bus.publishes.push({ event, data })
       return 'sent'
     },
@@ -201,12 +207,12 @@ describe('session wiring', () => {
   })
 })
 
-describe('outbound routing', () => {
-  test('a lane delta lands on the delta kind, as base64 text', () => {
+describe('outbound is the journal, one frame per tick', () => {
+  test('a journalled op lands on the delta kind, as base64 text', () => {
     const bus = installBus()
     startWorldSync()
     publishRemovedKeys('node-7', [cellKey(2, 2, 2)])
-    flushDamage()
+    pumpWorldSync()
     expect(framesOn(bus, WORLD_KIND).length).toBe(1)
     const envelope = envelopeOn(bus, WORLD_KIND)
     expect(envelope.kind).toBe(WORLD_KIND)
@@ -215,24 +221,127 @@ describe('outbound routing', () => {
     expect((envelope.data as string).length).toBeLessThanOrEqual(MAX_WIRE_TEXT)
   })
 
+  /**
+   * THE DOUBLE-SEND REGRESSION. Every local op journals itself AND the damage
+   * lane auto-flushes to its own sink after each one, so there are two roads to
+   * the wire and wiring both would put every cell out twice — correct, but
+   * double the bytes on a channel that only grants one frame per 66 ms. The
+   * sink is deliberately a counted no-op, so the count rises while the frame
+   * count stays at one.
+   */
+  test('the lane sink is ignored, so a record goes out ONCE and not twice', () => {
+    const bus = installBus()
+    startWorldSync()
+    publishRemovedKeys('node-7', [cellKey(2, 2, 2)])
+    // The lane already offered us this frame through its own sink...
+    expect(worldSyncDebug().laneSinkIgnored).toBeGreaterThan(0)
+    // ...and we dropped it, so nothing has gone out yet.
+    expect(framesOn(bus, WORLD_KIND).length).toBe(0)
+    pumpWorldSync()
+    expect(framesOn(bus, WORLD_KIND).length).toBe(1)
+  })
+
+  test('the lane flushing on its own publishes nothing at all', () => {
+    const bus = installBus()
+    startWorldSync()
+    const before = bus.publishes.length
+    flushDamage()
+    flushDamage()
+    expect(bus.publishes.length).toBe(before)
+  })
+
+  /**
+   * The journal's whole point: it holds maps and sets, not a list of ops, so
+   * sixty shots into one wall collapse into one node entry carrying the union
+   * of the cells. Without that, a burst either floods the bus or is silently
+   * eaten by the coalescing window.
+   */
+  test('a burst collapses into ONE frame instead of sixty', () => {
+    const bus = installBus()
+    startWorldSync()
+    for (let i = 0; i < 60; i++) publishRemovedKeys('node-7', [cellKey(1, 1, i)])
+    expect(framesOn(bus, WORLD_KIND).length).toBe(0)
+    pumpWorldSync()
+    expect(framesOn(bus, WORLD_KIND).length).toBe(1)
+    // And the frame really did carry all sixty cells, via the round trip.
+    const text = envelopeOn(bus, WORLD_KIND).data as string
+    const echo = decodeDeltaText(text)
+    if (echo === null) throw new Error('our own frame did not decode')
+    expect(echo.nodes.length).toBe(1)
+    expect(echo.nodes[0]?.removed.length).toBe(60)
+  })
+
+  test('a tick with an empty journal publishes nothing', () => {
+    const bus = installBus()
+    startWorldSync()
+    const before = bus.publishes.length
+    pumpWorldSync()
+    pumpWorldSync()
+    expect(bus.publishes.length).toBe(before)
+    expect(worldSyncDebug().depth).toBe(0)
+  })
+
   test('a snapshot lands on its OWN kind, never the delta kind', () => {
     const bus = installBus()
     startWorldSync()
     publishRemovedKeys('node-7', [cellKey(2, 2, 2)])
-    flushDamage()
+    pumpWorldSync()
     const deltasBefore = framesOn(bus, WORLD_KIND).length
     publishWorldSnapshot()
+    pumpWorldSync()
     expect(framesOn(bus, WORLD_SNAP_KIND).length).toBe(1)
     // Sharing one host event would let the snapshot coalesce the delta away.
     expect(framesOn(bus, WORLD_KIND).length).toBe(deltasBefore)
     expect(worldSyncDebug().snapshots).toBe(1)
   })
 
+  /**
+   * 'deferred' is the host's coalescing window refusing us. The frame must go
+   * back to the queue, not on the floor: the alternative is that a burst of
+   * local work vanishes into a 66 ms window with nobody the wiser.
+   */
+  test('a frame the host refuses is requeued and goes out on the next tick', () => {
+    const bus = installBus()
+    startWorldSync()
+    publishRemovedKeys('node-7', [cellKey(2, 2, 2)])
+    bus.result = 'deferred'
+    pumpWorldSync()
+    expect(framesOn(bus, WORLD_KIND).length).toBe(0)
+    let debug = worldSyncDebug()
+    expect(debug.deferred).toBe(1)
+    expect(debug.sent).toBe(0)
+    expect(debug.depth).toBe(1) // still owed, still visible
+    bus.result = 'sent'
+    pumpWorldSync()
+    expect(framesOn(bus, WORLD_KIND).length).toBe(1)
+    debug = worldSyncDebug()
+    expect(debug.sent).toBe(1)
+    expect(debug.depth).toBe(0)
+    expect(debug.requeued).toBe(1)
+  })
+
+  test('a snapshot supersedes our own increments still waiting in the queue', () => {
+    const bus = installBus()
+    startWorldSync()
+    publishRemovedKeys('node-7', [cellKey(2, 2, 2)])
+    bus.result = 'deferred'
+    pumpWorldSync() // queued, refused, requeued
+    expect(worldSyncDebug().depth).toBe(1)
+    bus.result = 'sent'
+    publishWorldSnapshot()
+    // The snapshot already contains those cells, so keeping the increment would
+    // be pure duplicate bytes.
+    expect(worldSyncDebug().superseded).toBeGreaterThan(0)
+    pumpWorldSync()
+    expect(framesOn(bus, WORLD_SNAP_KIND).length).toBe(1)
+    expect(framesOn(bus, WORLD_KIND).length).toBe(0)
+  })
+
   test('a published delta survives the round trip into another peer', () => {
     const bus = installBus('session-a')
     startWorldSync()
     publishRemovedKeys('node-7', [cellKey(2, 2, 2), cellKey(2, 2, 3)])
-    flushDamage()
+    pumpWorldSync()
     const text = envelopeOn(bus, WORLD_KIND).data as string
     // Now play it back as if it came from somebody else.
     const before = worldSyncDebug()
@@ -240,6 +349,14 @@ describe('outbound routing', () => {
     const after = worldSyncDebug()
     expect(after.merged).toBe(before.merged + 1)
     expect(worldSyncWorld()?.dropped).toBe(0)
+  })
+
+  test('the interval publishes without anyone calling pump', async () => {
+    const bus = installBus()
+    startWorldSync()
+    publishRemovedKeys('node-7', [cellKey(3, 3, 3)])
+    await sleep(PUBLISH_TICK_MS * 3)
+    expect(framesOn(bus, WORLD_KIND).length).toBe(1)
   })
 })
 
@@ -365,7 +482,6 @@ describe('late join', () => {
     const bus = installBus()
     startWorldSync()
     publishRemovedKeys('node-7', [cellKey(1, 1, 1)])
-    flushDamage()
     inbound('state-request', { of: WORLD_KIND }, 'session-joiner')
     // Answers are jittered so N peers do not publish in one 66 ms window.
     expect(framesOn(bus, WORLD_SNAP_KIND).length).toBe(0)
@@ -411,5 +527,19 @@ describe('the constants are the policy', () => {
     // quote characters, and base64 needs no escaping.
     expect(MAX_WIRE_TEXT).toBeGreaterThan(0)
     expect(JSON.stringify('A'.repeat(MAX_WIRE_TEXT)).length).toBe(MAX_WIRE_TEXT + 2)
+  })
+
+  test('the adapter and the wire agree on the budget', () => {
+    // Two modules derive the same number from different directions: the
+    // transport's payload cap minus the quotes, and shared-wire's own default
+    // chunk budget. If they ever drift, frames are either refused by the host
+    // or split more finely than they need to be.
+    expect(MAX_WIRE_TEXT).toBe(MAX_TEXT_CHARS)
+  })
+
+  test('the publish tick matches the window the host actually grants', () => {
+    // The host keeps the latest value per (plugin, event) per 66 ms. Ticking
+    // faster cannot make frames leave sooner, it only manufactures 'deferred'.
+    expect(PUBLISH_TICK_MS).toBeGreaterThanOrEqual(66)
   })
 })

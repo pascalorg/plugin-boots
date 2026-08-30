@@ -345,17 +345,21 @@ a peer id containing it would be an identity forgery.
 **Byte ceiling.** The transport's is **8 000 serialized chars**, ~130× tighter
 than `shared-wire`'s own `MAX_FRAME_BYTES` (1 MiB). Measured: a rifle shot's
 delta ~100 B binary → ~136 B base64, comfortable; a 28-node / 10.7 k-dead-cell
-snapshot 4.7 kB → ~6.2 kB base64, which fits the 7 880-char budget **but only
-just**. A bigger lobby must chunk — `{part, parts}` is reserved for exactly
-this, one node per chunk being the natural split. `payloadFits()` before
-publishing, and `'too-large'` if you skip the check.
+snapshot 4.7 kB → ~6.2 kB base64, which fits the 7 878-char budget **but only
+just**. Anything bigger is chunked by `wireParts(delta, MAX_TEXT_CHARS)`, which
+splits per node / per record group and stamps `{part, parts}`; each part is a
+complete, independently mergeable delta, so there is no transport-level
+reassembly. `payloadFits()` before publishing, and `'too-large'` if you skip the
+check.
 
 **Coalescing is the real hazard, not loss.** The host keeps only the latest
 value per event per 66 ms. A burst of deltas inside one window is *lost*, not
-queued. So: accumulate locally and flush **one** delta per ~66 ms tick (a
-delta is itself a union, so batching is free and exact), and publish a full
-snapshot periodically as the healing channel. `publishFrame` returns the host
-verdict verbatim — `'deferred'` / `'suppressed'` mean *that frame is gone*.
+queued — so nothing publishes per-op. The journal accumulates (as maps and sets,
+so a burst collapses instead of accumulating) and one batched delta goes out per
+66 ms tick through the outbox, with a full snapshot periodically as the healing
+channel. `publishFrame` returns the host verdict verbatim — `'deferred'` /
+`'suppressed'` mean *that frame is gone*, so the outbox requeues it rather than
+trusting the send.
 
 **Late join.** Every peer answers a `requestState('boots/world')` with its
 **own** records (see the table above). Snapshots are therefore ingested with
@@ -376,11 +380,19 @@ reaching for a wire, so this is where they get wired.
 
 | | |
 |---|---|
-| `startWorldSync()` | Creates the session's `SharedWorld` keyed on `localSessionId()`, registers both kinds `{ ordered: false }`, attaches both lanes, starts the heal timer, and calls `requestState('boots/world')`. Returns **false**, having changed nothing, when there is no bus or when the host's session id is not `isSafePeerId` (a peer that could never author a record must not pretend to be in a session). Idempotent. |
+| `startWorldSync()` | Creates the session's `SharedWorld` keyed on `localSessionId()`, attaches both lanes, registers both kinds `{ ordered: false }`, starts the publish tick and the heal timer, and calls `requestState('boots/world')`. Returns **false**, having changed nothing, when there is no bus or when the host's session id is not `isSafePeerId` (a peer that could never author a record must not pretend to be in a session). Idempotent. |
 | `stopWorldSync()` | `detachBuildSync()` + `setDamageSync(null)` — which also unwires the Save-side ownership gate — plus every subscription and timer. Restores exact single-player behaviour mid-session. Does **not** stop the transport; the avatar layer may still be on it. |
 | `worldSyncWorld()` | The session's world, or null. Read-only: the lanes own every mutation. |
-| `publishWorldSnapshot()` | Force a heal broadcast (QA / debug HUD). |
-| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / rejected / snapshots / throttled / applyErrors`, plus `active` and `self`. |
+| `pumpWorldSync()` | Run one outbound tick now. QA and tests only; the interval is the normal path. |
+| `publishWorldSnapshot()` | Queue a heal broadcast (QA / debug HUD). |
+| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
+
+**Attach order is load-bearing.** The lanes are attached *before* the
+subscriptions exist and before `session` is set, because a frame that arrives
+first would be dropped rather than buffered: `receiveBuildDelta` with no world
+attached deliberately merges nothing. Nothing in `startWorldSync` awaits, so
+today this is belt and braces — the point is that adding an `await` later cannot
+quietly open that window.
 
 **Inbound is one merge, then two appliers**:
 
@@ -398,12 +410,45 @@ merge stays unconditional and the lanes turn on and off independently. Each
 applier is wrapped in its own try/catch: this runs inside the host's subscribe
 callback, which swallows throws, so an exception would otherwise vanish.
 
-**Outbound is one sink for both lanes**, routed by `delta.kind` so a snapshot
-never lands on the delta event. A payload over `MAX_WIRE_TEXT`
-(`MAX_PAYLOAD_SERIALIZED - 2`, the two JSON quotes) is counted as `oversize`
-and dropped loudly rather than truncated silently; the heal broadcast is what
-limits the damage. The sink tolerates being called several times per frame —
-the damage lane's per-node cell cap splits a big explosion into several frames.
+**Outbound is the journal, and NOTHING else.** There are two roads from a local
+op to the wire and only one is used:
+
+```ts
+attachBuildSync(world)                          // no sink
+setDamageSync({ world, publish: countOnly })    // required by the type, ignored
+
+// every PUBLISH_TICK_MS (66 ms):
+const out = takePending(world)                  // one batched delta, or null
+if (out) queueDelta(outbox, out)
+const frame = takeWireFrame(outbox)             // ONE frame per tick
+if (frame) {
+  const kind = frame.kind === 'snapshot' ? WORLD_SNAP_KIND : WORLD_KIND
+  if (publishFrame(kind, frame.text, frame) !== 'sent') requeueWireFrame(outbox, frame)
+}
+```
+
+Every local op journals itself inside `shared-world` (`addLocal*` / `killRecord`
+for build, `noteLocal*` for damage), so the journal already holds both lanes'
+records. Passing a sink *as well* would put every piece, item, stroke and cell on
+the bus **twice** — idempotent, so correct, but double the bytes on a channel
+that grants one frame per 66 ms. The damage lane auto-flushes to its sink after
+every op, so `laneSinkIgnored` climbs steadily in normal play; that is not an
+error, it is the count of frames the journal saved.
+
+The journal is maps and sets rather than a list of ops, which is why a burst
+**collapses**: sixty shots into one wall become one node entry carrying the
+union of the cells, one frame. Coalescing therefore stops being a hazard — a
+burst inside one window is batched, not lost — and the outbox handles the rest:
+one frame per tick, refused frames requeued at the **front** (the oldest state is
+what a peer is most likely missing), a snapshot superseding queued increments it
+already contains, and a hard cap with counters on everything dropped.
+
+Frames are routed by `delta.kind`, so a snapshot never lands on the delta event.
+Oversize is no longer a drop: `wireParts` splits a delta at `MAX_WIRE_TEXT` and
+each part is an independently mergeable delta, so nothing reassembles them at the
+transport level — that is the lattice paying off. `oversize` now counts only a
+delta that could not be split even into `MAX_WIRE_PARTS` parts, which the
+periodic snapshot then heals.
 
 **Late join answers on `'boots/world-snap'`, not the addressed channel.** A
 peer can only ever answer with its own records, and a snapshot of one peer's own
@@ -414,9 +459,10 @@ hundred milliseconds". Answers are jittered (`SNAP_JITTER_MS`) so N peers do not
 publish inside one 66 ms window, and rate-limited (`SNAP_MIN_GAP_MS`) so a
 replayed request cannot make a peer shout — this is a public lobby.
 
-**Known gap, stated rather than hidden:** a snapshot larger than the transport
-budget is dropped, not chunked. `{part, parts}` is reserved for it and one node
-per chunk is the natural split (each node's records merge independently, so no
-transport-level reassembly is needed — that is the lattice paying off). The
-measured 28-node / 10.7 k-dead-cell snapshot is ~6.2 kB base64 against a 7 878
-char budget, so this bites only in a lobby bigger than v1 aims at.
+**What is still not handled, stated rather than hidden.** A frame lost to the
+outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a
+timer — it heals when the next snapshot goes out, up to `HEAL_PERIOD_MS` later.
+That is the design, not an oversight: a lattice has nothing to retransmit *from*
+once the journal has been taken. The cost is a bounded window in which one peer's
+view of another can be stale; the fix, if it ever matters, is a shorter heal
+period or a peer asking again, not a reliability layer.
