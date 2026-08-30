@@ -718,6 +718,60 @@ describe('our own name is not a constant', () => {
     expect(callers).toBeGreaterThan(0)
   })
 
+  /**
+   * THE OTHER DOOR INTO A RECORD LANE, which the mint fence structurally cannot
+   * see: `restorePending` re-journals record adds through a private `restoreLane`,
+   * with no `addLocal*` token anywhere, so no pattern over that name will ever
+   * catch it. It has no production caller today — this test is what keeps that
+   * true, because the day a send-failure retry path wants one, the accounting
+   * acquires an unstated precondition:
+   *
+   *   ONLY EVER HAND restorePending THE EXACT DELTA takePending RETURNED.
+   *
+   * `restoreLane` validates id SHAPE only (`isSafeId`), never authorship. Hand it
+   * a RECEIVED frame instead — which is exactly what a natural "apply failed, put
+   * it back, retry" path does — and a stranger's records enter our journal. The
+   * world stays correct, because peers refuse them: `isAuthoredBy` compares the
+   * record prefix to the envelope sender, and our envelope says us. What breaks is
+   * this lane's NUMBERS. `rekeySharedWorld` returns every pending add id
+   * regardless of prefix, so `staleMints` counts the stranger's records, while
+   * `remintSharedRecords` correctly returns nothing for them — none is bound to a
+   * runtime object of ours — and `staleMints - staleReminted` stops being the loss
+   * figure Part 4 documents.
+   *
+   * Deliberately matched by NAME here, not by the `restore[A-Z]` shape the mint
+   * fence uses: `addLocal` denotes minting, whereas `restore` denotes nothing in
+   * particular — `restoreOperableTarget` (doors) and the model's own private
+   * `restoreLane`/`restoreDead` are unrelated, so a wide pattern would cry wolf.
+   * The import check is the part that generalises: a future `restoreFrame` export
+   * would be caught by it without that cost.
+   */
+  test('nothing outside the model puts records back into a journal', async () => {
+    const glob = new Bun.Glob('**/*.{ts,tsx}')
+    const dir = new URL('../', import.meta.url).pathname
+    let importers = 0
+    for await (const file of glob.scan({ cwd: dir })) {
+      if (file.includes('.test.') || file === 'game/shared-world.ts') continue
+      const source = await Bun.file(`${dir}${file}`).text()
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+      // No module imports a journal-restoring name out of the shared model...
+      for (const match of code.matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*'([^']+)'/g)) {
+        if (!/shared-world$/.test(match[2] as string)) continue
+        importers++
+        for (const name of (match[1] as string).split(',')) {
+          const bare = name.trim().replace(/^type\s+/, '')
+          expect(/^restore/i.test(bare), `${file} imports ${bare}: see the pairing rule`).toBe(
+            false,
+          )
+        }
+      }
+      // ...and nobody reaches it through a namespace import either.
+      expect(/\brestorePending\s*\(/.test(code), `${file} calls restorePending`).toBe(false)
+    }
+    // The fence is worthless if it scanned nothing.
+    expect(importers).toBeGreaterThan(0)
+  })
+
   test('a re-key with nothing pending loses nothing', () => {
     installBus('session-old')
     startWorldSync()

@@ -649,6 +649,27 @@ two reasons that are both worth re-checking before either is changed:
   teardown-and-re-mint recovery would have left `sync.world` pointing at a world we
   had already discarded, and the re-mint would have read the dead one.
 
+**The other door into a journal, and the precondition it will arrive with.**
+`restorePending` re-journals record adds without going near `addLocal*`, so the
+mint fence structurally cannot see it. It has no production caller today, and a
+second fence keeps that true — because the day a send-failure retry path wants
+one, this lane's numbers acquire an unstated rule: **hand `restorePending` only
+the exact delta `takePending` returned.** Its `restoreLane` validates id *shape*,
+never authorship. Give it a *received* frame instead — exactly what a natural
+"apply failed, put it back, retry" path does — and a stranger's records enter our
+journal. The world survives that: peers refuse them, because `isAuthoredBy`
+compares the record prefix against the envelope sender and our envelope says us.
+The *numbers* do not. `rekeySharedWorld` returns every pending add id regardless
+of prefix, so `staleMints` counts the stranger's work while the re-mint correctly
+recovers none of it, and the loss figure above quietly stops meaning what it says.
+
+**An owed change, deliberately not made here:** the real fix is an authorship check
+inside `restoreLane` — refuse a record this world could not have minted — and that
+is in `shared-world.ts`, the frozen contract. A wiring lane fencing its own
+precondition is the honest move; a wiring lane reaching into the model to relax or
+tighten the contract is not. If a retry path is ever wired, do that check in the
+model first and delete the fence, rather than satisfying the fence by convention.
+
 **Two residues, both deliberate.** Our snapshots still carry old-prefixed records
 that peers refuse — wasted bytes and an inflated `dropped` on their side —
 because "two peers answering one request produce byte-identical snapshots" is a
