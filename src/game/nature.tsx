@@ -24,6 +24,18 @@ import {
   Vector3,
 } from 'three'
 import { Craters } from './craters'
+import {
+  FAR_GRASS_COUNT,
+  FAR_GRASS_INNER,
+  FAR_GRASS_OUTER,
+  farGrassRadius,
+  farTuftGeometry,
+  farTuftScale,
+  HAZE_LIFT,
+  hazeGeometry,
+  hazeTexture,
+  skirtGeometry,
+} from './horizon'
 import { type GameWorld, pointInPolygonXZ, pointOnRoad, siteGroundYAt } from './world'
 
 /**
@@ -389,6 +401,13 @@ export function freezeStaticObject(obj: Object3D): void {
   obj.matrixWorldAutoUpdate = false
 }
 
+/** Ref for a never-moving plain mesh (the lawn skirt, the haze plate): settle
+ * its world matrix once, then leave three's per-frame recompose walk. Module
+ * level so React never re-attaches it. */
+function freezeRef(obj: Object3D | null): void {
+  if (obj) freezeStaticObject(obj)
+}
+
 /**
  * Deterministic ring scatter around the building, rejecting the footprint
  * (+ pad) and every hard-surface footprint (roads, driveways, pads) with a
@@ -405,6 +424,10 @@ export function freezeStaticObject(obj: Object3D): void {
  * - DRAPE: `position.y` arrives at the make callback PRE-SET to the terrain
  *   surface height at (x, z) (scatterGroundY); callbacks ADD their per-kind
  *   lift (`position.y += lift`) instead of assigning an absolute Y.
+ *
+ * `radiusOf` overrides the default `rMin + (rMax − rMin)·u^bias` radial law
+ * with an explicit inverse CDF — the far tuft layer needs a real power-law
+ * density falloff (horizon.ts `farGrassRadius`), which no single bias gives.
  */
 export function scatter(
   world: GameWorld,
@@ -414,6 +437,7 @@ export function scatter(
   rMax: number,
   make: (rand: () => number, position: Vector3, matrix: Matrix4, t: number) => Color,
   bias = 0.5,
+  radiusOf?: (u: number) => number,
 ): Scatter {
   const rand = mulberry32(seed)
   const center = world.buildingAabb.isEmpty()
@@ -428,7 +452,7 @@ export function scatter(
   let guard = count * 6
   while (matrices.length < count && guard-- > 0) {
     const angle = rand() * Math.PI * 2
-    const radius = rMin + (rMax - rMin) * rand() ** bias
+    const radius = radiusOf ? radiusOf(rand()) : rMin + (rMax - rMin) * rand() ** bias
     position.set(center.x + Math.cos(angle) * radius, 0, center.z + Math.sin(angle) * radius)
     if (
       !world.buildingAabb.isEmpty() &&
@@ -570,6 +594,8 @@ const GRASS_B = new Color('#55853c')
  * `args` like the voxel-wall layer materials — R3F never auto-disposes it,
  * and all chunks keep hitting the same warm pipeline). */
 const GRASS_MATERIAL = new MeshStandardMaterial({ roughness: 1, side: DoubleSide, vertexColors: true })
+/** A pool that never mounts (site scenes skip the void-only far layer). */
+const NO_SCATTER: Scatter = { matrices: [], colors: [] }
 const FLOWER_WHITE = new Color('#f6f3e7')
 const FLOWER_YELLOW = new Color('#f2c14e')
 const _quat = new Quaternion()
@@ -591,7 +617,22 @@ export function Nature({ world }: { world: GameWorld }) {
     [world],
   )
 
+  // THE ENDLESS LOT (horizon.ts): the disc's own rim used to be the edge of
+  // the world. The skirt carries the same grass out to HORIZON_FAR and the
+  // haze plate dissolves it into the sky dome's horizon band, so the void
+  // world reads as an open field from the ground AND from a rooftop. Void
+  // only — a site scene keeps the host's ground, plate and editor sky.
+  const voidLot = shouldMountGroundDisc(world)
+  const skirtGeo = useMemo(
+    () => (voidLot ? skirtGeometry(GROUND_RADIUS, GROUND_RADIUS * 2) : null),
+    [voidLot],
+  )
+  const hazeGeo = useMemo(() => (voidLot ? hazeGeometry() : null), [voidLot])
+  const hazeMap = useMemo(() => (voidLot ? hazeTexture() : null), [voidLot])
+
   const grassGeometry = useMemo(grassClusterGeometry, [])
+
+  const farTuftGeo = useMemo(() => (voidLot ? farTuftGeometry() : null), [voidLot])
 
   const flowerGeometry = useMemo(() => new CircleGeometry(1, 7).rotateX(-Math.PI / 2), [])
 
@@ -648,6 +689,39 @@ export function Nature({ world }: { world: GameWorld }) {
     [world],
   )
 
+  /**
+   * THE FAR BLADE LAYER (void lots only). The detailed field stops dead at
+   * 55 m — from standing height that ring is a hard line of fuzz over bare
+   * texture, and from a rooftop it draws the lawn's real size. This layer
+   * carries blades to 170 m on a power-law density falloff and shrinks every
+   * tuft to nothing at the rim (farTuftScale), so the scatter ends in nothing
+   * instead of in a circle. Cheap by construction: 4-triangle crossed quads
+   * (the near cluster is 15) on the SAME material, sectorized like the near
+   * field so looking one way culls most of it.
+   */
+  const farGrass = useMemo(
+    () =>
+      voidLot
+        ? scatter(
+            world,
+            23,
+            FAR_GRASS_COUNT,
+            FAR_GRASS_INNER,
+            FAR_GRASS_OUTER,
+            (rand, position, matrix, t) => {
+              _quat.setFromAxisAngle(_yAxis, rand() * Math.PI * 2)
+              const s = (0.9 + rand() * 0.7) * farTuftScale(t)
+              _scale.set(s, s * (0.85 + rand() * 0.5), s)
+              matrix.compose(position, _quat, _scale)
+              return GRASS_A.clone().lerp(GRASS_B, rand())
+            },
+            0.5,
+            (u) => farGrassRadius(u),
+          )
+        : NO_SCATTER,
+    [world, voidLot],
+  )
+
   const rocks = useMemo(
     () =>
       scatter(world, 51, 24, 6, 50, (rand, position, matrix) => {
@@ -672,6 +746,11 @@ export function Nature({ world }: { world: GameWorld }) {
     [grass, center.x, center.z],
   )
 
+  const farGrassChunks = useMemo(
+    () => sectorizeScatter(farGrass, center.x, center.z, GRASS_SECTORS),
+    [farGrass, center.x, center.z],
+  )
+
   // EVERY scatter pool is a clearable field now: craters strip what they
   // cover (a bush standing in a fresh blast crater read wrong), and the
   // depot's footprint sweep can evict the odd bush/rock that seeded inside
@@ -679,6 +758,10 @@ export function Nature({ world }: { world: GameWorld }) {
   const grassChunkRefs = useMemo(
     () => grassChunks.map((chunk) => fieldRef(chunk, storage)),
     [grassChunks, storage],
+  )
+  const farGrassChunkRefs = useMemo(
+    () => farGrassChunks.map((chunk) => fieldRef(chunk, storage)),
+    [farGrassChunks, storage],
   )
   const flowersRef = useMemo(() => fieldRef(flowers, storage), [flowers, storage])
   const bushesRef = useMemo(() => fieldRef(bushes, storage), [bushes, storage])
@@ -699,6 +782,49 @@ export function Nature({ world }: { world: GameWorld }) {
         </mesh>
       )}
 
+      {/* The skirt: the disc's own grass, same material, same texture grain,
+          carried from the disc's rim out to HORIZON_FAR. Its inner ring IS
+          the disc's outer contour (horizon.ts discContour), so the two share
+          an edge exactly — no crack, no overlap, nothing to z-fight. */}
+      {skirtGeo && (
+        <mesh
+          geometry={skirtGeo}
+          position={[center.x, 0.05, center.z]}
+          ref={freezeRef}
+          rotation={[-Math.PI / 2, 0, 0]}
+        >
+          {texture ? (
+            <meshStandardMaterial map={texture} roughness={1} />
+          ) : (
+            <meshStandardMaterial color="#4e7c3a" roughness={1} />
+          )}
+        </mesh>
+      )}
+
+      {/* The haze: distance fog as one transparent plate, painted the sky
+          dome's own horizon color with the ramp baked by radius. Full opacity
+          well inside HORIZON_FAR, so the lawn's rim dissolves into the sky
+          instead of ending. renderOrder keeps it behind every other
+          transparent (dust, glass, splats) and it writes no depth. */}
+      {hazeGeo && hazeMap && (
+        <mesh
+          geometry={hazeGeo}
+          position={[center.x, 0.05 + HAZE_LIFT, center.z]}
+          ref={freezeRef}
+          renderOrder={-40}
+          rotation={[-Math.PI / 2, 0, 0]}
+        >
+          <meshBasicMaterial
+            depthWrite={false}
+            fog={false}
+            map={hazeMap}
+            side={DoubleSide}
+            toneMapped={false}
+            transparent
+          />
+        </mesh>
+      )}
+
       {/* Grass sectors: shared geometry + module material, one chunk per
           45° wedge — each culls against its own scatterBoundingSphere. */}
       {grassChunks.map(
@@ -712,6 +838,20 @@ export function Nature({ world }: { world: GameWorld }) {
             />
           ),
       )}
+
+      {/* The far tufts: same wedges, same material, 4 triangles apiece. */}
+      {farTuftGeo &&
+        farGrassChunks.map(
+          (chunk, sector) =>
+            chunk.matrices.length > 0 && (
+              <instancedMesh
+                args={[farTuftGeo, GRASS_MATERIAL, chunk.matrices.length]}
+                // biome-ignore lint/suspicious/noArrayIndexKey: sectors are positional by construction
+                key={sector}
+                ref={farGrassChunkRefs[sector]}
+              />
+            ),
+        )}
 
       {/* Flower dots: flat discs floating in the blade layer for charm. */}
       <instancedMesh args={[flowerGeometry, undefined, flowers.matrices.length]} ref={flowersRef}>

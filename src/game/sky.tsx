@@ -2,6 +2,7 @@
 
 import { useMemo } from 'react'
 import { BackSide, CanvasTexture, SRGBColorSpace, Vector3 } from 'three'
+import { HORIZON_COLOR, HORIZON_SKY_RADIUS } from './horizon'
 import type { GameWorld } from './world'
 
 /**
@@ -18,7 +19,10 @@ import type { GameWorld } from './world'
  * ignores it).
  */
 
-const RADIUS = 180
+/** The dome sits OUTSIDE the lawn's own outer edge (horizon.ts HORIZON_FAR),
+ * so the ground covers its below-equator half in every direction the player
+ * can look — the "floating platter" read is gone by construction. */
+const RADIUS = HORIZON_SKY_RADIUS
 
 let skyTexture: CanvasTexture | null = null
 
@@ -42,7 +46,13 @@ function getSkyTexture(): CanvasTexture | null {
   grad.addColorStop(0, '#a8a7a3') // zenith: mid warm gray
   grad.addColorStop(0.28, '#bcb9b2')
   grad.addColorStop(0.46, '#d6d0c5') // approaching the horizon: warm light
-  grad.addColorStop(0.52, '#ddd7ca') // horizon band — the "less gray" lift
+  // The horizon band is FLAT at HORIZON_COLOR from +1° above the equator to
+  // −8° below, which is exactly the sliver the ground's outer rim can never
+  // quite cover (a finite lawn always shows a fraction of a degree of dome
+  // under itself). The lawn's haze dissolves to this same color, so that
+  // sliver is a color identity — there is no ground/sky seam to find.
+  grad.addColorStop(0.495, HORIZON_COLOR)
+  grad.addColorStop(0.545, HORIZON_COLOR)
   grad.addColorStop(0.62, '#c2bcb1')
   grad.addColorStop(1, '#9a968e') // below ground: muted, never visible much
   g.fillStyle = grad
