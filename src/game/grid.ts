@@ -150,6 +150,33 @@ const MIN_TERRAIN_SPAN = 1
  * path stays green by construction). */
 let _storeyY: number[] | null = null
 
+/** THE DIRT the storeys are measured from: the ground elevation under the
+ * building anchor, installed by builder.tsx BEFORE the ladder (the terrain
+ * rung below normalizes against it). 0 on a flat lot — and 0 is what every
+ * hand-built world and legacy test gets, so those paths are bit-identical.
+ *
+ * A literal 0 here was the builder's y = 0 assumption: on a lot whose yard
+ * sits at +0.69 the bottom rung was SNAPPED to 0 and every ground-floor
+ * piece was placed two thirds of a metre into the site slab; on an
+ * excavated lot the uniform legacy storeys started metres in the air. */
+let _terrainY = 0
+
+/** Install the session's ground elevation (see _terrainY). Call it before
+ * setStoreyLadder — the terrain rung is derived against it. */
+export function setGridTerrainY(y: number): void {
+  _terrainY = Number.isFinite(y) ? y : 0
+}
+
+/** The live ground elevation the storeys are measured from. */
+export function gridTerrainY(): number {
+  return _terrainY
+}
+
+/** Back to the lot plane — session teardown (next to resetStoreyLadder). */
+export function resetGridTerrainY(): void {
+  _terrainY = 0
+}
+
 /** Install the session storey ladder (copied + normalized: non-finite and
  * non-climbing entries drop, a lowest boundary above the terrain plane
  * prepends the terrain storey [0, base, …]). Fewer than two surviving
@@ -167,23 +194,24 @@ export function setStoreyLadder(ys: readonly number[] | null | undefined): void 
     ladder.push(y)
   }
   // Terrain rung: grounding needs SOME storey whose base sits ON the
-  // terrain plane (isTerrainGrounded — piece-slots roots the support graph
-  // there, and without one GROUND placement is refused building-wide). A
-  // bottom rung within a real storey of the plane IS that rung — snap it
-  // to 0: a slightly SUNK building (ladder[0] < −EPS) used to get no
-  // terrain storey at all, and a slightly RAISED one minted a degenerate
-  // sub-MIN_TERRAIN_SPAN sliver [0, base] that deriveStoreyLadder would
-  // have merged. Only a bottom rung a full storey up gets the [0, base]
-  // terrain storey prepended; basement ladders (bottom rung a storey or
-  // more DOWN) keep their own ground-level rung untouched.
-  if (ladder.length > 0 && Math.abs(ladder[0]!) > TERRAIN_EPS) {
-    if (ladder[0]! >= MIN_TERRAIN_SPAN) {
-      ladder.unshift(0)
+  // GROUND (isTerrainGrounded — piece-slots roots the support graph there,
+  // and without one GROUND placement is refused building-wide). A bottom
+  // rung within a real storey of the dirt IS that rung — snap it to the
+  // dirt: a slightly SUNK building (below it by more than EPS) used to get
+  // no terrain storey at all, and a slightly RAISED one minted a degenerate
+  // sub-MIN_TERRAIN_SPAN sliver that deriveStoreyLadder would have merged.
+  // Only a bottom rung a full storey up gets a [ground, base] terrain
+  // storey prepended; basement ladders (bottom rung a storey or more DOWN)
+  // keep their own ground-level rung untouched. _terrainY is the ground
+  // under the building, 0 on a flat lot.
+  if (ladder.length > 0 && Math.abs(ladder[0]! - _terrainY) > TERRAIN_EPS) {
+    if (ladder[0]! - _terrainY >= MIN_TERRAIN_SPAN) {
+      ladder.unshift(_terrainY)
     } else if (
-      ladder[0]! > -MIN_TERRAIN_SPAN &&
-      (ladder.length < 2 || ladder[1]! > TERRAIN_EPS)
+      ladder[0]! - _terrainY > -MIN_TERRAIN_SPAN &&
+      (ladder.length < 2 || ladder[1]! > _terrainY + TERRAIN_EPS)
     ) {
-      ladder[0] = 0
+      ladder[0] = _terrainY
     }
   }
   _storeyY = ladder.length >= 2 ? ladder : null
@@ -211,9 +239,10 @@ function boundaryY(b: number): number {
   return ladder[b]!
 }
 
-/** Base elevation of storey `s` — STOREY·s in legacy mode. */
+/** Base elevation of storey `s` — the ground plus STOREY·s in legacy mode
+ * (the ground is 0 on a flat lot, so that is the historical STOREY·s). */
 export function storeyBase(s: number): number {
-  if (!_storeyY) return s * STOREY
+  if (!_storeyY) return _terrainY + s * STOREY
   return boundaryY(s)
 }
 
@@ -230,7 +259,7 @@ export function storeySpan(s: number): number {
  * division did for y < 0. */
 export function storeyOfY(y: number): number {
   const yy = y + 0.1
-  if (!_storeyY) return Math.floor(yy / STOREY)
+  if (!_storeyY) return Math.floor((yy - _terrainY) / STOREY)
   const ladder = _storeyY
   const last = ladder.length - 1
   if (yy < ladder[0]!) return Math.floor((yy - ladder[0]!) / STOREY)
@@ -767,14 +796,18 @@ export function slotsTouching(id: string): string[] {
   return out.map(slotId)
 }
 
-/** Terrain rule: slots whose base sits ON the ground plane are self-grounded.
- * Legacy mode that is exactly storey 0 (base 0); under a ladder it is the
- * storey whose base elevation is the terrain plane — for an elevated
- * building that's the prepended terrain storey, for a basement ladder it's
- * the ground level's own rung (the basement storey below is NOT terrain). */
+/** Terrain rule: slots whose base sits ON the ground are self-grounded.
+ * Legacy mode that is exactly storey 0 (whose base IS the ground); under a
+ * ladder it is the storey whose base elevation is the ground — for an
+ * elevated building that's the prepended terrain storey, for a basement
+ * ladder the ground level's own rung (the basement storey below is NOT
+ * terrain). Measured against _terrainY, not against absolute zero: on the
+ * owner's lots the whole building sits metres off the lot plane, and
+ * comparing to zero meant NO storey was ever terrain-grounded, so ground
+ * placement was refused building-wide. */
 export function isTerrainGrounded(id: string): boolean {
   const slot = parseSlotId(id)
   if (!slot) return false
   if (!_storeyY) return slot.s === 0
-  return Math.abs(storeyBase(slot.s)) <= TERRAIN_EPS
+  return Math.abs(storeyBase(slot.s) - _terrainY) <= TERRAIN_EPS
 }

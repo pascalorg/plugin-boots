@@ -1,3 +1,4 @@
+import { groundSurfaceY } from './ground'
 import { perfSection } from './perf-monitor'
 import { raycastVoxels, type VoxelGridData } from './voxel'
 
@@ -104,7 +105,12 @@ export type SupportProbeCtx = {
    * probe re-iterates once per sampled base cell, and Map.values() style
    * iterators are one-shot. */
   targets: () => Iterable<SupportTargetLike>
-  /** Ground plane height (collision.ts's lot plane) — default 0. */
+  /** Ground height OVERRIDE, in metres, applied at every sampled cell. Left
+   * out (the session path), each cell asks ground.ts for the height under
+   * ITSELF — a single number cannot describe sculpted ground, and using one
+   * cut both ways: over an excavation every wall read as terrain-supported
+   * and nothing ever crumbled, while a wall standing on high ground read as
+   * unsupported and collapsed the moment a neighbour was shot. */
   terrainY?: number
 }
 
@@ -138,7 +144,6 @@ export function probeTargetSupport(target: SupportTargetLike, ctx: SupportProbeC
   }
   if (base.length === 0) return true
 
-  const terrainY = ctx.terrainY ?? 0
   const halfCell = grid.cellY / 2
   const reach = halfCell + SUPPORT_GAP + 0.02
   const minDrop = Math.max(0, halfCell - MIN_DROP_SLACK)
@@ -149,7 +154,9 @@ export function probeTargetSupport(target: SupportTargetLike, ctx: SupportProbeC
     const cy = grid.centers[idx * 3 + 1]!
     const cz = grid.centers[idx * 3 + 2]!
     const bottom = cy - halfCell
-    // 1) Terrain — the lot's infinite ground plane (collision.ts).
+    // 1) Terrain — the ground UNDER THIS CELL (≤ SAMPLE_CAP probes per pass,
+    // and support passes are event-driven, never per-frame).
+    const terrainY = ctx.terrainY ?? groundSurfaceY(cx, cz)
     if (bottom <= terrainY + SUPPORT_GAP) return true
     // 2) Live collider top inside the support band under this cell.
     for (const collider of ctx.colliders) {

@@ -26,9 +26,11 @@ import {
   type GridAnchor,
   parseSlotId,
   resetGridAnchor,
+  resetGridTerrainY,
   resetStoreyLadder,
   resolveTargetSlot,
   setGridAnchor,
+  setGridTerrainY,
   setStoreyLadder,
   type Slot,
   storeyBase,
@@ -37,6 +39,7 @@ import {
   type TargetResult,
   worldToGrid,
 } from './grid'
+import { groundSurfaceY } from './ground'
 import { itemGhostActive } from './item-place'
 import { perfEvent } from './perf-monitor'
 import {
@@ -820,10 +823,17 @@ const PROBE_MARGIN = 0.35
 /** ANCHOR ALLOWLIST — the structural host kinds that can prop placed
  * pieces ("props never anchor", the fort-builder genre rule: a bookshelf
  * must not hold a sky bridge up). Doors/windows count as structure — they
- * fill structural openings and read as part of their wall. Item-family
- * kinds, fences, generic blocks and the rest of SOLID_KINDS are collision
- * geometry only. */
+ * fill structural openings and read as part of their wall. THE GROUND
+ * ITSELF is structure too: 'site' is the sculpted heightfield, and leaving
+ * it out meant a piece resting on real dirt away from the building had
+ * nothing holding it up (the storey-index terrain rule only knows ONE
+ * elevation, so it grants support to a slot floating over a slope and
+ * refuses it to one sitting on higher ground). The probe's narrow phase
+ * tests the terrain's own triangles, so this grants contact, not the
+ * heightfield's lot-wide bounding box. Item-family kinds, fences, generic
+ * blocks and the rest of SOLID_KINDS are collision geometry only. */
 const SUPPORT_NODE_TYPES: ReadonlySet<string> = new Set([
+  'site',
   'wall',
   'slab',
   'roof',
@@ -1180,7 +1190,13 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     // GRID ANCHOR: the build lattice adopts the building's frame for the
     // whole session — same lifecycle as the scene-support probe. Hand-built
     // worlds without one run the legacy identity grid.
-    setGridAnchor(world.gridAnchor ?? IDENTITY_ANCHOR)
+    const anchor = world.gridAnchor ?? IDENTITY_ANCHOR
+    setGridAnchor(anchor)
+    // THE DIRT the storeys are measured from: the ground under the anchor
+    // (the start of the building's longest wall). 0 on a flat lot, so
+    // hand-built worlds and legacy tests are unchanged. MUST precede the
+    // ladder — its terrain rung normalizes against this.
+    setGridTerrainY(groundSurfaceY(anchor.x, anchor.z))
     // STOREY LADDER: the storeys adopt the building's real level elevations
     // (same lifecycle). Worlds without one keep the uniform 2.8 fallback.
     setStoreyLadder(world.storeyLadder ?? null)
@@ -1208,6 +1224,7 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
       resetPieceSlots() // cancels pending rings; probe + registry die with the session
       resetGridAnchor() // the lattice frame dies with the session — back to identity
       resetStoreyLadder() // …and the storeys fall back to uniform 2.8
+      resetGridTerrainY() // …measured from the lot plane again
       resetCladQueue() // pending clads die too (their meshes just unmounted)
       // Span-keyed geometry caches die with the ladder that minted their
       // spans (they'd otherwise grow per building across an editor run).

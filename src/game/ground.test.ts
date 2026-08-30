@@ -12,7 +12,7 @@ import {
   spawnFloorBreach,
 } from './craters'
 import { clearDebris, debrisDump, spawnDebris } from './debris'
-import { probeLandingY, resetDestruction } from './destruction'
+import { ensureVoxelTarget, probeLandingY, resetDestruction, useDestruction } from './destruction'
 import {
   type Bot,
   type BotKind,
@@ -39,6 +39,19 @@ import {
   setGroundSurfaceProbe,
   setLotFloorY,
 } from './ground'
+import {
+  getStoreyLadder,
+  isTerrainGrounded,
+  resetGridTerrainY,
+  resetStoreyLadder,
+  setGridTerrainY,
+  setStoreyLadder,
+  slotId,
+  storeyBase,
+  storeyOfY,
+} from './grid'
+import { probeTargetSupport } from './structure'
+import { buildTreesFrom } from './trees-destruct'
 import { itemDropY, itemProbeFromY } from './item-place'
 import { applyTeleport } from './player'
 import {
@@ -135,6 +148,44 @@ function makeWorld(colliders: ColliderEntry[]): GameWorld {
   }
 }
 
+/** A world the support probe can voxelize walls in (see structure.test.ts). */
+function supportWorld(): GameWorld {
+  const world = makeWorld([])
+  world.spawn.set(0, 0, 30)
+  return world
+}
+
+/** Register a host wall so ensureVoxelTarget takes the anatomy lane.
+ * `center` is the wall's world center; length runs along X. */
+function addWall(
+  world: GameWorld,
+  nodeId: string,
+  center: [number, number, number],
+  length = 2,
+  height = 2.7,
+): void {
+  const collider = boxCollider(nodeId, 'wall', [length, height, 0.12], center)
+  world.colliders.push(collider)
+  world.walls.set(nodeId, {
+    node: {
+      id: nodeId,
+      start: [center[0] - length / 2, center[2]],
+      end: [center[0] + length / 2, center[2]],
+      height,
+      thickness: 0.12,
+    },
+    root: collider.root,
+    meshes: [collider.mesh],
+  })
+}
+
+/** The session's own probe context: no terrainY override, so every sampled
+ * cell asks ground.ts for the height under itself. */
+const supportCtx = (world: GameWorld) => ({
+  colliders: world.colliders,
+  targets: () => useDestruction.getState().targets.values(),
+})
+
 /** Deterministic ground bot — groundT 0 forces a probe on the first settle. */
 function makeBot(kind: BotKind, x: number, y: number, z: number): Bot {
   return {
@@ -174,6 +225,8 @@ afterEach(() => {
   resetDestruction()
   resetBots()
   resetBotProbeBudget()
+  resetStoreyLadder()
+  resetGridTerrainY()
 })
 
 // ---------------------------------------------------------------------------
@@ -416,6 +469,98 @@ describe('debris rests on the ground before its probe lands', () => {
     const piece = debrisDump()[0]!
     expect(piece.ground).toBeGreaterThan(0)
     expect(piece.ground).toBeLessThan(0.3)
+  })
+})
+
+describe('the build lattice is measured from the dirt', () => {
+  test('legacy storeys start at the GROUND, not at the lot plane', () => {
+    setGridTerrainY(-5)
+    expect(storeyBase(0)).toBe(-5)
+    expect(storeyBase(1)).toBeCloseTo(-2.2, 6)
+    // Aiming at the dirt in an excavated yard used to resolve to storey −2
+    // and get clamped to 0 — a build target 5 m over the player's head.
+    expect(storeyOfY(-5)).toBe(0)
+    expect(storeyOfY(-2.5)).toBe(0)
+    expect(storeyOfY(-2)).toBe(1)
+  })
+
+  test('flat lot: legacy storeys are the historical 2.8 multiples', () => {
+    expect(storeyBase(0)).toBe(0)
+    expect(storeyBase(2)).toBeCloseTo(5.6, 6)
+    expect(storeyOfY(0)).toBe(0)
+  })
+
+  test("a building on high ground keeps its own ground rung (it was snapped to 0)", () => {
+    // warner-2's yard: the ground floor sits on the site slab at +0.69.
+    setGridTerrainY(0.69)
+    setStoreyLadder([0.69, 3.19, 5.69])
+    expect(getStoreyLadder()?.[0]).toBeCloseTo(0.69, 6)
+    expect(isTerrainGrounded(slotId({ kind: 'F', i: 0, k: 0, s: 0 }))).toBe(true)
+    expect(isTerrainGrounded(slotId({ kind: 'F', i: 0, k: 0, s: 1 }))).toBe(false)
+  })
+
+  test('an elevated building gets a terrain rung at the DIRT, not at zero', () => {
+    setGridTerrainY(-5)
+    setStoreyLadder([-1, 1.5, 4]) // deck 4 m over an excavated yard
+    expect(getStoreyLadder()?.[0]).toBe(-5)
+    expect(isTerrainGrounded(slotId({ kind: 'F', i: 0, k: 0, s: 0 }))).toBe(true)
+  })
+
+  test('flat lot: the ladder normalization is unchanged', () => {
+    setStoreyLadder([0.4, 3, 5.5])
+    expect(getStoreyLadder()?.[0]).toBe(0)
+    setStoreyLadder([2.5, 5, 7.5])
+    expect(getStoreyLadder()?.[0]).toBe(0)
+    expect(getStoreyLadder()?.[1]).toBe(2.5)
+  })
+})
+
+describe('scene walls are held up by the ground under them', () => {
+  test('a wall standing on high ground is supported (it used to crumble)', () => {
+    useRampTerrain()
+    const world = supportWorld()
+    // Base at +2 — exactly the bench. Against an absolute terrainY of 0 this
+    // read as unsupported, so shooting a neighbour collapsed a wall that was
+    // sitting on solid dirt.
+    addWall(world, 'wall-bench', [-5, 3.35, 0])
+    const target = ensureVoxelTarget(world, 'wall-bench')!
+    expect(probeTargetSupport(target, supportCtx(world))).toBe(true)
+  })
+
+  test('a wall floating over an excavation is NOT supported', () => {
+    useRampTerrain()
+    const world = supportWorld()
+    // Base at y = 0, ground 5 m below: an absolute terrainY of 0 called this
+    // terrain-supported, so nothing over a pit ever fell.
+    addWall(world, 'wall-void', [9, 1.35, 20])
+    const target = ensureVoxelTarget(world, 'wall-void')!
+    expect(probeTargetSupport(target, supportCtx(world))).toBe(false)
+  })
+
+  test('flat lot: a wall at the plane is supported, one in the air is not', () => {
+    const world = supportWorld()
+    addWall(world, 'wall-flat', [0, 1.35, 0])
+    expect(probeTargetSupport(ensureVoxelTarget(world, 'wall-flat')!, supportCtx(world))).toBe(true)
+    addWall(world, 'wall-air', [30, 4.05, 0])
+    expect(probeTargetSupport(ensureVoxelTarget(world, 'wall-air')!, supportCtx(world))).toBe(false)
+  })
+})
+
+describe('the grove follows the dirt', () => {
+  test('a placement with no y probes the ground instead of planting at 0', () => {
+    useRampTerrain()
+    const trees = buildTreesFrom([
+      { x: -5, z: 0, scale: 1, yaw: 0, color: [0, 1, 0] },
+      { x: 9, z: 20, scale: 1, yaw: 0, color: [0, 1, 0] },
+      { x: 0, y: 3.2, z: 0, scale: 1, yaw: 0, color: [0, 1, 0] }, // host tree on a deck
+    ])
+    expect(trees[0]!.y).toBe(2)
+    expect(trees[1]!.y).toBe(-5)
+    expect(trees[2]!.y).toBe(3.2)
+  })
+
+  test('flat lot: a placement with no y is still planted at 0', () => {
+    expect(buildTreesFrom([{ x: 9, z: 20, scale: 1, yaw: 0, color: [0, 1, 0] }])[0]!.y).toBe(0)
   })
 })
 

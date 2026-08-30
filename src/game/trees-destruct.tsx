@@ -16,6 +16,7 @@ import {
 import { sfx, type TreeCrackleHandle } from './audio'
 import { spawnDebris } from './debris'
 import { spawnDust } from './dust'
+import { groundSurfaceY } from './ground'
 import { scatter } from './nature'
 import { hideForGame } from './session'
 import { registerTreeRoutes } from './shooting'
@@ -128,7 +129,8 @@ export function buildTreesFrom(placements: TreePlacement[]): CombatTree[] {
   return placements.map((p, id) => ({
     ...p,
     id,
-    y: p.y ?? 0,
+    // No y on the placement = probe the ground (0 on a flat lot, as before).
+    y: p.y ?? groundSurfaceY(p.x, p.z),
     params: p.params ?? treeParamsAt(p.x, p.z),
     state: 'healthy' as TreeState,
     hp: TREE_HP,
@@ -756,7 +758,18 @@ function treePlacements(world: GameWorld): TreePlacement[] {
     const yaw = rand() * Math.PI * 2
     const scale = 0.8 + rand() * 0.9
     const params = treeParamsAt(position.x, position.z)
-    placements.push({ x: position.x, z: position.z, scale, yaw, color: params.color, params })
+    // scatter() drapes `position` onto the lot surface — KEEP the y. Throwing
+    // it away planted the grove on the lot plane while the grass around it
+    // followed the dirt: trunks buried on a rise, floating over a dip.
+    placements.push({
+      x: position.x,
+      y: position.y,
+      z: position.z,
+      scale,
+      yaw,
+      color: params.color,
+      params,
+    })
     return _canopyColor.setRGB(params.color[0], params.color[1], params.color[2]).clone()
   })
   return placements
