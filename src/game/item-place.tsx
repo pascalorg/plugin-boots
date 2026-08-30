@@ -792,7 +792,7 @@ export function disposeItemContent(content: Object3D, proxy: boolean, ghost: boo
  * after every show (proxy AND the GLB swap) — PlacedItemMesh hangs its
  * collider (re)registration off it; the ghost passes nothing.
  */
-function mountItemVisual(
+export function mountItemVisual(
   holder: Group,
   asset: CatalogEntry,
   ghost: boolean,

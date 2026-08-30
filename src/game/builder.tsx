@@ -310,7 +310,11 @@ function geometryFor(piece: BuildPiece, span: number): BoxGeometry {
  * swaps both at once. Null when every cell is dead (nothing to
  * render/collide). */
 const maskGeometryCache = new Map<string, BufferGeometry>()
-function geometryForMask(piece: BuildPiece, mask: number, span = WALL_H): BufferGeometry | null {
+export function geometryForMask(
+  piece: BuildPiece,
+  mask: number,
+  span = WALL_H,
+): BufferGeometry | null {
   const live = mask & FULL_MASK
   if (live === 0) return null
   if (live === FULL_MASK) return geometryFor(piece, span)
