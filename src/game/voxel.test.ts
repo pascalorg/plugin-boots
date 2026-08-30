@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Quaternion, Vector3 } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
+import { MAX_CELLS_PER_NODE } from './shared-world'
 import {
   buildVoxelGrid,
   dropInteriorCells,
   findUnsupportedIslands,
   gridFrameToWorld,
+  MAX_VOXELS,
   raycastObb,
   raycastVoxels,
   raycastYawObb,
@@ -30,6 +32,124 @@ describe('buildVoxelGrid', () => {
     expect(grid.ny).toBe(5)
     expect(grid.count).toBe(50)
     expect(grid.aliveCount).toBe(50)
+  })
+
+  /**
+   * A solid `s`-metre cube voxelized the way the unpinned callers do it
+   * (solid = false, no per-axis override): the item silhouette lane, the
+   * roof residual soup, and the diagonal-wall fallback in destruction.ts.
+   * Solid is the WORST CASE for the two-stage sizing: occupied == raw, so
+   * any gap between the cell-size search's budget and the fill cap shows up
+   * immediately as a missing chunk of cube.
+   */
+  function solidCube(s: number, cell = 0.15, cellSizes?: { x?: number; y?: number; z?: number }) {
+    const geometry = new BoxGeometry(s, s, s)
+    const bvh = new MeshBVH(geometry)
+    const h = s / 2
+    const bounds = new Box3(new Vector3(-h, -h, -h), new Vector3(h, h, h))
+    return buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, cell, false, cellSizes)
+  }
+
+  /** Cells the grid holds in the LAST slab along each axis (nx-1 / ny-1 /
+   * nz-1) — zero on any axis means a contiguous face of the object simply
+   * does not exist. */
+  function farSlabCounts(grid: ReturnType<typeof buildVoxelGrid>) {
+    let x = 0
+    let y = 0
+    let z = 0
+    for (let i = 0; i < grid.count; i++) {
+      if (grid.coords[i * 3] === grid.nx - 1) x++
+      if (grid.coords[i * 3 + 1] === grid.ny - 1) y++
+      if (grid.coords[i * 3 + 2] === grid.nz - 1) z++
+    }
+    return { x, y, z }
+  }
+
+  test('a source past the fill cap keeps its far-Z end', () => {
+    // 3 m cube at the default 0.15 m cell = 20 × 20 × 20 = 8000 raw cells,
+    // which the thin-geometry raw budget (24 × MAX_VOXELS = 38400 RAW cells)
+    // accepted untouched — while emission stopped at MAX_VOXELS = 1600, i.e.
+    // exactly the first four iz slabs of 400. `iz` is the OUTER scan axis, so
+    // the loss was not a thinning: cells iz 4..19 never existed at all —
+    // invisible (nothing instanced), non-colliding (walk right through), and
+    // silently under-counted (damage ratios, walkOnly, save-demolition).
+    const grid = solidCube(3)
+    expect(grid.count).toBeLessThanOrEqual(MAX_VOXELS)
+    // WHOLE: a solid cube occupies every cell of its own grid.
+    expect(grid.count).toBe(grid.nx * grid.ny * grid.nz)
+    const far = farSlabCounts(grid)
+    expect(far.z).toBe(grid.nx * grid.ny)
+    expect(far.y).toBe(grid.nx * grid.nz)
+    expect(far.x).toBe(grid.ny * grid.nz)
+  })
+
+  test('a shot at the near face hits the near face', () => {
+    // The consumer-visible shape of the same loss: the far-Z surface is gone,
+    // so a DDA ray entering there travelled metres into the solid before
+    // finding a live cell (bullets and the collision push-out both).
+    const grid = solidCube(3)
+    const hit = raycastVoxels(grid, 0, 0, 5, 0, 0, -1, 20)
+    expect(hit).not.toBeNull()
+    // Surface at z = +1.5 → 3.5 m from the muzzle, within one cell.
+    expect(hit!.distance).toBeGreaterThan(3.5 - grid.cellZ)
+    expect(hit!.distance).toBeLessThan(3.5 + grid.cellZ)
+  })
+
+  test('sizing and emission cannot drift: a 100%-occupied source is never capped', () => {
+    // THE DRIFT GUARD. The two stages measure different things — the
+    // cell-size search counts RAW cells (nx·ny·nz) while the fill cap counts
+    // OCCUPIED ones — so a raw budget above the cap is only ever a BET on
+    // occupancy. A solid box is the case where the bet always loses
+    // (occupied == raw). Edit either constant so the sizing stage promises
+    // more than emission will emit and one of these grids comes back short.
+    for (const s of [1, 2, 3, 4.5, 6]) {
+      for (const cell of [0.05, 0.1, 0.15, 0.3]) {
+        for (const pins of [undefined, { z: 0.04 }] as const) {
+          const grid = solidCube(s, cell, pins)
+          const where = `${s}m cube @ ${cell}${pins ? ' pinned' : ''}`
+          expect(grid.count, where).toBeLessThanOrEqual(MAX_VOXELS)
+          expect(grid.count, where).toBe(grid.nx * grid.ny * grid.nz)
+        }
+      }
+    }
+  })
+
+  test('a pinned thickness cell survives when it fits (wall sandwich contract)', () => {
+    // The anatomy lanes (walls, slabs, roof planes) pin the thickness axis and
+    // rely on getting that exact cell back — growth must land on the ADAPTIVE
+    // axes while the pins can still fit under the cap.
+    const geometry = new BoxGeometry(6, 2.5, 0.12)
+    const bvh = new MeshBVH(geometry)
+    const bounds = new Box3(new Vector3(-3, -1.25, -0.06), new Vector3(3, 1.25, 0.06))
+    const grid = buildVoxelGrid([{ bvh, matrixWorld: new Matrix4() }], bounds, 0.15, false, {
+      z: 0.04,
+    })
+    expect(grid.cellZ).toBe(0.04)
+    expect(grid.nz).toBe(3)
+    expect(grid.count).toBe(grid.nx * grid.ny * grid.nz)
+    expect(grid.count).toBeLessThanOrEqual(MAX_VOXELS)
+  })
+
+  test('the cap stays inside the multiplayer per-node wire budget', () => {
+    // The other half of "do not just raise the cap": shared-wire REJECTS a
+    // decoded node record above MAX_CELLS_PER_NODE and shared-damage SLICES a
+    // node's cells to it per frame, so a grid bigger than that could never be
+    // fully synced or late-joined — a co-op peer would see a partly intact
+    // wall the shooter sees as gone. Raise MAX_VOXELS past this and the
+    // failure is silent in single player and invisible until co-op.
+    expect(MAX_VOXELS).toBeLessThanOrEqual(MAX_CELLS_PER_NODE)
+  })
+
+  test('an override that alone blows the cap is relaxed, not truncated', () => {
+    // Pathological pin: 3 m of 0.5 mm layers is 6000 cells on Z before any
+    // other axis exists, so NO adaptive cell can bring the raw count under
+    // the cap. The pin itself grows then — a coarser sandwich is still a
+    // whole wall, whereas the old code returned two thirds of a wall.
+    const grid = solidCube(3, 0.15, { z: 0.0005 })
+    expect(grid.cellZ).toBeGreaterThan(0.0005)
+    expect(grid.count).toBe(grid.nx * grid.ny * grid.nz)
+    expect(grid.count).toBeLessThanOrEqual(MAX_VOXELS)
+    expect(farSlabCounts(grid).z).toBe(grid.nx * grid.ny)
   })
 
   test('respects transforms', () => {

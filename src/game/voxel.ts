@@ -168,8 +168,39 @@ const _v = { x: 0, y: 0, z: 0 }
 const gridKey = (ix: number, iy: number, iz: number, nx: number, ny: number) =>
   ix + nx * (iy + ny * iz)
 
-/** Cap on voxels per wall — beyond this the cell size grows to compensate. */
-const MAX_VOXELS = 1600
+/**
+ * Cap on voxels per grid — beyond this the cell size grows to compensate.
+ * This is the SINGLE authority: the cell-size search does not stop at a cell
+ * it merely hopes will fit, it stops at one whose SAMPLED fill fits here (see
+ * buildVoxelGrid stage 2), so the emission loop is never asked to drop a
+ * cell. Exported so tests and consumers assert against the one number
+ * instead of copying it.
+ *
+ * Why not raise it? It bounds per-node memory (coords + centers + alive +
+ * the index Map) and per-node instancing work in voxel-walls, on scenes with
+ * hundreds of live targets — and shared-world's wire caps a node at
+ * MAX_CELLS_PER_NODE = 4096 cells per frame, a bound written against this
+ * value: a grid above that could not be fully synced or late-joined at all.
+ */
+export const MAX_VOXELS = 1600
+
+/** Cell growth step of the sizing search (destruction.ts's own pre-sizing
+ * loops mirror it). */
+const CELL_GROWTH = 1.35
+
+/**
+ * Occupancy bet for unpinned, non-`solid` sources: thin geometry (plain
+ * walls, the roof residual's gable soup) fills only a few percent of its
+ * AABB, so its RAW grid (nx·ny·nz) may run this far above MAX_VOXELS and
+ * still emit far fewer cells than the cap. It is a bet on shape, not a
+ * promise — stage 2 collects on it by sampling and re-sizing when it loses.
+ */
+const THIN_RAW_BUDGET_FACTOR = 24
+
+/** Growth steps stage 2 may take before giving up. Every step shrinks the
+ * raw count monotonically and occupied ≤ raw, so a whole grid is reached in
+ * a handful — this is a tripwire, not a policy. */
+const MAX_SIZING_ATTEMPTS = 20
 
 /** Per-axis cell override — wall anatomy pins the THICKNESS axis to a thin
  * cell (thickness/3 → 0.03–0.05 m skins) so even a 0.10 m wall gets three
@@ -187,7 +218,10 @@ export function buildVoxelGrid(
   preferredCell = 0.15,
   /** True for chunky volumes (doors, slabs, furniture): sizes the cell so
    * even a 100%-occupied grid stays ≤ MAX_VOXELS instead of relying on the
-   * thin-wall occupancy discount. */
+   * thin-wall occupancy discount. Since stage 2 VERIFIES that discount by
+   * sampling, this is now a hint that saves re-sampling passes on volumes —
+   * never a correctness requirement: an unpinned, non-solid chunky source
+   * comes back whole either way. */
   solid = false,
   cellSizes?: VoxelCellOverride,
   /** Rotate the grid axes about world Y — diagonal walls build in their
@@ -205,26 +239,38 @@ export function buildVoxelGrid(
 ): VoxelGridData {
   const size = new Vector3()
   worldBounds.getSize(size)
+  // ── Cell sizing, stage 1: the RAW budget ────────────────────────────────
   // Grow the adaptive cell until the raw grid is small enough that even a
   // solid fill stays under budget (plain walls are mostly thin, so real
   // counts land far lower). Anisotropic wall grids fill their thickness
   // axis ~100%, so an override forfeits the occupancy discount.
+  /** Pinned per-axis cells (0 = adaptive, i.e. follows `cell`). */
+  let pinX = cellSizes?.x ?? 0
+  let pinY = cellSizes?.y ?? 0
+  let pinZ = cellSizes?.z ?? 0
   let cell = preferredCell
-  const budget = solid || cellSizes ? MAX_VOXELS : MAX_VOXELS * 24
-  for (let guard = 0; guard < 12; guard++) {
-    const rawCount =
-      spanOf(size.x, cellSizes?.x ?? cell) *
-      spanOf(size.y, cellSizes?.y ?? cell) *
-      spanOf(size.z, cellSizes?.z ?? cell)
-    if (rawCount <= budget) break
-    cell *= 1.35
+  const rawCount = () =>
+    spanOf(size.x, pinX || cell) * spanOf(size.y, pinY || cell) * spanOf(size.z, pinZ || cell)
+  /** Raw cells the PINS alone impose (1 when nothing is pinned). */
+  const pinnedCount = () =>
+    (pinX ? spanOf(size.x, pinX) : 1) *
+    (pinY ? spanOf(size.y, pinY) : 1) *
+    (pinZ ? spanOf(size.z, pinZ) : 1)
+  /** One growth step. The ADAPTIVE axes carry it, so an override keeps its
+   * exact cell — the wall/roof/slab sandwich contract (thickness/3 skins).
+   * Once the pins ALONE exceed the cap no adaptive cell can ever fit, so
+   * then they grow too: a coarser sandwich is still a whole wall, where the
+   * alternative is returning part of one. */
+  const grow = () => {
+    cell *= CELL_GROWTH
+    if (pinnedCount() > MAX_VOXELS) {
+      if (pinX) pinX *= CELL_GROWTH
+      if (pinY) pinY *= CELL_GROWTH
+      if (pinZ) pinZ *= CELL_GROWTH
+    }
   }
-  const cellX = cellSizes?.x ?? cell
-  const cellY = cellSizes?.y ?? cell
-  const cellZ = cellSizes?.z ?? cell
-  const nx = spanOf(size.x, cellX)
-  const ny = spanOf(size.y, cellY)
-  const nz = spanOf(size.z, cellZ)
+  const rawBudget = solid || cellSizes ? MAX_VOXELS : MAX_VOXELS * THIN_RAW_BUDGET_FACTOR
+  for (let guard = 0; guard < 12 && rawCount() > rawBudget; guard++) grow()
   const origin = worldBounds.min
 
   // Resolve the grid basis. An explicit yaw-only basis routes through the
@@ -249,53 +295,115 @@ export function buildVoxelGrid(
   const cosYaw = Math.cos(yaw)
   const sinYaw = Math.sin(yaw)
 
-  const coords: number[] = []
-  const centers: number[] = []
-  const index = new Map<number, number>()
-
-  const halfX = cellX / 2
-  const halfY = cellY / 2
-  const halfZ = cellZ / 2
-  for (let iz = 0; iz < nz; iz++) {
-    for (let iy = 0; iy < ny; iy++) {
-      for (let ix = 0; ix < nx; ix++) {
-        const cx = origin.x + ix * cellX + halfX
-        const cy = origin.y + iy * cellY + halfY
-        const cz = origin.z + iz * cellZ + halfZ
-        let inside = false
-        for (let m = 0; m < sources.length && !inside; m++) {
-          const bvh = sources[m]?.bvh
-          const inv = inverses[m]
-          if (!bvh || !inv) continue
-          // Shell test: world-aligned voxel box as an OBB in mesh space.
-          _box.min.set(cx - halfX, cy - halfY, cz - halfZ)
-          _box.max.set(cx + halfX, cy + halfY, cz + halfZ)
-          if (bvh.intersectsBox(_box, inv)) {
-            inside = true
+  // ── Cell sizing, stage 2: sample, then VERIFY the fill ──────────────────
+  // Stage 1 counted RAW cells; the cap counts OCCUPIED ones, and the thin
+  // geometry discount is only a bet on the shape (a 3 m cube handed in
+  // unpinned raises 8000 raw cells, well under the 38400 raw budget, and
+  // fills every one of them). So SAMPLE, and if the fill overflows the cap,
+  // grow the cell and sample again. Termination is arithmetic: growth shrinks
+  // the raw count monotonically (pins included — see grow()) and occupied ≤
+  // raw, so once raw ≤ MAX_VOXELS an overflow is impossible. The grid handed
+  // back is therefore always WHOLE.
+  //
+  // This is the fix for a silent, spatially-biased data loss: emission used
+  // to keep scanning and simply stop ADDING cells at the cap, and because iz
+  // is the OUTER axis that deleted the object's entire far-Z end — invisible,
+  // non-colliding, and under-counted (damage ratios, walkOnly, and the
+  // save-demolition "zero voxels left" test all read grid.count). A coarser
+  // whole grid is the honest trade: cells stay bounded, nothing vanishes.
+  // The overflow bail-out also makes the losing bet CHEAPER than it was —
+  // sampling stops at the cap instead of BVH-testing the whole remaining
+  // volume only to throw the results away.
+  let cellX = 0
+  let cellY = 0
+  let cellZ = 0
+  let nx = 0
+  let ny = 0
+  let nz = 0
+  let coords: number[] = []
+  let centers: number[] = []
+  let index = new Map<number, number>()
+  let overflow = false
+  for (let attempt = 0; ; attempt++) {
+    cellX = pinX || cell
+    cellY = pinY || cell
+    cellZ = pinZ || cell
+    nx = spanOf(size.x, cellX)
+    ny = spanOf(size.y, cellY)
+    nz = spanOf(size.z, cellZ)
+    coords = []
+    centers = []
+    index = new Map<number, number>()
+    overflow = false
+    const halfX = cellX / 2
+    const halfY = cellY / 2
+    const halfZ = cellZ / 2
+    for (let iz = 0; iz < nz && !overflow; iz++) {
+      for (let iy = 0; iy < ny && !overflow; iy++) {
+        for (let ix = 0; ix < nx; ix++) {
+          const cx = origin.x + ix * cellX + halfX
+          const cy = origin.y + iy * cellY + halfY
+          const cz = origin.z + iz * cellZ + halfZ
+          let inside = false
+          for (let m = 0; m < sources.length && !inside; m++) {
+            const bvh = sources[m]?.bvh
+            const inv = inverses[m]
+            if (!bvh || !inv) continue
+            // Shell test: world-aligned voxel box as an OBB in mesh space.
+            _box.min.set(cx - halfX, cy - halfY, cz - halfZ)
+            _box.max.set(cx + halfX, cy + halfY, cz + halfZ)
+            if (bvh.intersectsBox(_box, inv)) {
+              inside = true
+              break
+            }
+            if (surfaceOnly) continue
+            // Interior test: a local-space ray that first hits a backface
+            // started inside the mesh (voxelize.js recipe).
+            _p.set(cx, cy, cz).applyMatrix4(inv)
+            _ray.origin.copy(_p)
+            _ray.direction.set(0, 0, 1)
+            const hit = bvh.raycastFirst(_ray, 2)
+            if (hit?.face && hit.face.normal.dot(_ray.direction) > 0) inside = true
+          }
+          if (!inside) continue
+          if (coords.length / 3 >= MAX_VOXELS) {
+            // The bet lost: abandon this cell size (see above).
+            overflow = true
             break
           }
-          if (surfaceOnly) continue
-          // Interior test: a local-space ray that first hits a backface
-          // started inside the mesh (voxelize.js recipe).
-          _p.set(cx, cy, cz).applyMatrix4(inv)
-          _ray.origin.copy(_p)
-          _ray.direction.set(0, 0, 1)
-          const hit = bvh.raycastFirst(_ray, 2)
-          if (hit?.face && hit.face.normal.dot(_ray.direction) > 0) inside = true
+          index.set(gridKey(ix, iy, iz, nx, ny), coords.length / 3)
+          coords.push(ix, iy, iz)
+          // Centers are ALWAYS world-space — rendering, debris, and distance
+          // checks never need to know about the grid frame.
+          if (!pureYaw) {
+            rotateByBasisInverse(q, cx, cy, cz, _v)
+            centers.push(_v.x, _v.y, _v.z)
+          } else if (yaw === 0) centers.push(cx, cy, cz)
+          else centers.push(cx * cosYaw - cz * sinYaw, cy, cx * sinYaw + cz * cosYaw)
         }
-        if (!inside) continue
-        if (coords.length / 3 >= MAX_VOXELS) continue
-        index.set(gridKey(ix, iy, iz, nx, ny), coords.length / 3)
-        coords.push(ix, iy, iz)
-        // Centers are ALWAYS world-space — rendering, debris, and distance
-        // checks never need to know about the grid frame.
-        if (!pureYaw) {
-          rotateByBasisInverse(q, cx, cy, cz, _v)
-          centers.push(_v.x, _v.y, _v.z)
-        } else if (yaw === 0) centers.push(cx, cy, cz)
-        else centers.push(cx * cosYaw - cz * sinYaw, cy, cx * sinYaw + cz * cosYaw)
       }
     }
+    if (!overflow || attempt >= MAX_SIZING_ATTEMPTS) break
+    grow()
+  }
+  if (overflow) {
+    // Unreachable by stage 2's arithmetic (raw ≤ MAX_VOXELS ⇒ occupied ≤
+    // MAX_VOXELS, and MAX_SIZING_ATTEMPTS growth steps shrink the raw count
+    // ~400×). Kept as a LOUD tripwire because the silent version of exactly
+    // this line is the bug stage 2 exists to kill: a truncated grid is a
+    // node with a missing far-Z slab, and nothing downstream can tell.
+    //
+    // Why the residue still keeps a CONTIGUOUS prefix rather than thinning
+    // the whole volume evenly: the grid's 6-connectivity is load-bearing.
+    // findUnsupportedIslands floods from the base row through face
+    // neighbours, so a strided/decimated fill would leave every surviving
+    // cell touching nothing — every cell its own unsupported island — and the
+    // node would crumble to debris the moment it took a scratch. A whole grid
+    // at a coarser cell is the only good answer, which is why stage 2 makes
+    // that outcome the reachable one and this branch a shout, not a policy.
+    console.warn(
+      `[boots] voxel: fill still over MAX_VOXELS (${MAX_VOXELS}) after ${MAX_SIZING_ATTEMPTS} sizing steps at ${nx}×${ny}×${nz} cells — this grid is TRUNCATED past iz ${coords[coords.length - 1] ?? 0}`,
+    )
   }
 
   const count = coords.length / 3
