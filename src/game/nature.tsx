@@ -672,13 +672,17 @@ export function Nature({ world }: { world: GameWorld }) {
     [grass, center.x, center.z],
   )
 
-  // Grass + flowers are clearable fields (craters strip the blades they
-  // cover); bushes/rocks survive a blast, so they bind the plain way.
+  // EVERY scatter pool is a clearable field now: craters strip what they
+  // cover (a bush standing in a fresh blast crater read wrong), and the
+  // depot's footprint sweep can evict the odd bush/rock that seeded inside
+  // the container (owner-spotted: a bush growing through the armory deck).
   const grassChunkRefs = useMemo(
     () => grassChunks.map((chunk) => fieldRef(chunk, storage)),
     [grassChunks, storage],
   )
   const flowersRef = useMemo(() => fieldRef(flowers, storage), [flowers, storage])
+  const bushesRef = useMemo(() => fieldRef(bushes, storage), [bushes, storage])
+  const rocksRef = useMemo(() => fieldRef(rocks, storage), [rocks, storage])
 
   return (
     <group userData={{ __boots: true }}>
@@ -715,17 +719,11 @@ export function Nature({ world }: { world: GameWorld }) {
       </instancedMesh>
 
       {/* Bushes: baked three-lobe clusters (species 4 — low, trunkless). */}
-      <instancedMesh
-        args={[bushGeometry, undefined, bushes.matrices.length]}
-        ref={(mesh) => setInstances(mesh, bushes, storage)}
-      >
+      <instancedMesh args={[bushGeometry, undefined, bushes.matrices.length]} ref={bushesRef}>
         <meshStandardMaterial roughness={1} vertexColors />
       </instancedMesh>
 
-      <instancedMesh
-        args={[undefined, undefined, rocks.matrices.length]}
-        ref={(mesh) => setInstances(mesh, rocks, storage)}
-      >
+      <instancedMesh args={[undefined, undefined, rocks.matrices.length]} ref={rocksRef}>
         <icosahedronGeometry args={[0.5, 0]} />
         <meshStandardMaterial roughness={0.9} />
       </instancedMesh>
