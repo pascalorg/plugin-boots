@@ -86,8 +86,13 @@ export default function BootsPanel() {
             was.
           </p>
           <p className="text-xs leading-relaxed">
+            {/* `=== 1`, not `> 1`: zero is reachable now. The section opens for
+                paint or demolition alone, and in a shared world the pieces in
+                the store can all be other players' — which this count
+                deliberately excludes — so "0 piece" was a sentence a live
+                session could actually print. */}
             You built <span className="font-semibold">{placed.length}</span> piece
-            {placed.length > 1 ? 's' : ''} in-game
+            {placed.length === 1 ? '' : 's'} in-game
             {wallCount > 0 ? ` (${wallCount} wall${wallCount > 1 ? 's' : ''} can become real)` : ''}
             .
           </p>
