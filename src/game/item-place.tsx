@@ -25,6 +25,7 @@ import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
 import { collectWallOpenings, dropTarget, probeLandingY } from './destruction'
+import { groundSurfaceY } from './ground'
 import {
   type CatalogEntry,
   closeItemMenu,
@@ -190,8 +191,38 @@ export const ITEM_REACH = 6
 const LEVEL_GAZE_AHEAD = ITEM_REACH * 0.6
 /** cos(pitch) below this (looking near straight up/down) = no anchor. */
 const MIN_HORIZONTAL = 0.2
+/** How far BELOW the player's own floor plane a probed surface may still take
+ * the ghost. Sloped ground within the 6 m reach drops well under this; a
+ * storey does not, so aiming into a hole in the floor you are standing on
+ * still places the item at your feet instead of on the ground below. */
+const ITEM_MAX_STEP_DOWN = 2.2
+/** How far ABOVE the floor plane the landing probe may start. Aiming uphill,
+ * the ground at the anchor is above the plane and a probe beginning under it
+ * reads as "inside the ground"; starting over it fixes that, and the cap
+ * keeps a room's ceiling out of the running. */
+const ITEM_PROBE_MAX_RISE = 1.8
 
 export type ItemAnchor = { x: number; y: number; z: number; valid: boolean }
+
+/**
+ * Where the landing probe starts for a ghost anchored at (x, z) while the
+ * player's feet are at floorY. Pure, exported for tests.
+ */
+export function itemProbeFromY(floorY: number, x: number, z: number): number {
+  return Math.min(
+    floorY + ITEM_PROBE_MAX_RISE,
+    Math.max(floorY + 1, groundSurfaceY(x, z) + 0.02),
+  )
+}
+
+/**
+ * The ghost's height: the probed surface, unless it is more than a step below
+ * the player's own floor plane (then the plane, the upper-storey guard).
+ * Pure, exported for tests.
+ */
+export function itemDropY(anchorY: number, snapped: number): number {
+  return snapped >= anchorY - ITEM_MAX_STEP_DOWN ? snapped : anchorY
+}
 
 /**
  * Aim-anchored floor point — pure, allocation-free (writes `out`), exported
@@ -1277,9 +1308,12 @@ export function GameItems({ world }: { world: GameWorld }) {
       return
     }
     const probe = probeCache.current
+    // Probe origin: over the player's feet, and over the ground at the anchor
+    // when the aim points uphill (see ITEM_PROBE_MAX_RISE).
+    const probeFrom = itemProbeFromY(floorY, _anchor.x, _anchor.z)
     const qx = Math.round(_anchor.x * 100)
     const qz = Math.round(_anchor.z * 100)
-    const qf = Math.round(floorY * 100)
+    const qf = Math.round(probeFrom * 100)
     if (
       probe.qx !== qx ||
       probe.qz !== qz ||
@@ -1292,10 +1326,16 @@ export function GameItems({ world }: { world: GameWorld }) {
       probe.qf = qf
       probe.colliders = world.colliders.length
       probe.frame = frame.current
-      probe.y = probeLandingY(world, _anchor.x, floorY + 1, _anchor.z)
+      probe.y = probeLandingY(world, _anchor.x, probeFrom, _anchor.z)
     }
     const snapped = probe.y
-    const y = snapped > _anchor.y ? snapped : _anchor.y
+    // Downhill, the probed surface is BELOW the player's own floor plane —
+    // and that is exactly where the item belongs. The old max() pinned it to
+    // the plane, so anything dropped on a slope hung in the air. The plane
+    // still wins past ITEM_MAX_STEP_DOWN, which is the upper-storey guard:
+    // aiming into a hole in the floor you stand on must not place the item on
+    // the ground a storey below.
+    const y = itemDropY(_anchor.y, snapped)
     const yaw = ghostYaw(playerRig.yaw, yawTurns.current)
     ghost.visible = true
     ghost.position.set(_anchor.x, y, _anchor.z)

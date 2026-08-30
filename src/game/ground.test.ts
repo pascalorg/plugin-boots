@@ -33,6 +33,7 @@ import {
   setGroundSurfaceProbe,
   setLotFloorY,
 } from './ground'
+import { itemDropY, itemProbeFromY } from './item-place'
 import {
   bvhFor,
   type ColliderEntry,
@@ -408,6 +409,48 @@ describe('debris rests on the ground before its probe lands', () => {
     const piece = debrisDump()[0]!
     expect(piece.ground).toBeGreaterThan(0)
     expect(piece.ground).toBeLessThan(0.3)
+  })
+})
+
+describe('dropped items land on the slope', () => {
+  test('a ghost aimed downhill takes the probed surface, not the feet plane', () => {
+    // The bug: the snap was max(plane, probed), so an item dropped down a
+    // bank hung in the air at the height the player was standing at.
+    useRampTerrain()
+    const world = makeWorld([])
+    // Feet on the ramp at x = 0 (y = 0), aiming 1.5 m downhill (ground −1.5).
+    const from = itemProbeFromY(0, 1.5, 0)
+    const snapped = probeLandingY(world, 1.5, from, 0)
+    expect(snapped).toBeCloseTo(-1.5, 6)
+    expect(itemDropY(0, snapped)).toBeCloseTo(-1.5, 6)
+  })
+
+  test('aiming uphill starts the probe over the ground, so it reads the hill', () => {
+    // A probe beginning under the surface reports "inside the ground" and the
+    // ghost sank into the hill.
+    useRampTerrain()
+    const world = makeWorld([])
+    const from = itemProbeFromY(0, -1.5, 0)
+    expect(from).toBeGreaterThan(1.5)
+    expect(probeLandingY(world, -1.5, from, 0)).toBeCloseTo(1.5, 6)
+  })
+
+  test('the probe origin never climbs past a room ceiling', () => {
+    useRampTerrain()
+    // The bench is +2 while the player stands at 0 inside a dug-in room: the
+    // origin stops at the rise cap instead of poking through the ceiling.
+    expect(itemProbeFromY(0, -5, 0)).toBeCloseTo(1.8, 6)
+  })
+
+  test('a hole in the floor you stand on still places at your feet', () => {
+    useRampTerrain()
+    // Probed surface a storey down (−3 vs a plane at 0) is past the step cap.
+    expect(itemDropY(0, -3)).toBe(0)
+  })
+
+  test('flat lot: the probe origin and snap are unchanged', () => {
+    expect(itemProbeFromY(0, 4, 4)).toBe(1)
+    expect(itemDropY(0, 0.3)).toBe(0.3)
   })
 })
 
