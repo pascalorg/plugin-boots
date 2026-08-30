@@ -486,6 +486,16 @@ question.
 act. There is no goodbye frame for the world: records are grow-only, so leaving
 removes our avatar, not our fort. `__boots.worldSync()` is the QA handle.
 
+**One known interaction with the grid stamp.** `startWorldSync()` attaches in
+`game-root.tsx`'s effect, but the lot's grid fingerprint is published later, from
+`builder.tsx`'s grid effect when the piece tree mounts. Until then
+`world.gridStamp` is 0, and the merge gate refuses any frame whose stamp is
+non-zero — which is correct (we do not yet know our own lot) but reads to the
+player as "a builder is on a different lot grid". Records are grow-only so a
+later frame lands and nothing is lost; the honest fix belongs to the notice, not
+the transport: *do not surface a grid-mismatch notice while `world.gridStamp` is
+0*, because 0 means unknown, not different.
+
 **What is still not handled, stated rather than hidden.** A frame lost to the
 outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a
 timer — it heals when the next snapshot goes out, up to `HEAL_PERIOD_MS` later.
@@ -493,3 +503,12 @@ That is the design, not an oversight: a lattice has nothing to retransmit *from*
 once the journal has been taken. The cost is a bounded window in which one peer's
 view of another can be stale; the fix, if it ever matters, is a shorter heal
 period or a peer asking again, not a reliability layer.
+
+**No build identity on the wire.** The envelope carries `v: 1`, a *protocol*
+version, but nothing identifies the codec build. Two clients running different
+`shared-wire.ts` revisions would decode each other's frames into the wrong cells
+and neither would notice. Today the only way that happens is a stale hot-deploy
+copy, which is a discipline problem rather than a design one; if flag-on testing
+ever spans two machines, fold a codec fingerprint in beside `gridStamp` rather
+than trusting that everyone copied the same files. Logged as a deliberate
+deferral, not a surprise.
