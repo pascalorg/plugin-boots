@@ -2,6 +2,7 @@ import { Box3, Color, Vector3 } from 'three'
 import { sfx } from './audio'
 import { spawnDebris } from './debris'
 import { probeLandingY } from './destruction'
+import { groundSurfaceY } from './ground'
 import type { DoorEntry, GameWorld } from './world'
 
 /**
@@ -63,6 +64,10 @@ export type Bot = {
   climb: number
   /** Ground bots: cached landing plane under the feet (settleGroundBot). */
   groundY: number
+  /** Ground bots: the XZ the cached plane was probed at — a bot that has
+   * walked away from it needs a fresh one (sloped terrain). */
+  groundX: number
+  groundZ: number
   /** Ground bots: seconds until the landing plane re-probes. */
   groundT: number
   /** Ground bots: seconds spent hindered (blocked OR wall-following) — the
@@ -313,10 +318,18 @@ export function resetBots(): void {
   debugFlags.botsFrozen = false
 }
 
-export function spawnBot(kind: BotKind, x: number, z: number, groundY = 0): void {
+export function spawnBot(
+  kind: BotKind,
+  x: number,
+  z: number,
+  groundY = groundSurfaceY(x, z),
+): void {
   // groundY: the probed terrain height at (x,z) — site hills lift the ring
   // point (settleGroundBot only ever probes DOWNWARD, so a bot born at 0
   // under a +1.6 m hill stayed buried until the first probe never freed it).
+  // The default is the GROUND at (x, z), not the old literal 0: a caller
+  // without a collider set (tests, scripted spawns) still lands on the
+  // terrain instead of at the lot plane's height.
   const y = kind === 'drone' ? groundY + 2.4 + Math.random() * 1.2 : groundY
   const id = botId++
   bots.push({
@@ -335,6 +348,8 @@ export function spawnBot(kind: BotKind, x: number, z: number, groundY = 0): void
     followSign: 1,
     climb: 0,
     groundY,
+    groundX: x,
+    groundZ: z,
     // Stagger the probe cadence so a whole wave never re-probes on the
     // same frame (settleGroundBot probes as soon as this hits 0).
     groundT: Math.random() * GROUND_PROBE_PERIOD,
@@ -485,19 +500,63 @@ const GROUND_PROBE_PERIOD = 0.2
 /** Probe from just above the feet so a surface exactly at foot level
  * registers (probeLandingY rejects voxel hits < 0.02 from its start). */
 const GROUND_PROBE_LIFT = 0.1
+/** Horizontal travel (m) that invalidates a cached plane on its own, before
+ * the cadence runs out. On sloped ground the plane is only true where it was
+ * sampled: at a bot's ~3 m/s this fires about every 7 frames, and the worst
+ * stale error is this times the slope (≈ 0.2 m on a 30° bank) — small enough
+ * that the settle rate below swallows it, which is the "sample and
+ * interpolate" the horde can afford. */
+const GROUND_PROBE_STEP = 0.35
+const GROUND_PROBE_STEP_SQ = GROUND_PROBE_STEP * GROUND_PROBE_STEP
+
+/**
+ * Per-frame ceiling on DISPLACEMENT-triggered probes across the whole horde
+ * (the cadence ones always run — every bot keeps its 5 Hz floor no matter
+ * what). A probe walks every collider in the scene, so on a 670-node
+ * neighborhood this is the one cost that scales with horde size; capping it
+ * makes the terrain follow cost O(1) per frame instead of O(bots). Worst
+ * case adds 8 probes/frame ≈ 480/s on top of the cadence's 5/s per bot, and
+ * a bot that loses the draw is at most one cadence tick (0.2 s) stale.
+ */
+export const BOT_PROBE_BUDGET = 8
+let probeBudget = BOT_PROBE_BUDGET
+
+/** Refill the displacement-probe budget — enemies.tsx calls this once per
+ * frame before the bot loop. */
+export function resetBotProbeBudget(): void {
+  probeBudget = BOT_PROBE_BUDGET
+}
+
+/** Remaining displacement probes this frame (tests / perf introspection). */
+export function botProbeBudgetLeft(): number {
+  return probeBudget
+}
 
 /**
  * Pull a ground bot's feet toward the live landing plane under them —
  * destruction.probeLandingY over collider tops + live voxel cells + the
- * terrain plane. Standing on slabs/floors holds; walking over a carved
+ * ground at its XZ. Standing on slabs/floors holds; walking over a carved
  * hole drops to the next support below (near-support settle 3 m/s, real
- * falls 6 m/s). The probe result is cached per bot for ~0.2 s; only the
- * pull runs per frame. Never lifts — capsule step-up owns upward motion.
+ * falls 6 m/s). Never lifts — capsule step-up owns upward motion.
+ *
+ * SLOPES: bots steer in XZ only, so on sculpted terrain the cached plane
+ * goes stale as soon as one takes a step — downhill it hovered on the plane
+ * it left, uphill the capsule shoved it out of the hill every frame while
+ * this dragged it back in (visible jitter). The cache is now invalidated by
+ * DISPLACEMENT as well as time, throttled by a horde-wide per-frame budget
+ * (see BOT_PROBE_BUDGET) so a 40-bot wave costs a bounded number of probes.
  */
 export function settleGroundBot(world: GameWorld, bot: Bot, dt: number): void {
   bot.groundT -= dt
-  if (bot.groundT <= 0) {
+  const dx = bot.position.x - bot.groundX
+  const dz = bot.position.z - bot.groundZ
+  const due = bot.groundT <= 0
+  const moved = dx * dx + dz * dz >= GROUND_PROBE_STEP_SQ
+  if (due || (moved && probeBudget > 0)) {
+    if (!due) probeBudget--
     bot.groundT = GROUND_PROBE_PERIOD
+    bot.groundX = bot.position.x
+    bot.groundZ = bot.position.z
     bot.groundY = probeLandingY(
       world,
       bot.position.x,

@@ -128,6 +128,8 @@ function makeBot(kind: BotKind, x: number, y: number, z: number): Bot {
     followSign: 1,
     climb: 0,
     groundY: 0,
+    groundX: x,
+    groundZ: z,
     groundT: 0,
     stuckT: 0,
     doorScanT: 0,

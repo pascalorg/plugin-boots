@@ -39,6 +39,7 @@ import {
   GROUND_BOT_CAPSULE,
   pickDoorCandidate,
   segmentHitsBox,
+  resetBotProbeBudget,
   resetBots,
   setDoorApproach,
   settleGroundBot,
@@ -326,6 +327,10 @@ export function Enemies({ world }: { world: GameWorld }) {
 
     // Integrate bots.
     const frozen = debugFlags.botsFrozen // dev/E2E: hold poses, no attacks
+    // Refill the horde-wide budget for terrain re-probes triggered by a bot
+    // having WALKED off its cached landing plane (see BOT_PROBE_BUDGET). The
+    // per-bot cadence probe is never budgeted.
+    resetBotProbeBudget()
     let nearestDrone = Infinity
     for (let i = bots.length - 1; i >= 0; i--) {
       const bot = bots[i]!
