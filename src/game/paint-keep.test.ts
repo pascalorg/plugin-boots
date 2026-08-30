@@ -1,9 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { useScene } from '@pascal-app/core'
 import {
   applyPaint,
   buildPaintPatches,
+  discardPaint,
   dominantPaint,
+  mergePendingPaint,
   mintSceneMaterialId,
   type PaintedNode,
   usePaintKeep,
@@ -189,6 +191,53 @@ describe('buildPaintPatches (the save planner)', () => {
     const { minted, updates } = buildPaintPatches({ wall_a: {} }, [coat('wall_a', '#9cab8b')])
     expect(minted).toEqual([])
     expect(updates[0]!.data.slots).toBeUndefined()
+  })
+})
+
+// A pending decision spans every session since the last Save/Discard. The splat
+// ledger dies with the game tree, so a capture that REPLACED dropped the
+// previous session's coats — from the panel and, worse, from Save, which then
+// wrote nothing for them.
+describe('mergePendingPaint (coats accumulate across sessions)', () => {
+  afterEach(() => {
+    discardPaint()
+  })
+
+  test('a second session keeps the first session coat pending', () => {
+    expect(mergePendingPaint([coat('wall_a', '#3b4a63')])).toBe(1)
+    // Re-entry: the scene was restored, so the ledger knows nothing of wall_a.
+    expect(mergePendingPaint([coat('wall_b', '#9cab8b', 'SAGE')])).toBe(2)
+    expect(usePaintKeep.getState().painted.map((p) => p.nodeId)).toEqual(['wall_a', 'wall_b'])
+  })
+
+  test('a session that paints nothing leaves the pending list untouched', () => {
+    expect(mergePendingPaint([coat('wall_a', '#3b4a63')])).toBe(1)
+    // Non-zero is what keeps exitGame's pendingDecision true.
+    expect(mergePendingPaint([])).toBe(1)
+    expect(usePaintKeep.getState().painted).toEqual([coat('wall_a', '#3b4a63')])
+  })
+
+  test('a node repainted later takes the LATER colour, in its original row', () => {
+    mergePendingPaint([coat('wall_a', '#3b4a63'), coat('wall_b', '#9cab8b', 'SAGE')])
+    expect(mergePendingPaint([coat('wall_a', '#44464a', 'CHARCOAL')])).toBe(2)
+    const painted = usePaintKeep.getState().painted
+    // One node, one material: the most recent spray is what Save writes.
+    expect(painted[0]).toEqual({ nodeId: 'wall_a', color: '#44464a', colorName: 'CHARCOAL', cells: 2 })
+    // wall_a keeps row 0 — the panel must not reshuffle on re-entry.
+    expect(painted.map((p) => p.nodeId)).toEqual(['wall_a', 'wall_b'])
+  })
+
+  test('cells sum — the pending row is the total spend on that surface', () => {
+    mergePendingPaint([{ nodeId: 'wall_a', color: '#3b4a63', colorName: 'NAVY', cells: 9 }])
+    mergePendingPaint([{ nodeId: 'wall_a', color: '#3b4a63', colorName: 'NAVY', cells: 4 }])
+    expect(usePaintKeep.getState().painted[0]!.cells).toBe(13)
+  })
+
+  test('the decision clears the accumulation, so the next session starts empty', () => {
+    mergePendingPaint([coat('wall_a', '#3b4a63')])
+    discardPaint()
+    expect(mergePendingPaint([coat('wall_b', '#9cab8b', 'SAGE')])).toBe(1)
+    expect(usePaintKeep.getState().painted.map((p) => p.nodeId)).toEqual(['wall_b'])
   })
 })
 

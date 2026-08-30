@@ -100,7 +100,14 @@ export const DECAL_VOTE_PER_M2 = 255 / (0.15 * 0.15)
  * (pristine hosts the sprayer splatted without voxelizing, P5) vote
  * area-weighted next to them through DECAL_VOTE_PER_M2. Game-only targets
  * (tables, builder pieces — '__boots' ids) never qualify: they are not
- * scene nodes. Returns the captured count for the pendingDecision gate.
+ * scene nodes.
+ *
+ * ACCUMULATES ACROSS SESSIONS, same contract as `captureDemolition`: the splat
+ * ledger dies with the game tree, so replacing made a second exit report zero
+ * and silently dropped the first session's coats from the panel AND from Save.
+ * Cleared only by the explicit decision — `applyPaint` or `discardPaint`.
+ *
+ * Returns the TOTAL pending count for the pendingDecision gate.
  */
 export function capturePaint(): number {
   const painted: PaintedNode[] = []
@@ -164,8 +171,27 @@ export function capturePaint(): number {
       cells: cellsByNode.get(nodeId) ?? 0,
     })
   }
-  usePaintKeep.getState().setPainted(painted)
-  return painted.length
+  return mergePendingPaint(painted)
+}
+
+/**
+ * Fold a session's coats into what is already pending, keyed by node id. A node
+ * repainted in a later session takes the LATER colour — one node, one material,
+ * and the most recent spray is the one the player would expect to save — while
+ * keeping its original row position so the panel doesn't reshuffle on re-entry.
+ * `cells` sums: it is the player's total spend on that surface, and the panel
+ * doesn't render it. Exported for tests.
+ */
+export function mergePendingPaint(painted: readonly PaintedNode[]): number {
+  const byNode = new Map<string, PaintedNode>()
+  for (const coat of usePaintKeep.getState().painted) byNode.set(coat.nodeId, coat)
+  for (const coat of painted) {
+    const prior = byNode.get(coat.nodeId)
+    byNode.set(coat.nodeId, prior ? { ...coat, cells: prior.cells + coat.cells } : coat)
+  }
+  const merged = [...byNode.values()]
+  usePaintKeep.getState().setPainted(merged)
+  return merged.length
 }
 
 /** Freshly minted scene-material datablock (the host's `SceneMaterial`

@@ -742,6 +742,11 @@ export function exitGame(): void {
   const leveled = captureDemolition()
   // Same deal for paint: snapshot sprayed coats before the ledger resets.
   const painted = capturePaint()
+  // Both captures return the TOTAL still pending, not just this session's, so
+  // the gate below survives a re-entry that touched nothing: the runtime state
+  // they read is rebuilt from the restored scene on every Jump in, and a
+  // session-local count would have flipped pendingDecision back to false and
+  // stranded the earlier work with no way to Save or Discard it.
   useBoots
     .getState()
     .setPendingDecision(placed.length > 0 || leveled > 0 || painted > 0 || placedItemCount() > 0)

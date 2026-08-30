@@ -108,6 +108,19 @@ function fullyMine(work: LocalWork, target: VoxelTarget): boolean {
  * In a shared session every candidate must also pass `fullyMine`. In single
  * player the projection is null and the loop is byte-for-byte the one that
  * shipped.
+ *
+ * ACCUMULATES ACROSS SESSIONS. The pending decision spans every session since
+ * the last Save/Discard — Jump in, level a wall, Esc, Jump in again, Esc — so
+ * this capture folds into what is already pending instead of replacing it. It
+ * used to replace, and the destruction runtime is rebuilt from the restored
+ * scene on every entry, so the second exit reported zero and the first
+ * session's demolition vanished: not just from the panel, but from Save, which
+ * would then have written nothing for it. `placed` has always behaved this way
+ * (only `resolvePlaced` clears it), and the two clear paths here are the same
+ * explicit decision: `deleteDestroyed` (Save) and `discardDemolition`.
+ *
+ * Returns the TOTAL pending count, not this session's, because `exitGame`
+ * derives `pendingDecision` from it.
  */
 export function captureDemolition(): number {
   const work = localDemolitionWork()
@@ -148,12 +161,35 @@ export function captureDemolition(): number {
     }
     destroyed.push({ nodeId: groupId, kind: 'volume' })
   }
-  useDemolition.getState().setDestroyed(
-    destroyed,
-    destroyed.map((d) => d.nodeId),
-    foreign,
-  )
-  return destroyed.length
+  return mergePendingDemolition(destroyed, foreign)
+}
+
+/**
+ * Fold a session's capture into what is already pending, keyed by node id.
+ * Prior entries keep their position (the panel's row order stays stable across
+ * a re-entry) and a node levelled twice is listed once. Exported for tests.
+ */
+export function mergePendingDemolition(
+  destroyed: readonly DestroyedNode[],
+  foreign: number,
+): number {
+  const prior = useDemolition.getState()
+  const byNode = new Map<string, DestroyedNode>()
+  for (const node of prior.destroyed) byNode.set(node.nodeId, node)
+  for (const node of destroyed) byNode.set(node.nodeId, node)
+  const merged = [...byNode.values()]
+  // `mine` is the allow-list `deleteDestroyed` re-checks at click time, long
+  // after this session's evidence is gone — so it has to carry every session's
+  // grant, not just the last one.
+  const mine = [...new Set([...prior.mine, ...destroyed.map((d) => d.nodeId)])]
+  // `foreign` does NOT accumulate, and that is deliberate: it is a bare count,
+  // not a keyed set, and the shared model re-projects the same stranger's rubble
+  // into the rebuilt runtime on every entry — so one withheld wall would read 1,
+  // then 2, then 3 across re-entries of the same pending window. Per-capture it
+  // answers the question it exists to answer: at THIS exit, how many leveled
+  // nodes did the gate withhold.
+  useDemolition.getState().setDestroyed(merged, mine, foreign)
+  return merged.length
 }
 
 /**
