@@ -1,26 +1,67 @@
 'use client'
 
+import { sceneRegistry } from '@pascal-app/core'
 import { useEffect } from 'react'
 import { useBoots } from '../store'
 import { enterGame } from './session'
 
 /**
- * THE SHAREABLE-LINK DROP GATE (owner vision: "share a link, sign in, and
- * you're in the game with other people"). When the editor URL carries
- * `?boots=drop`, a full-screen interstitial offers one button — DROP IN —
- * and that single click both satisfies the browser's user-gesture
- * requirement (fullscreen + pointer lock) and enters the game. Plugin-only:
- * the host just has to deliver a signed-in user to the project URL with the
- * param intact (the callbackURL preservation is the host-side P0).
+ * THE SHAREABLE-LINK DROP GATE (owner vision, refined): open a project URL
+ * carrying `?boots=drop` and you never see the editor at all — an OPAQUE
+ * full-screen veil covers everything from the moment the plugin mounts,
+ * a loading bar tracks the scene hydrating underneath, and when the world
+ * is ready the bar gives way to ONE centered button: JUMP IN. That single
+ * click satisfies the browser's user-gesture requirement (fullscreen +
+ * pointer lock) and enters the game; the in-game loading card takes over
+ * without a flash (the veil holds until the game's own veil is up).
  *
- * One-shot per page load: Esc after dropping returns to the EDITOR on
- * purpose — the gate never nags again until a fresh navigation.
+ * Ideally there'd be no button — but fullscreen/pointer-lock need a real
+ * gesture, so the button is the gesture and everything heavy has already
+ * loaded behind the veil by the time it appears.
+ *
+ * READINESS is measured, not guessed: the host registers every rendered
+ * node in sceneRegistry — the bar advances as nodes stream in and the
+ * button appears once the census holds still for a few polls (plus a
+ * hard cap so an empty lobby scene never stalls the gate).
+ *
+ * One-shot per page load, latched ON THE CLICK: React StrictMode
+ * double-invokes effects in dev — a mount-time latch made the first pass
+ * consume the gate while its cleanup removed the veil.
  */
 
 /** Pure gate: offer the interstitial? Exported for tests. */
 export function shouldOfferDrop(search: string, phase: string, consumed: boolean): boolean {
   if (consumed || phase !== 'editor') return false
   return new URLSearchParams(search).get('boots') === 'drop'
+}
+
+/** Poll cadence + stability window for the readiness census. */
+const POLL_MS = 250
+const STABLE_POLLS = 4
+/** Never hold the button hostage longer than this (empty scenes settle
+ * instantly; huge ones keep streaming dormant work AFTER entry anyway). */
+const READY_CAP_MS = 12000
+
+/**
+ * Progress model, pure (exported for tests): maps (elapsedMs, census,
+ * stablePolls) to a 0..1 bar. Node streaming dominates the middle; the
+ * stability window walks the last stretch; the cap forces 1.
+ */
+export function dropProgress(elapsedMs: number, census: number, stablePolls: number): number {
+  if (elapsedMs >= READY_CAP_MS) return 1
+  const time = Math.min(0.25, elapsedMs / 8000) // slow ambient crawl
+  const nodes = census > 0 ? Math.min(0.55, 0.2 + census / 400) : 0
+  const stable = Math.min(1, stablePolls / STABLE_POLLS) * 0.35
+  return Math.min(1, Math.max(time, 0.05) + nodes + stable)
+}
+
+/** Total registered nodes across every kind — the hydration census. */
+function registryCensus(): number {
+  let total = 0
+  for (const kind of Object.keys(sceneRegistry.byType)) {
+    total += sceneRegistry.byType[kind]?.size ?? 0
+  }
+  return total
 }
 
 let dropConsumed = false
@@ -30,52 +71,78 @@ export function resetDropGate(): void {
   dropConsumed = false
 }
 
+const FONT = "system-ui, -apple-system, sans-serif"
+
 export function DropGate() {
   const phase = useBoots((s) => s.phase)
   useEffect(() => {
     if (typeof window === 'undefined' || typeof document === 'undefined') return
     if (!shouldOfferDrop(window.location.search, phase, dropConsumed)) return
-    // The one-shot latches on the CLICK, not on mount: React StrictMode
-    // double-invokes effects in dev — a mount-time latch made the first
-    // pass consume the gate and its cleanup remove the veil, leaving the
-    // second pass silent (the interstitial never showed at all).
 
-    // Body-level DOM (NOT inside the canvas parent): enterGame requests
-    // fullscreen on the canvas container, and the interstitial must not
-    // ride into it — it removes itself on the very click that enters.
+    // OPAQUE from the first paint the plugin gets — the visitor never sees
+    // the editor chrome. Body-level (NOT the canvas parent): enterGame
+    // fullscreens the canvas container and the veil must not ride into it.
     const veil = document.createElement('div')
     veil.style.cssText =
-      'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;' +
-      'background:radial-gradient(ellipse at center, rgba(18,21,24,0.82), rgba(10,12,14,0.94))'
-    const card = document.createElement('div')
-    card.style.cssText =
-      'display:flex;flex-direction:column;align-items:center;gap:18px;padding:44px 56px;' +
-      'background:#14171b;border:2px solid #2e343b;border-radius:12px'
+      `position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;` +
+      `justify-content:center;gap:26px;background:#0c0e10`
     const word = document.createElement('div')
     word.textContent = 'BOOTS'
-    word.style.cssText =
-      "font:800 40px/1 system-ui, -apple-system, sans-serif;letter-spacing:0.35em;color:rgba(255,255,255,0.92);padding-left:0.35em"
-    const stripe = document.createElement('div')
-    stripe.style.cssText =
-      'width:100%;height:6px;border-radius:3px;background:repeating-linear-gradient(45deg,#e8c229 0 12px,#15171a 12px 24px)'
+    word.style.cssText = `font:800 44px/1 ${FONT};letter-spacing:0.35em;color:rgba(255,255,255,0.92);padding-left:0.35em`
+    // Loading bar (visible until ready) — same look as the in-game card.
+    const track = document.createElement('div')
+    track.style.cssText =
+      'width:min(420px,60vw);height:10px;border-radius:5px;background:rgba(255,255,255,0.08);overflow:hidden'
+    const fill = document.createElement('div')
+    fill.style.cssText =
+      'width:0%;height:100%;border-radius:5px;background:rgba(255,255,255,0.85);transition:width 0.25s linear'
+    track.appendChild(fill)
+    // The ONE button — hidden until the world is ready.
     const button = document.createElement('button')
-    button.textContent = '⏵ DROP IN'
+    button.textContent = '⏵ JUMP IN'
     button.style.cssText =
-      "font:700 18px/1 system-ui, -apple-system, sans-serif;letter-spacing:0.12em;color:#0f1113;" +
-      'background:#e8c229;border:none;border-radius:8px;padding:14px 34px;cursor:pointer'
-    const hint = document.createElement('div')
-    hint.textContent = 'WASD move · E gear up at the depot behind you · Esc leaves the game'
-    hint.style.cssText =
-      "font:600 11px/1.4 system-ui, -apple-system, sans-serif;letter-spacing:0.06em;color:rgba(255,255,255,0.4)"
-    card.append(word, stripe, button, hint)
-    veil.appendChild(card)
+      `display:none;font:700 20px/1 ${FONT};letter-spacing:0.12em;color:#0f1113;background:#e8c229;` +
+      'border:none;border-radius:8px;padding:16px 44px;cursor:pointer'
+    veil.append(word, track, button)
+    document.body.appendChild(veil)
+
+    const t0 = performance.now()
+    let lastCensus = -1
+    let stablePolls = 0
+    let ready = false
+    const timer = setInterval(() => {
+      const census = registryCensus()
+      if (census === lastCensus && census >= 0) stablePolls++
+      else stablePolls = 0
+      lastCensus = census
+      const elapsed = performance.now() - t0
+      const p = dropProgress(elapsed, census, stablePolls)
+      fill.style.width = `${Math.round(p * 100)}%`
+      if (!ready && p >= 1) {
+        ready = true
+        clearInterval(timer)
+        // Bar → button: the swap IS the "it's ready" tell.
+        track.style.display = 'none'
+        button.style.display = 'block'
+      }
+    }, POLL_MS)
+
     button.onclick = () => {
       dropConsumed = true
-      veil.remove()
       enterGame()
+      // Hold the opaque veil until the game's own loading card is up, so
+      // the editor never flashes between the click and the game veil.
+      const holdT0 = performance.now()
+      const hold = setInterval(() => {
+        const gameVeil = document.querySelector('[data-boots-veil]')
+        if (gameVeil || performance.now() - holdT0 > 3000) {
+          clearInterval(hold)
+          veil.remove()
+        }
+      }, 100)
     }
-    document.body.appendChild(veil)
     return () => {
+      clearInterval(timer)
       veil.remove()
     }
   }, [phase])
