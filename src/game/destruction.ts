@@ -654,6 +654,18 @@ function subtractSpans(
   return spans.sort((x, y) => x[0] - y[0])
 }
 
+/** buildStuds' OWN scratch pair. It must never borrow ensureVoxelTarget's
+ * `_bounds` / `_size`: buildStuds runs from the middle of that function
+ * (the `segments` build), and the node AABB collected at its top is still
+ * read afterwards — enqueueShellBuild(nodeId, _bounds) hands the deferred
+ * shell queue its near-gate sphere from it. A shared scratch made that
+ * sphere the WALL-MESH 2-corner box instead of the node AABB, which is
+ * smaller for any wall whose transform rotates, so the sphere no longer
+ * contained the node and the near gate read the wall as farther than it
+ * is. Module-level, so this costs no per-call allocation. */
+const _studBounds = new Box3()
+const _studCenter = new Vector3()
+
 /** Exported for the deterministic stud-openings tests only — gameplay goes
  * through ensureVoxelTarget, which feeds collectWallOpenings' rects in. */
 export function buildStuds(
@@ -674,21 +686,21 @@ export function buildStuds(
   // The wall's meshes live in a level whose Y offset we take from their
   // world bounds (start/end are level-local XZ but match world XZ in the
   // common single-transform case; the voxel grid corrects any drift).
-  _bounds.makeEmpty()
+  _studBounds.makeEmpty()
   for (const mesh of wall.meshes) {
     if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
-    _bounds.expandByPoint(
+    _studBounds.expandByPoint(
       mesh.geometry.boundingBox!.min.clone().applyMatrix4(mesh.matrixWorld),
     )
-    _bounds.expandByPoint(
+    _studBounds.expandByPoint(
       mesh.geometry.boundingBox!.max.clone().applyMatrix4(mesh.matrixWorld),
     )
   }
-  const baseY = _bounds.min.y
+  const baseY = _studBounds.min.y
   const midX = (start[0] + end[0]) / 2
   const midZ = (start[1] + end[1]) / 2
-  const centerX = _bounds.getCenter(_size).x
-  const centerZ = _size.z
+  const centerX = _studBounds.getCenter(_studCenter).x
+  const centerZ = _studCenter.z
   // Shift start/end into world XZ using the delta between node midpoint and
   // the mesh bounds center (levels can offset their children).
   const offX = centerX - midX
@@ -2280,6 +2292,22 @@ let syncShellSpentMs = 0
 /** QA/tests: pending deferred shell builds still outstanding. */
 export function shellPendingCount(): number {
   return shellPendingTotal
+}
+
+/**
+ * QA/tests: the near-gate SPHERE a pending entry was queued with (center +
+ * radius, world space). The gate is `centerDistance − r > SHELL_NEAR_RADIUS
+ * ⇒ still far`, so the sphere must CONTAIN the node's world AABB or a node
+ * that is genuinely near reads as far and stays pending — see
+ * shell-queue-bounds.test.ts.
+ */
+export function shellQueueSphere(
+  id: string,
+): { x: number; y: number; z: number; r: number } | null {
+  for (const entry of shellQueue) {
+    if (entry.id === id) return { x: entry.x, y: entry.y, z: entry.z, r: entry.r }
+  }
+  return null
 }
 
 function clearShellPending(target: VoxelTarget): void {
