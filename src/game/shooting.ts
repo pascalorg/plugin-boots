@@ -16,6 +16,7 @@ import { hitGlass, raycastGlass } from './glass'
 import type { HitmarkerKind } from './hud'
 import { playerRig } from './player'
 import { getSession } from './session'
+import { beginDamageBatch, endDamageBatch } from './shared-damage'
 import type { WeaponDef } from './weapons'
 import type { GameWorld } from './world'
 
@@ -436,7 +437,29 @@ function smashKnockback(center: Vector3, range: number): void {
   }
 }
 
+/**
+ * ONE TRIGGER PULL IS ONE FRAME on the wire.
+ *
+ * A single shot can carve the crater, nibble its rim 4-6 more times, fan across
+ * every plane of a roof group and snap a stud — a dozen separate publish calls
+ * for one bang. Batching them means peers receive the shot as one atomic delta
+ * instead of watching it arrive in pieces, and it collapses the repeat visits
+ * to the same node into one entry.
+ *
+ * The batch is opened OUTSIDE the hitscan, so a shot that resolves to nothing
+ * costs an integer increment and nothing else. With sync off both calls return
+ * immediately on a null check: single player never allocates here.
+ */
 export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
+  beginDamageBatch()
+  try {
+    return fireShot(world, weapon)
+  } finally {
+    endDamageBatch()
+  }
+}
+
+function fireShot(world: GameWorld, weapon: WeaponDef): FireOutcome {
   _origin.copy(playerRig.position)
   aimDirection(_direction, weapon.spread)
 

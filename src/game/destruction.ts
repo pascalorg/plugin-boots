@@ -34,6 +34,16 @@ import {
 } from './roof-planes'
 import { hideForGameKeepingRoots, maskForGame, sweepWallBatches } from './session'
 import {
+  beginDamageBatch,
+  endDamageBatch,
+  publishBrokenSegment,
+  publishKilledNode,
+  publishNodeReset,
+  publishRemovedCells,
+  resetSharedDamage,
+  setDamageRuntime,
+} from './shared-damage'
+import {
   cellToneAt,
   clearToneAudit,
   isUntexturedWhite,
@@ -3376,6 +3386,12 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
       if (sheetId !== undefined && sheetId >= 0) target.sheets[sheetId]!.torn++
     }
   }
+  // An island crumble is DERIVED from the carve that undercut it, but the
+  // derivation is order-dependent (findUnsupportedIslands floods a live grid
+  // whose contents depend on which frames have arrived), so what converges is
+  // the OUTCOME. Cells a stranger's shot already killed are not in `fallen` —
+  // the loop above skips dead cells — so this cannot claim their work.
+  publishRemovedCells(target, fallen)
   // Debris SAMPLING (Phase B): a big region collapse must not flood the
   // global ring 1-per-voxel — spawn at most CRUMBLE_DEBRIS_CAP pieces
   // sampled uniformly across the fallen cells; the unsampled remainder
@@ -3454,7 +3470,27 @@ function crumbleIslands(world: GameWorld, target: VoxelTarget): void {
  * SupportGraph.probeExternal re-check), so placed pieces standing on the
  * crumbled host wall fall too. Returns how many cells fell.
  */
+/**
+ * Scratch for the cells one whole-target collapse killed. Module-scope and
+ * reused so single player never allocates it: the array keeps its capacity
+ * across collapses and is consumed before this function can re-enter (the
+ * publish happens before settleSupportAfterRemoval, which is the only path
+ * back in here).
+ */
+const _collapsedCells: number[] = []
+
 export function collapseWholeTarget(nodeId: string): number {
+  // One collapse is one frame: the cell list, the kill bit, and every stick
+  // the skeleton snap takes with it belong to the same outcome.
+  beginDamageBatch()
+  try {
+    return collapseWholeTargetBody(nodeId)
+  } finally {
+    endDamageBatch()
+  }
+}
+
+function collapseWholeTargetBody(nodeId: string): number {
   const target = useDestruction.getState().targets.get(nodeId)
   if (!target || target.grid.aliveCount === 0) return 0
   // A structure cascade can crumble a still-DORMANT prebuild (support shot
@@ -3471,11 +3507,13 @@ export function collapseWholeTarget(nodeId: string): number {
   const total = grid.aliveCount
   const debrisChance = Math.min(1, CRUMBLE_DEBRIS_CAP / total)
   let first = -1
+  _collapsedCells.length = 0
   for (let idx = 0; idx < grid.count; idx++) {
     if (!grid.alive[idx]) continue
     grid.alive[idx] = 0
     grid.aliveCount--
     target.removedQueue.push(idx)
+    _collapsedCells.push(idx)
     if (first < 0) first = idx
     // Sheet bookkeeping only (torn cells) — same rule as island crumbles.
     const sheetId = target.sheetByCell[idx]
@@ -3492,6 +3530,15 @@ export function collapseWholeTarget(nodeId: string): number {
       )
     }
   }
+  // BOTH halves go out. The kill bit is what a peer who has never materialized
+  // this node can obey — it needs no grid at all, which is the whole point for
+  // a dormant prebuild two rooms away. The cell list is what keeps the Save
+  // ownership gate truthful: without it this peer would have no record of
+  // having killed the cells, and a wall it levelled alone would be withheld
+  // from its own demolition save.
+  publishRemovedCells(target, _collapsedCells)
+  publishKilledNode(nodeId)
+  _collapsedCells.length = 0
   target.revision++
   useDestruction.getState().bump()
   // Nothing is left for a pending island pass to find.
@@ -3522,6 +3569,8 @@ wireStructureDriver({
 })
 
 const _sheetCenter = new Vector3()
+/** Scratch for the cells one sheet fly-off freed (see _collapsedCells). */
+const _flownCells: number[] = []
 /** Scratch launch direction for fly-off shards (the sheet's outward normal,
  * biased down-slope on roof planes). */
 const _shardDir = { x: 0, y: 0, z: 0 }
@@ -3537,14 +3586,22 @@ const _sheetNormal = new Vector3()
 function flySheetOff(target: VoxelTarget, sheet: SheetMember, direction?: Vector3): void {
   sheet.flownOff = true
   let freed = 0
+  _flownCells.length = 0
   for (const idx of sheet.cells) {
     if (!target.grid.alive[idx]) continue
     target.grid.alive[idx] = 0
     target.grid.aliveCount--
     target.removedQueue.push(idx)
+    _flownCells.push(idx)
     sheet.torn++
     freed++
   }
+  // The fly-off THRESHOLD is local (hit counters accumulate local hits and are
+  // deliberately not replicated), so what crosses is the board's cells. A peer
+  // that never shot this wall sees the same sheet leave; shared-derive's
+  // sheetHasFlown then reads it as flown from the cells alone.
+  publishRemovedCells(target, _flownCells)
+  _flownCells.length = 0
   target.revision++
   useDestruction.getState().bump()
   // Shreds — torn-edge PLATES (debris.tsx's flat flutter path) sampled
@@ -3884,6 +3941,25 @@ export function damageTarget(
   radius: number,
   direction?: Vector3,
 ): number {
+  // One carve is ONE published frame. The fan-out below can touch every plane
+  // of a roof group and every coincident wall twin, and a peer must receive
+  // that as a single atomic outcome — not a dribble of frames that could be
+  // applied half-way and leave a visibly different hole for a frame.
+  beginDamageBatch()
+  try {
+    return damageTargetFan(world, nodeId, point, radius, direction)
+  } finally {
+    endDamageBatch()
+  }
+}
+
+function damageTargetFan(
+  world: GameWorld,
+  nodeId: string,
+  point: Vector3,
+  radius: number,
+  direction?: Vector3,
+): number {
   const target = ensureVoxelTarget(world, nodeId)
   if (!target) return 0
   // Per-plane roofs: a carve through EITHER the real node id or one plane's
@@ -4004,6 +4080,13 @@ function damageTargetOne(
   if (removed.length === 0) return 0
   // B5: indexed pushes — spread-push blows the argument limit on 1000+-cell carves.
   for (let i = 0; i < removed.length; i++) target.removedQueue.push(removed[i]!)
+  // THE CARVE FOOTPRINT, replicated as an outcome. Everything that shaped it is
+  // local and irreproducible: the nibble offsets and radii are Math.random(),
+  // the skin gate depends on which face this player's shot entered, and the
+  // adaptive cell floor depends on this node's grid. A peer re-simulating
+  // "someone shot here" would carve a different hole; a peer told which cells
+  // died carves the same one.
+  publishRemovedCells(target, removed)
   target.revision++
   useDestruction.getState().bump()
   // FLOOR BREACH (owner "broken floor looks broken"): a ground-slab carve
@@ -4349,16 +4432,33 @@ const STRUCT_RATIO = 0.3
  * budgeted queue as the island checks (see islandKey). */
 const framingKey = (nodeId: string) => `framing:${nodeId}`
 
+/** Scratch for one avalanche band's cells (see _collapsedCells). */
+const _avalancheCells: number[] = []
+
 function scheduleStructureCheck(world: GameWorld, nodeId: string): void {
   scheduleSettleTask(framingKey(nodeId), 160 + nextSettleJitter(), () => {
     const target = useDestruction.getState().targets.get(nodeId)
-    if (target) checkStructuralCollapse(world, target)
+    if (!target) return
+    // The 30 %-support check can snap dozens of sticks and fly several sheets
+    // in one pass — one frame, not one per stick.
+    beginDamageBatch()
+    try {
+      checkStructuralCollapse(world, target)
+    } finally {
+      endDamageBatch()
+    }
   })
 }
 
 function breakSegmentQuiet(target: VoxelTarget, segment: SegmentMember): void {
   segment.hp = 0
   segment.broken = true
+  // Every silent break funnels through here — hanging sticks above a chain
+  // break, the whole frame above the 30 % support ceiling, and the skeleton
+  // snap's staggered rain. Breaking is one-way, so a set union converges; and
+  // WHICH sticks break is Map-order-dependent in the paths above, which is
+  // exactly why it is replicated rather than re-derived.
+  publishBrokenSegment(target.nodeId, segment.id)
   const pieces = 2
   for (let i = 0; i < pieces; i++) {
     const t = ((i + 0.5) / pieces - 0.5) * segment.size[1]
@@ -4426,11 +4526,13 @@ function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
         const live = useDestruction.getState().targets.get(target.nodeId)
         if (!live) return
         let removed = 0
+        _avalancheCells.length = 0
         for (const idx of indices) {
           if (!live.grid.alive[idx]) continue
           live.grid.alive[idx] = 0
           live.grid.aliveCount--
           live.removedQueue.push(idx)
+          _avalancheCells.push(idx)
           removed++
           if (removed <= 8) {
             spawnDebris(
@@ -4443,6 +4545,11 @@ function checkStructuralCollapse(world: GameWorld, target: VoxelTarget): void {
             )
           }
         }
+        // The avalanche bands land on setTimeout, one per 60 ms, so each band
+        // is its own frame — which is right: a peer should watch the wall come
+        // down in layers, not blink to rubble.
+        publishRemovedCells(live, _avalancheCells)
+        _avalancheCells.length = 0
         live.revision++
         useDestruction.getState().bump()
         // The avalanche can strip the LAST cladding cells — skeleton snap.
@@ -4672,17 +4779,26 @@ function collectExplosionNodes(
 }
 
 function explosionSegments(world: GameWorld, center: Vector3, radius: number): void {
-  const radiusSq = radius * radius
-  let snapped = 0
-  outer: for (const target of useDestruction.getState().targets.values()) {
-    if (target.dormant) continue // the blast rings wake what they reach
-    for (const segment of target.segments) {
-      if (segment.broken) continue
-      _boomSeg.set(segment.center[0], segment.center[1], segment.center[2])
-      if (_boomSeg.distanceToSquared(center) > radiusSq) continue
-      damageSegment(world, target.nodeId, segment.id, 999, _boomSeg)
-      if (++snapped >= EXPLOSION_SEGMENT_CAP) break outer
+  // WHICH 48 sticks snap depends on Map iteration order, and that order is
+  // prevoxelization order — it depends on where this player happened to be
+  // standing when each wall enrolled. Two peers would cap at different sticks.
+  // So the set is published as an outcome, in one frame.
+  beginDamageBatch()
+  try {
+    const radiusSq = radius * radius
+    let snapped = 0
+    outer: for (const target of useDestruction.getState().targets.values()) {
+      if (target.dormant) continue // the blast rings wake what they reach
+      for (const segment of target.segments) {
+        if (segment.broken) continue
+        _boomSeg.set(segment.center[0], segment.center[1], segment.center[2])
+        if (_boomSeg.distanceToSquared(center) > radiusSq) continue
+        damageSegment(world, target.nodeId, segment.id, 999, _boomSeg)
+        if (++snapped >= EXPLOSION_SEGMENT_CAP) break outer
+      }
     }
+  } finally {
+    endDamageBatch()
   }
 }
 
@@ -4700,9 +4816,16 @@ export function damageExplosion(
   opts?: { immediate?: boolean },
 ): number {
   if (opts?.immediate) {
-    let total = explosionRing(world, center, radius, true)
-    explosionSegments(world, center, radius)
-    return total
+    // The whole blast in one frame (this is the test/edge path — the staggered
+    // path below publishes one frame per step, which is what players see).
+    beginDamageBatch()
+    try {
+      const total = explosionRing(world, center, radius, true)
+      explosionSegments(world, center, radius)
+      return total
+    } finally {
+      endDamageBatch()
+    }
   }
   // PER-NODE stagger inside each ring (QA 2026-08-28): the frame cost of a
   // blast scales with how many nodes carve — and, on the FIRST mid-house
@@ -4724,7 +4847,18 @@ export function damageExplosion(
   let cursor = 0
   let coreTotal = 0
   const epoch = blastEpoch
+  /** One staggered step is one published frame: the peers watch the same
+   * shockwave expand at the same granularity the local player does. Each step
+   * is its own macrotask, so these batches never nest. */
   const step = (budget: number): void => {
+    beginDamageBatch()
+    try {
+      stepBody(budget)
+    } finally {
+      endDamageBatch()
+    }
+  }
+  const stepBody = (budget: number): void => {
     // Session ended mid-blast (Save/Discard tears the store down) — drop
     // the tail instead of carving into the next session's targets.
     if (epoch !== blastEpoch) return
@@ -4798,6 +4932,8 @@ export function damageSegment(
   }
   segment.hp = 0 // clamp — debug snapshots read hp, don't show underflow
   segment.broken = true
+  // A stick's hp is local (it accumulates local hits); only the break crosses.
+  publishBrokenSegment(nodeId, segmentId)
   target.revision++
   useDestruction.getState().bump()
   // Charcoal-stick snap: 2-3 stick pieces spread along the long axis
@@ -5006,6 +5142,10 @@ export function restoreOperableTarget(nodeId: string): boolean {
   const target = state.targets.get(nodeId)
   if (!target) return false
   if (target.dormant) {
+    // Nothing was damaged, but the epoch still goes out: a peer's frame for
+    // this door may be in flight, and without a higher epoch their holes would
+    // land on a node the host has just taken back.
+    publishNodeReset(nodeId)
     dropTarget(nodeId)
     return true
   }
@@ -5018,6 +5158,12 @@ export function restoreOperableTarget(nodeId: string): boolean {
     collider.disabled = false
     collider.ballistic = false
   }
+  // THE ONE NON-MONOTONE OPERATION. Every other damage op is a set union, so
+  // it converges by construction; this one un-destroys, which no grow-only set
+  // can express. It publishes a new EPOCH: a higher epoch wins outright on
+  // every receiver and drops the whole old generation of holes, including this
+  // client's own — which is right, because the door came back.
+  publishNodeReset(nodeId)
   dropTarget(nodeId)
   return true
 }
@@ -5064,6 +5210,9 @@ export function dropTarget(nodeId: string): void {
 export function resetDestruction(): void {
   sessionWorld = null
   blastEpoch++
+  // A teardown mid-batch must not leak half a frame into the next session.
+  // The injected sync and runtime survive: whoever wired them owns unwiring.
+  resetSharedDamage()
   dormantRoofHide.clear()
   dormantCount = 0
   // Next session re-reads shellFlags (per-kind prevoxelize latches).
@@ -5101,3 +5250,136 @@ export function resetDestruction(): void {
   resetStructure()
   useDestruction.getState().reset()
 }
+
+// ── The shared-world damage bridge (see shared-damage.ts) ────────────────────
+
+/**
+ * What a stranger's damage is allowed to do to this client's scene.
+ *
+ * Registered once at module load. shared-damage.ts calls in here only while it
+ * is applying a merged frame, with its own publish path disarmed — so the local
+ * cascades this provokes still happen (collapse is DERIVED, not received) but
+ * are never mistaken for this player's own work, and so can never ride into the
+ * owner's demolition save under our authorship.
+ *
+ * Every entry point MATERIALIZES first. Remote damage arrives for nodes this
+ * player has never walked near: a dormant prebuild whose host mesh is still
+ * doing the rendering, a target whose conforming shell has not been built yet,
+ * or a node with no voxel target at all. A wall has to be able to lose its
+ * cells on this screen without this player ever having fired at it.
+ */
+const _remoteDust = new Vector3()
+
+function remoteTarget(nodeId: string): VoxelTarget | null {
+  const world = sessionWorld
+  if (!world) return null
+  let target = useDestruction.getState().targets.get(nodeId) ?? null
+  if (target === null) {
+    // A roof PLANE member (`<nodeId>#p0`) exists only once its group has
+    // decomposed — build the group, then look the member up again.
+    const hash = nodeId.indexOf('#')
+    if (hash > 0) {
+      ensureVoxelTarget(world, nodeId.slice(0, hash))
+      target = useDestruction.getState().targets.get(nodeId) ?? null
+    }
+  }
+  target ??= ensureVoxelTarget(world, nodeId)
+  if (target === null) return null
+  // A prebuild that is still asleep has its host mesh rendering over the grid;
+  // killing cells underneath it would change nothing on screen.
+  if (target.dormant) wakeTarget(world, target)
+  return target
+}
+
+setDamageRuntime({
+  materialize: (nodeId) => remoteTarget(nodeId),
+
+  removeCells: (handle, indices) => {
+    const world = sessionWorld
+    const target = useDestruction.getState().targets.get(handle.nodeId)
+    if (!world || !target) return
+    const { grid } = target
+    let removed = 0
+    let first = -1
+    for (const idx of indices) {
+      if (!grid.alive[idx]) continue
+      grid.alive[idx] = 0
+      grid.aliveCount--
+      target.removedQueue.push(idx)
+      if (first < 0) first = idx
+      // Sheet bookkeeping only — torn cells, no hits. Same rule as an island
+      // crumble: these cells are an already-decided outcome, and whether the
+      // board has flown is derivable from its cells being dead.
+      const sheetId = target.sheetByCell[idx]
+      if (sheetId !== undefined && sheetId >= 0) target.sheets[sheetId]!.torn++
+      removed++
+    }
+    if (removed === 0 || first < 0) return
+    // Someone else's shot should look and sound like a shot. Sampled debris,
+    // never 1:1 — a remote whole-wall collapse would otherwise flood the ring.
+    const spawn = Math.min(removed, 10)
+    for (let n = 0; n < spawn; n++) {
+      const idx = indices[Math.floor(((n + 0.5) * indices.length) / spawn)]
+      if (idx === undefined) continue
+      spawnDebris(
+        grid.centers[idx * 3]!,
+        grid.centers[idx * 3 + 1]!,
+        grid.centers[idx * 3 + 2]!,
+        grid.cell,
+        cellTint(target, idx),
+        1.8,
+      )
+    }
+    _remoteDust.set(grid.centers[first * 3]!, grid.centers[first * 3 + 1]!, grid.centers[first * 3 + 2]!)
+    spawnDust(_remoteDust, Math.min(1, 0.4 + removed / 18), {
+      kind: target.kind === 'volume' ? 'concrete' : 'drywall',
+      tint: target.item ? target.baseColor : undefined,
+    })
+    sfx.crumble(removed)
+    target.revision++
+    useDestruction.getState().bump()
+    // The SAME tail a local carve runs. Everything below is derived from state
+    // that has already converged, so both clients reach the same conclusion —
+    // and where the derivation is order-dependent (the island flood, the 30 %
+    // support rule) its own outcome is published in turn by whoever gets there.
+    scheduleSettleTask(islandKey(target.nodeId), 140 + nextSettleJitter(), () => {
+      crumbleIslands(world, target)
+      settleSupportAfterRemoval(target)
+    })
+    maybeSkeletonSnap(target)
+    settleSupportAfterRemoval(target)
+    settleWalkOnly(world, target)
+    noteStructureCarve(world, target.nodeId)
+  },
+
+  breakSegments: (handle, ids) => {
+    const target = useDestruction.getState().targets.get(handle.nodeId)
+    if (!target) return
+    let changed = false
+    for (const id of ids) {
+      const segment = target.segments.find((s) => s.id === id)
+      if (!segment || segment.broken) continue
+      breakSegmentQuiet(target, segment)
+      changed = true
+    }
+    if (!changed) return
+    sfx.studSnap()
+    target.revision++
+    useDestruction.getState().bump()
+    // A break may drop hanging sticks or trip the support rule — same settle.
+    if (sessionWorld) scheduleStructureCheck(sessionWorld, target.nodeId)
+  },
+
+  killNode: (nodeId) => {
+    // The kill BIT needs no grid on the wire, but it needs one here: a target
+    // that never voxelized is still being rendered by its host mesh, and the
+    // node has to leave this player's screen.
+    const target = remoteTarget(nodeId)
+    if (target === null) return
+    collapseWholeTarget(target.nodeId)
+  },
+
+  resetNode: (nodeId) => {
+    restoreOperableTarget(nodeId)
+  },
+})
