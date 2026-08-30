@@ -425,6 +425,45 @@ const emptyDamage = (nodeId: NodeId): NodeDamage => ({
   killedByMe: false,
 })
 
+// ── The outbound journal ────────────────────────────────────────────────────
+
+/**
+ * What this client has done since it last published — held as maps and sets so
+ * a burst of ops COLLAPSES instead of accumulating: sixty rifle shots into the
+ * same wall journal as one node entry with the union of their cells, and a
+ * record edited twice journals once.
+ *
+ * Kept separate from the model proper because the model is what we KNOW and
+ * the journal is what we still OWE the room. Merging a remote frame never
+ * touches it: relaying someone else's records would be refused by their
+ * authorship gate anyway.
+ */
+export type Journal = {
+  nodes: Map<NodeId, NodeDelta>
+  pieces: Map<RecordId, PieceRec>
+  items: Map<RecordId, ItemRec>
+  apertures: Map<RecordId, ApertureRec>
+  strokes: Map<RecordId, StrokeRec>
+  deadPieces: Set<RecordId>
+  deadItems: Set<RecordId>
+  deadApertures: Set<RecordId>
+  deadStrokes: Set<RecordId>
+}
+
+function emptyJournal(): Journal {
+  return {
+    nodes: new Map(),
+    pieces: new Map(),
+    items: new Map(),
+    apertures: new Map(),
+    strokes: new Map(),
+    deadPieces: new Set(),
+    deadItems: new Set(),
+    deadApertures: new Set(),
+    deadStrokes: new Set(),
+  }
+}
+
 // ── The model ───────────────────────────────────────────────────────────────
 
 export type SharedWorld = {
@@ -443,10 +482,23 @@ export type SharedWorld = {
   items: OrSet<ItemRec>
   apertures: OrSet<ApertureRec>
   strokes: OrSet<StrokeRec>
+  /**
+   * Everything local that has happened since the last `takePending` — the
+   * outbound journal. See the section below: the transport coalesces to ONE
+   * frame per kind per 66 ms window and drops the rest of a burst, so
+   * "publish once per tick" is the only sane cadence and this is what makes
+   * it a first-class path instead of something each lane reinvents.
+   */
+  journal: Journal
   /** QA counters — hostile or over-cap input is dropped, never thrown. */
   dropped: number
   /** Ops applied from remote peers (observability). */
   applied: number
+  /** Local ops that were journalled, taken, and then handed BACK because the
+   * publish did not happen (coalesced, refused, or over the byte budget).
+   * They are still in the journal and will go out on a later tick; the
+   * counter exists so a lost frame is visible instead of silent. */
+  unsent: number
 }
 
 export function createSharedWorld(self: PeerId): SharedWorld {
@@ -460,8 +512,10 @@ export function createSharedWorld(self: PeerId): SharedWorld {
     items: emptyOrSet(),
     apertures: emptyOrSet(),
     strokes: emptyOrSet(),
+    journal: emptyJournal(),
     dropped: 0,
     applied: 0,
+    unsent: 0,
   }
 }
 
@@ -506,6 +560,22 @@ export function brokenSegments(world: SharedWorld, nodeId: NodeId): number[] {
 // ── Local ops (the only writers of `mine`) ──────────────────────────────────
 
 /**
+ * The journal entry for a node, at the node's CURRENT epoch. A reset replaces
+ * the entry outright (see noteLocalReset): cells journalled at an old epoch
+ * are not merely redundant, they are wrong — every receiver would discard them
+ * against the higher epoch, and re-sending them would be noise forever.
+ */
+function journalNode(world: SharedWorld, nodeId: NodeId): NodeDelta {
+  const epoch = world.nodes.get(nodeId)?.epoch ?? 0
+  let entry = world.journal.nodes.get(nodeId)
+  if (!entry || entry.epoch !== epoch) {
+    entry = { nodeId, epoch, removed: [], segments: [], killed: false, reset: false }
+    world.journal.nodes.set(nodeId, entry)
+  }
+  return entry
+}
+
+/**
  * Record cells the LOCAL player just destroyed. Returns the keys that were
  * genuinely new (the wire payload — re-reporting a cell is legal but wasteful).
  * `mine` grows with them so the Save bridges can still tell the player's own
@@ -525,7 +595,11 @@ export function noteLocalRemoval(
     dmg.removed.add(key)
     fresh.push(key)
   }
-  if (fresh.length > 0) world.clock++
+  if (fresh.length > 0) {
+    world.clock++
+    const entry = journalNode(world, nodeId)
+    for (const key of fresh) entry.removed.push(key)
+  }
   return fresh
 }
 
@@ -548,7 +622,11 @@ export function noteLocalSegments(
     dmg.segments.add(id)
     fresh.push(id)
   }
-  if (fresh.length > 0) world.clock++
+  if (fresh.length > 0) {
+    world.clock++
+    const entry = journalNode(world, nodeId)
+    for (const id of fresh) entry.segments.push(id)
+  }
   return fresh
 }
 
@@ -560,6 +638,7 @@ export function noteLocalKill(world: SharedWorld, nodeId: NodeId): boolean {
   if (dmg.killed) return false
   dmg.killed = true
   world.clock++
+  journalNode(world, nodeId).killed = true
   return true
 }
 
@@ -579,6 +658,15 @@ export function noteLocalReset(world: SharedWorld, nodeId: NodeId): number {
   dmg.killed = false
   dmg.killedByMe = false
   world.clock++
+  // Replaces whatever was journalled at the old epoch, cells included.
+  world.journal.nodes.set(nodeId, {
+    nodeId,
+    epoch: dmg.epoch,
+    removed: [],
+    segments: [],
+    killed: false,
+    reset: true,
+  })
   return dmg.epoch
 }
 
@@ -602,7 +690,10 @@ export function addLocalPiece(
         ]
       : null,
   }
-  return sanePiece(full) ? (world.pieces.adds.set(full.id, full), full) : null
+  if (!sanePiece(full)) return null
+  world.pieces.adds.set(full.id, full)
+  world.journal.pieces.set(full.id, full)
+  return full
 }
 
 export function addLocalItem(
@@ -618,7 +709,10 @@ export function addLocalItem(
     z: quantPos(rec.z),
     yaw: quantYaw(rec.yaw),
   }
-  return saneItem(full) ? (world.items.adds.set(full.id, full), full) : null
+  if (!saneItem(full)) return null
+  world.items.adds.set(full.id, full)
+  world.journal.items.set(full.id, full)
+  return full
 }
 
 export function addLocalAperture(
@@ -634,7 +728,10 @@ export function addLocalAperture(
     width: quantPos(rec.width),
     height: quantPos(rec.height),
   }
-  return saneAperture(full) ? (world.apertures.adds.set(full.id, full), full) : null
+  if (!saneAperture(full)) return null
+  world.apertures.adds.set(full.id, full)
+  world.journal.apertures.set(full.id, full)
+  return full
 }
 
 export function addLocalStroke(
@@ -650,7 +747,10 @@ export function addLocalStroke(
     z: quantPos(rec.z),
     radius: quantPos(rec.radius),
   }
-  return saneStroke(full) ? (world.strokes.adds.set(full.id, full), full) : null
+  if (!saneStroke(full)) return null
+  world.strokes.adds.set(full.id, full)
+  world.journal.strokes.set(full.id, full)
+  return full
 }
 
 /** Lane names, so removals and effects can be spoken about generically. */
@@ -664,8 +764,20 @@ export function killRecord(world: SharedWorld, lane: Lane, id: RecordId): boolea
   if (set.dead.has(id)) return false
   set.dead.add(id)
   world.clock++
+  world.journal[DEAD_LANE[lane]].add(id)
+  // An add still waiting in the journal is now pointless: the tombstone alone
+  // says everything a receiver needs, and it wins anyway.
+  ;(world.journal[lane] as Map<RecordId, Stamped>).delete(id)
   return true
 }
+
+/** Lane → the journal's tombstone set for that lane. */
+const DEAD_LANE = {
+  pieces: 'deadPieces',
+  items: 'deadItems',
+  apertures: 'deadApertures',
+  strokes: 'deadStrokes',
+} as const satisfies Record<Lane, keyof Journal>
 
 // ── The wire shape ──────────────────────────────────────────────────────────
 
@@ -788,6 +900,178 @@ export function snapshotOf(world: SharedWorld): SharedDelta {
   out.deadApertures = [...world.apertures.dead].sort()
   out.deadStrokes = [...world.strokes.dead].sort()
   return out
+}
+
+// ── Publishing once per tick ────────────────────────────────────────────────
+
+/**
+ * ONE BATCHED DELTA PER TICK — the cadence the transport actually wants.
+ *
+ * The host bus coalesces to the latest value per (plugin, event) every ~66 ms
+ * and a burst inside one window is DROPPED, not queued: publishing per op
+ * means a magazine emptied into a wall arrives as its last shot. So the wiring
+ * layer does not publish per op. It calls the local-op functions as usual —
+ * they journal what was genuinely new — and once per tick calls takePending()
+ * and publishes the single frame that comes back.
+ *
+ * The journal collapses: sixty shots into one wall become one node entry with
+ * the union of their cells, which is both smaller than sixty frames and
+ * cheaper than one frame per shot would have been.
+ *
+ *   const out = takePending(world)
+ *   if (out) {
+ *     for (const frame of wireParts(out, MAX_WIRE_TEXT)) { ...publish... }
+ *     // and if the publish did not happen:
+ *     restorePending(world, out)
+ *   }
+ *
+ * Returns null when there is nothing to say. `lamport` is stamped at take
+ * time, `from`/`gridStamp` from the world, and the contents are canonically
+ * ordered so two clients in the same state produce the same bytes.
+ */
+export function takePending(
+  world: SharedWorld,
+  kind: SharedDelta['kind'] = 'delta',
+): SharedDelta | null {
+  const j = world.journal
+  const out = emptyDelta(world.self, kind)
+  out.lamport = world.clock
+  out.gridStamp = world.gridStamp
+  for (const nodeId of [...j.nodes.keys()].sort()) {
+    const entry = j.nodes.get(nodeId)!
+    entry.removed = ascendingUnique(entry.removed)
+    entry.segments = ascendingUnique(entry.segments)
+    out.nodes.push(entry)
+  }
+  out.pieces = stampedOrder(j.pieces)
+  out.items = stampedOrder(j.items)
+  out.apertures = stampedOrder(j.apertures)
+  out.strokes = stampedOrder(j.strokes)
+  out.deadPieces = [...j.deadPieces].sort()
+  out.deadItems = [...j.deadItems].sort()
+  out.deadApertures = [...j.deadApertures].sort()
+  out.deadStrokes = [...j.deadStrokes].sort()
+  if (deltaIsEmpty(out)) return null
+  world.journal = emptyJournal()
+  return out
+}
+
+/**
+ * STRICTLY ascending, which is a precondition and not a nicety: the wire spells
+ * a cell list as gaps between consecutive keys, so a repeated key would ask the
+ * encoder for a gap of -1. The local ops only ever journal genuinely-new keys,
+ * but `restorePending` unions frames back in and cannot know what the journal
+ * already holds — so the guarantee is made here, where canonical form is made.
+ */
+function ascendingUnique(values: number[]): number[] {
+  values.sort((a, b) => a - b)
+  const out: number[] = []
+  for (const value of values) {
+    if (out[out.length - 1] !== value) out.push(value)
+  }
+  return out
+}
+
+/** Canonical (lamport, then id) order — the same rule the merge tie-breaks on. */
+function stampedOrder<T extends Stamped>(lane: Map<RecordId, T>): T[] {
+  const out = [...lane.values()]
+  out.sort((a, b) => (a.lamport !== b.lamport ? a.lamport - b.lamport : a.id < b.id ? -1 : 1))
+  return out
+}
+
+/**
+ * Hand a taken delta BACK because it never went out — the host coalesced it
+ * ('deferred'), refused it ('suppressed'), or it was over the byte budget.
+ * The journal absorbs it (union, max epoch, or of the flags), so the next tick
+ * publishes it together with whatever happened since. Idempotent: restoring a
+ * delta that partly went out costs a few duplicate bytes and nothing else.
+ *
+ * `world.unsent` counts these, because a lost frame that nobody can see is a
+ * desync nobody can explain. The 15 s heal snapshot is the safety net; this is
+ * the fast path that usually means the player never notices.
+ */
+export function restorePending(world: SharedWorld, delta: SharedDelta): void {
+  if (delta === null || typeof delta !== 'object') return
+  const j = world.journal
+  world.unsent++
+  for (const nd of Array.isArray(delta.nodes) ? delta.nodes : []) {
+    if (!isSafeId(nd?.nodeId, MAX_NODE_ID_LEN)) continue
+    // A node that has since been reset (higher epoch) must not have its old
+    // cells resurrected: the epoch on the wire would lose anyway, and the
+    // bytes would be spent every tick from now on.
+    const epoch = world.nodes.get(nd.nodeId)?.epoch ?? 0
+    if (nd.epoch !== epoch) continue
+    const entry = journalNode(world, nd.nodeId)
+    for (const key of Array.isArray(nd.removed) ? nd.removed : []) {
+      if (isCellKey(key)) entry.removed.push(key)
+    }
+    for (const id of Array.isArray(nd.segments) ? nd.segments : []) {
+      if (smallInt(id, MAX_SEGMENT_ID)) entry.segments.push(id)
+    }
+    entry.killed = entry.killed || nd.killed === true
+    entry.reset = entry.reset || nd.reset === true
+  }
+  restoreLane(j.pieces, delta.pieces)
+  restoreLane(j.items, delta.items)
+  restoreLane(j.apertures, delta.apertures)
+  restoreLane(j.strokes, delta.strokes)
+  restoreDead(j.deadPieces, delta.deadPieces)
+  restoreDead(j.deadItems, delta.deadItems)
+  restoreDead(j.deadApertures, delta.deadApertures)
+  restoreDead(j.deadStrokes, delta.deadStrokes)
+}
+
+function restoreLane<T extends Stamped>(into: Map<RecordId, T>, recs: T[] | undefined): void {
+  for (const rec of Array.isArray(recs) ? recs : []) {
+    if (rec && isSafeId(rec.id, MAX_RECORD_ID_LEN) && !into.has(rec.id)) into.set(rec.id, rec)
+  }
+}
+
+function restoreDead(into: Set<RecordId>, ids: RecordId[] | undefined): void {
+  for (const id of Array.isArray(ids) ? ids : []) {
+    if (isSafeId(id, MAX_RECORD_ID_LEN)) into.add(id)
+  }
+}
+
+/** Is there anything to publish? (Cheaper than building the frame to ask.) */
+export function hasPending(world: SharedWorld): boolean {
+  const j = world.journal
+  return (
+    j.nodes.size > 0 ||
+    j.pieces.size > 0 ||
+    j.items.size > 0 ||
+    j.apertures.size > 0 ||
+    j.strokes.size > 0 ||
+    j.deadPieces.size > 0 ||
+    j.deadItems.size > 0 ||
+    j.deadApertures.size > 0 ||
+    j.deadStrokes.size > 0
+  )
+}
+
+/** What is waiting, for the debug HUD. */
+export function pendingCount(world: SharedWorld): {
+  nodes: number
+  cells: number
+  segments: number
+  records: number
+  tombstones: number
+} {
+  const j = world.journal
+  let cells = 0
+  let segments = 0
+  for (const nd of j.nodes.values()) {
+    cells += nd.removed.length
+    segments += nd.segments.length
+  }
+  return {
+    nodes: j.nodes.size,
+    cells,
+    segments,
+    records: j.pieces.size + j.items.size + j.apertures.size + j.strokes.size,
+    tombstones:
+      j.deadPieces.size + j.deadItems.size + j.deadApertures.size + j.deadStrokes.size,
+  }
 }
 
 // ── Effects: what the local game must now do ────────────────────────────────
@@ -993,8 +1277,16 @@ function joinRecord<T extends Stamped>(lane: Lane, a: T, b: T): T {
  *
  * `sender` is the peer the TRANSPORT says sent this (bus envelope
  * `sessionId`), not `delta.from`. It gates authorship: a peer may only add
- * records under its own id prefix. Pass null for a locally-produced delta
- * (a replayed snapshot of our own state) to skip that gate.
+ * records under its own id prefix.
+ *
+ * NULL IS NOT A TRUSTED RELAY. It means "this frame came out of THIS client's
+ * own model" — replaying our own snapshot, or a test fixture — and it skips
+ * both the authorship gate and the grid gate for exactly that reason. The bus
+ * never produces it: every inbound frame carries a host-stamped
+ * `msg.sessionId`, so net-world.ts always passes a real peer. There is no
+ * channel on which somebody else's aggregate could arrive vouched for, which
+ * is why late join is answered by every peer with its OWN records rather than
+ * by one peer relaying the room.
  */
 export function mergeDelta(
   world: SharedWorld,
@@ -1325,9 +1617,11 @@ export function resetSharedWorld(world: SharedWorld): void {
   world.items = emptyOrSet()
   world.apertures = emptyOrSet()
   world.strokes = emptyOrSet()
+  world.journal = emptyJournal()
   world.clock = 0
   world.dropped = 0
   world.applied = 0
+  world.unsent = 0
 }
 
 /** Plain-data QA dump for the `__boots` handle — copies, never live refs. */
@@ -1344,6 +1638,10 @@ export function sharedWorldDebug(world: SharedWorld): {
   strokes: number
   dropped: number
   applied: number
+  /** Cells + records still owed to the room (see takePending). */
+  pending: number
+  /** Frames taken and handed back unsent (coalesced, refused, oversize). */
+  unsent: number
 } {
   let cells = 0
   let segments = 0
@@ -1366,5 +1664,10 @@ export function sharedWorldDebug(world: SharedWorld): {
     strokes: liveRecords(world.strokes).length,
     dropped: world.dropped,
     applied: world.applied,
+    pending: (() => {
+      const p = pendingCount(world)
+      return p.cells + p.segments + p.records + p.tombstones
+    })(),
+    unsent: world.unsent,
   }
 }

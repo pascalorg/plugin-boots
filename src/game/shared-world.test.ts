@@ -17,6 +17,7 @@ import {
   emptyDelta,
   emptyEffects,
   effectsAreEmpty,
+  hasPending,
   isAuthoredBy,
   isSafeId,
   isSafePeerId,
@@ -33,14 +34,17 @@ import {
   noteLocalRemoval,
   noteLocalReset,
   noteLocalSegments,
+  pendingCount,
   pieceTargetId,
   quantPos,
   quantYaw,
   removedCells,
   resetSharedWorld,
+  restorePending,
   setGridStamp,
   sharedWorldDebug,
   snapshotOf,
+  takePending,
   type NodeDelta,
   type PieceRec,
   type SharedDelta,
@@ -652,6 +656,199 @@ describe('localWork is the only projection the Save bridges may see', () => {
     // Remote cells have no author on the wire, and `mine` is written only by
     // the local op — so a remote frame can never enter the Save set at all.
     expect(work.cells.size).toBe(0)
+  })
+})
+
+// ── The outbound journal ────────────────────────────────────────────────────
+
+/**
+ * The transport keeps ONE value per event per coalescing window and drops the
+ * rest of a burst, so a client that publishes per op publishes into a bin. The
+ * journal is the answer: every local op records itself, and a tick asks for one
+ * batched delta. These tests are about that batching being lossless, idempotent
+ * and local-only.
+ */
+describe('the outbound journal', () => {
+  test('a burst of ops collapses into one delta, keeping every cell once', () => {
+    const world = worldFor(ALICE)
+    // Sixty shots across three walls inside one window — one frame's worth.
+    for (let i = 0; i < 60; i++) {
+      noteLocalRemoval(world, `__boots-node-w${i % 3}`, [i * 7, i * 7 + 1, i * 7 + 2])
+      // The same cells again: the second call adds nothing, and must not
+      // put a duplicate on the wire either.
+      noteLocalRemoval(world, `__boots-node-w${i % 3}`, [i * 7])
+    }
+    expect(pendingCount(world).nodes).toBe(3)
+    expect(pendingCount(world).cells).toBe(180)
+
+    const out = takePending(world)
+    expect(out).not.toBeNull()
+    const delta = out as SharedDelta
+    expect(delta.nodes.length).toBe(3)
+    let cells = 0
+    for (const nd of delta.nodes) {
+      // Canonical order, and no cell twice.
+      expect(nd.removed).toEqual([...nd.removed].sort((a, b) => a - b))
+      expect(new Set(nd.removed).size).toBe(nd.removed.length)
+      cells += nd.removed.length
+    }
+    expect(cells).toBe(180)
+    // And it is addressed and stamped like any other frame of ours.
+    expect(delta.from).toBe(ALICE)
+    expect(delta.gridStamp).toBe(7)
+    expect(delta.kind).toBe('delta')
+  })
+
+  test('taking empties the journal, and an empty journal has nothing to say', () => {
+    const world = worldFor(ALICE)
+    expect(hasPending(world)).toBe(false)
+    expect(takePending(world)).toBeNull()
+    noteLocalRemoval(world, WALL, [1, 2])
+    expect(hasPending(world)).toBe(true)
+    expect(takePending(world)).not.toBeNull()
+    expect(hasPending(world)).toBe(false)
+    expect(takePending(world)).toBeNull()
+  })
+
+  test('every lane rides along, and a snapshot take is the same journal', () => {
+    const world = worldFor(ALICE)
+    addLocalPiece(world, {
+      kind: 'wall',
+      slot: 'Wx:0,0,0',
+      mask: 511,
+      yaw: 0,
+      height: 2.7,
+      corners: null,
+    })
+    addLocalItem(world, { catalogId: 'sofa', x: 1, y: 0, z: 1, yaw: 0 })
+    addLocalAperture(world, {
+      catalogId: 'door-single',
+      host: WALL,
+      u: 1,
+      v: 0,
+      width: 0.9,
+      height: 2.1,
+    })
+    addLocalStroke(world, { node: WALL, color: 3, x: 0, y: 1, z: 0, radius: 0.2 })
+    noteLocalSegments(world, WALL, [2, 5])
+    noteLocalKill(world, '__boots-node-gone')
+    expect(pendingCount(world)).toEqual({
+      nodes: 2,
+      cells: 0,
+      segments: 2,
+      records: 4,
+      tombstones: 0,
+    })
+
+    const out = takePending(world, 'snapshot') as SharedDelta
+    expect(out.kind).toBe('snapshot')
+    expect(out.pieces.length).toBe(1)
+    expect(out.items.length).toBe(1)
+    expect(out.apertures.length).toBe(1)
+    expect(out.strokes.length).toBe(1)
+    expect(out.nodes.find((nd) => nd.nodeId === WALL)?.segments).toEqual([2, 5])
+    expect(out.nodes.find((nd) => nd.nodeId === '__boots-node-gone')?.killed).toBe(true)
+  })
+
+  test('a reset replaces the entry instead of joining it', () => {
+    // Cells from the generation that no longer exists must not go out beside
+    // the reset that erased them: they would be discarded on arrival, and the
+    // receiver would have paid for them.
+    const world = worldFor(ALICE)
+    noteLocalRemoval(world, WALL, [10, 11, 12])
+    noteLocalReset(world, WALL)
+    noteLocalRemoval(world, WALL, [40])
+    const out = takePending(world) as SharedDelta
+    expect(out.nodes.length).toBe(1)
+    expect(out.nodes[0]?.epoch).toBe(1)
+    expect(out.nodes[0]?.reset).toBe(true)
+    expect(out.nodes[0]?.removed).toEqual([40])
+  })
+
+  test('a tombstone cancels the add still waiting beside it', () => {
+    const world = worldFor(ALICE)
+    const item = idOf(addLocalItem(world, { catalogId: 'crate', x: 0, y: 0, z: 0, yaw: 0 }))
+    const kept = idOf(addLocalItem(world, { catalogId: 'sofa', x: 2, y: 0, z: 0, yaw: 0 }))
+    expect(killRecord(world, 'items', item)).toBe(true)
+    const out = takePending(world) as SharedDelta
+    expect(out.items.map((r) => r.id)).toEqual([kept])
+    expect(out.deadItems).toEqual([item])
+  })
+
+  test('a frame the host refused comes back, and the loss stays visible', () => {
+    const world = worldFor(ALICE)
+    noteLocalRemoval(world, WALL, [1, 2, 3])
+    noteLocalSegments(world, WALL, [4])
+    addLocalItem(world, { catalogId: 'sofa', x: 0, y: 0, z: 0, yaw: 0 })
+    const first = takePending(world) as SharedDelta
+    expect(world.unsent).toBe(0)
+
+    // publishFrame said 'deferred'. Nothing is retransmitted by the transport,
+    // so the state goes back into the journal and leaves next tick.
+    restorePending(world, first)
+    expect(world.unsent).toBe(1)
+    expect(hasPending(world)).toBe(true)
+    expect(takePending(world)).toEqual(first)
+    expect(sharedWorldDebug(world).unsent).toBe(1)
+  })
+
+  test('a restored frame does not resurrect a generation that has since gone', () => {
+    const world = worldFor(ALICE)
+    noteLocalRemoval(world, WALL, [10, 11])
+    const lost = takePending(world) as SharedDelta
+    // The wall was rebuilt before the retry: those holes no longer exist.
+    noteLocalReset(world, WALL)
+    const afterReset = takePending(world) as SharedDelta
+    expect(afterReset.nodes[0]?.epoch).toBe(1)
+    restorePending(world, lost)
+    expect(pendingCount(world).cells).toBe(0)
+    expect(world.unsent).toBe(1)
+  })
+
+  test('restoring is a union, not an append: a retry cannot double a cell', () => {
+    const world = worldFor(ALICE)
+    noteLocalRemoval(world, WALL, [1, 2])
+    const frame = takePending(world) as SharedDelta
+    restorePending(world, frame)
+    restorePending(world, frame)
+    const again = takePending(world) as SharedDelta
+    expect(again.nodes[0]?.removed).toEqual([1, 2])
+  })
+
+  test('restoring survives a hostile shape, because the retry path is code too', () => {
+    const world = worldFor(ALICE)
+    expect(() => restorePending(world, null as unknown as SharedDelta)).not.toThrow()
+    expect(() =>
+      restorePending(world, { nodes: [{ nodeId: 42 }], pieces: 7 } as unknown as SharedDelta),
+    ).not.toThrow()
+    expect(hasPending(world)).toBe(false)
+  })
+
+  test('the journal is local work only — a merge never puts bytes in it', () => {
+    // Otherwise every peer would rebroadcast every other peer's frames, and a
+    // three-player room would multiply its own traffic.
+    const world = worldFor(ALICE)
+    mergeDelta(
+      world,
+      deltaWith(BOB, {
+        nodes: [nodeDelta({ nodeId: WALL, removed: [1, 2, 3], segments: [1], killed: true })],
+        pieces: [piece(`${BOB}#1`)],
+        deadItems: [`${BOB}#2`],
+      }),
+      BOB,
+    )
+    expect(damagedNodes(world)).toEqual([WALL])
+    expect(hasPending(world)).toBe(false)
+    expect(takePending(world)).toBeNull()
+  })
+
+  test('reset forgets what we still owed the room', () => {
+    const world = worldFor(ALICE)
+    noteLocalRemoval(world, WALL, [1, 2])
+    restorePending(world, takePending(world) as SharedDelta)
+    resetSharedWorld(world)
+    expect(hasPending(world)).toBe(false)
+    expect(world.unsent).toBe(0)
   })
 })
 
