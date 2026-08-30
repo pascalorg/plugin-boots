@@ -414,6 +414,93 @@ describe('localWork is the only door, and it opens on our work alone', () => {
     expect(localWork(world).pieces).toEqual([])
   })
 
+  test('a remote frame can take ownership away, never grant it', () => {
+    // The Save set's damage half is MEMBERSHIP recorded at authoring time
+    // (dmg.mine, dmg.mySegments, dmg.killedByMe) — not a prefix comparison. So
+    // it is immune to anything a peer says, and immune to our own peer id
+    // changing underneath us. This is that claim, tested rather than grepped.
+    const { world } = mixedWorld()
+    const before = localWork(world)
+    const ours = [...before.cells.get('wall-a')!]
+    expect(ours.length).toBe(2)
+
+    // A storm that includes frames claiming the very cells we authored.
+    for (let i = 0; i < 200; i++) {
+      const d = emptyDelta(`peer-${i % 7}`)
+      d.gridStamp = STAMP
+      d.lamport = 500 + i
+      d.nodes.push({
+        nodeId: i % 3 === 0 ? 'wall-a' : `wall-${i % 9}`,
+        epoch: 0,
+        // Our own cells, echoed back at us, plus new ones.
+        removed: i % 3 === 0 ? ours : [cellKey(i % 25, i % 35, i % 2)],
+        segments: i % 3 === 0 ? [3] : [i % 13],
+        killed: i % 29 === 0,
+        reset: false,
+      })
+      mergeDelta(world, d, `peer-${i % 7}`)
+    }
+    for (const { delta, sender } of hostileFrames()) mergeDelta(world, delta, sender)
+
+    const after = localWork(world)
+    expect([...after.cells.keys()]).toEqual(['wall-a'])
+    expect(after.cells.get('wall-a')).toEqual(ours)
+    expect(after.segments.get('wall-a')).toEqual([3])
+    expect(after.killed).toEqual(['shed-a'])
+    expect(after.pieces.length).toBe(before.pieces.length)
+
+    // The one thing a peer MAY do is clear it, by restoring the node: a higher
+    // epoch wipes the generation those cells belonged to. That errs toward
+    // withholding a node from Save, which leaves it intact in its owner's
+    // document — the safe direction, and the only direction available.
+    const restore = emptyDelta('stranger')
+    restore.gridStamp = STAMP
+    restore.nodes.push({
+      nodeId: 'wall-a',
+      epoch: 1,
+      removed: [],
+      segments: [],
+      killed: false,
+      reset: true,
+    })
+    mergeDelta(world, restore, 'stranger')
+    const healed = localWork(world)
+    expect(healed.cells.has('wall-a')).toBe(false)
+    expect(healed.segments.has('wall-a')).toBe(false)
+    // And it took nothing else with it.
+    expect(healed.killed).toEqual(['shed-a'])
+    expect(healed.pieces.length).toBe(before.pieces.length)
+  })
+
+  test('only the local ops can grant local ownership, by construction', async () => {
+    // The behavioural test above proves it for the storm it runs. This proves
+    // there is no other writer at all: three functions may record ownership,
+    // and exactly two places may erase it. mergeNodes is allowed to erase
+    // because a restore must, and it is NOT allowed to record.
+    const code = codeOf(await read('./shared-world.ts'))
+    const owners = (needle: RegExp): string[] => {
+      const out: string[] = []
+      for (const chunk of code.split(/\n(?=(?:export )?(?:function|const|class) )/)) {
+        if (!needle.test(chunk)) continue
+        out.push(/^(?:export )?(?:function|const|class)\s+(\w+)/.exec(chunk)?.[1] ?? '(top level)')
+      }
+      return out
+    }
+
+    const grants = owners(/dmg\.mine\.add\(|dmg\.mySegments\.add\(|dmg\.killedByMe = true/)
+    const revokes = owners(/dmg\.mine\.clear\(|dmg\.mySegments\.clear\(|dmg\.killedByMe = false/)
+    // Set equality in both directions, so the rule fails loudly if a writer
+    // moves AND if the scan stops finding them — a fence that matches nothing
+    // passes vacuously, and a renamed field must rewrite this rule, not delete
+    // it.
+    expect([...new Set(grants)].sort()).toEqual([
+      'noteLocalKill',
+      'noteLocalRemoval',
+      'noteLocalSegments',
+    ])
+    expect([...new Set(revokes)].sort()).toEqual(['mergeNodes', 'noteLocalReset'])
+  })
+
   test('merge reports only plain data, so nothing live can leak to the wiring', () => {
     // The wiring layer receives SharedEffects and acts on it. If effects could
     // carry a function or a store handle, the fence would be decorative.
