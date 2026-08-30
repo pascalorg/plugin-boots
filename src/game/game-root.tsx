@@ -525,6 +525,10 @@ function ActiveGame() {
   const [world, setWorld] = useState(() => collectWorld())
   // Stable for the canvas' life — used by the __boots coplanar-suspect probe.
   const scene = useThree((s) => s.scene)
+  // The camera the session renders through — read straight from the R3F
+  // store (not getSession(): dev hot-reloads can duplicate the session
+  // module, and the __boots.cameraPose QA probe must survive that).
+  const camera = useThree((s) => s.camera)
 
   // Remount healing (Fast Refresh / dev module sync — players never remount
   // mid-session): this component unmounting is NOT the session ending;
@@ -609,6 +613,18 @@ function ActiveGame() {
         fire(world, WEAPONS[weapon]),
       teleport: (x: number, z: number, yaw: number, pitch?: number, y?: number) =>
         playerDebug.teleport?.(x, z, yaw, pitch, y),
+      // Live game-camera pose (look-parity QA): exact position/quaternion/fov
+      // of the camera the session renders through. Plain copies, never refs.
+      cameraPose: () => ({
+        position: camera.position.toArray() as [number, number, number],
+        quaternion: [
+          camera.quaternion.x,
+          camera.quaternion.y,
+          camera.quaternion.z,
+          camera.quaternion.w,
+        ] as [number, number, number, number],
+        fov: (camera as { fov?: number }).fov ?? 0,
+      }),
       state: () => useBoots.getState(),
       wallNodes: () => Array.from(world.walls.values()).map((w) => w.node),
       doors: doorsDebug,
@@ -776,7 +792,7 @@ function ActiveGame() {
       clearDebris()
       clearDust()
     }
-  }, [world, scene])
+  }, [world, scene, camera])
 
   return (
     <>
