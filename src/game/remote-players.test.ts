@@ -14,7 +14,9 @@ import {
   SLUMP_TORSO,
   SPAWN_SCALE_MS,
   spawnScale,
+  TAG_FADE_START,
   TAG_MAX_DIST,
+  tagOpacity,
   tagVisible,
 } from './remote-players'
 
@@ -115,5 +117,32 @@ describe('join scale-in + name-tag gate', () => {
     expect(tagVisible(39.9 * 39.9)).toBe(true)
     expect(tagVisible(TAG_MAX_DIST * TAG_MAX_DIST)).toBe(true)
     expect(tagVisible(40.1 * 40.1)).toBe(false)
+  })
+
+  test(`name tags are solid to ${TAG_FADE_START}m, then ramp out to nothing`, () => {
+    expect(tagOpacity(0)).toBe(1)
+    expect(tagOpacity(TAG_FADE_START * TAG_FADE_START)).toBe(1)
+    // Halfway through the fade band reads as half opacity.
+    const mid = (TAG_FADE_START + TAG_MAX_DIST) / 2
+    expect(tagOpacity(mid * mid)).toBeCloseTo(0.5, 5)
+    expect(tagOpacity(TAG_MAX_DIST * TAG_MAX_DIST)).toBe(0)
+    expect(tagOpacity(1e6)).toBe(0)
+  })
+
+  test('the fade is monotonic and never leaves [0,1] (no negative opacity)', () => {
+    let previous = Number.POSITIVE_INFINITY
+    for (let d = 0; d <= 60; d += 0.5) {
+      const opacity = tagOpacity(d * d)
+      expect(opacity).toBeGreaterThanOrEqual(0)
+      expect(opacity).toBeLessThanOrEqual(1)
+      expect(opacity).toBeLessThanOrEqual(previous)
+      previous = opacity
+    }
+  })
+
+  test('anything the fade shows is also inside the visibility gate', () => {
+    for (let d = 0; d <= 60; d += 0.5) {
+      if (tagOpacity(d * d) > 0) expect(tagVisible(d * d)).toBe(true)
+    }
   })
 })

@@ -7,6 +7,7 @@ import {
   CanvasTexture,
   Color,
   type Group,
+  type MeshBasicMaterial,
   MeshStandardMaterial,
   Quaternion,
 } from 'three'
@@ -43,8 +44,12 @@ import {
  * driven by normalized speed, airborne tuck when !g, slump when st), the
  * held weapon silhouette reusing the viewmodel's weapon-models components
  * (swapped on `w`, change-gated), and a name-tag billboard CanvasTexture
- * (the guntable TableSign idiom — disposed on despawn, hidden past 40 m).
- * Avatars scale in over 200 ms on join.
+ * (the guntable TableSign idiom — disposed on despawn, solid to 24 m then
+ * faded out to nothing by 40 m). Avatars scale in over 200 ms on join.
+ *
+ * The roster this renders is HARD-CAPPED upstream at
+ * presence.MAX_REMOTE_AVATARS, so the mounted rig count is bounded no matter
+ * how busy the lobby gets.
  *
  * ANTI-GOAL (deliberate, do not "fix"): avatars NEVER join the world's
  * colliders and are NEVER shootable. They are pure visuals — never pushed
@@ -179,6 +184,8 @@ export function articulate(
 export const SPAWN_SCALE_MS = 200
 /** Name tags hide past this distance (m). */
 export const TAG_MAX_DIST = 40
+/** Tags are fully solid within this distance (m), then ramp out to the cutoff. */
+export const TAG_FADE_START = 24
 
 /** 200 ms ease-out scale-in on join; floored so the matrix never hits 0. */
 export function spawnScale(ageMs: number): number {
@@ -189,6 +196,20 @@ export function spawnScale(ageMs: number): number {
 
 export function tagVisible(distSq: number): boolean {
   return distSq <= TAG_MAX_DIST * TAG_MAX_DIST
+}
+
+/**
+ * Name-tag opacity ramp: solid nearby, linear fade to nothing at
+ * TAG_MAX_DIST. A lobby crowd stays readable at conversation range without
+ * a picket fence of labels along the horizon (and the far ones stop
+ * competing with the world for attention).
+ */
+export function tagOpacity(distSq: number): number {
+  const near = TAG_FADE_START * TAG_FADE_START
+  if (distSq <= near) return 1
+  const far = TAG_MAX_DIST * TAG_MAX_DIST
+  if (distSq >= far) return 0
+  return (TAG_MAX_DIST - Math.sqrt(distSq)) / (TAG_MAX_DIST - TAG_FADE_START)
 }
 
 // ── Cached geometries + materials (module-lifetime, bounded) ─────────────────
@@ -291,6 +312,7 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
   const legLRef = useRef<Group>(null)
   const legRRef = useRef<Group>(null)
   const tagRef = useRef<Group>(null)
+  const tagMatRef = useRef<MeshBasicMaterial>(null)
   const gaitPhase = useRef(0)
   const lastScale = useRef(-1)
   const frame = useRef(0)
@@ -336,16 +358,23 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
     // Weapon swap — change-gated, so per-frame calls are free while held.
     if (_pose.w !== weapon) setWeapon(_pose.w)
 
-    // Name tag: 40 m gate + billboard (parent-compensated camera copy).
+    // Name tag: distance fade + billboard (parent-compensated camera copy).
     const tag = tagRef.current
     if (tag) {
       const camera = rootState.camera
       const dx = camera.position.x - _pose.x
       const dy = camera.position.y - _pose.y
       const dz = camera.position.z - _pose.z
-      const visible = tagVisible(dx * dx + dy * dy + dz * dz)
+      const distSq = dx * dx + dy * dy + dz * dz
+      const opacity = tagOpacity(distSq)
+      const visible = opacity > 0
       if (tag.visible !== visible) tag.visible = visible
       if (visible) {
+        // Change-gated (per-avatar JSX-owned material — never shared).
+        const material = tagMatRef.current
+        if (material && Math.abs(material.opacity - opacity) > 0.01) {
+          material.opacity = opacity
+        }
         root.getWorldQuaternion(_worldQuat).invert()
         tag.quaternion.copy(_worldQuat.multiply(camera.quaternion))
       }
@@ -411,7 +440,7 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
         {tagTexture ? (
           <mesh>
             <planeGeometry args={[0.72, 0.18]} />
-            <meshBasicMaterial map={tagTexture} transparent depthWrite={false} />
+            <meshBasicMaterial ref={tagMatRef} map={tagTexture} transparent depthWrite={false} />
           </mesh>
         ) : null}
       </group>
