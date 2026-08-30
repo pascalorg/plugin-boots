@@ -15,8 +15,9 @@ const runAsOneHistoryStep = <T,>(run: () => T): T => {
 }
 import { useState } from 'react'
 import { useBoots } from './store'
+import { isForeignPlacedPiece } from './game/builder'
 import { applyItems, discardItems } from './game/item-keep'
-import { useItems } from './game/item-place'
+import { isForeignItemPlacement, useItems } from './game/item-place'
 import { discardPlaced, keepPlaced } from './game/keep'
 import { applyPaint, discardPaint, usePaintKeep } from './game/paint-keep'
 import { deleteDestroyed, discardDemolition, useDemolition } from './game/save-demolition'
@@ -30,11 +31,20 @@ import { enterGame } from './game/session'
  */
 export default function BootsPanel() {
   const pendingDecision = useBoots((s) => s.pendingDecision)
-  const placed = useBoots((s) => s.placed)
+  const allPlaced = useBoots((s) => s.placed)
   const destroyed = useDemolition((s) => s.destroyed)
   const painted = usePaintKeep((s) => s.painted)
-  const placedItems = useItems((s) => s.items)
+  const allPlacedItems = useItems((s) => s.items)
   const [lastKept, setLastKept] = useState<string | null>(null)
+
+  // "You built N pieces" has to mean what it says. In a shared world the
+  // stores also hold what other players built, and Save writes only this
+  // player's work (keep.ts / item-keep.ts filter the same way), so counting
+  // the whole list would promise to keep walls that are not ours and offer a
+  // decision to a player who built nothing. Both are the full list in
+  // single-player.
+  const placed = allPlaced.filter((p) => !isForeignPlacedPiece(p.id))
+  const placedItems = allPlacedItems.filter((p) => !isForeignItemPlacement(p.id))
 
   const wallCount = placed.filter((p) => p.piece === 'wall').length
   const otherCount = placed.length - wallCount
