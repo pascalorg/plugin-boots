@@ -634,7 +634,14 @@ two reasons that are both worth re-checking before either is changed:
   those journals are necessarily empty and both numbers are zero in the same
   breath. **Mint into a record lane from outside that module and this stops
   holding**: `staleMints` would count work the lane has never heard of, and the
-  loss figure would blame the re-mint for records it could never have seen.
+  loss figure would blame the re-mint for records it could never have seen. A
+  source scan in `net-world.test.ts` fences it over all of `src`, and it matches
+  `addLocal<Anything>` rather than those four names on purpose — **a fifth lane is
+  the case a list of four literals sails straight through**, and it is the case
+  most likely to be added. The model itself stays allowed, because the hazard is a
+  minting path whose *lifecycle* is not the build lane's; the model has none, it
+  mints only when called, so a private helper shared by the four minters is a
+  refactor rather than a new site.
 - `attachBuildSync` / `detachBuildSync` are called from `startWorldSync` /
   `stopWorldSync` and nowhere else in production, so for as long as `pump` runs the
   lane is attached — and attached to the *same world object* the adapter just

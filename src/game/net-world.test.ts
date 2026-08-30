@@ -680,19 +680,35 @@ describe('our own name is not a constant', () => {
    * Mint from a fifth site and `staleMints - staleReminted` silently stops being
    * the loss figure documented in MULTIPLAYER.md Part 4 — it starts blaming the
    * re-mint for records it could never have seen. Cheaper to fail here.
+   *
+   * Two deliberate choices in how wide it looks:
+   *
+   *  - The name pattern is `addLocal<Something>`, NOT the four lane names spelled
+   *    out. A fifth lane — `addLocalSign` in the model and in LANES — is the exact
+   *    failure this exists to catch, and a fence listing four literals would stay
+   *    green through it. The invariant is "one module mints", not "these four
+   *    functions live in one place".
+   *  - `shared-world.ts` stays allowed, and that is not slack. The hazard is a
+   *    minting path whose LIFECYCLE is not the build lane's — a module that can add
+   *    to a journal while the lane is detached. The model has no lifecycle: it
+   *    mints only when someone calls it, so a private helper there (the four
+   *    minters sharing an `addLocalRecord`, say) is a refactor, not a new minting
+   *    site, and failing on it would make this fence look wrong to the lane that
+   *    owns the file — the surest way to get a fence deleted instead of read.
    */
   test('only the build lane mints into a record lane', async () => {
-    const glob = new Bun.Glob('*.{ts,tsx}')
-    const dir = new URL('.', import.meta.url).pathname
-    // shared-world.ts declares them; shared-build.ts is the one caller.
-    const allowed = new Set(['shared-world.ts', 'shared-build.ts'])
+    // Whole plugin source, not just src/game: a mint from panel.tsx would count.
+    const glob = new Bun.Glob('**/*.{ts,tsx}')
+    const dir = new URL('../', import.meta.url).pathname
+    // game/shared-world.ts declares them; game/shared-build.ts is the one caller.
+    const allowed = new Set(['game/shared-world.ts', 'game/shared-build.ts'])
     let callers = 0
     for await (const file of glob.scan({ cwd: dir })) {
       if (file.includes('.test.')) continue
       const source = await Bun.file(`${dir}${file}`).text()
       // Comments discuss these functions by name at length; scan code only.
       const code = source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
-      for (const match of code.matchAll(/(function\s+)?\baddLocal(?:Piece|Item|Aperture|Stroke)\s*\(/g)) {
+      for (const match of code.matchAll(/(function\s+)?\baddLocal[A-Z]\w*\s*\(/g)) {
         if (match[1]) continue // the declaration itself
         callers++
         expect(allowed.has(file), `${file} mints into a record lane`).toBe(true)
