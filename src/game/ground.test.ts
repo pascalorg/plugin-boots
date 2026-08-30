@@ -297,6 +297,30 @@ describe('installGroundProbes (world.ts)', () => {
     expect(lotFloorY()).toBeCloseTo(-6.5, 6)
   })
 
+  test('install → teardown → install: the probe comes back, every time', () => {
+    // THE REGRESSION, found on a live sculpted lot. The install ran once per
+    // world snapshot while resetGround() ran in a React effect cleanup, so a
+    // StrictMode double-invoke — or any change of world/scene/camera — tore the
+    // probe down and nothing put it back: the rest of the session read the flat
+    // lot plane, and a teleport onto a +1.6 m lawn answered 0. Installing has to
+    // stay re-runnable from the world alone, with no once-only guard and no
+    // memo that survives a reset.
+    const terrain = boxCollider('site-1', 'site', [40, 8, 40], [0, -2, 0])
+    const world = { colliders: [terrain], site: site(true, rampTerrain) }
+    expect(installGroundProbes(world)).toBe(true)
+    expect(groundSurfaceY(-5, 0)).toBe(2)
+
+    resetGround()
+    expect(hasGroundSurfaceProbe()).toBe(false)
+    expect(groundSurfaceY(-5, 0)).toBe(FLAT_LOT_Y)
+
+    expect(installGroundProbes(world)).toBe(true)
+    expect(hasGroundSurfaceProbe()).toBe(true)
+    expect(groundSurfaceY(-5, 0)).toBe(2)
+    expect(groundSurfaceY(9, 20)).toBe(-5)
+    expect(lotFloorY()).toBeCloseTo(-6.5, 6)
+  })
+
   test('terrainSurfaceYAt prefers the analytic field over a BVH probe', () => {
     const world = { colliders: [], site: site(true, rampTerrain) }
     expect(terrainSurfaceYAt(world, 1, 0)).toBe(-1)

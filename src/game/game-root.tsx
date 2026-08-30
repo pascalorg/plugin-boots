@@ -66,6 +66,7 @@ import {
   collectWorld,
   countCoplanarSuspects,
   type GameWorld,
+  installGroundProbes,
   isOverlayName,
 } from './world'
 
@@ -596,6 +597,16 @@ function ActiveGame() {
     // whole overlay roots for the session; exitGame's hiddenObjects ledger
     // restores every visibility flip untouched.
     for (const root of world.overlayRoots) hideForGame(root)
+
+    // THE GROUND AUTHORITY, installed where it is torn down. collectWorld
+    // installs it too (its own road/tree passes read it), but that runs ONCE
+    // per snapshot while this effect's cleanup calls resetGround() — a
+    // StrictMode double-invoke, or any change of world/scene/camera, wiped
+    // the probe and left the whole session reading the flat lot plane again
+    // (found live on a sculpted lot: the ground was 1.6 m up and every
+    // teleport/settle answered 0). Install and reset must be the same pair.
+    // Idempotent and cheap: one closure plus a scan of the site colliders.
+    installGroundProbes(world)
 
     // Floors for things (MULTILEVEL-PLAN Phase B polish): debris and dust
     // resolve their landing plane through one shared downward probe over
