@@ -2795,6 +2795,11 @@ export function ensureVoxelTarget(
     target.walkOnly = hideHostNode(world, nodeId, meshes, wall?.root, item)
   }
 
+  // A POSED node (door leaf, window sash) can move later, and this grid is
+  // baked in world space — stamp the pose it belongs to so a bake taken
+  // mid-swing can be caught and healed instead of hanging in the air for the
+  // rest of the session (see posedBake).
+  stampPosedBake(nodeId, nodeType, meshes)
   state.targets.set(nodeId, target)
   state.bump()
   // Cross-target support (Phase B3): record the target's world AABB so
@@ -5199,6 +5204,92 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
 /** Legacy alias. */
 export const collideVoxelWalls = collideVoxelTargets
 
+// ---------------------------------------------------------------------------
+// POSED NODES: a grid is only correct at the pose it was baked at
+// ---------------------------------------------------------------------------
+
+/** The node kinds the E-interact system POSES during a session (interact.tsx
+ * applyPose): a hinged leaf swings ~100° about its hinge edge, a sash slides
+ * or tips on its named parts. Item-family operables (cabinets, cabinet
+ * modules) are deliberately OUT — they voxelize awake at session start and
+ * interact stands down from frame one, so they never move, and their host
+ * hide is a LAYERS MASK (maskForGame) that the handback below does not
+ * reverse. */
+const POSED_KINDS = new Set(['door', 'window'])
+
+/** Pose tolerance, applied to raw matrix elements: metres on the translation
+ * column, cosines on the rotation basis. A door swing moves the leaf by
+ * tenths of a metre and 100° of yaw, and a node that did NOT move recomputes
+ * the same matrix bit for bit, so this only has to clear float noise. */
+const POSE_EPSILON = 1e-4
+
+/**
+ * THE POSE STAMP — which world matrices a posed node's grid was baked from.
+ *
+ * A voxel grid is baked in WORLD space (VoxelGridData.centers are world
+ * points) and nothing ever re-poses one, so a grid is correct only at the
+ * pose its source meshes stood in at voxelize time. Every path that poses an
+ * operable retires its DORMANT prebuild first, and a toggle refuses to pose
+ * an AWAKE node — but a bullet that lands DURING the swing (0.28 s, colliders
+ * ballistic the whole way) bakes the grid mid-arc, wakes it (the host leaf
+ * hides, the replica takes over), and the animation then carries the leaf on
+ * to fully open. The grid stays where the leaf WAS: a solid, shootable slab
+ * of voxels hanging in the air — and the doorway prism masks only the cells
+ * that happen to fall inside it, so what survives is a partial ghost. The
+ * player fires at the leaf where it now stands and the shot dies in mid-air
+ * short of it; the doorway keeps blocking movement; and E is refused for the
+ * rest of the session (an open node is not restorable), so the door can never
+ * be fixed.
+ *
+ * Keyed by node id, retired with the target (dropTarget). The mesh references
+ * are the ones the collider list already holds — no new session retention.
+ */
+const posedBake = new Map<string, { meshes: Mesh[]; stamp: Float64Array }>()
+
+/** Record the pose a posed node's grid was just baked at. No-op for every
+ * other kind (walls, slabs, roofs, items — nothing poses them). */
+function stampPosedBake(nodeId: string, nodeType: string | null, meshes: Mesh[]): void {
+  if (nodeType === null || !POSED_KINDS.has(nodeType)) return
+  const stamp = new Float64Array(meshes.length * 16)
+  for (let i = 0; i < meshes.length; i++) stamp.set(meshes[i]!.matrixWorld.elements, i * 16)
+  posedBake.set(nodeId, { meshes: meshes.slice(), stamp })
+}
+
+/** Has a posed node MOVED since its grid was baked? False for anything
+ * carrying no stamp. Exported for the interact settle check, tests and QA. */
+export function posedTargetIsStale(nodeId: string): boolean {
+  const bake = posedBake.get(nodeId)
+  if (!bake) return false
+  for (let i = 0; i < bake.meshes.length; i++) {
+    const live = bake.meshes[i]!.matrixWorld.elements
+    const base = i * 16
+    for (let e = 0; e < 16; e++) {
+      if (Math.abs(live[e]! - bake.stamp[base + e]!) > POSE_EPSILON) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Hand a STALE posed node back to the host (see posedBake): its grid does not
+ * correspond to the leaf anymore, and a grid standing where the geometry
+ * isn't is strictly worse than losing the damage it holds — the same trade
+ * restoreOperableTarget already makes for a sealed door, for the same reason.
+ * The node re-voxelizes from its live pose on the next hit.
+ *
+ * Returns whether the host owns the node again; a no-op (false) when the node
+ * never voxelized, carries no stamp, or still stands exactly where it baked.
+ * The CALLER owns collider posture afterwards: the handback latches the node
+ * SOLID, which is right for a leaf that settled shut and wrong for one that
+ * settled open — only the interact state knows which pose won.
+ */
+export function resyncPosedTarget(nodeId: string): boolean {
+  if (!posedBake.has(nodeId)) return false
+  if (!useDestruction.getState().targets.has(nodeId)) return false
+  if (!posedTargetIsStale(nodeId)) return false
+  return restoreOperableTarget(nodeId)
+}
+
 /**
  * OPERABLE HANDBACK (owner repro 2026-08-30, Starter House: "can't walk
  * through a regular door — something on the wall blocks me"): a CLOSED door
@@ -5271,6 +5362,7 @@ export function dropTarget(nodeId: string): void {
     return
   }
   roofMemberOf.delete(nodeId)
+  posedBake.delete(nodeId) // the pose stamp dies with the grid it described
   cancelSettleTask(islandKey(nodeId))
   cancelSettleTask(framingKey(nodeId))
   // Tone audit: nothing renders this node's fallback anymore, and any
@@ -5313,6 +5405,7 @@ export function resetDestruction(): void {
   resetSharedDamage()
   dormantRoofHide.clear()
   dormantCount = 0
+  posedBake.clear() // no pose stamps outlive their session's meshes
   // Next session re-reads shellFlags (per-kind prevoxelize latches).
   shellLatch.wall = null
   shellLatch.roof = null

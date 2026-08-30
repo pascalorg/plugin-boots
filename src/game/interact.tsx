@@ -16,7 +16,12 @@ import {
   resetPassageReliefStats,
   unregisterPassage,
 } from './collision'
-import { dropTarget, restoreOperableTarget, useDestruction } from './destruction'
+import {
+  dropTarget,
+  resyncPosedTarget,
+  restoreOperableTarget,
+  useDestruction,
+} from './destruction'
 import { armoryStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
@@ -355,11 +360,29 @@ export function buildPassageBox(colliders: readonly ColliderEntry[]): Box3 | nul
   return box
 }
 
-/** Drop a STALE dormant prebuild (grid baked at another pose) — see the
- * header block. Awake targets are destruction's; never touched. */
-function dropStalePrebuild(nodeId: string): void {
+/**
+ * Retire a bake that no longer describes the pose. Two cases:
+ *
+ *  - a DORMANT prebuild on a node we are ABOUT to pose: it was baked at the
+ *    pose we are leaving, so it would wake wrong (see the header block).
+ *  - an AWAKE grid that was baked MID-SWING and now stands where the leaf
+ *    isn't: destruction.resyncPosedTarget compares the leaf's live world
+ *    matrices against the ones the grid was baked from and hands the node
+ *    back when they disagree. The handback heals the holes that grid held —
+ *    which beats a solid voxel ghost hanging in the doorway, blocking shots
+ *    in mid-air, for the rest of the session.
+ *
+ * Returns whether destruction gave the node BACK (the awake case only — a
+ * dormant prebuild never owned it), so the caller can re-assert the collider
+ * posture the handback latched solid.
+ */
+function retireStaleBake(nodeId: string): boolean {
   const target = useDestruction.getState().targets.get(nodeId)
-  if (target?.dormant) dropTarget(nodeId)
+  if (target?.dormant) {
+    dropTarget(nodeId)
+    return false
+  }
+  return resyncPosedTarget(nodeId)
 }
 
 /** Re-snapshot the state's collider transforms from the LIVE meshes — the
@@ -464,7 +487,7 @@ export function toggleOperable(state: OperableState): void {
   }
   // The pose is about to change — a dormant prebuild baked at the old pose
   // would wake wrong (see the header block).
-  dropStalePrebuild(state.nodeId)
+  retireStaleBake(state.nodeId)
   sfx.doorCreak()
 }
 
@@ -483,6 +506,21 @@ export function advanceOperables(states: Iterable<OperableState>, dt: number): v
       state.value = state.to
       applyPose(state)
       refreshColliderTransforms(state)
+      // A bake that landed MID-SWING froze the grid at a pose the leaf has
+      // now left. Retire it HERE, before the re-latch below reads isVoxelized,
+      // so a leaf that ends shut really does latch solid and retire its prism
+      // instead of staying walk-through behind a ghost grid.
+      if (retireStaleBake(state.nodeId) && state.open && state.passable) {
+        // The handback latches the node solid; an OPEN doorway has to go back
+        // to pass-through-for-feet, live-for-bullets. The prism stayed
+        // registered through the handback, so only the flags need re-asserting
+        // (setOpenColliders would register it a second time).
+        for (const collider of state.colliders) {
+          collider.disabled = true
+          collider.ballistic = true
+        }
+        state.ballistic = true
+      }
       if (!state.open && state.passable && !isVoxelized(state.nodeId)) {
         // Fully shut: solid again, latch catches; the passage prism and the
         // ballistic exception retire with the re-latch.
@@ -494,9 +532,6 @@ export function advanceOperables(states: Iterable<OperableState>, dt: number): v
         if (state.passage) unregisterPassage(state.passage)
         sfx.doorLatch()
       }
-      // A prevoxelize rebuild that landed MID-SWING baked a mid-arc pose —
-      // drop it so the next build/hit uses the settled one.
-      dropStalePrebuild(state.nodeId)
     }
   }
 }
