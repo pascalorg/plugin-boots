@@ -891,9 +891,11 @@ export const interactDebug = {
   /** Would the VOXEL lane relieve a cell centered here for a capsule whose feet
    * are at `feetY`? (collision.ts::passageRelievesCell — the exact predicate
    * collideVoxelTargets consults.) Lets QA prove, cell by cell, that the
-   * blockers standing in an open doorway are the ones being dropped. */
-  relievesCell: (x: number, y: number, z: number, feetY: number): boolean =>
-    passageRelievesCell(x, y, z, feetY),
+   * blockers standing in an open doorway are the ones being dropped. Pass
+   * `cellHalf` (the grid's `cell * 0.55`, as `occupancy` reports it) to ask the
+   * question the collision really asks — cube overlap, not centre containment. */
+  relievesCell: (x: number, y: number, z: number, feetY: number, cellHalf = 0): boolean =>
+    passageRelievesCell(x, y, z, feetY, cellHalf),
   /** Did the VOXEL lane actually ask this module for relief, and was it
    * granted? Distinguishes "relief said no" from "relief was never consulted". */
   reliefStats: () => passageReliefStats(),

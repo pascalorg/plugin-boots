@@ -4,6 +4,7 @@ import {
   clearPassages,
   moveCapsule,
   passageCount,
+  passageRelievesCell,
   PLAYER_CAPSULE,
   registerPassage,
   unregisterPassage,
@@ -214,6 +215,69 @@ describe('passage relief is bounded — it frees the opening and nothing else', 
     const before = pos.x
     collideVoxelTargets(pos, new Vector3(-1, 0, 0), PLAYER_CAPSULE.radius, PLAYER_CAPSULE.height)
     expect(pos.x).toBeGreaterThan(before + 0.01)
+  })
+
+  /**
+   * A CELL IS A CUBE, NOT A POINT — the second half of the same owner report.
+   *
+   * With the relief comparing only cell CENTRES against the prism, the flat QA
+   * house's front door still refused the player (open-walk advance 1.81 m
+   * against 20.6 m pristine) while the relief was demonstrably firing: 6633
+   * consults, 5067 grants. Recording and attributing every refusal named the
+   * blockers exactly — 1566 refusals, ZERO of them "below the feet", all of
+   * them "centre outside the prism", from two owners only: `wall_e`'s column at
+   * z 3.54 against a prism starting at z 3.587 (cell 0.203, so the cube spans
+   * 3.44-3.64 and over half of it stands INSIDE the opening) and the swung-open
+   * leaf's own grid at x 5.44 against a prism ending at x 5.40 (cell 0.15).
+   *
+   * Relieving centres only therefore leaves a fringe one cell thick lining the
+   * whole aperture. A 0.8 m door leaves a 0.68 m capsule 0.06 m of clearance per
+   * side, so a fringe of 0.08-0.11 m seals it on its own — the door looks open,
+   * reports open, and still will not admit anyone. These pin the rule that
+   * fixes it (relief means "this cube intrudes into the opening") and the bound
+   * that keeps it honest (a cube clear of the opening still resolves, so the
+   * padding can never open a hole in a jamb).
+   */
+  test('a cell whose CUBE overlaps the opening is relieved though its centre is outside', () => {
+    const world = makeDoorwayWorld()
+    const prism = openDoor(world)
+    // `collideVoxelTargets` resolves a cell as a sphere of `grid.cell * 0.55`;
+    // the relief has to be told the same half-extent to answer the same question.
+    for (const cell of [0.15, 0.203, 0.273]) {
+      const half = cell * 0.55
+      const feetY = prism.min.y
+      // Straddling the far face: more than half the cube is inside the opening.
+      const straddlesFarFace = prism.min.z - half * 0.5
+      expect(passageRelievesCell(0, 1, straddlesFarFace, feetY, half)).toBe(true)
+      // The same cell judged as a bare point — the fringe that sealed the door.
+      expect(passageRelievesCell(0, 1, straddlesFarFace, feetY, 0)).toBe(false)
+      // And the leaf's own grid, just past the hinge-side edge of the opening.
+      expect(passageRelievesCell(prism.max.x + half * 0.5, 1, 0, feetY, half)).toBe(true)
+    }
+  })
+
+  test('the padding is bounded by the cell itself: a cube clear of the opening still blocks', () => {
+    const world = makeDoorwayWorld()
+    const prism = openDoor(world)
+    const half = 0.203 * 0.55
+    const feetY = prism.min.y
+    // Two cells out from the opening is jamb wall / room, not doorway.
+    expect(passageRelievesCell(0, 1, prism.min.z - half * 3, feetY, half)).toBe(false)
+    expect(passageRelievesCell(prism.max.x + half * 3, 1, 0, feetY, half)).toBe(false)
+    // A generous half-extent must not reach across a whole doorway's width
+    // either: relief is per-cell, so it can only ever free what a cell occupies.
+    expect(passageRelievesCell(prism.max.x + 1, 1, 0, feetY, half)).toBe(false)
+  })
+
+  test('padding never relieves the floor: a cell below the feet resolves at any size', () => {
+    const world = makeDoorwayWorld()
+    const prism = openDoor(world)
+    // Dead centre of the doorway, cell just under the capsule's feet: the feet
+    // test is deliberately unpadded, or the padding would drop the player
+    // through the very threshold slab holding them up.
+    const feetY = prism.min.y + 0.05
+    expect(passageRelievesCell(0, feetY - 0.01, 0, feetY, 0.273 * 0.55)).toBe(false)
+    expect(passageRelievesCell(0, feetY + 0.01, 0, feetY, 0.273 * 0.55)).toBe(true)
   })
 
   test('relief is keyed to the LIVE registry, not to the door being open', () => {

@@ -5106,8 +5106,10 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
           // capsule across the threshold). Without this, waking a wall whose
           // grid crosses a doorway re-solidifies the very geometry the prism
           // relieves in the triangle lane, and the open door stops admitting
-          // the player.
-          if (passageRelievesCell(_voxelCenter.x, _voxelCenter.y, _voxelCenter.z, pos.y)) {
+          // the player. `r` is the cell's half-extent: the test has to know a
+          // cell is a CUBE, or the ring of cells whose centres sit just outside
+          // the prism lines the aperture and seals it anyway.
+          if (passageRelievesCell(_voxelCenter.x, _voxelCenter.y, _voxelCenter.z, pos.y, r)) {
             continue
           }
           const push = (minDist - dist) / dist

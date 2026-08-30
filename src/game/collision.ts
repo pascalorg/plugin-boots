@@ -201,13 +201,38 @@ const _passageCell = new Vector3()
  * in a doorway. (The prism's Y band is a second guard on the same invariant:
  * it starts at the door leaf's sill, so floor cells are usually already out of
  * the band before the feet test ever runs.)
+ *
+ * `cellHalf` is the HALF-EXTENT of the cell being resolved, and it is not
+ * optional in practice — a cell is a CUBE, not the point this test used to
+ * compare. Measured on the flat QA house's front door with every refusal
+ * recorded and attributed: 1566 refusals, all of them "centre outside the
+ * prism", from exactly two owners — `wall_e`'s column at z 3.54 against a
+ * prism starting at z 3.587 (cell 0.203, so the cube spans 3.44-3.64 and more
+ * than half of it is INSIDE the opening) and the open leaf's own grid at x 5.44
+ * against a prism ending at x 5.40 (cell 0.15). Dropping only the cells whose
+ * CENTRES fall inside leaves a fringe one cell thick lining the whole aperture,
+ * and a 0.8 m door has just 0.06 m of clearance per side for a 0.68 m capsule —
+ * so that fringe alone seals it. Padding the test by the cell's own half-extent
+ * is what makes the rule mean "this cube intrudes into the opening", which is
+ * the question the collision actually asks. It cannot open a hole in a jamb:
+ * a cube more than its own half-extent clear of the prism still resolves, so
+ * only cells genuinely overlapping the doorway volume are dropped.
  */
-export function passageRelievesCell(x: number, y: number, z: number, feetY: number): boolean {
+export function passageRelievesCell(
+  x: number,
+  y: number,
+  z: number,
+  feetY: number,
+  cellHalf = 0,
+): boolean {
   _reliefCalls++
   if (passages.length === 0) return false
+  // The feet test stays STRICT (unpadded): a voxel floor's cells sit below the
+  // feet, and padding this by `cellHalf` would relieve the very slab holding
+  // the capsule up in the doorway and drop the player through it.
   if (y < feetY) return false
   _passageCell.set(x, y, z)
-  const relieved = inPassage(_passageCell, PASSAGE_EDGE_EPS)
+  const relieved = inPassage(_passageCell, PASSAGE_EDGE_EPS + Math.max(0, cellHalf))
   if (relieved) _reliefGrants++
   return relieved
 }
