@@ -15,7 +15,7 @@ import {
 import { create } from 'zustand'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { passageRelievesCell } from './collision'
+import { passageCount, passageHidesCell, passageRelievesCell } from './collision'
 import { spawnFloorBreach } from './craters'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
@@ -4988,6 +4988,35 @@ export type TargetRayHit = { nodeId: string; distance: number; point: Vector3 }
 /** Legacy alias. */
 export type WallRayHit = TargetRayHit
 
+/**
+ * A cell standing in an OPEN DOORWAY is transparent to these rays.
+ *
+ * Third lane of the same rule. The player already walks through those cells
+ * (collision.ts relief) and no longer sees them (voxel-walls.tsx), so a bullet
+ * that stopped dead in mid-air in an open doorway reads as the GUN being
+ * broken — and enemy line-of-sight blocked by cells that exist for neither the
+ * eye nor the feet makes bots refuse to shoot back through a door they can
+ * walk through.
+ *
+ * UNPADDED, exactly like the render lane and unlike the collision lane: here
+ * over-relieving is the dangerous direction, because a pad that reached past
+ * the aperture would let shots through the wall BESIDE a doorway, or through a
+ * door that is shut. Under-relieving costs at most the half-cell fringe lining
+ * the opening, and a shot that clips that fringe is a shot that grazed the
+ * jamb — which is what a player would expect to see happen anyway.
+ *
+ * Module-scope so the hot path (every bullet, plus every bot's melee probe)
+ * allocates no closure; `_skipGrid` is set immediately before the call and
+ * read only inside it, and nothing here can yield.
+ */
+let _skipGrid: VoxelGridData | null = null
+const _skipOpenDoorway = (index: number): boolean => {
+  const grid = _skipGrid
+  if (grid === null) return false
+  const i = index * 3
+  return passageHidesCell(grid.centers[i]!, grid.centers[i + 1]!, grid.centers[i + 2]!)
+}
+
 /** First live voxel any damaged target's grid intersects along the ray. */
 export function raycastVoxelTargets(
   origin: Vector3,
@@ -4995,8 +5024,12 @@ export function raycastVoxelTargets(
   maxDist: number,
 ): TargetRayHit | null {
   let best: TargetRayHit | null = null
+  // No door open anywhere: hand the walk no predicate at all, so the common
+  // case is the walk it always was.
+  const relieve = passageCount() > 0
   for (const target of useDestruction.getState().targets.values()) {
     if (target.dormant) continue // the host mesh still owns rays/collision
+    _skipGrid = target.grid
     const hit = raycastVoxels(
       target.grid,
       origin.x,
@@ -5006,6 +5039,7 @@ export function raycastVoxelTargets(
       direction.y,
       direction.z,
       maxDist,
+      relieve ? _skipOpenDoorway : undefined,
     )
     if (!hit) continue
     if (!best || hit.distance < best.distance) {
@@ -5016,6 +5050,7 @@ export function raycastVoxelTargets(
       }
     }
   }
+  _skipGrid = null // don't pin a whole grid's buffers alive between shots
   return best
 }
 

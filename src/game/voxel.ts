@@ -702,6 +702,17 @@ export type VoxelRayHit = { index: number; distance: number }
  * exact and far cheaper than any mesh raycast — rotated grids just rotate
  * the WORLD ray into the grid frame first (rotations preserve distances, so
  * the returned distance is valid in world space as-is).
+ *
+ * `skip` lets a caller declare a live cell TRANSPARENT to this ray and keep
+ * walking — the doorway lanes use it, because a cell standing in an open
+ * doorway is one the player can already walk and see through, so a bullet has
+ * to pass it too. It belongs INSIDE the walk rather than in a re-cast loop
+ * outside: the DDA already knows the exact next cell, whereas nudging the
+ * origin past a skipped hit would have to advance by a whole cell diagonal and
+ * could jump a solid neighbour on the thickness axis (wall cells are 0.03 m
+ * thin there against 0.2 m in plane). Omit it and this is bit-for-bit the
+ * walk it always was — which is what keeps the support probes honest, since
+ * `probeLandingY` and `cellIsSupported` call straight in here.
  */
 export function raycastVoxels(
   grid: VoxelGridData,
@@ -712,6 +723,7 @@ export function raycastVoxels(
   dy: number,
   dz: number,
   maxDist: number,
+  skip?: (index: number) => boolean,
 ): VoxelRayHit | null {
   const { cellX, cellY, cellZ, origin, nx, ny, nz, yaw } = grid
   if (!basisIsYawOnly(grid.q)) {
@@ -782,7 +794,9 @@ export function raycastVoxels(
   let t = startT
   for (let guard = 0; guard < nx + ny + nz + 3; guard++) {
     const idx = grid.index.get(gridKey(ix, iy, iz, nx, ny))
-    if (idx !== undefined && grid.alive[idx]) return { index: idx, distance: t }
+    if (idx !== undefined && grid.alive[idx] && (skip === undefined || !skip(idx))) {
+      return { index: idx, distance: t }
+    }
     if (tX <= tY && tX <= tZ) {
       t = tX
       tX += tDeltaX
