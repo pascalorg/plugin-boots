@@ -48,8 +48,10 @@ import {
   noteLocalKill,
   noteLocalRemoval,
   noteLocalSegments,
+  rekeySharedWorld,
   setGridStamp,
   snapshotOf,
+  takePending,
   type SharedDelta,
   type SharedWorld,
 } from './shared-world'
@@ -124,6 +126,24 @@ describe('the shared model cannot write a scene', () => {
       const code = codeOf(await read(module))
       for (const needle of banned) {
         expect(code, `${module} uses ${needle}`).not.toContain(needle)
+      }
+    }
+  })
+
+  test('it takes its name from the transport, never from browser storage', async () => {
+    // The fence around a REJECTED design, which is why it is spelled out rather
+    // than assumed. Authorship here is a capability, not a label: mergeLane
+    // admits a record only when its prefix matches the sender the bus envelope
+    // named, and localWork — the only projection the Save bridges may consume —
+    // selects by that same prefix. A peer id remembered in storage would be
+    // self-asserted instead, so a hostile peer could mint under our name and
+    // have its wall arrive inside our own "yours" filter, and from there into a
+    // scene write. Whatever a re-key costs, it does not cost that. See the
+    // identity section of shared-world.ts for the whole argument.
+    for (const module of SHARED_MODULES) {
+      const code = codeOf(await read(module))
+      for (const needle of ['localStorage', 'sessionStorage', 'indexedDB', 'document.cookie']) {
+        expect(code, `${module} reads identity from ${needle}`).not.toContain(needle)
       }
     }
   })
@@ -470,6 +490,58 @@ describe('localWork is the only door, and it opens on our work alone', () => {
     // And it took nothing else with it.
     expect(healed.killed).toEqual(['shed-a'])
     expect(healed.pieces.length).toBe(before.pieces.length)
+  })
+
+  test('a re-key keeps our Save set ours, and still admits no one else', () => {
+    // The transport can rename us mid-session (the bus scope key contains the
+    // session id, so restoring an outbox lease replaces the bus). Two things
+    // must hold across that: the work we did under the old name is still ours to
+    // save, and the old name is not a door for anyone else to walk through.
+    const { world } = mixedWorld()
+    const before = localWork(world)
+    expect(before.pieces.length).toBeGreaterThan(0)
+    const oldName = world.self
+    takePending(world) // published under the old name; peers hold it
+
+    expect(rekeySharedWorld(world, 'me-after-the-lease')).toEqual([])
+    const after = localWork(world)
+    expect(after.pieces.map((r) => r.id)).toEqual(before.pieces.map((r) => r.id))
+    expect(after.items.map((r) => r.id)).toEqual(before.items.map((r) => r.id))
+    expect(after.apertures.map((r) => r.id)).toEqual(before.apertures.map((r) => r.id))
+    expect(after.strokes.map((r) => r.id)).toEqual(before.strokes.map((r) => r.id))
+    expect(after.cells.get('wall-a')).toEqual(before.cells.get('wall-a'))
+    expect(after.killed).toEqual(before.killed)
+
+    // Now the hostile half, with the old name in hand — it was the prefix on
+    // every record we ever published, so a peer knows it.
+    const forged = emptyDelta(oldName)
+    forged.gridStamp = STAMP
+    forged.pieces.push({
+      id: `${oldName}#9999`,
+      lamport: 900,
+      kind: 'wall',
+      slot: 'Wx:9,9,0',
+      mask: 511,
+      yaw: 0,
+      height: 2.7,
+      corners: null,
+    })
+    forged.items.push({
+      id: `${oldName}#9998`,
+      lamport: 901,
+      catalogId: 'sofa',
+      x: 1,
+      y: 0,
+      z: 1,
+      yaw: 0,
+    })
+    mergeDelta(world, forged, 'stranger')
+    for (const { delta, sender } of hostileFrames()) mergeDelta(world, delta, sender)
+
+    const stormed = localWork(world)
+    expect(stormed.pieces.map((r) => r.id)).toEqual(before.pieces.map((r) => r.id))
+    expect(stormed.items.map((r) => r.id)).toEqual(before.items.map((r) => r.id))
+    expect(stormed.cells.get('wall-a')).toEqual(before.cells.get('wall-a'))
   })
 
   test('only the local ops can grant local ownership, by construction', async () => {

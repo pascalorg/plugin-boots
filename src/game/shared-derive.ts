@@ -20,7 +20,7 @@
  *                    their slot ids mean different places.
  *   deriveCollapse   a round-synchronous fixpoint over the support graph:
  *                    same inputs, same output, in any order, on any machine.
- *   electSlots       one piece per slot when two peers claim it at once.
+ *   electSlots       one piece per slot id when two peers claim it at once.
  *   foldCoats        replays paint strokes into the per-cell coat ledger in
  *                    canonical order, so held-spray build-up converges.
  *   buriedApertures  the derived form of the "wall gone ⇒ its openings are
@@ -36,6 +36,8 @@
 
 import {
   quantPos,
+  quantYaw,
+  YAW_STEPS,
   type CellKey,
   type NodeId,
   type PieceRec,
@@ -112,20 +114,40 @@ export function mulberry32(seed: number): () => number {
  *
  * Slot ids are strings like "Wx:3,-1,0" — a kind plus integer lattice coords.
  * They are stable and deterministic, but they are only a WORLD ADDRESS given
- * grid.ts's module-level anchor (the lot origin the client snapped to) and its
- * storey ladder (the y of each floor). Two clients in the same project derive
- * the same pair and stamp the same number; a client that has not resolved its
- * lot yet, or is somehow in a different one, stamps differently and its
- * slot-addressed pieces are refused rather than dropped in the wrong place.
+ * grid.ts's module-level anchor (the lot origin the client snapped to, WITH
+ * its rotation) and its storey ladder (the y of each floor). Two clients in
+ * the same project derive the same inputs and stamp the same number; a client
+ * that has not resolved its lot yet, or is somehow in a different one, stamps
+ * differently and its slot-addressed pieces are refused rather than dropped in
+ * the wrong place.
  *
- * Anchor and storey values are quantized to the millimetre before hashing so
- * that floating-point noise in two clients' identical arithmetic cannot make
- * them disagree. Returns a non-zero u32 (0 is reserved for "unknown").
+ * THE YAW IS PART OF THE ADDRESS, NOT DECORATION. slotPose computes the pose
+ * in the grid frame and then carries it grid→world across the anchor seam:
+ * position rotated about the anchor point by `_anchor.yaw`, and that same yaw
+ * added to the piece's own. So two clients agreeing on the anchor POINT and
+ * the ladder while disagreeing on the anchor's rotation are in different
+ * coordinate systems — same slot id, walls somewhere else, some of them
+ * inside each other. Without the yaw in here the stamps match and the gate
+ * waves that frame through, which is the one failure the gate exists to stop.
+ *
+ * Anchor and storey values are quantized to the millimetre before hashing, and
+ * the yaw to grid.ts's own turn (wrapped, so 0 and 2π are one grid) so that
+ * floating-point noise in two clients' identical arithmetic cannot make them
+ * disagree. Returns a non-zero u32 (0 is reserved for "unknown").
  */
-export function gridStamp(anchorX: number, anchorZ: number, storeyYs: readonly number[]): number {
+export function gridStamp(
+  anchorX: number,
+  anchorZ: number,
+  anchorYaw: number,
+  storeyYs: readonly number[],
+): number {
   const parts: string[] = [
     (quantPos(anchorX) * 1000).toFixed(0),
     (quantPos(anchorZ) * 1000).toFixed(0),
+    // Prefixed because it is the one part that is not a millimetre: a stamp
+    // whose inputs are all bare integers invites the assumption that they
+    // share a unit.
+    `y${Math.round((quantYaw(anchorYaw) / (Math.PI * 2)) * YAW_STEPS) % YAW_STEPS}`,
   ]
   for (const y of storeyYs) parts.push((quantPos(y) * 1000).toFixed(0))
   const h = hashString(parts.join('|'))
@@ -224,16 +246,27 @@ export function deriveCollapse(input: CollapseInput): NodeId[] {
 // ── Slot election ───────────────────────────────────────────────────────────
 
 /**
- * One piece per slot.
+ * One piece per slot ID — the same unit of exclusion the runtime uses.
  *
  * Two players can hammer the same wall slot in the same tick, and both
  * records are legitimate — neither peer may overwrite the other's id, so the
- * OR-Set correctly keeps both. The GAME cannot show both (there is one slot,
- * and slotByPiece is a 1:1 map), so the tie is settled by a projection every
- * client computes identically: highest lamport wins, id breaks the tie. The
- * loser stays in the model, untombstoned — if the winner is later destroyed
- * the slot simply stays empty, which is the same thing that happens when a
- * single-player wall is destroyed, rather than a zombie piece popping back.
+ * OR-Set correctly keeps both. The GAME cannot show both, so the tie is
+ * settled by a projection every client computes identically: highest lamport
+ * wins, id breaks the tie. The loser stays in the model, untombstoned — if the
+ * winner is later destroyed the slot simply stays empty, which is the same
+ * thing that happens when a single-player wall is destroyed, rather than a
+ * zombie piece popping back.
+ *
+ * THE KEY IS THE SLOT ID ALONE, and the piece KIND is deliberately not part of
+ * it, because piece-slots.ts is the single authority on occupancy and it keys
+ * `pieceBySlot` by slot id: `registerPlacement` refuses outright when another
+ * piece already holds the slot. Kinds do share slot strings — a floor and a
+ * stair both address `F:i,k,s` — so electing per (kind, slot) hands the runtime
+ * two winners for one lattice address, and the second install is REFUSED by the
+ * registry rather than arbitrated here. Refused installs are the divergence
+ * this projection exists to prevent: the frame order decides who got there
+ * first, so two peers keep different pieces. Electing per slot id means the
+ * projection and the registry exclude exactly the same set.
  */
 export function electSlots(pieces: Iterable<PieceRec>): {
   winners: Map<string, PieceRec>
@@ -242,7 +275,7 @@ export function electSlots(pieces: Iterable<PieceRec>): {
   const winners = new Map<string, PieceRec>()
   const losers: PieceRec[] = []
   for (const rec of canonicalRecordOrder(pieces)) {
-    const key = `${rec.kind}|${rec.slot}`
+    const key = rec.slot
     const prior = winners.get(key)
     if (!prior) {
       winners.set(key, rec)

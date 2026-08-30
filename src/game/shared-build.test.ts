@@ -129,7 +129,7 @@ function boot(): Harness {
     sink: (delta) => sent.push(delta),
     notice: (text) => notices.push(text),
   })
-  const stamp = publishGridStamp(0, 0, [gridTerrainY(), ...LADDER])
+  const stamp = publishGridStamp(0, 0, 0, [gridTerrainY(), ...LADDER])
   return { mine, theirs, sent, notices, stamp }
 }
 
@@ -255,7 +255,7 @@ describe('with sync off the build lane does not exist', () => {
     })
 
     // Every seam the wiring touches, called exactly as the game calls it.
-    expect(publishGridStamp(0, 0, LADDER)).toBe(0)
+    expect(publishGridStamp(0, 0, 0, LADDER)).toBe(0)
     reconcileSharedPieces()
     expect(publishItem(id, 'crate-small', [0, 0, 0], 0)).toBeNull()
     expect(publishAperture(id, 'opening-door-hinged', 'wall-1', 1, 1, 0.9, 2)).toBeNull()
@@ -273,7 +273,7 @@ describe('with sync off the build lane does not exist', () => {
       corners: null,
     })!
     const hostile = emptyDelta('them')
-    hostile.gridStamp = gridStamp(0, 0, LADDER)
+    hostile.gridStamp = gridStamp(0, 0, 0, LADDER)
     hostile.pieces.push(rec)
     const fx = receiveBuildDelta(hostile, 'them')
     expect(fx.addedPieces).toHaveLength(0)
@@ -616,11 +616,27 @@ describe('a builder on a different lot grid', () => {
     const wrong = frame(h, 'them', (d) => d.items.push(item))
     wrong.gridStamp = 0 // unknown grid: the hardest case the gate allows
     const fx = receiveBuildDelta(wrong, 'them')
-    // The gate closed (their slots are meaningless to us) but the item is
-    // world-absolute, so it lands: a mismatch costs pieces, not everything.
-    expect(fx.refusedGrid).toBe(true)
+    // The item is world-absolute, so it lands: a mismatch costs pieces, not
+    // everything. And the gate keeps quiet, because this frame never spelled a
+    // slot — there is nothing for a stamp to have been wrong about.
+    expect(fx.refusedGrid).toBe(false)
+    expect(fx.dropped).toBe(0)
     expect(useItems.getState().items).toHaveLength(1)
     expect(isForeignPlacement(useItems.getState().items[0]!.id)).toBe(true)
+
+    // Same peer, same bad stamp, now with a wall in the frame: that one IS
+    // refused, and the second item still arrives beside it.
+    const second = addLocalItem(h.theirs, { catalogId: ITEM.id, x: 4, y: 0, z: 3, yaw: 0 })!
+    const both = frame(h, 'them', (d) => {
+      d.pieces.push(theirWall(h, WALL_SLOT))
+      d.items.push(second)
+    })
+    both.gridStamp = 0
+    const fx2 = receiveBuildDelta(both, 'them')
+    expect(fx2.refusedGrid).toBe(true)
+    expect(fx2.dropped).toBe(1)
+    expect(useBoots.getState().placed).toHaveLength(0)
+    expect(useItems.getState().items).toHaveLength(2)
   })
 
   test('a stamp we have not published yet refuses everyone’s slots, in silence', () => {
@@ -639,7 +655,7 @@ describe('a builder on a different lot grid', () => {
       corners: null,
     })!
     const delta = emptyDelta('them')
-    delta.gridStamp = gridStamp(0, 0, LADDER)
+    delta.gridStamp = gridStamp(0, 0, 0, LADDER)
     delta.pieces.push(rec)
     expect(receiveBuildDelta(delta, 'them').refusedGrid).toBe(true)
     expect(useBoots.getState().placed).toHaveLength(0)
@@ -651,7 +667,7 @@ describe('a builder on a different lot grid', () => {
 
     // Once we know our own lot, the very same frame is a real disagreement and
     // the player hears about it.
-    publishGridStamp(0, 0, [gridTerrainY(), ...LADDER])
+    publishGridStamp(0, 0, 0, [gridTerrainY(), ...LADDER])
     expect(receiveBuildDelta(delta, 'them').refusedGrid).toBe(true)
     expect(notices).toEqual(['A builder is on a different lot grid — their pieces are hidden'])
   })

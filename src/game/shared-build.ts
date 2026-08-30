@@ -194,19 +194,20 @@ function say(text: string): void {
 
 /**
  * Publish this client's build-grid fingerprint. Slot ids are addresses
- * RELATIVE to grid.ts's module anchor and storey ladder, so a peer whose
- * stamp differs is speaking a different coordinate system and mergeDelta
- * refuses its slot-addressed pieces (raising `refusedGrid`, which we surface
- * as a line the player can read). Called from PlacedPieces the moment the
- * anchor and ladder are installed, which is the only moment they change.
+ * RELATIVE to grid.ts's module anchor (point AND rotation) and storey ladder,
+ * so a peer whose stamp differs is speaking a different coordinate system and
+ * mergeDelta refuses its slot-addressed pieces (raising `refusedGrid`, which we
+ * surface as a line the player can read). Called from PlacedPieces the moment
+ * the anchor and ladder are installed, which is the only moment they change.
  */
 export function publishGridStamp(
   anchorX: number,
   anchorZ: number,
+  anchorYaw: number,
   storeyYs: readonly number[],
 ): number {
   if (!sync) return 0
-  const stamp = gridStamp(anchorX, anchorZ, storeyYs)
+  const stamp = gridStamp(anchorX, anchorZ, anchorYaw, storeyYs)
   setGridStamp(sync.world, stamp)
   return stamp
 }
@@ -452,29 +453,22 @@ export function forgetSharedPieces(): void {
 /**
  * One piece per slot, agreed by everyone.
  *
- * `electSlots` keys winners by `kind|slot`, which is one notch weaker than
- * the runtime's own authority: piece-slots.ts registers by SLOT ID alone, and
- * stairs and floors share the `F:` slots. So the election is narrowed here by
- * the same canonical rule (ascending (lamport, id) — the later record wins),
- * which keeps the projection derived, total and order-free while matching
- * what the registry will actually accept.
+ * `electSlots` keys winners by SLOT ID, which is the same unit of exclusion
+ * piece-slots.ts enforces (`pieceBySlot`, one piece per slot id, and a floor
+ * and a stair share the `F:` addresses), so the election needs no narrowing
+ * here: every winner it returns is a placement the registry will accept.
+ * `deposedPieces` is the memory that keeps a loser from coming back, and the
+ * install order stays canonical so two clients walk the same list.
  */
 function electedPieces(): { desired: Map<RecordId, PieceRec>; losers: PieceRec[] } {
   const s = sync!
   const { winners, losers } = electSlots(liveRecords(s.world.pieces))
-  const bySlot = new Map<string, PieceRec>()
-  const deposed: PieceRec[] = [...losers]
-  for (const rec of canonicalRecordOrder([...winners.values()])) {
-    const prior = bySlot.get(rec.slot)
-    if (prior) deposed.push(prior)
-    bySlot.set(rec.slot, rec)
-  }
   const desired = new Map<RecordId, PieceRec>()
-  for (const rec of bySlot.values()) {
+  for (const rec of canonicalRecordOrder([...winners.values()])) {
     if (deposedPieces.has(rec.id)) continue // lost once, gone for good
     desired.set(rec.id, rec)
   }
-  return { desired, losers: deposed }
+  return { desired, losers }
 }
 
 /** Human name for a piece kind, for the one line the loser gets to read. */

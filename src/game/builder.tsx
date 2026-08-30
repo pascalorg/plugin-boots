@@ -1217,8 +1217,14 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     // in the wrong place (shared-build surfaces that refusal to the player).
     // The terrain rung goes in first: with no ladder the storeys are measured
     // from it, so two lots at different elevations are genuinely different
-    // grids even when the anchor and the ladder match.
-    publishGridStamp(anchor.x, anchor.z, [gridTerrainY(), ...(getStoreyLadder() ?? [])])
+    // grids even when the anchor and the ladder match. The anchor's YAW counts
+    // for the same reason: slotPose carries the lattice across the seam by
+    // rotating about the anchor, so the same slot id under two rotations is two
+    // different places.
+    publishGridStamp(anchor.x, anchor.z, anchor.yaw, [
+      gridTerrainY(),
+      ...(getStoreyLadder() ?? []),
+    ])
     for (const p of useBoots.getState().placed) {
       if (p.slotId) registerPlacement(p.slotId, p.id)
     }

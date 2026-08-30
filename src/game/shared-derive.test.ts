@@ -96,20 +96,42 @@ describe('stable seeds', () => {
 
 describe('gridStamp', () => {
   test('same lot, same stamp; different lot, different stamp', () => {
-    const a = gridStamp(12.5, -3.25, [0, 2.7, 5.4])
-    expect(gridStamp(12.5, -3.25, [0, 2.7, 5.4])).toBe(a)
-    expect(gridStamp(12.5, -3.25, [0, 2.7])).not.toBe(a)
-    expect(gridStamp(12.6, -3.25, [0, 2.7, 5.4])).not.toBe(a)
-    expect(gridStamp(12.5, -3.24, [0, 2.7, 5.4])).not.toBe(a)
+    const a = gridStamp(12.5, -3.25, 0, [0, 2.7, 5.4])
+    expect(gridStamp(12.5, -3.25, 0, [0, 2.7, 5.4])).toBe(a)
+    expect(gridStamp(12.5, -3.25, 0, [0, 2.7])).not.toBe(a)
+    expect(gridStamp(12.6, -3.25, 0, [0, 2.7, 5.4])).not.toBe(a)
+    expect(gridStamp(12.5, -3.24, 0, [0, 2.7, 5.4])).not.toBe(a)
+  })
+
+  test('a rotated anchor is a different grid, not the same one', () => {
+    // The whole point: slotPose rotates the lattice about the anchor, so two
+    // clients agreeing on the point and the ladder while disagreeing on the
+    // rotation would otherwise pass the gate and place "Wx:1,0,0" in two
+    // different places — the one mismatch that lands rather than being refused.
+    const a = gridStamp(12.5, -3.25, 0, [0, 2.7, 5.4])
+    expect(gridStamp(12.5, -3.25, Math.PI / 2, [0, 2.7, 5.4])).not.toBe(a)
+    expect(gridStamp(12.5, -3.25, Math.PI, [0, 2.7, 5.4])).not.toBe(a)
+    // A degree apart is a different grid too: at 30 m from the anchor that is
+    // half a metre of drift, and the lattice is 3 m wide.
+    expect(gridStamp(12.5, -3.25, Math.PI / 180, [0, 2.7, 5.4])).not.toBe(a)
   })
 
   test('float noise below a millimetre cannot split two clients', () => {
-    const a = gridStamp(12.5, -3.25, [0, 2.7, 5.4])
-    expect(gridStamp(12.5000001, -3.2499999, [0, 2.7000001, 5.4])).toBe(a)
+    const a = gridStamp(12.5, -3.25, 0, [0, 2.7, 5.4])
+    expect(gridStamp(12.5000001, -3.2499999, 0, [0, 2.7000001, 5.4])).toBe(a)
+    // Yaw is wrapped and quantized to grid.ts's own turn, so the same rotation
+    // spelled differently is the same grid: a full turn, a negative angle, and
+    // noise below one 65536th all agree.
+    expect(gridStamp(12.5, -3.25, Math.PI * 2, [0, 2.7, 5.4])).toBe(a)
+    const b = gridStamp(12.5, -3.25, Math.PI / 2, [0, 2.7, 5.4])
+    expect(gridStamp(12.5, -3.25, Math.PI / 2 - Math.PI * 2, [0, 2.7, 5.4])).toBe(b)
+    expect(gridStamp(12.5, -3.25, Math.PI / 2 + 1e-9, [0, 2.7, 5.4])).toBe(b)
   })
 
   test('never returns the reserved 0', () => {
-    for (let i = 0; i < 2000; i++) expect(gridStamp(i * 0.001, -i * 0.002, [i * 0.01])).not.toBe(0)
+    for (let i = 0; i < 2000; i++) {
+      expect(gridStamp(i * 0.001, -i * 0.002, i * 0.003, [i * 0.01])).not.toBe(0)
+    }
   })
 })
 
@@ -278,7 +300,7 @@ describe('electSlots', () => {
     const rand = mulberry32(8)
     for (let trial = 0; trial < 10; trial++) {
       const { winners, losers } = electSlots(shuffled(claims, rand))
-      expect(winners.get('wall|Wx:1,0,0')?.id).toBe('bob#4')
+      expect(winners.get('Wx:1,0,0')?.id).toBe('bob#4')
       expect(losers.map((r) => r.id)).toEqual(['alice#2'])
     }
   })
@@ -288,17 +310,23 @@ describe('electSlots', () => {
     const rand = mulberry32(9)
     for (let trial = 0; trial < 10; trial++) {
       const { winners } = electSlots(shuffled(claims, rand))
-      expect(winners.get('wall|Wx:1,0,0')?.id).toBe('bob#1')
+      expect(winners.get('Wx:1,0,0')?.id).toBe('bob#1')
     }
   })
 
-  test('different kinds may share a slot string', () => {
+  test('two kinds on one slot string still elect one winner', () => {
+    // A floor and a stair both address `F:i,k,s`, and piece-slots.ts holds ONE
+    // piece per slot id: electing per (kind, slot) would hand the runtime two
+    // winners for one address and let `registerPlacement` refuse the second,
+    // which makes the outcome depend on frame order — the divergence this
+    // projection exists to remove.
     const { winners, losers } = electSlots([
       piece('a#1', 1, 'F:0,0,0'),
-      { ...piece('a#2', 1, 'F:0,0,0'), kind: 'floor' },
+      { ...piece('a#2', 1, 'F:0,0,0'), kind: 'stairs' },
     ])
-    expect(winners.size).toBe(2)
-    expect(losers).toEqual([])
+    expect(winners.size).toBe(1)
+    expect(winners.get('F:0,0,0')?.id).toBe('a#2')
+    expect(losers.map((r) => r.id)).toEqual(['a#1'])
   })
 
   test('unclaimed slots produce nothing', () => {

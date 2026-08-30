@@ -19,6 +19,7 @@ import {
   effectsAreEmpty,
   hasPending,
   isAuthoredBy,
+  isOurs,
   isSafeId,
   isSafePeerId,
   itemTargetId,
@@ -38,6 +39,7 @@ import {
   pieceTargetId,
   quantPos,
   quantYaw,
+  rekeySharedWorld,
   removedCells,
   resetSharedWorld,
   restorePending,
@@ -170,6 +172,113 @@ describe('identity', () => {
     expect(pieceTargetId('alice#3')).toBe('__boots-piece-alice#3')
     expect(itemTargetId('bob#3')).toBe('__boots-item-bob#3')
     expect(pieceTargetId('alice#3')).not.toBe(pieceTargetId('bob#3'))
+  })
+})
+
+// ── A name the transport takes back ─────────────────────────────────────────
+
+describe('a re-key renames us without disowning our work', () => {
+  const ALICE2 = 'alice-released'
+
+  test('the state stays, the name changes, and nothing is re-minted', () => {
+    const world = worldFor(ALICE)
+    const wall = idOf(addLocalPiece(world, piece('ignored')))
+    const sofa = idOf(addLocalItem(world, { catalogId: 'sofa', x: 1, y: 0, z: 1, yaw: 0 }))
+    noteLocalRemoval(world, WALL, [1, 2, 3])
+    noteLocalKill(world, 'gone')
+    takePending(world) // published: peers hold all of it under the old name
+
+    expect(rekeySharedWorld(world, ALICE2)).toEqual([])
+    expect(world.self).toBe(ALICE2)
+    expect(world.formerSelves).toEqual([ALICE])
+
+    // The records are the SAME records — a rename is not a republish, which is
+    // the entire point: peers already have these and would otherwise get a
+    // second copy of every sofa.
+    expect(liveRecords(world.pieces).map((r) => r.id)).toEqual([wall])
+    expect(liveRecords(world.items).map((r) => r.id)).toEqual([sofa])
+    expect(hasPending(world)).toBe(false)
+
+    // And Save still knows they are the player's, along with the rubble.
+    const mine = localWork(world)
+    expect(mine.pieces.map((r) => r.id)).toEqual([wall])
+    expect(mine.items.map((r) => r.id)).toEqual([sofa])
+    expect(mine.cells.get(WALL)).toEqual([1, 2, 3])
+    expect(mine.killed).toEqual(['gone'])
+
+    // The next record is minted under the new name and is vouched for by it.
+    const next = mintRecordId(world)
+    expect(isAuthoredBy(next, ALICE2)).toBe(true)
+    expect(isOurs(world, next)).toBe(true)
+    expect(isOurs(world, wall)).toBe(true)
+    expect(isOurs(world, 'bob#1')).toBe(false)
+  })
+
+  test('pending adds are reported, because no peer will ever accept them', () => {
+    const world = worldFor(ALICE)
+    const staged = idOf(addLocalPiece(world, piece('ignored')))
+    noteLocalRemoval(world, WALL, [4])
+    killRecord(world, 'items', 'bob#7')
+
+    // Minted but not yet published: our new envelope cannot vouch for the old
+    // prefix, so this one add is the whole cost of the rename.
+    expect(rekeySharedWorld(world, ALICE2)).toEqual([staged])
+
+    // The rest of the journal is nameless and still goes out — under the new
+    // name, with the damage and the tombstone intact.
+    const out = takePending(world)
+    expect(out?.from).toBe(ALICE2)
+    expect(out?.nodes[0]?.removed).toEqual([4])
+    expect(out?.deadItems).toEqual(['bob#7'])
+  })
+
+  test('the wire question stays narrow: a former name is not a way in', () => {
+    const world = worldFor(ALICE)
+    rekeySharedWorld(world, ALICE2)
+    // BOB knows our old name — it was on every record we published. Claiming it
+    // is still refused, because the sender the bus names is BOB.
+    const forged = deltaWith(BOB, { pieces: [piece(`${ALICE}#99`)] })
+    const fx = mergeDelta(world, forged, BOB)
+    expect(fx.addedPieces).toEqual([])
+    expect(fx.dropped).toBe(1)
+    expect(liveRecords(world.pieces)).toEqual([])
+    // Which is what keeps the widened ownership question safe: isOurs would have
+    // said yes to that id, and localWork feeds the Save bridges.
+    expect(isOurs(world, `${ALICE}#99`)).toBe(true)
+    expect(localWork(world).pieces).toEqual([])
+  })
+
+  test('an unusable new name is refused, and so is a rename to the same name', () => {
+    const world = worldFor(ALICE)
+    for (const bad of ['', 'alice#2', 'a'.repeat(MAX_PEER_ID_LEN + 1), 'has space', ALICE]) {
+      expect(rekeySharedWorld(world, bad)).toEqual([])
+      expect(world.self).toBe(ALICE)
+      expect(world.formerSelves).toEqual([])
+    }
+  })
+
+  test('the memory of old names is bounded, and a name is remembered once', () => {
+    const world = worldFor(ALICE)
+    for (let i = 1; i <= 12; i++) rekeySharedWorld(world, `name-${i}`)
+    expect(world.self).toBe('name-12')
+    expect(world.formerSelves).toHaveLength(8)
+    expect(world.formerSelves[0]).toBe('name-4') // oldest dropped, order kept
+    expect(world.formerSelves.at(-1)).toBe('name-11')
+    expect(isOurs(world, 'alice#1')).toBe(false) // long gone, and that is fine
+    expect(isOurs(world, 'name-5#1')).toBe(true)
+
+    rekeySharedWorld(world, 'name-11')
+    rekeySharedWorld(world, 'name-12')
+    expect(world.formerSelves.filter((n) => n === 'name-11')).toHaveLength(1)
+  })
+
+  test('names survive teardown, so a second Jump-in still knows its own work', () => {
+    const world = worldFor(ALICE)
+    rekeySharedWorld(world, ALICE2)
+    resetSharedWorld(world)
+    expect(world.self).toBe(ALICE2)
+    expect(world.formerSelves).toEqual([ALICE])
+    expect(sharedWorldDebug(world).formerSelves).toEqual([ALICE])
   })
 })
 
@@ -400,6 +509,34 @@ describe('grid fingerprint gate', () => {
     expect(liveRecords(world.pieces)).toEqual([])
     expect(liveRecords(world.items).length).toBe(1)
     expect(removedCells(world, WALL)).toEqual([3])
+  })
+
+  test('a frame with no slots in it is not accused of being on another grid', () => {
+    // A rifle shot, a sofa and a coat of paint are addressed without the grid —
+    // node-relative, world-absolute, node-relative. A peer whose storey ladder
+    // has not installed yet publishes stamp 0 and sends exactly those, and the
+    // frame is COMPLETE: nothing was refused, so nothing was wrong. Raising the
+    // effect here would have the notice tell the player a stranger is in a
+    // different lot on the evidence of a frame that never mentioned one.
+    const world = worldFor(ALICE, 7)
+    const fx = mergeDelta(
+      world,
+      deltaWith(
+        BOB,
+        {
+          items: [{ id: 'bob#2', lamport: 2, catalogId: 'sofa', x: 1, y: 0, z: 1, yaw: 0 }],
+          nodes: [nodeDelta({ nodeId: WALL, removed: [3] })],
+          deadPieces: ['carol#9'],
+        },
+        0,
+      ),
+      BOB,
+    )
+    expect(fx.refusedGrid).toBe(false)
+    expect(fx.dropped).toBe(0)
+    expect(liveRecords(world.items).length).toBe(1)
+    expect(removedCells(world, WALL)).toEqual([3])
+    expect(world.pieces.dead.has('carol#9')).toBe(true)
   })
 
   test('an unknown (0) stamp also refuses', () => {

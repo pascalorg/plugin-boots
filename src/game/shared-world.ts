@@ -66,7 +66,8 @@
  * Nothing here reaches a scene write. The four Save bridges (keep.ts,
  * save-demolition.ts, paint-keep.ts, item-keep.ts) must only ever see the
  * LOCAL player's work, so every lane can answer "is this mine?" without a
- * lookup: `id.startsWith(self + '#')`. Voxel damage has no per-cell author
+ * lookup: `id.startsWith(self + '#')`, widened by `isOurs` to the names the
+ * transport has made us leave behind. Voxel damage has no per-cell author
  * (that would double the memory), so a node keeps a second, LOCAL-ONLY set
  * `mine` — the subset of `removed` this client caused. `mine` is never
  * encoded, never merged, and never read by anything but `localWork()`; the
@@ -146,6 +147,106 @@ export function isAuthoredBy(id: RecordId, peer: PeerId): boolean {
 export function authorOf(id: RecordId): PeerId {
   const hash = id.indexOf('#')
   return hash > 0 ? id.slice(0, hash) : ''
+}
+
+/**
+ * OUR NAME CAN CHANGE MID-SESSION, AND IT STAYS THE TRANSPORT'S TO GIVE.
+ *
+ * The host does not promise a stable session id: restoring a persisted outbox
+ * lease adopts the restored operation's id, and the bus scope key contains the
+ * session id, so the bus object is replaced with one answering to a new name.
+ * Records already published carry the old name in their id prefix.
+ *
+ * ── Why the id is NOT a persisted per-browser client id ──────────────────────
+ * The tempting fix is to stop deriving identity from the transport: mint a
+ * client id once, keep it in storage, and demote the session id to routing.
+ * Then a re-key changes nothing and a reload keeps authoring under the same
+ * name. It is the wrong trade, and the reason is the invariant this whole
+ * model is built to protect.
+ *
+ * Authorship here is not a label, it is a CAPABILITY: `mergeLane` accepts a
+ * record only when its prefix equals the sender the BUS ENVELOPE named, and
+ * `localWork` — the one projection the four Save bridges may consume — selects
+ * by that same prefix. Together they mean a peer cannot put a record into our
+ * Save set, so it cannot write into our document. A persisted client id is
+ * self-asserted: nothing in the envelope contradicts it, because the host
+ * stamps the session id and knows nothing of our storage. A hostile peer would
+ * simply mint `<our-client-id>#<n>` and the wall it invented would arrive
+ * inside our own "yours" filter, and from there into a scene write on our disk.
+ * There is no cheap repair: binding client id → session id on first sight fails
+ * on the honest case, because two tabs of one browser legitimately share the
+ * persisted id, so the binding is many-to-one and a squatter is
+ * indistinguishable from a second tab — and the moment to squat is exactly the
+ * re-key window the scheme exists to smooth over.
+ *
+ * ── So a reload deliberately does NOT keep the old identity ─────────────────
+ * Stated out loud, because the opposite is the intuitive expectation: coming
+ * back after F5 makes us a NEW author. What is lost by that is small — our
+ * scene is empty on return, so "re-owning" the previous session's records would
+ * offer the Save panel walls the player can no longer see — and what is gained
+ * is that a record bearing a dead session's prefix belongs to nobody's Save
+ * set, so forging one poisons no document. Identity is per session by design;
+ * these helpers only stop a name CHANGE from erasing what we already did.
+ *
+ * ── What a re-key must therefore not do: rebuild the world ───────────────────
+ * The duplicated furniture the room actually shows comes from recovery, not
+ * from the naming: tearing the world down and re-minting the local scene under
+ * the new name republishes work every peer already holds. Items and apertures
+ * have no slot, so nothing collapses them and the room gets two sofas. It also
+ * throws away the two things only we hold — `mine`/`mySegments`/`killedByMe`,
+ * which is how Save knows which rubble is ours, and the ids of our published
+ * records, without which we cannot even tombstone the duplicates we made.
+ *
+ * Renaming in place keeps all of it. Nothing is re-minted, so nothing
+ * duplicates; peers keep our old records exactly as they accepted them; the
+ * next record we mint carries the new name and is vouched for by the new
+ * envelope. `formerSelves` is what makes the rename honest afterwards: "is
+ * this mine?" is a question about the PLAYER, and the answer has to span every
+ * name this tab has published under.
+ */
+const MAX_FORMER_SELVES = 8
+
+/**
+ * Adopt a new transport name, keeping the state and the memory of the old one.
+ *
+ * Returns the ids of pending ADDS that were minted under the former name.
+ * Those are the one thing a rename cannot save: they are still in the journal,
+ * so no peer has them, and every peer will refuse them now that our envelope
+ * says someone else — they name a record we can no longer vouch for. The model
+ * will not rewrite their ids, because it does not know what the runtime bound
+ * them to; the wiring layer owns that map and must re-publish that work. The
+ * list is at most one tick long, which is the whole difference between this and
+ * rebuilding: a re-key now costs the last 66 ms of local publishing instead of
+ * the session's.
+ *
+ * Tombstones and damage in the journal are unaffected — neither carries our
+ * name, and both apply whoever sends them.
+ */
+export function rekeySharedWorld(world: SharedWorld, next: PeerId): RecordId[] {
+  if (!isSafePeerId(next) || next === world.self) return []
+  const stale: RecordId[] = []
+  for (const lane of LANES) {
+    for (const id of (world.journal[lane] as Map<RecordId, Stamped>).keys()) stale.push(id)
+  }
+  world.formerSelves = [...world.formerSelves.filter((id) => id !== world.self), world.self].slice(
+    -MAX_FORMER_SELVES,
+  )
+  world.self = next
+  stale.sort()
+  return stale
+}
+
+/**
+ * "Did this player make this?" — the question Save asks, and the only one that
+ * may span names. `isAuthoredBy(id, world.self)` remains the question the WIRE
+ * asks, and it must stay narrow: a frame is vouched for by one live session.
+ */
+export function isOurs(world: SharedWorld, id: RecordId): boolean {
+  if (isAuthoredBy(id, world.self)) return true
+  for (const former of world.formerSelves) {
+    if (isAuthoredBy(id, former)) return true
+  }
+  return false
 }
 
 /**
@@ -469,6 +570,13 @@ function emptyJournal(): Journal {
 export type SharedWorld = {
   /** This client's peer id (the bus session id). */
   self: PeerId
+  /**
+   * Names this tab published under BEFORE the current one, oldest first — see
+   * rekeySharedWorld. Empty in the ordinary case. Only ever written from the
+   * transport's own account of who we were, never from a payload, so a peer
+   * cannot get itself adopted as a former us.
+   */
+  formerSelves: PeerId[]
   /** Lamport clock: max(seen) — bumped on every local op, raised on merge. */
   clock: number
   /** Local record serial (the `#n` half of a minted id). */
@@ -504,6 +612,7 @@ export type SharedWorld = {
 export function createSharedWorld(self: PeerId): SharedWorld {
   return {
     self: isSafePeerId(self) ? self : 'local',
+    formerSelves: [],
     clock: 0,
     seq: 0,
     gridStamp: 0,
@@ -1325,10 +1434,18 @@ export function mergeDelta(
   // slot names point somewhere else entirely, so we take everything EXCEPT
   // the slot-addressed lane. Tombstones are slot-free (they name a record id)
   // so they still apply — a piece can always be destroyed.
+  //
+  // The refusal is only WORTH REPORTING when the frame actually spelled a slot.
+  // Damage, items, apertures and paint are addressed without the grid, so a
+  // rifle shot from a peer whose ladder has not installed yet is a complete,
+  // correct frame that the gate has no opinion about — raising refusedGrid on
+  // it would have the notice accuse a peer of being in a different lot on the
+  // evidence of a frame that never mentioned one.
   const slotsOk = sender === null || (delta.gridStamp !== 0 && delta.gridStamp === world.gridStamp)
-  if (!slotsOk) {
+  const claimedSlots = Array.isArray(delta.pieces) && delta.pieces.length > 0
+  if (!slotsOk && claimedSlots) {
     fx.refusedGrid = true
-    if (Array.isArray(delta.pieces)) fx.dropped += delta.pieces.length
+    fx.dropped += delta.pieces.length
   }
   mergeLane(
     world,
@@ -1582,8 +1699,11 @@ export function localWork(world: SharedWorld): LocalWork {
     }
     if (dmg.killedByMe) killed.push(nodeId)
   }
+  // isOurs, not isAuthoredBy: the wire's question is "which live session
+  // vouches for this record", but Save's question is about the PLAYER, and a
+  // mid-session re-key must not quietly disown the fort they just built.
   const mine = <T extends Stamped>(lane: OrSet<T>): T[] =>
-    liveRecords(lane).filter((rec) => isAuthoredBy(rec.id, world.self))
+    liveRecords(lane).filter((rec) => isOurs(world, rec.id))
   return {
     cells,
     segments,
@@ -1609,8 +1729,10 @@ export function setGridStamp(world: SharedWorld, stamp: number): void {
 
 // ── Teardown ────────────────────────────────────────────────────────────────
 
-/** Forget everything (session exit). The peer id and serial survive so a
- * re-entry in the same tab cannot re-mint ids it already published. */
+/** Forget everything (session exit). The peer id, the names it used to publish
+ * under, and the serial survive so a re-entry in the same tab cannot re-mint
+ * ids it already published — and cannot mistake its own earlier work for a
+ * stranger's if it comes back from a peer. */
 export function resetSharedWorld(world: SharedWorld): void {
   world.nodes.clear()
   world.pieces = emptyOrSet()
@@ -1627,6 +1749,10 @@ export function resetSharedWorld(world: SharedWorld): void {
 /** Plain-data QA dump for the `__boots` handle — copies, never live refs. */
 export function sharedWorldDebug(world: SharedWorld): {
   self: PeerId
+  /** Non-empty means the transport re-keyed us mid-session (see
+   * rekeySharedWorld) — worth seeing in QA, because it explains why our older
+   * records carry a prefix that is not `self`. */
+  formerSelves: PeerId[]
   clock: number
   nodes: number
   cells: number
@@ -1653,6 +1779,7 @@ export function sharedWorldDebug(world: SharedWorld): {
   }
   return {
     self: world.self,
+    formerSelves: [...world.formerSelves],
     clock: world.clock,
     nodes: world.nodes.size,
     cells,
