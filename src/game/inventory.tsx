@@ -11,7 +11,10 @@ import type { GameSession } from './session'
  * thumbnail + GLB URLs). Press I in-game (any tool) to open; pick a couch,
  * an appliance, a planter — item-place.tsx arms an aim-anchored ghost and
  * clicking drops GAME-ONLY copies; item-keep.ts converts them into real
- * `item` nodes only from the sidebar Save button.
+ * `item` nodes only from the sidebar Save button. A last 'openings' tab
+ * (OPENING_ENTRIES, not catalog rows) offers doors and windows instead:
+ * those arm item-place's WALL-SNAP ghost and Save creates real host
+ * `door`/`window` nodes on the aimed wall.
  *
  * Imperative DOM, the hud.ts idiom (no React): the menu mounts INSIDE the
  * session's fullscreen container, builds its card grid once per open/tab
@@ -39,6 +42,143 @@ import type { GameSession } from './session'
 /** The bundled catalog rows; the live host types this AssetInput & {tool?}. */
 export type CatalogEntry = AssetInput & { tool?: string }
 
+/**
+ * A wall-hosted opening the catalog offers next to furniture — NOT an
+ * asset row: no GLB, no free-floor ghost. Picking one arms item-place's
+ * WALL-SNAP ghost instead; Save creates a real host `door`/`window` node
+ * on the aimed wall (item-keep.ts). `doorType`/`windowType` values come
+ * straight from the host schema enums (core DoorType / WindowType), widths
+ * and heights from the schema defaults or common trade sizes.
+ */
+export type OpeningEntry = {
+  /** Discriminant vs CatalogEntry (which never carries it). */
+  opening: true
+  id: string
+  category: string
+  name: string
+  thumbnail: string
+  node: 'door' | 'window'
+  doorType?: 'hinged' | 'double' | 'sliding'
+  windowType?: 'fixed' | 'sliding' | 'casement'
+  /** Nominal aperture size (host schema `width`/`height`). */
+  width: number
+  height: number
+  /** Bottom of the aperture above the wall base — 0 for doors (they sit on
+   * the floor, host renders position[1] = height/2), sill height for
+   * windows. */
+  sill: number
+}
+
+/** Anything a menu card can hold. */
+export type MenuEntry = CatalogEntry | OpeningEntry
+
+export function isOpeningEntry(entry: MenuEntry): entry is OpeningEntry {
+  return (entry as OpeningEntry).opening === true
+}
+
+/** Line-art data-URI thumbnail — openings have no CDN PNG to show. */
+function openingThumb(body: string): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" fill="none" ` +
+    `stroke="rgba(255,255,255,0.85)" stroke-width="2.5">${body}</svg>`
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`
+}
+
+export const OPENINGS_CATEGORY = 'openings'
+
+/**
+ * The v1 openings page: three door and three window families whose type
+ * enums the host schema supports verbatim. Sizes: doors at the schema
+ * default height (2.1); the fixed window at the schema default 1.5 × 1.5
+ * with a 0.9 m sill — every entry fits a host-default 2.5 m wall.
+ */
+export const OPENING_ENTRIES: readonly OpeningEntry[] = [
+  {
+    opening: true,
+    id: 'opening-door-hinged',
+    category: OPENINGS_CATEGORY,
+    name: 'Hinged door',
+    node: 'door',
+    doorType: 'hinged',
+    width: 0.9,
+    height: 2.1,
+    sill: 0,
+    thumbnail: openingThumb(
+      '<rect x="20" y="10" width="32" height="54"/><path d="M22 12 A30 30 0 0 1 50 40" stroke-dasharray="3 3"/><circle cx="46" cy="38" r="1.5"/>',
+    ),
+  },
+  {
+    opening: true,
+    id: 'opening-door-double',
+    category: OPENINGS_CATEGORY,
+    name: 'Double door',
+    node: 'door',
+    doorType: 'double',
+    width: 1.6,
+    height: 2.1,
+    sill: 0,
+    thumbnail: openingThumb(
+      '<rect x="12" y="10" width="48" height="54"/><line x1="36" y1="10" x2="36" y2="64"/><circle cx="32" cy="38" r="1.5"/><circle cx="40" cy="38" r="1.5"/>',
+    ),
+  },
+  {
+    opening: true,
+    id: 'opening-door-sliding',
+    category: OPENINGS_CATEGORY,
+    name: 'Sliding door',
+    node: 'door',
+    doorType: 'sliding',
+    width: 1.8,
+    height: 2.1,
+    sill: 0,
+    thumbnail: openingThumb(
+      '<rect x="10" y="10" width="52" height="54"/><rect x="14" y="14" width="26" height="46"/><path d="M44 37 h12 m-4 -4 l4 4 l-4 4"/>',
+    ),
+  },
+  {
+    opening: true,
+    id: 'opening-window-fixed',
+    category: OPENINGS_CATEGORY,
+    name: 'Fixed window',
+    node: 'window',
+    windowType: 'fixed',
+    width: 1.5,
+    height: 1.5,
+    sill: 0.9,
+    thumbnail: openingThumb(
+      '<rect x="14" y="14" width="44" height="44"/><line x1="36" y1="14" x2="36" y2="58"/><line x1="14" y1="36" x2="58" y2="36"/>',
+    ),
+  },
+  {
+    opening: true,
+    id: 'opening-window-sliding',
+    category: OPENINGS_CATEGORY,
+    name: 'Sliding window',
+    node: 'window',
+    windowType: 'sliding',
+    width: 1.5,
+    height: 1.0,
+    sill: 1.0,
+    thumbnail: openingThumb(
+      '<rect x="10" y="22" width="52" height="28"/><line x1="36" y1="22" x2="36" y2="50"/><path d="M20 36 h10 m-3 -3 l3 3 l-3 3"/>',
+    ),
+  },
+  {
+    opening: true,
+    id: 'opening-window-casement',
+    category: OPENINGS_CATEGORY,
+    name: 'Casement window',
+    node: 'window',
+    windowType: 'casement',
+    width: 0.6,
+    height: 1.2,
+    sill: 0.9,
+    thumbnail: openingThumb(
+      '<rect x="24" y="14" width="24" height="44"/><path d="M26 16 L44 36 L26 56" stroke-dasharray="3 3"/>',
+    ),
+  },
+]
+
 /** Cards per category tab — a hard DOM cap, not pagination (v1). */
 export const MENU_CATEGORY_CAP = 32
 /** Fixed grid columns — keyboard Up/Down move by exactly one row. */
@@ -65,7 +205,7 @@ export function placeableCatalog(
 }
 
 /** Distinct categories in first-appearance order — the tab row. */
-export function catalogCategories(items: readonly CatalogEntry[]): string[] {
+export function catalogCategories(items: ReadonlyArray<{ category: string }>): string[] {
   const seen: string[] = []
   for (const item of items) {
     if (!seen.includes(item.category)) seen.push(item.category)
@@ -74,12 +214,12 @@ export function catalogCategories(items: readonly CatalogEntry[]): string[] {
 }
 
 /** One tab's visible cards (first CAP of the category, catalog order). */
-export function categoryPage(
-  items: readonly CatalogEntry[],
+export function categoryPage<T extends { category: string }>(
+  items: readonly T[],
   category: string,
   cap = MENU_CATEGORY_CAP,
-): CatalogEntry[] {
-  const page: CatalogEntry[] = []
+): T[] {
+  const page: T[] = []
   for (const item of items) {
     if (item.category !== category) continue
     page.push(item)
@@ -125,12 +265,12 @@ type OpenMenu = {
   gridEl: HTMLDivElement
   tabEls: HTMLButtonElement[]
   cardEls: HTMLDivElement[]
-  items: CatalogEntry[]
+  items: MenuEntry[]
   categories: string[]
-  page: CatalogEntry[]
+  page: MenuEntry[]
   category: number
   selected: number
-  onPick: (item: CatalogEntry) => void
+  onPick: (item: MenuEntry) => void
 }
 
 let menu: OpenMenu | null = null
@@ -151,10 +291,13 @@ export function isItemMenuOpen(): boolean {
  */
 export function openItemMenu(
   session: GameSession,
-  onPick: (item: CatalogEntry) => void,
+  onPick: (item: MenuEntry) => void,
 ): boolean {
   if (menu || typeof document === 'undefined') return false
-  const items = placeableCatalog()
+  // Furniture tabs first (catalog order), then the openings tab — doors
+  // and windows the wall-snap ghost places (always present: they need no
+  // bundled catalog, so even a stub host build offers them).
+  const items: MenuEntry[] = [...placeableCatalog(), ...OPENING_ENTRIES]
   const categories = catalogCategories(items)
 
   // Latch input FIRST (flag before the lock release, so the session's
@@ -194,7 +337,7 @@ export function openItemMenu(
   titleText.textContent = 'ITEM CATALOG'
   titleText.style.cssText = 'font-size:14px;letter-spacing:0.18em'
   const titleHint = document.createElement('span')
-  titleHint.textContent = 'click or arrows + Enter · 1-5 tabs · I close'
+  titleHint.textContent = `click or arrows + Enter · 1-${Math.min(categories.length, 9)} tabs · I close`
   titleHint.style.cssText = 'font-size:11px;color:rgba(255,255,255,0.45)'
   title.appendChild(titleText)
   title.appendChild(titleHint)

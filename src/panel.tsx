@@ -98,8 +98,8 @@ export default function BootsPanel() {
           {placedItems.length > 0 && (
             <p className="text-xs leading-relaxed">
               You placed <span className="font-semibold">{placedItems.length}</span> catalog item
-              {placedItems.length > 1 ? 's' : ''} — saving adds {placedItems.length > 1 ? 'them' : 'it'} as
-              real furniture (undoable).
+              {placedItems.length > 1 ? 's' : ''} — saving adds {placedItems.length > 1 ? 'them' : 'it'} for
+              real (furniture, doors and windows — undoable).
             </p>
           )}
           <div className="flex gap-2">
@@ -189,7 +189,10 @@ export default function BootsPanel() {
           sides, stairs turn, roofs cycle shapes), run up your stairs while holding click to chain
           them, U undo, G grenade.
         </p>
-        <p>I opens the item catalog — place couches and appliances in your fort.</p>
+        <p>
+          I opens the item catalog — place couches and appliances in your fort; the openings tab
+          snaps doors and windows onto real walls.
+        </p>
         <p>
           F edits a placed piece — 3×3 cells on walls and floors (pocket the middle for a window),
           corner heights on roofs (raise or drop corners for slopes, valleys and flat caps).

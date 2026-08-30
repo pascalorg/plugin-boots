@@ -1,12 +1,16 @@
 import { describe, expect, test } from 'bun:test'
+import { DoorNode, WindowNode } from '@pascal-app/core'
 import {
   type CatalogEntry,
   catalogCategories,
   categoryPage,
   isItemMenuOpen,
+  isOpeningEntry,
   MENU_CATEGORY_CAP,
   MENU_COLUMNS,
   moveSelection,
+  OPENING_ENTRIES,
+  OPENINGS_CATEGORY,
   placeableCatalog,
 } from './inventory'
 
@@ -91,5 +95,59 @@ describe('moveSelection', () => {
 describe('menu state (headless)', () => {
   test('closed by default; nothing here can open it without a DOM', () => {
     expect(isItemMenuOpen()).toBe(false)
+  })
+})
+
+describe('OPENING_ENTRIES (the doors/windows tab)', () => {
+  test('one openings category, appended after the furniture tabs', () => {
+    const items = [entry('couch'), entry('fridge', { category: 'appliance' }), ...OPENING_ENTRIES]
+    expect(catalogCategories(items)).toEqual(['furniture', 'appliance', OPENINGS_CATEGORY])
+    expect(categoryPage(items, OPENINGS_CATEGORY)).toHaveLength(OPENING_ENTRIES.length)
+  })
+
+  test('every entry is card-complete and host-schema-typed', () => {
+    expect(OPENING_ENTRIES.length).toBeGreaterThanOrEqual(4)
+    for (const opening of OPENING_ENTRIES) {
+      expect(opening.opening).toBe(true)
+      expect(opening.category).toBe(OPENINGS_CATEGORY)
+      expect(opening.name.length).toBeGreaterThan(0)
+      expect(opening.thumbnail.startsWith('data:image/svg+xml,')).toBe(true)
+      expect(opening.width).toBeGreaterThan(0)
+      expect(opening.height).toBeGreaterThan(0)
+      // Proof by the REAL host schema: the entry's family value parses.
+      const base = {
+        object: 'node',
+        parentId: 'wall_x',
+        visible: true,
+        metadata: {},
+        name: opening.name,
+      }
+      if (opening.node === 'door') {
+        const parsed = DoorNode.parse({ ...base, doorType: opening.doorType }) as {
+          doorType: string
+        }
+        expect(parsed.doorType).toBe(opening.doorType!)
+        expect(opening.sill).toBe(0) // doors sit on the floor
+        expect(opening.windowType).toBeUndefined()
+      } else {
+        const parsed = WindowNode.parse({ ...base, windowType: opening.windowType }) as {
+          windowType: string
+        }
+        expect(parsed.windowType).toBe(opening.windowType!)
+        expect(opening.sill).toBeGreaterThan(0)
+        expect(opening.doorType).toBeUndefined()
+      }
+      // Every entry fits a host-default 2.5 m wall under the top margin.
+      expect(opening.sill + opening.height).toBeLessThanOrEqual(2.45)
+    }
+  })
+
+  test('ids are unique', () => {
+    expect(new Set(OPENING_ENTRIES.map((o) => o.id)).size).toBe(OPENING_ENTRIES.length)
+  })
+
+  test('isOpeningEntry discriminates openings from catalog assets', () => {
+    expect(isOpeningEntry(OPENING_ENTRIES[0]!)).toBe(true)
+    expect(isOpeningEntry(entry('couch'))).toBe(false)
   })
 })

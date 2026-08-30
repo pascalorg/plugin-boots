@@ -5,7 +5,7 @@
 // SyntaxError there; resolveUrl below feature-detects it.
 import * as viewerPkg from '@pascal-app/viewer'
 import { useFrame } from '@react-three/fiber'
-import { useEffect, useLayoutEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
   BoxGeometry,
   CanvasTexture,
@@ -15,6 +15,7 @@ import {
   MeshStandardMaterial,
   type Object3D,
   SRGBColorSpace,
+  Vector3,
 } from 'three'
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js'
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
@@ -23,12 +24,26 @@ import { create } from 'zustand'
 import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
-import { dropTarget, probeLandingY } from './destruction'
-import { type CatalogEntry, closeItemMenu, isItemMenuOpen, openItemMenu } from './inventory'
+import { collectWallOpenings, dropTarget, probeLandingY } from './destruction'
+import {
+  type CatalogEntry,
+  closeItemMenu,
+  isItemMenuOpen,
+  isOpeningEntry,
+  type MenuEntry,
+  type OpeningEntry,
+  openItemMenu,
+} from './inventory'
 import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
 import { getSession } from './session'
-import { bvhFor, type ColliderEntry, type GameWorld, isGlassLikeMesh } from './world'
+import {
+  bvhFor,
+  type ColliderEntry,
+  type GameWorld,
+  isGlassLikeMesh,
+  type WallNodeLike,
+} from './world'
 
 /**
  * Item placement — the ghost-and-drop half of the creative catalog
@@ -39,6 +54,18 @@ import { bvhFor, type ColliderEntry, type GameWorld, isGlassLikeMesh } from './w
  * stows the ghost, I reopens the catalog. Placements live in `useItems`
  * until the sidebar Save converts them into real `item` nodes (or Discard
  * drops them) — the scene store is NEVER written from here.
+ *
+ * OPENINGS (the doors/windows tab): picking an OpeningEntry arms the
+ * WALL-SNAP ghost instead — the aim ray projects onto the nearest HOST
+ * wall's mid-plane (world.walls; game-built walls are v1-excluded — their
+ * node ids don't exist until their own Save), slides along the wall's
+ * u-axis at APERTURE_STEP, and is valid only where the aperture fits the
+ * wall (end/top margins) without overlapping existing host doors/windows
+ * (collectWallOpenings) or other pending apertures. Invalid = the build
+ * ghost's red tint. LMB stores a PlacedAperture; the visible stand-in is a
+ * GAME-SIDE jamb/header/leaf (or glass) mock sitting ON the wall — the
+ * wall is never cut during play; the real hole arrives when Save creates
+ * the hosted door/window node.
  *
  * MODELS: GLTFLoader (with the host's Draco + meshopt decoder wiring — the
  * system catalog GLBs are Draco-compressed) on the catalog's public GLB
@@ -70,6 +97,7 @@ import { bvhFor, type ColliderEntry, type GameWorld, isGlassLikeMesh } from './w
  */
 
 export type PlacedItem = {
+  kind: 'item'
   id: number
   /** The catalog asset payload, verbatim — Keep hands it to the host's
    * item schema untouched (item-keep.ts). */
@@ -80,14 +108,38 @@ export type PlacedItem = {
   yaw: number
 }
 
+/**
+ * A pending door/window on a HOST wall — the openings tab's placement.
+ * Wall-local like the host's hosted-child convention: `u` meters along the
+ * wall's start→end axis, `v` the CENTER height above the wall base (doors:
+ * height/2 — they sit on the floor; windows: sill + height/2). During play
+ * this renders only the game-side framed stand-in ON the wall (the wall is
+ * not cut); Save turns it into a real `door`/`window` node hosted by
+ * `wallId` (item-keep.ts).
+ */
+export type PlacedAperture = {
+  kind: 'aperture'
+  id: number
+  def: OpeningEntry
+  wallId: string
+  u: number
+  v: number
+  width: number
+  height: number
+}
+
+/** Everything the I-catalog can leave pending for Save/Discard. */
+export type Placement = PlacedItem | PlacedAperture
+
 type ItemsState = {
   /** Placements this session (or awaiting the panel's Save/Discard). */
-  items: PlacedItem[]
-  /** Catalog item riding the ghost; null = stowed. */
-  armed: CatalogEntry | null
-  arm: (asset: CatalogEntry) => void
+  items: Placement[]
+  /** Menu entry riding a ghost (furniture OR opening); null = stowed. */
+  armed: MenuEntry | null
+  arm: (asset: MenuEntry) => void
   disarm: () => void
   addItem: (asset: CatalogEntry, position: [number, number, number], yaw: number) => PlacedItem
+  addAperture: (def: OpeningEntry, wallId: string, u: number, v: number) => PlacedAperture
   /** Save/Discard resolution — forgets every placement. */
   resolveItems: () => void
 }
@@ -100,7 +152,21 @@ export const useItems = create<ItemsState>((set, get) => ({
   arm: (armed) => set({ armed }),
   disarm: () => set({ armed: null }),
   addItem: (asset, position, yaw) => {
-    const stored: PlacedItem = { id: itemId++, asset, position, yaw }
+    const stored: PlacedItem = { kind: 'item', id: itemId++, asset, position, yaw }
+    set((s) => ({ items: [...s.items, stored] }))
+    return stored
+  },
+  addAperture: (def, wallId, u, v) => {
+    const stored: PlacedAperture = {
+      kind: 'aperture',
+      id: itemId++,
+      def,
+      wallId,
+      u,
+      v,
+      width: def.width,
+      height: def.height,
+    }
     set((s) => ({ items: [...s.items, stored] }))
     return stored
   },
@@ -230,6 +296,203 @@ export function itemOverlapsPlayer(
   const halfD = (swapped ? footprint[0] : footprint[2]) / 2 + capsule.radius
   if (Math.abs(playerX - x) >= halfW || Math.abs(playerZ - z) >= halfD) return false
   return playerFootY < y + footprint[1] && playerFootY + capsule.height > y
+}
+
+// --- Wall apertures (the openings tab's wall-snap lane) ----------------------
+
+/** Ghost slide step along the wall's u-axis — 10 cm: fine enough to place
+ * a door where you want it, coarse enough to feel snapped (the 3 m build
+ * lattice is far too coarse for openings). */
+export const APERTURE_STEP = 0.1
+/** Wall left clear at each end and above the aperture (jack-stud/header
+ * room — mirrors the host's own framing sensibilities). */
+export const APERTURE_MARGIN = 0.05
+/** Obstacle inflation between pending apertures (the OPENING_PAD value
+ * destruction.ts uses for host openings — keeps clearances symmetric). */
+export const APERTURE_PAD = 0.02
+
+/**
+ * A host wall's placement frame in WORLD space: origin at the wall start
+ * on the wall base, unit u-axis start→end in XZ. `yaw` is the three group
+ * rotation whose local +X runs along the u-axis.
+ *
+ * SOURCE OF TRUTH: the wall's registered root IS the wall-local frame —
+ * the host positions it at the wall start, local +X toward the end, and
+ * mounts hosted door/window children inside it at `position = [u, v, 0]`
+ * (measured live: a door at position[0] = 0 sits exactly at the wall's
+ * world start). So the frame is read off root.matrixWorld directly —
+ * transforming node start/end through it would double-apply the pose.
+ * node start/end contribute only the LENGTH (they are level-plan coords).
+ */
+export type WallFrame = {
+  wallId: string
+  originX: number
+  originY: number
+  originZ: number
+  ux: number
+  uz: number
+  length: number
+  height: number
+  thickness: number
+  yaw: number
+}
+
+const _wfStart = new Vector3()
+const _wfEnd = new Vector3()
+
+/** Build one wall's WallFrame (null = stub wall, the destruction.ts 0.3 m
+ * degeneracy floor). Curved walls get their straight chord — the same
+ * approximation the stud framing already makes. Height/thickness fall back
+ * to the host defaults (2.5 / 0.15). */
+export function wallPlacementFrame(wall: {
+  node: WallNodeLike
+  root: Object3D
+}): WallFrame | null {
+  const { start, end } = wall.node
+  const planLength = Math.hypot(end[0] - start[0], end[1] - start[1])
+  if (planLength < 0.3) return null
+  // Wall-local (0,0,0) and (length,0,0) through the root — origin and far
+  // end in world space (scale-safe: length re-measured after transform).
+  _wfStart.set(0, 0, 0).applyMatrix4(wall.root.matrixWorld)
+  _wfEnd.set(planLength, 0, 0).applyMatrix4(wall.root.matrixWorld)
+  const dx = _wfEnd.x - _wfStart.x
+  const dz = _wfEnd.z - _wfStart.z
+  const length = Math.hypot(dx, dz)
+  if (length < 0.3) return null
+  const ux = dx / length
+  const uz = dz / length
+  return {
+    wallId: wall.node.id,
+    originX: _wfStart.x,
+    originY: _wfStart.y,
+    originZ: _wfStart.z,
+    ux,
+    uz,
+    length,
+    height: wall.node.height ?? 2.5,
+    thickness: wall.node.thickness ?? 0.15,
+    yaw: Math.atan2(-uz, ux),
+  }
+}
+
+export type WallAim = { frame: WallFrame | null; u: number; v: number; dist: number }
+
+/**
+ * Aim ray vs the walls' mid-plane rectangles — pure, allocation-free
+ * (writes `out`), exported for tests. Same eye/yaw/pitch ray as
+ * anchorOnFloor; the nearest wall whose rectangle (0..length × 0..height)
+ * the ray crosses within `reach` wins. Returns false when no wall is aimed
+ * at (out.frame is nulled either way first).
+ */
+export function aimWallPoint(
+  out: WallAim,
+  frames: Iterable<WallFrame>,
+  eyeX: number,
+  eyeY: number,
+  eyeZ: number,
+  yaw: number,
+  pitch: number,
+  reach = ITEM_REACH,
+): boolean {
+  const cp = Math.cos(pitch)
+  const dx = -Math.sin(yaw) * cp
+  const dy = Math.sin(pitch)
+  const dz = -Math.cos(yaw) * cp
+  out.frame = null
+  out.dist = reach
+  for (const frame of frames) {
+    // Mid-plane normal = u-axis rotated 90° in XZ.
+    const nx = -frame.uz
+    const nz = frame.ux
+    const denom = dx * nx + dz * nz
+    if (Math.abs(denom) < 1e-6) continue // parallel gaze
+    const t = ((frame.originX - eyeX) * nx + (frame.originZ - eyeZ) * nz) / denom
+    if (t <= 0.05 || t >= out.dist) continue
+    const hx = eyeX + dx * t - frame.originX
+    const hz = eyeZ + dz * t - frame.originZ
+    const u = hx * frame.ux + hz * frame.uz
+    if (u < 0 || u > frame.length) continue
+    const v = eyeY + dy * t - frame.originY
+    if (v < 0 || v > frame.height) continue
+    out.frame = frame
+    out.u = u
+    out.v = v
+    out.dist = t
+  }
+  return out.frame !== null
+}
+
+/** Snap the aimed u to the ghost grid, clamped so the aperture keeps its
+ * end margins — null when the wall is too short for it at all. */
+export function snapApertureU(
+  u: number,
+  width: number,
+  length: number,
+  step = APERTURE_STEP,
+  margin = APERTURE_MARGIN,
+): number | null {
+  const min = margin + width / 2
+  const max = length - margin - width / 2
+  if (min > max) return null
+  return Math.min(max, Math.max(min, Math.round(u / step) * step))
+}
+
+/** Wall-space aperture rect from a center-u / bottom-v0 pose. Structurally
+ * compatible with destruction.ts's WallOpening rects. */
+export type ApertureRect = { u0: number; u1: number; v0: number; v1: number }
+
+export function apertureRect(
+  u: number,
+  v0: number,
+  width: number,
+  height: number,
+): ApertureRect {
+  return { u0: u - width / 2, u1: u + width / 2, v0, v1: v0 + height }
+}
+
+/** Strict 2D interval overlap — touching edges do NOT overlap. */
+export function rectsOverlap(a: ApertureRect, b: ApertureRect): boolean {
+  return a.u0 < b.u1 && a.u1 > b.u0 && a.v0 < b.v1 && a.v1 > b.v0
+}
+
+/**
+ * Would this aperture cut cleanly? Inside the wall span (end margins),
+ * under the top margin, and clear of every obstacle rect (host openings
+ * arrive pre-inflated from collectWallOpenings; pending ones through
+ * pendingApertureRects). Pure, exported for tests.
+ */
+export function apertureFits(
+  rect: ApertureRect,
+  wallLength: number,
+  wallHeight: number,
+  obstacles: readonly ApertureRect[],
+  margin = APERTURE_MARGIN,
+): boolean {
+  const eps = 1e-6
+  if (rect.u0 < margin - eps || rect.u1 > wallLength - margin + eps) return false
+  if (rect.v0 < -eps || rect.v1 > wallHeight - margin + eps) return false
+  for (const o of obstacles) if (rectsOverlap(rect, o)) return false
+  return true
+}
+
+/** The pending apertures already on `wallId`, as obstacle rects inflated
+ * by APERTURE_PAD (the same clearance host openings get). */
+export function pendingApertureRects(
+  items: readonly Placement[],
+  wallId: string,
+  pad = APERTURE_PAD,
+): ApertureRect[] {
+  const rects: ApertureRect[] = []
+  for (const placed of items) {
+    if (placed.kind !== 'aperture' || placed.wallId !== wallId) continue
+    rects.push({
+      u0: placed.u - placed.width / 2 - pad,
+      u1: placed.u + placed.width / 2 + pad,
+      v0: placed.v - placed.height / 2 - pad,
+      v1: placed.v + placed.height / 2 + pad,
+    })
+  }
+  return rects
 }
 
 // --- Model cache (one GLB template per catalog id, session-agnostic) --------
@@ -483,6 +746,135 @@ function mountItemVisual(
  * demolition / paint capture paths all skip it). */
 const ITEM_NODE_PREFIX = '__boots-item-'
 
+// --- Aperture stand-in (jambs + header + leaf/glass primitive mock) ----------
+
+const JAMB = 0.06
+const APERTURE_FRAME_COLOR = '#7a5a3a'
+const APERTURE_LEAF_COLOR = '#8a6844'
+const APERTURE_GLASS_COLOR = '#9fc7d9'
+/** The build ghost's invalid red (builder.tsx's ghost tint). */
+const APERTURE_INVALID_COLOR = '#ff5a4d'
+
+/** One material for the stand-in — JSX-created per mesh (R3F auto-dispose
+ * owns it). `userData.baseColor` is the ghost tint's restore point. */
+function StandInMaterial({ color, ghost, glass }: { color: string; ghost: boolean; glass: boolean }) {
+  return (
+    <meshStandardMaterial
+      color={color}
+      depthWrite={!ghost && !glass}
+      opacity={glass ? (ghost ? 0.25 : 0.35) : ghost ? 0.55 : 1}
+      roughness={glass ? 0.15 : 0.75}
+      transparent={ghost || glass}
+      userData={{ baseColor: color }}
+    />
+  )
+}
+
+/**
+ * The game-side visual for a pending door/window — a framed mock the
+ * guntable/weapon-models primitive idiom builds from boxes: two jambs, a
+ * header, and a leaf (doors; sliding doors get a glazed leaf, doubles two
+ * leaves) or a glass plate + sill (windows). Local frame: origin at the
+ * aperture's bottom-center on the wall mid-plane, +X along the wall
+ * u-axis, +Z across the thickness. The stand-in sits ON the wall (poking
+ * `depth` through both faces) — the wall itself is only cut at Save.
+ */
+export function ApertureStandIn({
+  def,
+  depth,
+  ghost = false,
+}: {
+  def: OpeningEntry
+  depth: number
+  ghost?: boolean
+}) {
+  const w = def.width
+  const h = def.height
+  const innerW = w - 2 * JAMB
+  const innerH = h - JAMB
+  const leaves: Array<{ x: number; w: number }> =
+    def.doorType === 'double'
+      ? [
+          { x: -innerW / 4 - 0.004, w: innerW / 2 - 0.008 },
+          { x: innerW / 4 + 0.004, w: innerW / 2 - 0.008 },
+        ]
+      : [{ x: 0, w: innerW }]
+  const glazedLeaf = def.doorType === 'sliding'
+  return (
+    <group>
+      {/* Jambs + header */}
+      <mesh position={[-(w - JAMB) / 2, innerH / 2, 0]}>
+        <boxGeometry args={[JAMB, innerH, depth]} />
+        <StandInMaterial color={APERTURE_FRAME_COLOR} ghost={ghost} glass={false} />
+      </mesh>
+      <mesh position={[(w - JAMB) / 2, innerH / 2, 0]}>
+        <boxGeometry args={[JAMB, innerH, depth]} />
+        <StandInMaterial color={APERTURE_FRAME_COLOR} ghost={ghost} glass={false} />
+      </mesh>
+      <mesh position={[0, h - JAMB / 2, 0]}>
+        <boxGeometry args={[w, JAMB, depth]} />
+        <StandInMaterial color={APERTURE_FRAME_COLOR} ghost={ghost} glass={false} />
+      </mesh>
+      {def.node === 'door' ? (
+        leaves.map((leaf) => (
+          <mesh key={leaf.x} position={[leaf.x, (innerH - 0.02) / 2 + 0.005, 0]}>
+            {/* Leaf pokes 1 cm proud of both wall faces (depth − 0.02 vs
+             * the jambs' depth) — flush inside the wall it was invisible. */}
+            <boxGeometry args={[leaf.w, innerH - 0.02, Math.max(0.04, depth - 0.02)]} />
+            <StandInMaterial
+              color={glazedLeaf ? APERTURE_GLASS_COLOR : APERTURE_LEAF_COLOR}
+              ghost={ghost}
+              glass={glazedLeaf}
+            />
+          </mesh>
+        ))
+      ) : (
+        <>
+          {/* Glass plate + sill; sliding sashes get a center mullion. */}
+          <mesh position={[0, h / 2 - JAMB / 2, 0]}>
+            <boxGeometry args={[innerW, h - 2 * JAMB, Math.max(0.02, depth - 0.03)]} />
+            <StandInMaterial color={APERTURE_GLASS_COLOR} ghost={ghost} glass />
+          </mesh>
+          {def.windowType === 'sliding' && (
+            <mesh position={[0, h / 2 - JAMB / 2, 0]}>
+              <boxGeometry args={[0.03, h - 2 * JAMB, Math.max(0.035, depth - 0.01)]} />
+              <StandInMaterial color={APERTURE_FRAME_COLOR} ghost={ghost} glass={false} />
+            </mesh>
+          )}
+          <mesh position={[0, -0.015, 0]}>
+            <boxGeometry args={[w + 0.08, 0.03, depth + 0.06]} />
+            <StandInMaterial color={APERTURE_FRAME_COLOR} ghost={ghost} glass={false} />
+          </mesh>
+        </>
+      )}
+    </group>
+  )
+}
+
+/** One pending aperture, posed on its host wall. NO colliders: the wall
+ * stays solid during play (the hole only exists after Save) — the mock is
+ * pure decoration. A wall missing from the snapshot renders nothing. */
+function PlacedApertureMesh({ placed, world }: { placed: PlacedAperture; world: GameWorld }) {
+  const frame = useMemo(() => {
+    const wall = world.walls.get(placed.wallId)
+    return wall ? wallPlacementFrame(wall) : null
+  }, [world, placed.wallId])
+  if (!frame) return null
+  const bottom = placed.v - placed.height / 2
+  return (
+    <group
+      position={[
+        frame.originX + frame.ux * placed.u,
+        frame.originY + bottom,
+        frame.originZ + frame.uz * placed.u,
+      ]}
+      rotation={[0, frame.yaw, 0]}
+    >
+      <ApertureStandIn def={placed.def} depth={frame.thickness + 0.04} />
+    </group>
+  )
+}
+
 /** One placed item: the GLB clone (or proxy) whose own solid sub-meshes
  * ARE the colliders (nodeType 'item' — the collectWorld convention, so
  * shooting/grenades voxelize the placement through the same
@@ -550,6 +942,7 @@ function PlacedItemMesh({ item, world }: { item: PlacedItem; world: GameWorld })
 }
 
 const _anchor: ItemAnchor = { x: 0, y: 0, z: 0, valid: false }
+const _wallAim: WallAim = { frame: null, u: 0, v: 0, dist: 0 }
 
 /**
  * The in-canvas orchestrator: ghost pose + the item lane's input, at
@@ -561,6 +954,10 @@ const _anchor: ItemAnchor = { x: 0, y: 0, z: 0, valid: false }
  *    stows it, weapon switch stows it, LMB edge on a valid anchor places;
  *  - ghost follow: floor-plane anchor + probeLandingY snap (items stack
  *    onto slabs/tabletops the probe already knows about);
+ *  - openings instead ride the WALL-SNAP ghost: aim ray → nearest host
+ *    wall mid-plane (aimWallPoint over session-cached WallFrames), u
+ *    snapped to APERTURE_STEP, validity = apertureFits against host
+ *    openings + pending apertures, red tint while invalid;
  *  - HUD: ghost-status 'too far' while clamped, prompt line while armed.
  */
 export function GameItems({ world }: { world: GameWorld }) {
@@ -568,6 +965,7 @@ export function GameItems({ world }: { world: GameWorld }) {
   const armed = useItems((s) => s.armed)
   const ghostRef = useRef<Group>(null)
   const ghostHolderRef = useRef<Group>(null)
+  const apGhostRef = useRef<Group>(null)
   const prevFire = useRef(false)
   const prevAlt = useRef(false)
   const yawTurns = useRef(0)
@@ -582,12 +980,97 @@ export function GameItems({ world }: { world: GameWorld }) {
    * quantized (1 cm) anchor, floor plane or collider census moves, with a
    * 10-frame fallback so destruction under a frozen aim still settles. */
   const probeCache = useRef({ qx: NaN, qz: NaN, qf: NaN, colliders: -1, frame: -1e9, y: 0 })
+  /** Session-lifetime wall frames (host walls never move during play);
+   * built lazily on the first aperture aim, dropped on world swap. */
+  const wallFramesRef = useRef<Map<string, WallFrame> | null>(null)
+  /** Aimed wall's obstacle rects (host openings + pending apertures) —
+   * collectWallOpenings allocates, so re-collect only when the aimed wall
+   * or the placement census changes. */
+  const apObstacles = useRef<{ wallId: string | null; count: number; rects: ApertureRect[] }>({
+    wallId: null,
+    count: -1,
+    rects: [],
+  })
+  /** Last aperture-ghost validity — tint traversal runs on edges only. */
+  const apInvalid = useRef(false)
+
+  useEffect(() => {
+    wallFramesRef.current = null
+  }, [world])
+
+  // Dev/QA handle (the __boots / __bootsBuilder idiom): the catalog lane's
+  // live state + an on-demand wall-aim probe — headless QA sees exactly
+  // what the aperture ghost sees. Plain data, never live refs.
+  useEffect(() => {
+    ;(globalThis as Record<string, unknown>).__bootsItems = {
+      state: () => {
+        const s = useItems.getState()
+        return {
+          armed: s.armed ? { id: s.armed.id, opening: isOpeningEntry(s.armed) } : null,
+          items: s.items.map((p) =>
+            p.kind === 'aperture'
+              ? {
+                  kind: p.kind,
+                  id: p.id,
+                  def: p.def.id,
+                  wallId: p.wallId,
+                  u: p.u,
+                  v: p.v,
+                  width: p.width,
+                  height: p.height,
+                }
+              : { kind: p.kind, id: p.id, asset: p.asset.id, position: [...p.position] },
+          ),
+        }
+      },
+      pose: () => ({
+        x: playerRig.position.x,
+        y: playerRig.position.y,
+        z: playerRig.position.z,
+        yaw: playerRig.yaw,
+        pitch: playerRig.pitch,
+      }),
+      wallFrames: () => {
+        const frames = wallFramesRef.current
+        return frames ? Array.from(frames.values()).map((f) => ({ ...f })) : []
+      },
+      aimWall: () => {
+        const frames = wallFramesRef.current
+        if (!frames) return { frames: 0, hit: false }
+        const out: WallAim = { frame: null, u: 0, v: 0, dist: 0 }
+        const hit = aimWallPoint(
+          out,
+          frames.values(),
+          playerRig.position.x,
+          playerRig.position.y,
+          playerRig.position.z,
+          playerRig.yaw,
+          playerRig.pitch,
+        )
+        return {
+          frames: frames.size,
+          hit,
+          wallId: out.frame?.wallId ?? null,
+          u: out.u,
+          v: out.v,
+          dist: out.dist,
+        }
+      },
+    }
+    return () => {
+      delete (globalThis as Record<string, unknown>).__bootsItems
+    }
+  }, [])
 
   // Ghost content tracks the armed asset (proxy first, GLB when cached).
+  // Openings mount nothing here — their ghost is the declarative
+  // ApertureStandIn under apGhostRef, keyed on the armed entry.
   useEffect(() => {
-    if (armed) armedFootprint.current = itemFootprint(armed)
+    apInvalid.current = false
+    if (!armed || isOpeningEntry(armed)) return
+    armedFootprint.current = itemFootprint(armed)
     const holder = ghostHolderRef.current
-    if (!holder || !armed) return
+    if (!holder) return
     return mountItemVisual(holder, armed, true)
   }, [armed])
 
@@ -642,8 +1125,11 @@ export function GameItems({ world }: { world: GameWorld }) {
       }
     }
 
+    const apGhost = apGhostRef.current
+
     if (isItemMenuOpen() || !state.armed) {
       ghost.visible = false
+      if (apGhost) apGhost.visible = false
       prevFire.current = session.input.state.firing
       prevAlt.current = session.input.state.altFiring
       if (promptShown.current) {
@@ -660,10 +1146,12 @@ export function GameItems({ world }: { world: GameWorld }) {
     if (armedWeapon.current !== null && weapon !== armedWeapon.current) {
       state.disarm()
       ghost.visible = false
+      if (apGhost) apGhost.visible = false
       return
     }
 
-    if (rotate) yawTurns.current = (yawTurns.current + 1) % 4
+    const openingArmed = isOpeningEntry(state.armed)
+    if (rotate && !openingArmed) yawTurns.current = (yawTurns.current + 1) % 4
 
     // RMB edge = stow.
     const alt = session.input.state.altFiring
@@ -671,6 +1159,7 @@ export function GameItems({ world }: { world: GameWorld }) {
       prevAlt.current = alt
       state.disarm()
       ghost.visible = false
+      if (apGhost) apGhost.visible = false
       sfx.weaponSwitch()
       return
     }
@@ -680,8 +1169,94 @@ export function GameItems({ world }: { world: GameWorld }) {
     // borrowed the line hands it back).
     if (!promptShown.current || frame.current % 30 === 0) {
       promptShown.current = true
-      session.hud.prompt('LMB place · R rotate · RMB stow · I catalog', 'items')
+      session.hud.prompt(
+        openingArmed
+          ? 'LMB place on a wall · RMB stow · I catalog'
+          : 'LMB place · R rotate · RMB stow · I catalog',
+        'items',
+      )
     }
+
+    // --- Openings: the wall-snap ghost lane -------------------------------
+    if (openingArmed) {
+      ghost.visible = false
+      const def = state.armed as OpeningEntry
+      let frames = wallFramesRef.current
+      if (!frames) {
+        frames = new Map()
+        for (const [id, wall] of world.walls) {
+          const wallFrame = wallPlacementFrame(wall)
+          if (wallFrame) frames.set(id, wallFrame)
+        }
+        wallFramesRef.current = frames
+      }
+      const aimed = aimWallPoint(
+        _wallAim,
+        frames.values(),
+        playerRig.position.x,
+        playerRig.position.y,
+        playerRig.position.z,
+        playerRig.yaw,
+        playerRig.pitch,
+      )
+      if (!aimed || !_wallAim.frame) {
+        if (apGhost) apGhost.visible = false
+        session.hud.ghostStatus?.(null, 'items')
+        prevFire.current = session.input.state.firing
+        return
+      }
+      const wall = _wallAim.frame
+      // Snap along the u-axis; a wall too short for the aperture still
+      // shows the ghost (clamped to its center) — just blocked.
+      const snappedU = snapApertureU(_wallAim.u, def.width, wall.length)
+      const u = snappedU ?? wall.length / 2
+      const rect = apertureRect(u, def.sill, def.width, def.height)
+      const obstacles = apObstacles.current
+      if (obstacles.wallId !== wall.wallId || obstacles.count !== state.items.length) {
+        obstacles.wallId = wall.wallId
+        obstacles.count = state.items.length
+        obstacles.rects = [
+          ...collectWallOpenings(world, wall.wallId),
+          ...pendingApertureRects(state.items, wall.wallId),
+        ]
+      }
+      const blocked =
+        state.items.length >= MAX_PLACED_ITEMS ||
+        snappedU === null ||
+        !apertureFits(rect, wall.length, wall.height, obstacles.rects)
+      if (apGhost) {
+        apGhost.visible = true
+        apGhost.position.set(
+          wall.originX + wall.ux * u,
+          wall.originY + def.sill,
+          wall.originZ + wall.uz * u,
+        )
+        apGhost.rotation.set(0, wall.yaw, 0)
+        // Red tint on validity EDGES only (per-frame traversal is waste).
+        if (apInvalid.current !== blocked) {
+          apInvalid.current = blocked
+          apGhost.traverse((object) => {
+            const mesh = object as Mesh
+            if (!mesh.isMesh) return
+            const material = mesh.material as MeshStandardMaterial
+            material.color.set(
+              blocked
+                ? APERTURE_INVALID_COLOR
+                : ((material.userData.baseColor as string) ?? APERTURE_FRAME_COLOR),
+            )
+          })
+        }
+      }
+      session.hud.ghostStatus?.(blocked ? 'occupied' : null, 'items')
+      const apFiring = session.input.state.firing
+      if (apFiring && !prevFire.current && !blocked && !useBoots.getState().staggered) {
+        useItems.getState().addAperture(def, wall.wallId, u, def.sill + def.height / 2)
+        sfx.place()
+      }
+      prevFire.current = apFiring
+      return
+    }
+    if (apGhost) apGhost.visible = false
 
     // Anchor on the player's floor plane, then snap onto whatever the
     // landing probe finds under the aim point (slabs, placed floors…).
@@ -757,7 +1332,7 @@ export function GameItems({ world }: { world: GameWorld }) {
       !blocked &&
       !useBoots.getState().staggered
     ) {
-      useItems.getState().addItem(state.armed, [_anchor.x, y, _anchor.z], yaw)
+      useItems.getState().addItem(state.armed as CatalogEntry, [_anchor.x, y, _anchor.z], yaw)
       sfx.place()
     }
     prevFire.current = firing
@@ -768,9 +1343,18 @@ export function GameItems({ world }: { world: GameWorld }) {
       <group ref={ghostRef} visible={false}>
         <group ref={ghostHolderRef} />
       </group>
-      {items.map((item) => (
-        <PlacedItemMesh item={item} key={item.id} world={world} />
-      ))}
+      <group ref={apGhostRef} visible={false}>
+        {armed && isOpeningEntry(armed) && (
+          <ApertureStandIn def={armed} depth={0.2} ghost key={armed.id} />
+        )}
+      </group>
+      {items.map((item) =>
+        item.kind === 'aperture' ? (
+          <PlacedApertureMesh key={item.id} placed={item} world={world} />
+        ) : (
+          <PlacedItemMesh item={item} key={item.id} world={world} />
+        ),
+      )}
     </group>
   )
 }

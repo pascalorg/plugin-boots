@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
-import { BoxGeometry, Group, Mesh, MeshStandardMaterial } from 'three'
+import { BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D } from 'three'
 import { PLAYER_CAPSULE } from './collision'
-import type { CatalogEntry } from './inventory'
+import { type CatalogEntry, OPENING_ENTRIES } from './inventory'
 import {
+  aimWallPoint,
   anchorOnFloor,
+  apertureFits,
+  apertureRect,
   disposeItemContent,
   ghostYaw,
   ITEM_REACH,
@@ -12,7 +15,12 @@ import {
   itemGhostActive,
   itemModelLoader,
   itemOverlapsPlayer,
+  pendingApertureRects,
+  rectsOverlap,
+  snapApertureU,
   useItems,
+  type WallAim,
+  wallPlacementFrame,
 } from './item-place'
 
 /**
@@ -234,5 +242,212 @@ describe('disposeItemContent: mount-owned three resources are released', () => {
     const { content, disposed } = build()
     disposeItemContent(content, false, false)
     expect(disposed).toEqual({ geometry: 0, material: 0 })
+  })
+})
+
+// --- Wall apertures (the openings tab's wall-snap lane) ----------------------
+
+const hingedDoor = OPENING_ENTRIES.find((e) => e.id === 'opening-door-hinged')!
+const fixedWindow = OPENING_ENTRIES.find((e) => e.id === 'opening-window-fixed')!
+
+/**
+ * A host wall entry. The registered root IS the wall-local frame (origin
+ * at the wall start, local +X toward the end — the group the host mounts
+ * door/window children in), so the helper poses the root the way the host
+ * does: at `start`, yawed along start→end. `pose` overrides simulate an
+ * elevated / re-posed frame directly.
+ */
+const wallEntry = (
+  start: [number, number],
+  end: [number, number],
+  over: { height?: number; thickness?: number } = {},
+  pose?: { position?: [number, number, number]; yawY?: number },
+) => {
+  const root = new Object3D()
+  const dx = end[0] - start[0]
+  const dz = end[1] - start[1]
+  root.position.set(...(pose?.position ?? [start[0], 0, start[1]]))
+  root.rotation.y = pose?.yawY ?? Math.atan2(-dz, dx)
+  root.updateMatrixWorld(true)
+  return { node: { id: 'wall_test', start, end, ...over }, root }
+}
+
+describe('wallPlacementFrame', () => {
+  test('host-posed root: origin at start, unit u start→end, defaults 2.5/0.15', () => {
+    const frame = wallPlacementFrame(wallEntry([1, 2], [5, 2]))!
+    expect(frame.wallId).toBe('wall_test')
+    expect([frame.originX, frame.originY, frame.originZ]).toEqual([1, 0, 2])
+    expect(frame.ux).toBeCloseTo(1)
+    expect(frame.uz).toBeCloseTo(0)
+    expect(frame.length).toBeCloseTo(4)
+    expect(frame.height).toBe(2.5)
+    expect(frame.thickness).toBe(0.15)
+    expect(frame.yaw).toBeCloseTo(0)
+  })
+
+  test('node height/thickness override the defaults', () => {
+    const frame = wallPlacementFrame(wallEntry([0, 0], [3, 0], { height: 3.2, thickness: 0.3 }))!
+    expect(frame.height).toBe(3.2)
+    expect(frame.thickness).toBe(0.3)
+  })
+
+  test('the root pose IS the frame — start/end only contribute length', () => {
+    // Elevated, re-posed root (a rotated building's wall): the frame reads
+    // the root, never re-applies plan coords through it.
+    const frame = wallPlacementFrame(
+      wallEntry([0, 0], [4, 0], {}, { position: [10, 3, 5], yawY: Math.PI / 2 }),
+    )!
+    expect([frame.originX, frame.originY, frame.originZ]).toEqual([10, 3, 5])
+    expect(frame.ux).toBeCloseTo(0)
+    expect(frame.uz).toBeCloseTo(-1)
+    expect(frame.length).toBeCloseTo(4)
+    expect(frame.yaw).toBeCloseTo(Math.PI / 2)
+  })
+
+  test('a diagonal wall frame follows its own yaw', () => {
+    const frame = wallPlacementFrame(wallEntry([0, 0], [3, 3]))!
+    expect(frame.ux).toBeCloseTo(Math.SQRT1_2)
+    expect(frame.uz).toBeCloseTo(Math.SQRT1_2)
+    expect(frame.length).toBeCloseTo(Math.hypot(3, 3))
+    expect(frame.yaw).toBeCloseTo(-Math.PI / 4)
+  })
+
+  test('stub walls (< 0.3 m) are refused', () => {
+    expect(wallPlacementFrame(wallEntry([0, 0], [0.2, 0]))).toBeNull()
+  })
+})
+
+describe('aimWallPoint', () => {
+  const aim = (): WallAim => ({ frame: null, u: 0, v: 0, dist: 0 })
+  // A 6 m wall along X at z = −2 (facing the origin-standing player).
+  const wall = () => wallPlacementFrame(wallEntry([-3, -2], [3, -2]))!
+
+  test('level gaze straight at the wall: u along the span, v at eye height', () => {
+    const out = aim()
+    expect(aimWallPoint(out, [wall()], 0, 1.6, 0, 0, 0)).toBe(true)
+    expect(out.frame!.wallId).toBe('wall_test')
+    expect(out.u).toBeCloseTo(3) // origin is the −3 end
+    expect(out.v).toBeCloseTo(1.6)
+    expect(out.dist).toBeCloseTo(2)
+  })
+
+  test('beyond reach: no hit', () => {
+    const far = wallPlacementFrame(wallEntry([-3, -10], [3, -10]))!
+    expect(aimWallPoint(aim(), [far], 0, 1.6, 0, 0, 0)).toBe(false)
+  })
+
+  test('wall behind the gaze: no hit', () => {
+    const behind = wallPlacementFrame(wallEntry([-3, 2], [3, 2]))!
+    expect(aimWallPoint(aim(), [behind], 0, 1.6, 0, 0, 0)).toBe(false)
+  })
+
+  test('nearest of two candidate walls wins', () => {
+    const near = wallPlacementFrame(wallEntry([-3, -1], [3, -1]))!
+    near.wallId = 'wall_near'
+    const out = aim()
+    expect(aimWallPoint(out, [wall(), near], 0, 1.6, 0, 0, 0)).toBe(true)
+    expect(out.frame!.wallId).toBe('wall_near')
+    expect(out.dist).toBeCloseTo(1)
+  })
+
+  test('aim past the wall end (u out of span): no hit', () => {
+    // Yawed ~64° left: the ray crosses the z=−2 plane at x≈−4.1, past −3.
+    expect(aimWallPoint(aim(), [wall()], 0, 1.6, 0, 1.12, 0)).toBe(false)
+  })
+
+  test('aim above the wall top (v > height): no hit', () => {
+    // tan(0.6) ≈ 0.68 → v ≈ 1.6 + 2.28 > 2.5.
+    expect(aimWallPoint(aim(), [wall()], 0, 1.6, 0, 0, 0.6)).toBe(false)
+  })
+})
+
+describe('snapApertureU', () => {
+  test('snaps to the 10 cm step', () => {
+    expect(snapApertureU(2.34, 0.9, 6)).toBeCloseTo(2.3)
+    expect(snapApertureU(2.36, 0.9, 6)).toBeCloseTo(2.4)
+  })
+
+  test('clamps so the aperture keeps its end margins', () => {
+    expect(snapApertureU(0.1, 0.9, 6)).toBeCloseTo(0.5) // margin + w/2
+    expect(snapApertureU(5.9, 0.9, 6)).toBeCloseTo(5.5)
+  })
+
+  test('wall too short for the aperture: null', () => {
+    expect(snapApertureU(0.4, 0.9, 0.8)).toBeNull()
+  })
+})
+
+describe('aperture rect validity (fits / overlap)', () => {
+  test('apertureRect: center-u, bottom-v0 → wall-space corners', () => {
+    expect(apertureRect(2, 0.9, 1.5, 1.5)).toEqual({ u0: 1.25, u1: 2.75, v0: 0.9, v1: 2.4 })
+  })
+
+  test('rectsOverlap is strict — touching edges do not overlap', () => {
+    const a = apertureRect(1, 0, 0.9, 2.1) // u 0.55..1.45, v 0..2.1
+    expect(rectsOverlap(a, apertureRect(1.9, 0, 0.9, 2.1))).toBe(false) // u-edge touch
+    expect(rectsOverlap(a, apertureRect(1.8, 0, 0.9, 2.1))).toBe(true)
+    // Disjoint vertically even though u-spans overlap (door vs high band).
+    expect(rectsOverlap(a, { u0: 0.5, u1: 1.5, v0: 2.2, v1: 2.4 })).toBe(false)
+    expect(rectsOverlap(a, { u0: 0.5, u1: 1.5, v0: 2.05, v1: 2.4 })).toBe(true)
+  })
+
+  test('fits mid-wall, clear of obstacles', () => {
+    expect(apertureFits(apertureRect(3, 0, 0.9, 2.1), 6, 2.5, [])).toBe(true)
+  })
+
+  test('violating an end margin refuses', () => {
+    expect(apertureFits(apertureRect(0.4, 0, 0.9, 2.1), 6, 2.5, [])).toBe(false)
+  })
+
+  test('poking past the top margin refuses (tall window on a low wall)', () => {
+    expect(apertureFits(apertureRect(3, 1.2, 1.5, 1.5), 6, 2.5, [])).toBe(false)
+  })
+
+  test('overlapping an existing opening refuses; clear neighbors pass', () => {
+    const existing = [{ u0: 2.03, u1: 2.97, v0: -0.02, v1: 2.12 }] // a host door
+    expect(apertureFits(apertureRect(2.8, 0.9, 1.5, 1.5), 6, 2.5, existing)).toBe(false)
+    expect(apertureFits(apertureRect(4.2, 0.9, 1.5, 1.5), 6, 2.5, existing)).toBe(true)
+  })
+})
+
+describe('useItems aperture round-trip', () => {
+  test('addAperture appends kind aperture with the def size, shared id sequence', () => {
+    const item = useItems.getState().addItem(asset(), [1, 0, 2], 0)
+    const door = useItems.getState().addAperture(hingedDoor, 'wall_a', 1.2, 1.05)
+    expect(door.kind).toBe('aperture')
+    expect(door.id).toBeGreaterThan(item.id)
+    expect(door.wallId).toBe('wall_a')
+    expect(door.u).toBe(1.2)
+    expect(door.v).toBe(1.05)
+    expect(door.width).toBe(hingedDoor.width)
+    expect(door.height).toBe(hingedDoor.height)
+    expect(useItems.getState().items).toEqual([item, door])
+  })
+
+  test('resolveItems forgets both kinds', () => {
+    useItems.getState().addItem(asset(), [0, 0, 0], 0)
+    useItems.getState().addAperture(fixedWindow, 'wall_a', 2, 1.65)
+    useItems.getState().resolveItems()
+    expect(useItems.getState().items).toEqual([])
+  })
+
+  test('an armed opening entry owns the trigger like furniture does', () => {
+    expect(itemGhostActive()).toBe(false)
+    useItems.getState().arm(hingedDoor)
+    expect(itemGhostActive()).toBe(true)
+    useItems.getState().disarm()
+    expect(itemGhostActive()).toBe(false)
+  })
+
+  test('pendingApertureRects: same-wall apertures only, inflated by the pad', () => {
+    useItems.getState().addAperture(hingedDoor, 'wall_a', 1.2, 1.05)
+    useItems.getState().addAperture(fixedWindow, 'wall_b', 2, 1.65)
+    useItems.getState().addItem(asset(), [0, 0, 0], 0)
+    const rects = pendingApertureRects(useItems.getState().items, 'wall_a')
+    expect(rects).toHaveLength(1)
+    expect(rects[0]!.u0).toBeCloseTo(1.2 - 0.45 - 0.02)
+    expect(rects[0]!.u1).toBeCloseTo(1.2 + 0.45 + 0.02)
+    expect(rects[0]!.v0).toBeCloseTo(-0.02)
+    expect(rects[0]!.v1).toBeCloseTo(2.12)
   })
 })
