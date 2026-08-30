@@ -494,6 +494,117 @@ export function dropInteriorCells(grid: VoxelGridData, maxThickness = Infinity):
 }
 
 /**
+ * Cell `i`'s world center DERIVED from the grid's own frame — the exact
+ * inverse of the emission in buildVoxelGrid (same three branches, same
+ * trig), rather than a read of the `centers` cache.
+ *
+ * `centers` is a CACHE of this: the bake writes both, and everything
+ * downstream reads the cache because it is one array lookup instead of a
+ * rotation. Having the derivation available separately is what lets a
+ * re-pose rewrite the cache from the frame (so the two can never drift —
+ * see reposeVoxelGrid) and lets a test re-derive world geometry without
+ * asking the code under test where a cell is.
+ *
+ * Writes into `out` and returns it; allocation-free.
+ */
+export function cellWorldCenter(
+  grid: VoxelGridData,
+  i: number,
+  out: { x: number; y: number; z: number },
+): { x: number; y: number; z: number } {
+  const gx = grid.origin.x + (grid.coords[i * 3]! + 0.5) * grid.cellX
+  const gy = grid.origin.y + (grid.coords[i * 3 + 1]! + 0.5) * grid.cellY
+  const gz = grid.origin.z + (grid.coords[i * 3 + 2]! + 0.5) * grid.cellZ
+  if (!basisIsYawOnly(grid.q)) {
+    rotateByBasisInverse(grid.q, gx, gy, gz, out)
+    return out
+  }
+  if (grid.yaw === 0) {
+    out.x = gx
+    out.y = gy
+    out.z = gz
+    return out
+  }
+  const cos = Math.cos(grid.yaw)
+  const sin = Math.sin(grid.yaw)
+  out.x = gx * cos - gz * sin
+  out.y = gy
+  out.z = gx * sin + gz * cos
+  return out
+}
+
+const _reposeQ = new Quaternion()
+const _reposeConj = new Quaternion()
+const _reposePos = new Vector3()
+const _reposeScale = new Vector3()
+const _reposeV = { x: 0, y: 0, z: 0 }
+
+/**
+ * RIGIDLY RE-POSE a baked grid — the cells, the holes carved in them, the
+ * islands they form and the paint on them all ride `motion` instead of being
+ * thrown away.
+ *
+ * A grid is not really world-space data: `(q, origin)` already IS a rotation
+ * plus a translation, every query rotates its world argument into that frame
+ * before touching an index, and `centers` is a derived cache. So the whole
+ * pose of a grid lives in three fields, and a rigid motion of the geometry it
+ * was baked from is expressible exactly:
+ *
+ *   a cell index must keep naming the same MATERIAL point, i.e. for every
+ *   world point p, gridOf'(M·p) = gridOf(p), where gridOf(p) = R_q·p − origin.
+ *   Writing M·p = R·p + t and matching terms:
+ *
+ *     R_q' = R_q ∘ R⁻¹        (the frame rotates the OPPOSITE way)
+ *     origin' = origin + R_q'·t
+ *
+ * Everything else — coords, index, alive, aliveCount, nx/ny/nz, the cell
+ * sizes — is index-space and untouched, which is the entire point: a door
+ * leaf that took six bullets keeps those six holes, in those six cells, and
+ * they swing with it.
+ *
+ * PRECONDITION, the caller's to enforce: `motion` must be RIGID (a rotation
+ * and a translation, no scale or shear) and must describe the motion of EVERY
+ * mesh the grid was baked from. One grid cannot follow two motions — a window
+ * sash sliding inside a frame that stays put is not re-poseable, and neither
+ * is anything holding a second world-space payload keyed to this pose
+ * (framing segments, drywall sheets, shell fragments, baked paint decals).
+ * See destruction.ts::resyncPosedTarget, which owns that policy.
+ *
+ * `centers` is rewritten from the NEW frame rather than by pushing the old
+ * world points through `motion`, so the cache cannot drift from `(q, origin)`
+ * no matter how many times a grid is re-posed: the render lane reads
+ * `centers` while the ray and collision lanes walk indices from `origin`/`q`,
+ * and a drift between those two is precisely the ghost where a bullet stops
+ * in mid-air short of a cube it can see. The new buffer is a FRESH
+ * allocation, which also keeps every consumer that caches by `centers`
+ * buffer identity (voxel-walls' grid bounding spheres) correct for free.
+ */
+export function reposeVoxelGrid(grid: VoxelGridData, motion: Matrix4): void {
+  motion.decompose(_reposePos, _reposeQ, _reposeScale)
+  _reposeConj.set(-_reposeQ.x, -_reposeQ.y, -_reposeQ.z, _reposeQ.w)
+  _reposeQ.set(grid.q.x, grid.q.y, grid.q.z, grid.q.w).multiply(_reposeConj)
+  grid.q = { x: _reposeQ.x, y: _reposeQ.y, z: _reposeQ.z, w: _reposeQ.w }
+  // `yaw` is authoritative only while the basis is yaw-only (see
+  // VoxelGridData.yaw); a general basis has no scalar equivalent and must
+  // report 0 so consumers read `q` instead.
+  grid.yaw = basisIsYawOnly(grid.q) ? yawOfBasis(grid.q) : 0
+  rotateByBasis(grid.q, _reposePos.x, _reposePos.y, _reposePos.z, _reposeV)
+  grid.origin = {
+    x: grid.origin.x + _reposeV.x,
+    y: grid.origin.y + _reposeV.y,
+    z: grid.origin.z + _reposeV.z,
+  }
+  const centers = new Float32Array(grid.count * 3)
+  for (let i = 0; i < grid.count; i++) {
+    cellWorldCenter(grid, i, _reposeV)
+    centers[i * 3] = _reposeV.x
+    centers[i * 3 + 1] = _reposeV.y
+    centers[i * 3 + 2] = _reposeV.z
+  }
+  grid.centers = centers
+}
+
+/**
  * Analytic ray vs yaw-rotated OBB (slab test in the box's local frame).
  * `yaw` follows the stud convention — the box renders with rotation
  * [0, -yaw, 0], so world→local is a +yaw rotation about Y. Half-extents,
