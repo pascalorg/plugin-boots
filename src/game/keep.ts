@@ -1,7 +1,16 @@
 import { type AnyNode, type AnyNodeId, nodeRegistry, useScene } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
-import { CELLS, PIECE_DIMS, planWallMask, trimmedWallSpan, WALL_H, type WallPocket } from './builder'
+import {
+  CELLS,
+  isForeignPlacedPiece,
+  PIECE_DIMS,
+  planWallMask,
+  releaseSharedPlacedPieces,
+  trimmedWallSpan,
+  WALL_H,
+  type WallPocket,
+} from './builder'
 import { classifyRoofShape, type RoofCorners } from './roof-corners'
 import { collectStackedLevels, type StackedLevel } from './world'
 
@@ -319,11 +328,19 @@ function levelForBaseY(levels: readonly StackedLevel[], baseY: number): StackedL
 }
 
 export function keepPlaced(): KeepResult {
-  const placed = useBoots.getState().placed
+  // ONLY WHAT THIS PLAYER BUILT. In a shared world the store interleaves
+  // everyone's pieces, and a Save writes the document on behalf of the person
+  // who pressed the button — a stranger's wall is theirs to keep on their own
+  // screen, not ours to commit here. Filtering at the top also keeps the tally
+  // honest: every count below, including the give-up path's `skipped`, is a
+  // count of work that was actually considered for writing. In single-player
+  // nothing is foreign and this is the store's own list.
+  const placed = useBoots.getState().placed.filter((piece) => !isForeignPlacedPiece(piece.id))
   const def = nodeRegistry.get('wall') as RegistryDef | undefined
   const selectionLevelId = useViewer.getState().selection.levelId
   const result: KeepResult = { kept: 0, skipped: 0, windows: 0, doors: 0, roofs: 0, floors: 0 }
   if (!def?.schema || !selectionLevelId) {
+    releaseSharedPlacedPieces()
     useBoots.getState().resolvePlaced()
     return { ...result, skipped: placed.length }
   }
@@ -419,10 +436,16 @@ export function keepPlaced(): KeepResult {
       result.skipped++
     }
   }
+  // Unbind our records WITHOUT tombstoning them: the pieces just became real
+  // scene walls here, and on every other screen they are still the walls they
+  // always were. Killing the records would delete a peer's view of a building
+  // that exists.
+  releaseSharedPlacedPieces()
   useBoots.getState().resolvePlaced()
   return result
 }
 
 export function discardPlaced(): void {
+  releaseSharedPlacedPieces()
   useBoots.getState().resolvePlaced()
 }

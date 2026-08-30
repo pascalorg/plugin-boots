@@ -1,6 +1,13 @@
 import { type AnyNode, type AnyNodeId, nodeRegistry, useScene } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
-import { type PlacedAperture, type PlacedItem, useItems } from './item-place'
+import {
+  isForeignItemPlacement,
+  type Placement,
+  type PlacedAperture,
+  type PlacedItem,
+  releaseSharedItemPlacements,
+  useItems,
+} from './item-place'
 
 /**
  * Save-the-furniture — the catalog lane's half of the persistence contract
@@ -105,7 +112,18 @@ export function buildAperturePayload(
 /** Placements awaiting the panel's decision (furniture AND apertures) —
  * session.ts folds this into the pendingDecision gate on exit. */
 export function placedItemCount(): number {
-  return useItems.getState().items.length
+  return ownPlacements().length
+}
+
+/**
+ * The placements THIS player is answerable for. Everything downstream reads
+ * this rather than the store: a Save writes the work of whoever pressed the
+ * button, and a session where the only furniture was carried in by other
+ * players has nothing to decide about — so the pendingDecision gate must not
+ * fire either. Identical to the store's list in single-player.
+ */
+function ownPlacements(): Placement[] {
+  return useItems.getState().items.filter((placed) => !isForeignItemPlacement(placed.id))
 }
 
 /** The explicit save: furniture placements attempt real 'item' nodes under
@@ -114,7 +132,7 @@ export function placedItemCount(): number {
  * resolves either way (skipped placements are reported, not retried — the
  * keepPlaced rule). */
 export function applyItems(): ItemKeepResult {
-  const items = useItems.getState().items
+  const items = ownPlacements()
   const result: ItemKeepResult = { kept: 0, skipped: 0, doors: 0, windows: 0 }
   if (items.length === 0) return result
   const itemDef = nodeRegistry.get('item') as RegistryDef | undefined
@@ -154,10 +172,14 @@ export function applyItems(): ItemKeepResult {
       result.skipped++
     }
   }
+  // Unbind ours without tombstoning: saving turns them into real nodes here,
+  // while on every other screen they are still the chairs and doors they were.
+  releaseSharedItemPlacements()
   useItems.getState().resolveItems()
   return result
 }
 
 export function discardItems(): void {
+  releaseSharedItemPlacements()
   useItems.getState().resolveItems()
 }

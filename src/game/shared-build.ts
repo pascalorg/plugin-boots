@@ -170,14 +170,14 @@ export function attachBuildSync(
 ): void {
   sync = { world, sink: opts?.sink ?? null, pending: null }
   if (opts?.notice) noticeSink = opts.notice
-  resetRegistries()
+  resetBindings()
 }
 
 /** Turn it off and forget every binding (session exit). The world itself is
  * not reset — its owner decides that (resetSharedWorld keeps the peer id). */
 export function detachBuildSync(): void {
   sync = null
-  resetRegistries()
+  resetBindings()
 }
 
 export function setBuildSyncSink(sink: DeltaSink | null): void {
@@ -239,22 +239,45 @@ const placementRecord = new Map<number, RecordId>()
 const placementRuntime = new Map<RecordId, number>()
 const foreignPlacements = new Set<number>()
 
-function resetRegistries(): void {
+/**
+ * Drop the record↔runtime bindings. NOT the authorship sets — see below.
+ */
+function resetBindings(): void {
   pieceRecord.clear()
   pieceRuntime.clear()
-  foreignPieces.clear()
   piecePublished.clear()
   deposedPieces.clear()
   placementRecord.clear()
   placementRuntime.clear()
+}
+
+/**
+ * AUTHORSHIP OUTLIVES THE SESSION, on purpose.
+ *
+ * The Save bridges do not run during play — the panel offers its decision back
+ * in the editor, after the session has torn down and the shared world has been
+ * detached. If detaching forgot who built what, every stranger's wall would
+ * read as this player's own work at exactly the moment Save writes the
+ * document, which is the one thing that must never happen.
+ *
+ * Keeping them is safe because runtime ids are monotonic: `placedId` and
+ * `itemId` are module counters that never reuse a number, so a stale entry can
+ * never be mistaken for a new object. Only a test reset clears them.
+ */
+function resetAttribution(): void {
+  foreignPieces.clear()
   foreignPlacements.clear()
 }
 
 /**
- * Is this placed piece somebody else's? False whenever sync is off, so the
- * single-player Save path is untouched. keep.ts reaches this through
- * builder.tsx (a Save bridge may not import a shared module for anything but
- * localWork — shared-invariant.test.ts enforces it).
+ * Is this placed piece somebody else's?
+ *
+ * Deliberately NOT gated on `buildSyncOn()`: Save runs after the session has
+ * torn down and the world has been detached, and the answer has to still be
+ * right then (see resetAttribution). Nothing is ever foreign in single-player,
+ * so that path is untouched. keep.ts reaches this through builder.tsx — a Save
+ * bridge may not import a shared module for anything but localWork, and
+ * shared-invariant.test.ts enforces it.
  */
 export function isForeignPiece(runtimeId: number): boolean {
   return foreignPieces.has(runtimeId)
@@ -749,6 +772,7 @@ export function sharedBuildDebug(): {
 /** Test/teardown reset: forget the session AND the once-per-session notices. */
 export function resetSharedBuild(): void {
   detachBuildSync()
+  resetAttribution()
   clearBuildAppliers()
   noticeSink = null
   refusedGridSaid = false
