@@ -4947,6 +4947,49 @@ export function collideVoxelTargets(pos: Vector3, vel: Vector3, radius: number, 
 /** Legacy alias. */
 export const collideVoxelWalls = collideVoxelTargets
 
+/**
+ * OPERABLE HANDBACK (owner repro 2026-08-30, Starter House: "can't walk
+ * through a regular door — something on the wall blocks me"): a CLOSED door
+ * that catches ANY stray fire wakes its voxel replica AT THE CLOSED POSE.
+ * The twin looks just like the door, the E prompt stands down (interact's
+ * isVoxelized), and the doorway is sealed for the rest of the session —
+ * one pistol round turned the house's only entrance into a wall.
+ *
+ * This hands the node back to the interact system: reverse hideHostNode
+ * (for a non-wall node the meshes ensureVoxelTarget collected and hid ARE
+ * exactly the node's collider meshes — doors have no glass split and nest
+ * no other node's kept root, so the hide plan was a plain `visible = false`
+ * per mesh; the session exit ledger re-asserts `visible = true`, so a
+ * mid-session un-hide stays consistent) and drop the target, so the leaf
+ * renders, swings, and re-voxelizes from its LIVE pose on the next hit.
+ * The few carved cells "heal" — a fair trade against a permanently sealed
+ * house. The DAMAGE POLICY lives with the caller (interact.tsx
+ * DOOR_RESTORE_MAX_DAMAGE); this refuses only structural impossibilities:
+ * no session, no target, or a roof-family member (never a door). A still-
+ * DORMANT target only retires its stale prebuild — the host already
+ * renders and collides. Returns whether the host owns the node again.
+ */
+export function restoreOperableTarget(nodeId: string): boolean {
+  const state = useDestruction.getState()
+  const target = state.targets.get(nodeId)
+  if (!target) return false
+  if (target.dormant) {
+    dropTarget(nodeId)
+    return true
+  }
+  if (roofGroups.has(nodeId) || roofMemberOf.has(nodeId)) return false
+  const world = sessionWorld
+  if (!world) return false
+  for (const collider of world.colliders) {
+    if (collider.nodeId !== nodeId) continue
+    collider.mesh.visible = true
+    collider.disabled = false
+    collider.ballistic = false
+  }
+  dropTarget(nodeId)
+  return true
+}
+
 /** Forget one voxel target (builder Z-undo unmounts its source mesh): the
  * replica unmounts and any pending island collapse for it is cancelled.
  * No-op if the node never voxelized. */

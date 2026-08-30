@@ -39,6 +39,7 @@ import {
   prevoxelizeTick,
   raycastSegments,
   resetDestruction,
+  restoreOperableTarget,
   savedCoatHex,
   setPrevoxelizeClock,
   sortPendingByDistance2,
@@ -1400,5 +1401,66 @@ describe('per-cell texture patterns at voxelize (stage 2)', () => {
     const world = makeWorld()
     const target = ensureVoxelTarget(world, 'wall-2')!
     expect(target.toneGrid).toBeUndefined()
+  })
+})
+
+/**
+ * SEALED-DOOR HANDBACK (owner repro 2026-08-30, Starter House): a closed
+ * door that catches stray fire voxelizes AT ITS CLOSED POSE and seals the
+ * doorway for the session. restoreOperableTarget is the destruction side
+ * of the E handback: reverse hideHostNode for the node's collider meshes
+ * and drop the grid, so interact can swing the live leaf again. The damage
+ * policy (DOOR_RESTORE_MAX_DAMAGE) lives in interact.tsx — see its suite.
+ */
+describe('restoreOperableTarget (sealed-door handback)', () => {
+  function doorWorld() {
+    const door = boxCollider('door-1', 'door', [1, 2.1, 0.06], [0, 1.05, 0])
+    const buildingAabb = new Box3().union(door.worldBox)
+    const world: GameWorld = {
+      colliders: [door],
+      walls: new Map(),
+      glass: [],
+      doors: [
+        {
+          nodeId: 'door-1',
+          root: door.root,
+          colliderIndices: [0],
+          node: { doorType: 'hinged', openingKind: 'door' },
+        },
+      ],
+      overlayRoots: [],
+      buildingAabb,
+      spawn: new Vector3(6, 0, 6),
+      spawnYaw: 0,
+      levelId: null,
+    }
+    return { door, world }
+  }
+
+  test('awake target: leaf visible again, colliders re-latched, grid dropped', () => {
+    const { door, world } = doorWorld()
+    ensureVoxelTarget(world, 'door-1')
+    expect(door.disabled).toBe(true) // hideHostNode handed collision over
+    // Headless: no live session, so hideForGame was a no-op — simulate the
+    // in-session hide + the ballistic lane the handback must also clear.
+    door.mesh.visible = false
+    door.ballistic = true
+    expect(restoreOperableTarget('door-1')).toBe(true)
+    expect(useDestruction.getState().targets.has('door-1')).toBe(false)
+    expect(door.mesh.visible).toBe(true)
+    expect(door.disabled).toBe(false)
+    expect(door.ballistic).toBe(false)
+  })
+
+  test('dormant prebuild: only the stale grid drops (host already renders)', () => {
+    const { door, world } = doorWorld()
+    ensureVoxelTarget(world, 'door-1', { dormant: true })
+    expect(door.disabled).toBeFalsy() // dormant = host still collides
+    expect(restoreOperableTarget('door-1')).toBe(true)
+    expect(useDestruction.getState().targets.has('door-1')).toBe(false)
+  })
+
+  test('never-voxelized node: false, no-op', () => {
+    expect(restoreOperableTarget('door-ghost')).toBe(false)
   })
 })

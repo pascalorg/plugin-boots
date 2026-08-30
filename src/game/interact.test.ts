@@ -6,6 +6,7 @@ import {
   AIM_RANGE,
   buildPassageBox,
   classifyOperable,
+  isRestorableDoor,
   mountInteract,
   nearestDoorFallback,
   type OperableState,
@@ -577,5 +578,114 @@ describe('open-door combat + passage relief', () => {
     // …the thin axis (z) pads past sills/rails that overhang the wall face.
     expect(box.min.z).toBeLessThan(-0.3)
     expect(box.max.z).toBeGreaterThan(0.3)
+  })
+})
+
+/**
+ * SEALED-DOOR HANDBACK (owner repro 2026-08-30, Starter House scene
+ * 31b8ec37e9bb: "still can't walk through a regular door … something on
+ * the wall blocks me"): ONE pistol round on a CLOSED door woke its voxel
+ * replica AT THE CLOSED POSE — the twin looked like the door, the E prompt
+ * stood down, and the doorway stayed sealed for the whole session. While
+ * the awake grid is lightly damaged (≤ DOOR_RESTORE_MAX_DAMAGE of its
+ * cells gone) the door must stay E-operable: the toggle hands the node
+ * back to the host (restoreOperableTarget — leaf visible, colliders
+ * re-latched) and swings it open like any other door.
+ */
+describe('sealed-door handback (voxelized-at-closed-pose doors)', () => {
+  function sealedDoorWorld() {
+    const door = buildOperable('door-v', 'door', [1, 2.1, 0.06], [0, 1.05, -1])
+    const world = makeWorld({
+      doors: [{ built: door, nodeId: 'door-v', node: { doorType: 'hinged', openingKind: 'door' } }],
+    })
+    const states = mountInteract(world)
+    return { door, world, states, state: states.get('door-v')! }
+  }
+
+  test('a lightly-shot closed door keeps the prompt and E re-takes + opens it', () => {
+    const { door, world, states, state } = sealedDoorWorld()
+    // Stray fire: the dormant-less awake voxelize at the CLOSED pose (the
+    // repro's pistol round). destruction disables the host colliders.
+    ensureVoxelTarget(world, 'door-v')
+    const target = useDestruction.getState().targets.get('door-v')!
+    expect(target.dormant).toBeFalsy()
+    expect(door.collider.disabled).toBe(true)
+    // Light damage — a few cells of the leaf carved out.
+    target.grid.aliveCount = target.grid.count - Math.floor(target.grid.count * 0.1)
+
+    // The door still answers the crosshair AND the point-blank fallback.
+    const origin = new Vector3(0, 1.05, 0.5)
+    const forward = new Vector3(0, 0, -1)
+    expect(isRestorableDoor(state)).toBe(true)
+    expect(pickAimedOperable(states.values(), origin, forward)?.nodeId).toBe('door-v')
+    expect(nearestDoorFallback(states.values(), new Vector3(0, 1.05, -0.2))?.nodeId).toBe('door-v')
+
+    // E: hand the node back to the host, then swing.
+    toggleOperable(state)
+    expect(useDestruction.getState().targets.has('door-v')).toBe(false) // grid gone
+    expect(door.collider.mesh.visible).toBe(true) // leaf renders again
+    expect(state.open).toBe(true)
+    settle(states)
+    // Open posture exactly like an undamaged door: passable + shootable.
+    expect(door.collider.disabled).toBe(true)
+    expect(door.collider.ballistic).toBe(true)
+    expect(passageCount()).toBe(1)
+    unmountInteract(states)
+  })
+
+  test('past the damage cap destruction keeps the door: no prompt, no toggle', () => {
+    const { door, world, states, state } = sealedDoorWorld()
+    ensureVoxelTarget(world, 'door-v')
+    const target = useDestruction.getState().targets.get('door-v')!
+    // More than DOOR_RESTORE_MAX_DAMAGE of the cells are gone — wrecked.
+    target.grid.aliveCount = Math.floor(target.grid.count * 0.5)
+    expect(isRestorableDoor(state)).toBe(false)
+
+    const origin = new Vector3(0, 1.05, 0.5)
+    const forward = new Vector3(0, 0, -1)
+    expect(pickAimedOperable(states.values(), origin, forward)).toBeNull()
+    expect(nearestDoorFallback(states.values(), new Vector3(0, 1.05, -0.2))).toBeNull()
+    toggleOperable(state) // self-guarded no-op
+    expect(state.open).toBe(false)
+    expect(useDestruction.getState().targets.has('door-v')).toBe(true)
+    expect(door.collider.disabled).toBe(true) // the grid keeps collision
+    unmountInteract(states)
+  })
+
+  test('a door that voxelized standing OPEN is never re-taken (doorway stays open)', () => {
+    const { world, states, state } = sealedDoorWorld()
+    toggleOperable(state)
+    settle(states)
+    expect(state.open).toBe(true)
+    // Bullets broke the open leaf — destruction owns it from here.
+    ensureVoxelTarget(world, 'door-v')
+    expect(isRestorableDoor(state)).toBe(false)
+    toggleOperable(state) // no close over a carved grid
+    expect(state.open).toBe(true)
+    expect(useDestruction.getState().targets.has('door-v')).toBe(true)
+    // The passage prism keeps relieving the open doorway.
+    expect(passageCount()).toBe(1)
+    unmountInteract(states)
+  })
+
+  test('windows and cabinets never hand back', () => {
+    const win = buildOperable('win-v', 'window', [1.2, 1.2, 0.1], [4, 1.5, 0])
+    const world = makeWorld({
+      operables: [
+        {
+          built: win,
+          nodeId: 'win-v',
+          kind: 'window',
+          node: { windowType: 'casement', openingKind: 'window', operationState: 0 },
+        },
+      ],
+    })
+    const states = mountInteract(world)
+    ensureVoxelTarget(world, 'win-v')
+    expect(isRestorableDoor(states.get('win-v')!)).toBe(false)
+    toggleOperable(states.get('win-v')!)
+    expect(states.get('win-v')!.open).toBe(false)
+    expect(useDestruction.getState().targets.has('win-v')).toBe(true)
+    unmountInteract(states)
   })
 })

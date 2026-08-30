@@ -8,7 +8,7 @@ import { Box3, Matrix4, type Object3D, Quaternion, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { registerPassage, unregisterPassage } from './collision'
-import { dropTarget, useDestruction } from './destruction'
+import { dropTarget, restoreOperableTarget, useDestruction } from './destruction'
 import { armoryStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
@@ -74,7 +74,11 @@ import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world
  * editor gets its scene back exactly as it was.
  *
  * Once gunfire voxelizes a node, destruction owns it: no prompt, no pose,
- * and NEVER re-enable colliders over the carved voxel grid.
+ * and NEVER re-enable colliders over the carved voxel grid — with ONE
+ * exception: a lightly-shot CLOSED door (voxelized at its closed pose, the
+ * doorway sealed) stays E-operable, and the toggle hands the node back to
+ * the host before swinging (see DOOR_RESTORE_MAX_DAMAGE /
+ * destruction.restoreOperableTarget — the Starter House owner repro).
  */
 
 export const AIM_RANGE = 2.5
@@ -277,6 +281,38 @@ function isVoxelized(nodeId: string): boolean {
   return !!target && !target.dormant
 }
 
+/** SEALED-DOOR HANDBACK cap (owner repro 2026-08-30, Starter House): a
+ * CLOSED door that catches stray fire voxelizes AT THE CLOSED POSE — the
+ * twin looks like the door, the prompt stands down, and the doorway is
+ * sealed for the whole session (one pistol round walled the house's only
+ * entrance shut). While the awake grid has lost NO MORE than this fraction
+ * of its cells, E still owns the door: the toggle hands the node back to
+ * the host (destruction.restoreOperableTarget — the bullet holes heal) and
+ * swings it. Past the cap the door is visibly wrecked and destruction
+ * keeps it: shoot the rest out, that's the game. */
+export const DOOR_RESTORE_MAX_DAMAGE = 1 / 3
+
+/** Can E still take this operable back from destruction? Doors only (a
+ * voxel cabinet has nothing to pose), CLOSED only (a door that voxelized
+ * standing open keeps its open doorway — and its passage prism — forever;
+ * re-posing it would sweep the leaf through the carved grid), and only
+ * while the awake grid is lightly damaged (see DOOR_RESTORE_MAX_DAMAGE). */
+export function isRestorableDoor(state: OperableState): boolean {
+  if (state.kind !== 'door-hinged' && state.kind !== 'door-operation') return false
+  if (state.open) return false
+  const target = useDestruction.getState().targets.get(state.nodeId)
+  if (!target || target.dormant) return false
+  const grid = target.grid
+  if (!grid || !(grid.count > 0)) return false
+  return grid.count - grid.aliveCount <= grid.count * DOOR_RESTORE_MAX_DAMAGE
+}
+
+/** The voxelize stand-down predicate for aim/fallback/toggle: destruction
+ * owns the node — EXCEPT a lightly-shot closed door, which E can restore. */
+function standsDown(state: OperableState): boolean {
+  return isVoxelized(state.nodeId) && !isRestorableDoor(state)
+}
+
 function easeOutCubic(k: number): number {
   const inv = 1 - k
   return 1 - inv * inv * inv
@@ -394,6 +430,12 @@ function applyNamedPose(
 
 /** Toggle open/close: retarget the animation and handle colliders + sfx. */
 export function toggleOperable(state: OperableState): void {
+  // Voxelized node: destruction owns it — no pose over a carved grid. The
+  // one exception is the sealed-door handback (see DOOR_RESTORE_MAX_DAMAGE):
+  // a lightly-shot CLOSED door re-takes its host leaf first, then swings.
+  if (isVoxelized(state.nodeId)) {
+    if (!isRestorableDoor(state) || !restoreOperableTarget(state.nodeId)) return
+  }
   state.open = !state.open
   // Paint decals are world-space splats baked at the host's clip-time pose
   // (doors/windows are PAINTABLE): the swinging leaf would leave them
@@ -641,7 +683,7 @@ export function pickAimedOperable(
   let best: OperableState | null = null
   let bestDist = maxDist
   for (const state of states) {
-    if (isVoxelized(state.nodeId)) continue
+    if (standsDown(state)) continue
     for (const collider of state.colliders) {
       _inverse.copy(collider.inverse)
       _localRay.origin.copy(_aimRay.origin).applyMatrix4(_inverse)
@@ -671,7 +713,7 @@ export function nearestDoorFallback(
   let bestSq = range * range
   for (const state of states) {
     if (state.kind !== 'door-hinged' && state.kind !== 'door-operation') continue
-    if (isVoxelized(state.nodeId)) continue
+    if (standsDown(state)) continue
     const dSq = state.center.distanceToSquared(position)
     if (dSq < bestSq) {
       bestSq = dSq
@@ -807,6 +849,8 @@ export const interactDebug = {
       : [],
   toggle: (nodeId: string): void => {
     const state = activeStates?.get(nodeId)
-    if (state && !isVoxelized(nodeId)) toggleOperable(state)
+    // toggleOperable self-guards the voxelized case (including the sealed-
+    // door handback), so bots fumbling a lightly-shot door open it too.
+    if (state) toggleOperable(state)
   },
 }
