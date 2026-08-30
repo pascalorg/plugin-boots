@@ -24,6 +24,7 @@ import {
   getGridAnchor,
   getStoreyLadder,
   type GridAnchor,
+  gridTerrainY,
   parseSlotId,
   resetGridAnchor,
   resetGridTerrainY,
@@ -66,6 +67,14 @@ import {
   toggleCorner,
 } from './roof-corners'
 import { getSession } from './session'
+import {
+  buildSyncOn,
+  forgetSharedPieces,
+  isForeignPiece,
+  publishGridStamp,
+  reconcileSharedPieces,
+  sharedBuildDebug,
+} from './shared-build'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -1200,6 +1209,15 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     // STOREY LADDER: the storeys adopt the building's real level elevations
     // (same lifecycle). Worlds without one keep the uniform 2.8 fallback.
     setStoreyLadder(world.storeyLadder ?? null)
+    // SLOT IDS ARE ADDRESSES IN THIS FRAME, so a peer only means the same
+    // thing by "Wx:1,0,0" if it installed the same one. Publish the
+    // fingerprint the moment the frame exists and never again — a peer whose
+    // stamp differs has its slot-addressed pieces refused rather than landed
+    // in the wrong place (shared-build surfaces that refusal to the player).
+    // The terrain rung goes in first: with no ladder the storeys are measured
+    // from it, so two lots at different elevations are genuinely different
+    // grids even when the anchor and the ladder match.
+    publishGridStamp(anchor.x, anchor.z, [gridTerrainY(), ...(getStoreyLadder() ?? [])])
     for (const p of useBoots.getState().placed) {
       if (p.slotId) registerPlacement(p.slotId, p.id)
     }
@@ -1234,6 +1252,27 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     }
   }, [world])
 
+  // THE SHARED BUILD LANE, in one place. Declared after the grid effect so
+  // the lattice frame and its fingerprint exist before the first piece is
+  // published, and keyed on `placed` so it runs after every change the store
+  // can take: a placement, an F-edit, an exit transform, U, the support
+  // cascade, a replica shot to bits. shared-build diffs the store against
+  // what it has already published, so ONE listener covers every path in and
+  // out — no publish call bolted onto each call site, and nothing at all when
+  // sync is off (it returns on its first line).
+  useEffect(() => {
+    reconcileSharedPieces()
+  }, [placed])
+
+  // Dev handle for the multiplayer QA scripts, alongside __bootsBuilder.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return
+    ;(globalThis as Record<string, unknown>).__bootsBuild = sharedBuildDebug
+    return () => {
+      delete (globalThis as Record<string, unknown>).__bootsBuild
+    }
+  }, [])
+
   return (
     <group userData={{ __boots: true }}>
       {placed.map((piece) => (
@@ -1241,6 +1280,52 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
       ))}
     </group>
   )
+}
+
+/**
+ * Is this placed piece another player's work?
+ *
+ * keep.ts asks THIS rather than shared-build directly: a Save bridge may not
+ * import a shared module for anything but `localWork`, and
+ * shared-invariant.test.ts enforces exactly that. The build lane already owns
+ * the authorship registry, so the bridge asks its own lane and the fence
+ * stays green. Always false in single-player.
+ */
+export function isForeignPlacedPiece(id: number): boolean {
+  return isForeignPiece(id)
+}
+
+/**
+ * Save/Discard resolved the placements: unbind ours WITHOUT tombstoning them.
+ * On this screen the game pieces become real scene walls; on every other
+ * screen they are still the walls they always were, and killing the records
+ * would delete a peer's view of a building that still exists. Called by
+ * keep.ts either side of resolvePlaced().
+ */
+export function releaseSharedPlacedPieces(): void {
+  forgetSharedPieces()
+}
+
+/**
+ * U undoes YOUR last placement, not whatever happens to sit last in the list.
+ *
+ * With a shared world attached, `placed` interleaves everyone's pieces in
+ * arrival order, so the store's own pop would hand the player a stranger's
+ * wall — and it would not even stay deleted, since the record is still alive
+ * and the next reconcile would put it straight back. So walk backwards to the
+ * last piece this client authored. With sync off there is nothing to skip and
+ * this is the store's `removeLastPlaced()`, called exactly as before.
+ */
+function undoLastOwnPlacement(): PlacedPiece | undefined {
+  const state = useBoots.getState()
+  if (!buildSyncOn()) return state.removeLastPlaced()
+  const placed = state.placed
+  for (let i = placed.length - 1; i >= 0; i--) {
+    const p = placed[i]
+    if (!p || isForeignPiece(p.id)) continue
+    return state.removePlaced(p.id)
+  }
+  return undefined
 }
 
 /** Direct piece hotkeys while the builder is held — the classic PC row:
@@ -1546,6 +1631,10 @@ export function Builder() {
       let bestT = EDIT_RANGE
       let bestBit = 0
       for (const p of useBoots.getState().placed) {
+        // YOUR pieces — the F-edit carves cells and re-mints the record, which
+        // is an authorship claim. A stranger's wall is not editable; it is
+        // shootable, which is the answer the genre already gives.
+        if (isForeignPiece(p.id)) continue
         const hit = raycastEditTarget(p, aox, aoy, aoz, adx, ady, adz, EDIT_RANGE)
         if (hit && hit.t <= bestT) {
           best = p
@@ -1710,13 +1799,14 @@ export function Builder() {
     prevFire.current = firing
     prevAltFire.current = session.input.state.altFiring
 
-    // UNDO on KeyU (Z selects the wall piece now). onPieceRemoved is the
+    // UNDO on KeyU (Z selects the wall piece now, undoLastOwnPlacement below
+    // keeps U off other people's walls). onPieceRemoved is the
     // ONE removal entry point: it stamps the died-slot lockout and cascades
     // anything the removal orphaned (the collapse listener in PlacedPieces
     // evicts those pieces through the same store path).
     const undoDown = session.input.state.keys.has('KeyU')
     if (undoDown && !prevUndo.current) {
-      const removed = useBoots.getState().removeLastPlaced()
+      const removed = undoLastOwnPlacement()
       if (removed) {
         if (removed.slotId) onPieceRemoved(removed.slotId)
         sfx.weaponSwitch()
