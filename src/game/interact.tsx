@@ -26,6 +26,7 @@ import { armoryStationPosition } from './guntable'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
 import { getSession } from './session'
+import { replicaDrawAudit } from './voxel-walls'
 import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world'
 
 /**
@@ -940,6 +941,11 @@ export const interactDebug = {
   },
   /** Every live passage prism as plain data (what collision.ts is relieving). */
   passages: () => passageBoxes(),
+  /** RENDER-LANE AGREEMENT: do the drawn cubes stand on the cells the collision
+   * and ray lanes are using? (voxel-walls.replicaDrawAudit — the only view into
+   * an InstancedMesh from QA, and the number that proves a re-posed door
+   * re-primed its matrices instead of drawing at its old pose.) */
+  drawAudit: (nodeId?: string) => replicaDrawAudit(nodeId),
   /** Would the VOXEL lane relieve a cell centered here for a capsule whose feet
    * are at `feetY`? (collision.ts::passageRelievesCell — the exact predicate
    * collideVoxelTargets consults.) Lets QA prove, cell by cell, that the
@@ -1054,6 +1060,13 @@ export const interactDebug = {
                   walkOnly: target.walkOnly === true,
                   aliveCount: target.grid.aliveCount,
                   totalCount: target.grid.alive.length,
+                  cell: +target.grid.cell.toFixed(4),
+                  /** How many times the grid FRAME has been rigidly re-posed
+                   * onto the leaf (destruction.ts reposePosedTarget): 0 = it
+                   * still stands where it baked, which for a door that has
+                   * swung since means the settle handed the node back
+                   * instead. */
+                  poseRevision: target.poseRevision ?? 0,
                 }
               : null,
           }

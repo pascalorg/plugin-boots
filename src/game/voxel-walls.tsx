@@ -922,6 +922,93 @@ function writeCellMatrix(
  * per grid instead of once per door toggle. */
 const _gridSpheres = new WeakMap<Float32Array, { sphere: Sphere; count: number }>()
 
+/** Every mounted skin layer, by node id — QA surface only (replicaDrawAudit).
+ * Written in the mount effect, deleted on unmount. */
+const _liveReplicas = new Map<string, InstancedMesh>()
+
+const _auditM = new Matrix4()
+
+/**
+ * DO THE DRAWN CUBES STAND ON THEIR CELLS?
+ *
+ * Per awake replica, the worst distance in metres between a VISIBLE instance's
+ * matrix translation and its cell's centre. Zero to float noise whenever the
+ * render lane and the query lanes (collision, rays, structure) agree, because
+ * both compose from `grid.centers` — and the direct numeric measure of the
+ * ghost class of bug, since a bullet stopping in mid-air short of a visible
+ * cube is exactly this number going positive.
+ *
+ * Reads only, allocates one row per replica, and is the only way to confirm
+ * from the browser that a re-posed grid (destruction.ts poseRevision) really
+ * did re-prime its matrices — nothing else can see inside an InstancedMesh.
+ * Hidden instances are skipped: a carved cell and a cell inside an open doorway
+ * both carry a zero matrix BY DESIGN, which is what `hidden` counts.
+ */
+export function replicaDrawAudit(nodeId?: string): Array<{
+  nodeId: string
+  /** Cells the grid says are alive. */
+  alive: number
+  /** Alive cells actually drawing (alive − hidden). */
+  drawn: number
+  /** Alive cells carrying a zero matrix — carved is impossible here, so this is
+   * open-doorway passage relief (voxel-walls passageHidesCell). */
+  hidden: number
+  /** Dead cells that are still drawing. Any nonzero value is a bug: a carved
+   * hole the player shot is still solid-looking. */
+  drawnDead: number
+  /** Worst |drawn position − cell centre|, metres. */
+  worstDrift: number
+  poseRevision: number
+}> {
+  const out: ReturnType<typeof replicaDrawAudit> = []
+  for (const [id, mesh] of _liveReplicas) {
+    if (nodeId !== undefined && id !== nodeId) continue
+    const target = useDestruction.getState().targets.get(id)
+    if (!target || target.dormant === true) continue
+    const grid = target.grid
+    let drawn = 0
+    let hidden = 0
+    let drawnDead = 0
+    let worstDrift = 0
+    for (let i = 0; i < grid.count && i < mesh.count; i++) {
+      mesh.getMatrixAt(i, _auditM)
+      const e = _auditM.elements
+      // Read the basis columns rather than decomposing: three's
+      // Matrix4.decompose GUARDS a zero determinant by reporting scale
+      // (1, 1, 1), so a hidden instance would come back as drawn full size.
+      const visible =
+        Math.hypot(e[0]!, e[1]!, e[2]!) > 1e-9 &&
+        Math.hypot(e[4]!, e[5]!, e[6]!) > 1e-9 &&
+        Math.hypot(e[8]!, e[9]!, e[10]!) > 1e-9
+      if (!grid.alive[i]) {
+        if (visible) drawnDead++
+        continue
+      }
+      if (!visible) {
+        hidden++
+        continue
+      }
+      drawn++
+      const drift = Math.hypot(
+        e[12]! - grid.centers[i * 3]!,
+        e[13]! - grid.centers[i * 3 + 1]!,
+        e[14]! - grid.centers[i * 3 + 2]!,
+      )
+      if (drift > worstDrift) worstDrift = drift
+    }
+    out.push({
+      nodeId: id,
+      alive: grid.aliveCount,
+      drawn,
+      hidden,
+      drawnDead,
+      worstDrift: +worstDrift.toFixed(5),
+      poseRevision: target.poseRevision ?? 0,
+    })
+  }
+  return out
+}
+
 /** Could any open doorway reach this target at all? One sphere-vs-prism test per
  * target keeps a door on the far side of the lot from walking every wall's
  * cells. Conservative: `gridBoundingSphere` covers dead cells too. */
@@ -1036,6 +1123,9 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
 
   useLayoutEffect(() => {
     const mesh = meshRef.current
+    // QA surface only (replicaDrawAudit) — a plain reference, dropped on
+    // unmount, so a session leaves nothing behind.
+    _liveReplicas.set(wall.nodeId, mesh)
     // Version-gated instance uploads (see the static-scene discipline block):
     // the skin only re-uploads on revision/skinRevision mutations now.
     markStorageInstanced(mesh, gl)
@@ -1106,6 +1196,7 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
     freezeStaticSubtree(groupRef.current)
     return () => {
       entry.primed = true // tombstone — the drain skips unmounted replicas
+      if (_liveReplicas.get(wall.nodeId) === mesh) _liveReplicas.delete(wall.nodeId)
     }
   }, [wall, gl])
 
