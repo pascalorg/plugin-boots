@@ -578,8 +578,11 @@ the **wire's** question and stays narrow: one live session vouches for one frame
 
 **The one thing a rename cannot save** is an add that was minted but still in the
 journal when the re-key landed: no peer has it, and no peer will accept it now
-that our envelope says someone else. It is bounded by one tick (≤66 ms of local
-building) and counted as `staleMints` rather than swallowed. The model will not
+that our envelope says someone else. The bound is **"since the last
+`takePending`"**, which in play is one tick (≤66 ms of building) because the tick
+drains the journal unconditionally — but a harness that installs a lane sink
+instead of pumping never drains, so there every record it ever made is pending and
+`staleMints` counts all of them. It is counted rather than swallowed. The model will not
 rewrite those ids, because it does not know what the runtime bound them to — that
 map belongs to the build lane — so recovering them means re-publishing that work
 through the lane that owns the binding, and is deliberately not attempted here.
