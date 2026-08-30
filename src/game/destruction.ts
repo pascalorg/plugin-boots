@@ -910,12 +910,6 @@ const ITEM_CELL_MAX = 0.11
  * volume budget so mid-size fixtures keep their fine cells; larger items
  * grow the cell in the same ×1.35 steps buildVoxelGrid uses. */
 const ITEM_VOXEL_BUDGET = 2600
-/** voxel.ts's hard fill cap (MAX_VOXELS — module-private there): a grid
- * stops ADDING occupied cells at this count, which would silently chop the
- * TOP off a dense item. buildItemGrid detects the hit (count == cap) and
- * rebuilds one step coarser; raising the cap itself belongs to voxel.ts's
- * owner. */
-const VOXEL_FILL_CEILING = 1600
 /** Item carve dust intensity cap — the 'concrete'-lite voice (see
  * damageTarget's porcelain note). */
 const ITEM_DUST_MAX = 0.55
@@ -953,13 +947,12 @@ export function itemChunkSize(cell: number, rand01: number): number {
 const _itemSize = new Vector3()
 
 /**
- * SILHOUETTE grid for an item-family target. Budgeted in TWO stages: the
- * raw AABB grid is pre-grown to fit ITEM_VOXEL_BUDGET (hollow shells get to
- * exploit the raised budget — occupancy runs far under raw), and a build
- * that lands exactly on voxel.ts's fill ceiling (= possibly truncated
- * top-off) rebuilds coarser until it fits whole. solid=false keeps
- * buildVoxelGrid's own adaptive loop out of the way (its raw budget is far
- * above ITEM_VOXEL_BUDGET); the sizing here is the only authority.
+ * SILHOUETTE grid for an item-family target: the raw AABB grid is pre-grown
+ * to fit ITEM_VOXEL_BUDGET (hollow shells get to exploit the raised budget —
+ * occupancy runs far under raw), then buildVoxelGrid sizes the fill.
+ * solid=false keeps its chunky-volume hint out of the way; its own sample-
+ * and-verify stage owns the cap from there and returns a WHOLE grid or a
+ * coarser whole one — never a truncated top (f0573b3).
  */
 function buildItemGrid(sources: VoxelSource[], bounds: Box3): VoxelGridData {
   bounds.getSize(_itemSize)
@@ -970,12 +963,7 @@ function buildItemGrid(sources: VoxelSource[], bounds: Box3): VoxelGridData {
     Math.max(1, Math.ceil(_itemSize.y / cell - 1e-6)) *
     Math.max(1, Math.ceil(_itemSize.z / cell - 1e-6))
   for (let guard = 0; guard < 12 && rawCount() > ITEM_VOXEL_BUDGET; guard++) cell *= 1.35
-  let grid = buildVoxelGrid(sources, bounds.clone(), cell, false)
-  for (let guard = 0; guard < 4 && grid.count >= VOXEL_FILL_CEILING; guard++) {
-    cell *= 1.35
-    grid = buildVoxelGrid(sources, bounds.clone(), cell, false)
-  }
-  return grid
+  return buildVoxelGrid(sources, bounds.clone(), cell, false)
 }
 
 // ── Item palette (owner: "underline the material, embrace the shape") ───────
@@ -1905,12 +1893,11 @@ const _residualBounds = new Box3()
  * faces, so gable ends keep a replica when the merged host mesh hides.
  * The soup is OPEN geometry — buildVoxelGrid runs surfaceOnly (the
  * interior backface fill would flood the whole attic between two end
- * caps). Cell sizing is the item recipe's two stages leaning on
- * buildVoxelGrid's own adaptive loop (the soup is thin like a wall, so the
- * occupancy-discounted raw budget applies), and a build that lands on the
- * fill ceiling (= possibly truncated) rebuilds coarser until it fits
- * whole. Null when the roof has no residual faces or they trace to
- * nothing. Voxelize-time work only.
+ * caps). Cell sizing leans on buildVoxelGrid's own sample-and-verify stage
+ * (the soup is thin like a wall, so the occupancy-discounted raw budget
+ * applies), which returns a whole grid or a coarser whole one — never a
+ * truncated top (f0573b3). Null when the roof has no residual faces or they
+ * trace to nothing. Voxelize-time work only.
  */
 function buildRoofResidualTarget(
   nodeId: string,
@@ -1926,7 +1913,7 @@ function buildRoofResidualTarget(
   const sources: VoxelSource[] = [{ bvh: bvhFor(soup), matrixWorld: soup.matrixWorld }]
   geometry.computeBoundingBox()
   _residualBounds.copy(geometry.boundingBox!)
-  let grid = buildVoxelGrid(
+  const grid = buildVoxelGrid(
     sources,
     _residualBounds.clone(),
     ITEM_CELL_MAX,
@@ -1936,18 +1923,6 @@ function buildRoofResidualTarget(
     undefined,
     true,
   )
-  for (let guard = 0; guard < 4 && grid.count >= VOXEL_FILL_CEILING; guard++) {
-    grid = buildVoxelGrid(
-      sources,
-      _residualBounds.clone(),
-      grid.cell * 1.35,
-      false,
-      undefined,
-      0,
-      undefined,
-      true,
-    )
-  }
   if (grid.count === 0) return null
   const segments: SegmentMember[] = []
   const residualId = `${nodeId}${ROOF_RESIDUAL_SUFFIX}`

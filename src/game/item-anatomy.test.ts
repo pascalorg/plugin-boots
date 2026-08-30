@@ -218,11 +218,13 @@ describe('item silhouette cells (ensureVoxelTarget)', () => {
     expect(target.grid.count).toBe(target.grid.nx * target.grid.ny * target.grid.nz)
   })
 
-  test('dense items never ship a truncated grid — the fill-ceiling guard rebuilds coarser', () => {
+  test('dense items never ship a truncated grid — buildVoxelGrid re-sizes instead', () => {
     // 0.9×2.4×0.9 at the 0.11 m silhouette cell is 1782 raw cells: under
     // the raised item budget but over voxel.ts's 1600 fill cap. A solid box
     // MUST fill every raw cell, so count == nx·ny·nz proves nothing was
-    // silently chopped off the top.
+    // silently chopped off the top. The re-size happens INSIDE buildVoxelGrid
+    // (its sample-and-verify stage, f0573b3) — destruction.ts does not second-
+    // guess the count it gets back; see the fine-cell test below for why.
     const world = makeWorld([boxCollider('cab-1', 'cabinet', [0.9, 2.4, 0.9], [0, 1.2, 0])])
     const target = ensureVoxelTarget(world, 'cab-1')!
     expect(target.grid.count).toBe(target.grid.nx * target.grid.ny * target.grid.nz)
@@ -230,6 +232,32 @@ describe('item silhouette cells (ensureVoxelTarget)', () => {
     // Still finer than the legacy 0.15 m volume cell.
     expect(target.grid.cellX).toBeLessThan(0.15)
     expect(target.grid.count).toBeGreaterThan(600)
+  })
+
+  test('an item that lands exactly ON the fill cap keeps its fine cells', () => {
+    // A wardrobe-shaped near-solid box, 1.10 × 1.10 × 1.76: the silhouette
+    // cell clamps to 0.11 m, which spans 10 × 10 × 16 = 1600 raw cells — the
+    // fill cap EXACTLY. Landing on the cap is not truncation: the cap check
+    // fires before the 1601st cell is added, and there is no 1601st cell, so
+    // this grid is WHOLE at the cap.
+    //
+    // destruction.ts used to read `count >= 1600` as "possibly chopped" and
+    // rebuild up to four steps coarser. Since f0573b3 that inference is
+    // wrong in both directions: buildVoxelGrid can no longer return a
+    // truncated grid (it samples, verifies and re-sizes, with a loud tripwire
+    // if it ever failed to), and a grid that legitimately lands on the cap
+    // was thrown away and rebuilt at 0.1485 m — 768 cells, less than half the
+    // silhouette, on exactly the dense items the fine lane exists for.
+    const world = makeWorld([boxCollider('wardrobe-1', 'item', [1.1, 1.1, 1.76], [0, 0.88, 0])])
+    const target = ensureVoxelTarget(world, 'wardrobe-1')!
+    const grid = target.grid
+    expect(grid.cellX).toBeCloseTo(0.11, 5) // the fine cell, not a coarsened one
+    expect(grid.nx * grid.ny * grid.nz).toBe(1600) // the fixture really is ON the cap
+    // WHOLE at the cap — the bound that makes keeping it safe. Both halves
+    // matter: over the cap would mean a chopped far-Z end (the f0573b3 bug),
+    // under nx·ny·nz would mean cells silently missing from a solid box.
+    expect(grid.count).toBe(1600)
+    expect(grid.count).toBe(grid.nx * grid.ny * grid.nz)
   })
 
   test('non-family kinds keep the legacy adaptive volume lane', () => {
