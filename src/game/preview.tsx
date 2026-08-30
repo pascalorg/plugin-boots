@@ -2,13 +2,8 @@
 
 import { sceneRegistry, useScene } from '@pascal-app/core'
 import { useEffect, useMemo, useRef } from 'react'
-import {
-  Group,
-  type Material,
-  type Mesh,
-  MeshStandardMaterial,
-  type Object3D,
-} from 'three'
+import type { BufferGeometry } from 'three'
+import { Group, type Material, type Mesh, MeshStandardMaterial, type Object3D } from 'three'
 import { type PlacedPiece, useBoots } from '../store'
 import { geometryForMask, isForeignPlacedPiece, piecePose, WALL_H } from './builder'
 import {
@@ -86,11 +81,18 @@ import { collectMeshes, collectSolidRoots, type WallNodeLike } from './world'
  * WebGPU-safe, edit-overlay.tsx style: plain geometry, singleton materials,
  * no shaders, zero per-frame work.
  *
- * ── API (pure / imperative exports for tests) ─────────────────────────────
+ * ── API ───────────────────────────────────────────────────────────────────
+ * `PendingPreview` is the only thing the plugin mounts (system.tsx). The rest
+ * is exported because the seams, not the call sites, are what preview.test.ts
+ * pins — each one is pure or purely imperative, and none of them reads a
+ * store:
  *   shouldPreview(phase, pendingDecision, lanes)   the mount condition.
  *   applyNodePreview(destroyed, painted)           → PreviewLedger
  *   restoreNodePreview(ledger)                     idempotent round-trip.
  *   PENDING_TINT                                   the pieces' material.
+ *   previewPieceGeometry / previewPiecePose        one piece's look and pose.
+ *   wallFrameFromScene(wallId)                     the one scene READ.
+ *   PreviewTree                                    the four lanes, store-free.
  * ──────────────────────────────────────────────────────────────────────────
  */
 
@@ -165,7 +167,7 @@ export function applyNodePreview(
   const levelled = new Set<string>()
   for (const { nodeId } of destroyed) {
     levelled.add(nodeId)
-    const root = sceneRegistry.nodes.get(nodeId as never)
+    const root = sceneRegistry.nodes.get(nodeId)
     // Already invisible (a level toggled off, say): nothing to flip, and
     // recording it would be a restore that changes nothing.
     if (!root || !root.visible) continue
@@ -178,7 +180,7 @@ export function applyNodePreview(
   const fence = painted.length > 0 ? collectSolidRoots() : null
   for (const { nodeId, color } of painted) {
     if (levelled.has(nodeId)) continue
-    const root = sceneRegistry.nodes.get(nodeId as never)
+    const root = sceneRegistry.nodes.get(nodeId)
     if (!root) continue
     let meshes = collectMeshes(root, fence ?? undefined)
     // A CONTAINER node (a roof whose planes are registered segment children)
@@ -245,28 +247,61 @@ export const PENDING_TINT = new MeshStandardMaterial({
   roughness: 0.6,
 })
 
+/** A corner roof carries its heights IN the geometry — base-y position, no
+ * plank tilt (the PlacedPieceMesh rule). */
+const isCornerRoof = (piece: PlacedPiece): boolean =>
+  piece.piece === 'roof' && piece.corners !== undefined
+
+/**
+ * The geometry one pending piece renders with — builder.tsx's own cached
+ * instances, through the very calls PlacedPieceMesh makes, so a preview can
+ * never drift from what the game (and therefore Save) understood the piece to
+ * be. Null when every cell was edited out: nothing to show.
+ *
+ * The caches are shared, so this allocates nothing on a re-mount — a second
+ * Esc previews from the same instances the first one used.
+ */
+export function previewPieceGeometry(piece: PlacedPiece): BufferGeometry | null {
+  const span = piece.height ?? WALL_H
+  return isCornerRoof(piece)
+    ? cornerRoofGeometry(piece.corners!, span)
+    : geometryForMask(piece.piece, piece.mask, span)
+}
+
+/** Rendered pose of one pending piece — walls/slabs lift to piecePose's
+ * center, the stairs plank takes its tilt, corner roofs sit flat at their
+ * base elevation. Pure; exported for tests. */
+export function previewPiecePose(piece: PlacedPiece): {
+  position: [number, number, number]
+  rotation: [number, number, number]
+} {
+  const span = piece.height ?? WALL_H
+  const cornered = isCornerRoof(piece)
+  const pose = piecePose(piece.piece, piece.position[1], span)
+  return {
+    position: [piece.position[0], cornered ? piece.position[1] : pose.y, piece.position[2]],
+    rotation: [cornered ? 0 : pose.tilt, piece.yaw, 0],
+  }
+}
+
 /**
  * One pending piece. Geometry, pose and the corner-roof special case come
- * from builder.tsx's own seams, so a piece previews byte-identically to the
- * mesh the game drew — but with none of PlacedPieceMesh's world wiring
+ * from builder.tsx's own seams, so a piece previews exactly where the mesh
+ * the game drew stood — but with none of PlacedPieceMesh's world wiring
  * (collider push, voxel cladding), which a preview has no use for and no
  * GameWorld to reach.
  */
 function PreviewPiece({ piece }: { piece: PlacedPiece }) {
-  const span = piece.height ?? WALL_H
-  const cornered = piece.piece === 'roof' && piece.corners !== undefined
-  const geometry = cornered
-    ? cornerRoofGeometry(piece.corners!, span)
-    : geometryForMask(piece.piece, piece.mask, span)
-  if (!geometry) return null // every cell edited out — nothing to show
-  const pose = piecePose(piece.piece, piece.position[1], span)
+  const geometry = previewPieceGeometry(piece)
+  if (!geometry) return null
+  const { position, rotation } = previewPiecePose(piece)
   return (
     <mesh
       castShadow
       geometry={geometry}
       material={PENDING_TINT}
-      position={[piece.position[0], cornered ? piece.position[1] : pose.y, piece.position[2]]}
-      rotation={[cornered ? 0 : pose.tilt, piece.yaw, 0, 'YXZ']}
+      position={position}
+      rotation={[rotation[0], rotation[1], rotation[2], 'YXZ']}
       userData={{ __boots: true }}
     />
   )
@@ -304,8 +339,8 @@ function PreviewItem({ item }: { item: PlacedItem }) {
  * (which IS the wall-local frame) plus the node's plan length. READ ONLY:
  * this is the module's single point of contact with the scene store.
  */
-function wallFrameFromScene(wallId: string): WallFrame | null {
-  const root = sceneRegistry.nodes.get(wallId as never)
+export function wallFrameFromScene(wallId: string): WallFrame | null {
+  const root = sceneRegistry.nodes.get(wallId)
   if (!root) return null
   const nodes = useScene.getState().nodes as unknown as Record<
     string,
@@ -345,13 +380,46 @@ function PreviewAperture({ placed }: { placed: PlacedAperture }) {
 // --- The mount --------------------------------------------------------------
 
 /**
+ * The four lanes, as a tree of what Save would write. Store-free ON PURPOSE
+ * — the gate lives in `shouldPreview` and the filtering in PendingPreview, so
+ * this is a pure function of its props and tests can render it against
+ * hand-built lists. Every lane renders nothing when its list is empty, so a
+ * paint-only session produces no preview objects at all: just the tint.
+ */
+export function PreviewTree({
+  destroyed,
+  items,
+  painted,
+  placed,
+}: {
+  destroyed: readonly DestroyedNode[]
+  items: readonly (PlacedItem | PlacedAperture)[]
+  painted: readonly PaintedNode[]
+  placed: readonly PlacedPiece[]
+}) {
+  return (
+    <group userData={{ __boots: true }}>
+      <NodeLedger destroyed={destroyed} painted={painted} />
+      {placed.map((piece) => (
+        <PreviewPiece key={piece.id} piece={piece} />
+      ))}
+      {items.map((placement) =>
+        placement.kind === 'item' ? (
+          <PreviewItem item={placement} key={placement.id} />
+        ) : (
+          <PreviewAperture key={placement.id} placed={placement} />
+        ),
+      )}
+    </group>
+  )
+}
+
+/**
  * The preview root, mounted in the plugin's system slot next to GameRoot
  * (system.tsx) — inside the editor's own R3F canvas, which is also the
  * game's canvas, so there is no second scene and no compositing to do.
- *
- * Renders null unless `shouldPreview`; every lane renders nothing when its
- * list is empty, so a paint-only session costs four meshes' worth of tint
- * and not one preview object.
+ * Reads the four stores, applies the ownership filter, and gates on
+ * `shouldPreview`.
  */
 export function PendingPreview() {
   const phase = useBoots((s) => s.phase)
@@ -382,19 +450,5 @@ export function PendingPreview() {
     return null
   }
 
-  return (
-    <group userData={{ __boots: true }}>
-      <NodeLedger destroyed={destroyed} painted={painted} />
-      {placed.map((piece) => (
-        <PreviewPiece key={piece.id} piece={piece} />
-      ))}
-      {items.map((placement) =>
-        placement.kind === 'item' ? (
-          <PreviewItem item={placement} key={placement.id} />
-        ) : (
-          <PreviewAperture key={placement.id} placed={placement} />
-        ),
-      )}
-    </group>
-  )
+  return <PreviewTree destroyed={destroyed} items={items} painted={painted} placed={placed} />
 }
