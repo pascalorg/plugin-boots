@@ -68,13 +68,13 @@ import {
   noteLocalReset,
   noteLocalSegments,
   type CellKey,
+  type LocalWork,
   type NodeDelta,
   type NodeId,
   type SharedDelta,
   type SharedEffects,
   type SharedWorld,
 } from './shared-world'
-import { setDemolitionWork } from './save-demolition'
 
 // ── The shape of the runtime, structurally ──────────────────────────────────
 
@@ -208,23 +208,50 @@ let sync: DamageSync | null = null
 let runtime: DamageRuntime | null = null
 
 /**
- * Turn the damage lane on (a shared session started) or off (single player,
- * or session exit). Also hands the Save bridge its one door onto the shared
- * model: a getter for LocalWork, so `deleteDestroyed()` can tell the player's
- * own demolition from a stranger's rubble. Passing null restores exact
- * single-player behaviour, including in the middle of a session.
+ * Turn the damage lane on (a shared session started) or off (single player, or
+ * session exit). Passing null restores exact single-player behaviour, including
+ * in the middle of a session — and closes the Save gate below with it.
  */
 export function setDamageSync(next: DamageSync | null): void {
   sync = next
   pending = null
   batchDepth = 0
   remoteDepth = 0
-  setDemolitionWork(next === null ? null : () => localWork(next.world))
 }
 
-/** Register what the bridge may do to the scene. */
-export function setDamageRuntime(next: DamageRuntime | null): void {
+/**
+ * THE SAVE BRIDGE'S ONE DOOR onto the shared model.
+ *
+ * `deleteDestroyed()` writes the owner's real building, so it has to be able to
+ * tell this player's demolition from a stranger's rubble — and it must be able
+ * to ask WITHOUT holding a SharedWorld, because holding one would mean being
+ * able to read peers' work. So this is the projection and nothing else: null in
+ * single player (no gate, no allocation, the loop that shipped), and otherwise
+ * exactly what shared-world.ts is willing to attribute to us.
+ *
+ * It is PULLED rather than pushed for a boring but load-bearing reason: pushing
+ * it meant importing save-demolition here, which closed an ES module cycle
+ * (shared-damage → save-demolition → destruction → shared-damage) and put
+ * `runtime` in the temporal dead zone whenever this module happened to be the
+ * graph's entry point. Import order must not be load-bearing.
+ */
+export function sharedLocalWork(): LocalWork | null {
+  return sync === null ? null : localWork(sync.world)
+}
+
+/**
+ * Register what the bridge may do to the scene. destruction.ts does this once,
+ * at module load — there is only ever one destruction runtime in a process.
+ *
+ * Returns the runtime it displaced, so a test that installs a fake can put the
+ * real one back. That matters more than it sounds: the registration is process
+ * global, so a test file that left null behind would silently turn every LATER
+ * file's remote damage into a no-op.
+ */
+export function setDamageRuntime(next: DamageRuntime | null): DamageRuntime | null {
+  const previous = runtime
   runtime = next
+  return previous
 }
 
 /** Is the damage lane live? The hot path never asks; QA and tests do. */

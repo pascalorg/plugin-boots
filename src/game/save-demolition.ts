@@ -1,6 +1,6 @@
 import { type AnyNodeId, useScene } from '@pascal-app/core'
 import { create } from 'zustand'
-import { useDestruction, type VoxelTarget } from './destruction'
+import { localDemolitionWork, useDestruction, type VoxelTarget } from './destruction'
 import { type LocalWork } from './shared-world'
 
 /**
@@ -28,20 +28,15 @@ export type DestroyedNode = { nodeId: string; kind: 'wall' | 'volume' }
  * nodes for good. A stranger levelling someone's garage must never be able to
  * ride that into the owner's document.
  *
- * So the bridge is handed a getter for LocalWork — the shared model's record of
- * what THIS peer destroyed — and nothing else. It is injected rather than
- * imported so this file has no idea a network exists, and so single player,
- * where the getter is simply absent, takes the identical code path it always
- * took: no gate, no allocation, everything is mine because nobody else is here.
+ * So the bridge asks one question, of the destruction runtime it already
+ * depends on: `localDemolitionWork()` — the shared model's record of what THIS
+ * peer destroyed, projected, and nothing else. No SharedWorld handle ever
+ * reaches this file, so there is no peers' work here to leak even by accident.
+ *
+ * In single player the answer is null, and everything below takes the identical
+ * code path it always took: no gate, no allocation, everything is mine because
+ * nobody else is here.
  */
-type WorkGetter = () => LocalWork | null
-
-let workOf: WorkGetter | null = null
-
-/** Wire (or unwire, with null) the shared model's local-work getter. */
-export function setDemolitionWork(next: WorkGetter | null): void {
-  workOf = next
-}
 
 type DemolitionState = {
   /** What Save will delete: leveled scene nodes this peer finished off alone. */
@@ -111,10 +106,11 @@ function fullyMine(work: LocalWork, target: VoxelTarget): boolean {
  * builder pieces — '__boots' ids) never qualify: they are not scene nodes.
  *
  * In a shared session every candidate must also pass `fullyMine`. In single
- * player `workOf` is null and the loop is byte-for-byte the one that shipped.
+ * player the projection is null and the loop is byte-for-byte the one that
+ * shipped.
  */
 export function captureDemolition(): number {
-  const work = workOf === null ? null : workOf()
+  const work = localDemolitionWork()
   const destroyed: DestroyedNode[] = []
   let foreign = 0
   // Roof shells enroll per PLANE under `<nodeId>#p<n>` member ids plus one

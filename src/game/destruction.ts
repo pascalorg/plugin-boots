@@ -42,7 +42,9 @@ import {
   publishRemovedCells,
   resetSharedDamage,
   setDamageRuntime,
+  sharedLocalWork,
 } from './shared-damage'
+import { type LocalWork } from './shared-world'
 import {
   cellToneAt,
   clearToneAudit,
@@ -3075,6 +3077,11 @@ export function prevoxelizeTick(
   focus?: { x: number; y: number; z: number },
 ): boolean {
   const start = now()
+  // Stamp the session's world on the FIRST tick, not on the first voxelize.
+  // Remote damage can arrive before this client has built a single grid — the
+  // shared bridge materializes through `sessionWorld`, and without this it
+  // would have nothing to build from and would silently drop the frame.
+  sessionWorld = world
   // S2 lazy shells measure "near" against the same focus the scheduler
   // sorts by — stamp it for every voxelize this tick performs.
   if (focus) stampShellFocus(focus)
@@ -5205,6 +5212,20 @@ export function dropTarget(nodeId: string): void {
       notifySceneSupportChanged()
     }
   }
+}
+
+/**
+ * What THIS peer destroyed, or null in single player — the Save bridge's only
+ * window onto the shared model.
+ *
+ * save-demolition.ts asks destruction.ts rather than the shared modules on
+ * purpose. It already depends on this file for the runtime targets, and routing
+ * the question through here means the bridge never holds a SharedWorld handle:
+ * it cannot read a stranger's work even by accident, and there is no import
+ * cycle to make module evaluation order matter.
+ */
+export function localDemolitionWork(): LocalWork | null {
+  return sharedLocalWork()
 }
 
 export function resetDestruction(): void {

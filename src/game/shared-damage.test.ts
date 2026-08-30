@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { BoxGeometry, Mesh } from 'three'
 import {
   applySharedDamage,
@@ -156,9 +156,22 @@ function capturingSync(self = 'peer-a'): { world: SharedWorld; sent: SharedDelta
   return { world, sent }
 }
 
+/**
+ * The DamageRuntime registration is process global and destruction.ts installs
+ * the real one at module load. Every test here swaps in a recording fake, so it
+ * has to put back whatever it displaced — leaving null behind would make remote
+ * damage a silent no-op for every test file that runs after this one. (It did,
+ * for one afternoon.)
+ */
+let incumbentRuntime: DamageRuntime | null = null
+
+beforeEach(() => {
+  incumbentRuntime = setDamageRuntime(null)
+})
+
 afterEach(() => {
   setDamageSync(null)
-  setDamageRuntime(null)
+  setDamageRuntime(incumbentRuntime)
   resetSharedDamage()
 })
 
