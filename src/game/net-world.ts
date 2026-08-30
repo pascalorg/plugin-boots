@@ -89,12 +89,7 @@ import {
   startNet,
 } from './net'
 import { applySharedDamage, setDamageSync } from './shared-damage'
-import {
-  applyBuildEffects,
-  attachBuildSync,
-  detachBuildSync,
-  reconcileSharedPieces,
-} from './shared-build'
+import { applyBuildEffects, attachBuildSync, detachBuildSync } from './shared-build'
 import {
   createOutbox,
   decodeDeltaText,
@@ -108,7 +103,7 @@ import {
   createSharedWorld,
   isSafePeerId,
   mergeDelta,
-  setGridStamp,
+  rekeySharedWorld,
   type SharedDelta,
   type SharedWorld,
   snapshotOf,
@@ -160,12 +155,18 @@ type Counters = {
    */
   laneSinkIgnored: number
   /**
-   * Times the host re-keyed our session id mid-game and we re-minted under the
-   * new name. Never silent: a recovery nobody can see is nearly as bad as the
-   * bug, because our earlier records are now orphaned in peers' worlds under a
-   * name we no longer own.
+   * Times the host re-keyed our session id mid-game and we renamed in place.
+   * Never silent: a recovery nobody can see is nearly as bad as the bug.
    */
   rekeys: number
+  /**
+   * Records we had minted but not yet published when a re-key landed. They name
+   * an author we can no longer vouch for, so every peer refuses them: this is
+   * exactly the work a rename cannot save, bounded by one tick.
+   */
+  staleMints: number
+  /** Re-keys to a name that could never author a record. We stop instead. */
+  unsafeNames: number
   /** Times the bus disappeared entirely and the session stopped. */
   busLost: number
   /** Exceptions escaping an applier (counted, never rethrown into the host). */
@@ -192,6 +193,8 @@ const counters: Counters = {
   throttled: 0,
   laneSinkIgnored: 0,
   rekeys: 0,
+  staleMints: 0,
+  unsafeNames: 0,
   busLost: 0,
   applyErrors: 0,
 }
@@ -262,31 +265,35 @@ function identityHeld(s: Session): boolean {
   }
   if (now === s.world.self) return true
 
-  counters.rekeys++
-  // The lot's grid fingerprint belongs to the LOT, not to us, so it must survive
-  // a change of name. Without it the new world publishes gridStamp 0 and peers
-  // refuse every slot-addressed record forever (slotsOk demands a non-zero
-  // stamp), which would trade this bug for a permanent version of it — the grid
-  // stamp is only ever published when the storey ladder installs, so nothing
-  // would set it again this session.
-  const stamp = s.world.gridStamp
-  stopWorldSync()
-  if (!startWorldSync()) return false
-  const fresh = session
-  if (!fresh) return false
-  if (stamp !== 0) setGridStamp(fresh.world, stamp)
-  // Re-mint our existing work under the new prefix. The old world went with the
-  // old name, so without this our fort is absent from everything we publish
-  // from now on, and only a fresh placement would ever bring it back.
-  try {
-    reconcileSharedPieces()
-  } catch {
-    counters.applyErrors++
+  // A name that cannot author anything must not be adopted: rekeySharedWorld
+  // refuses it by returning [], which is indistinguishable from "no stale adds",
+  // so silently carrying on would leave us publishing under a name no peer will
+  // ever vouch for. Stop for the same reason startWorldSync refuses to begin.
+  if (!isSafePeerId(now)) {
+    counters.unsafeNames++
+    stopWorldSync()
+    return false
   }
-  // Say the whole of it once, so peers get the re-minted records promptly rather
-  // than at the next heal.
-  queueSnapshot(fresh, Date.now())
-  return false
+
+  counters.rekeys++
+  // RENAME IN PLACE, do not start over. Tearing the world down and re-minting
+  // from the runtime looks equivalent and is not: it republishes work every peer
+  // already holds (items and apertures carry no slot, so nothing elects between
+  // the copies — two sofas), and it throws away everything only we hold, which
+  // is our own damage attribution and the ids of our published records. Renaming
+  // keeps the records, the tombstones, the journal, the lamport clock and the
+  // grid stamp; `formerSelves` keeps "is this mine?" answerable afterwards, so
+  // Save still recognises the fort we built under the old name.
+  const stale = rekeySharedWorld(s.world, now)
+  // The one thing a rename cannot save: adds still in the journal, minted under
+  // the old name, which no peer has and none will now accept. At most one tick's
+  // worth. Counted rather than swallowed — see MULTIPLAYER.md Part 4.
+  counters.staleMints += stale.length
+  // Say the whole of it once, so a peer that missed anything gets it promptly
+  // rather than at the next heal.
+  queueSnapshot(s, Date.now())
+  // The session itself is intact, so this tick carries on publishing as usual.
+  return true
 }
 
 /**
@@ -524,6 +531,8 @@ export function resetWorldSyncCounters(): void {
   counters.throttled = 0
   counters.laneSinkIgnored = 0
   counters.rekeys = 0
+  counters.staleMints = 0
+  counters.unsafeNames = 0
   counters.busLost = 0
   counters.applyErrors = 0
 }

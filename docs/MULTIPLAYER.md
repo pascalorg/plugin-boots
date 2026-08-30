@@ -174,14 +174,13 @@ a check against it could never fire. Any subsystem that keys long-lived state on
 `localSessionId()` must call `resyncNet()` before trusting it — `net-world.ts`
 does this at the top of every publish tick (Part 4).
 
-A rebind also files the name away: `wasLocalSession(id)` answers whether an id is
-one **this client published under earlier** (false for the live name and for
-every stranger), with `formerLocalSessions()` for the whole ring, bounded to
-`FORMER_SELF_MAX`. Records carry their author's session id as an id prefix and
-can be neither renamed nor tombstoned after a re-key, so "is this mine?" has two
-different answers: ask `localSessionId()` when the question is about the **wire**
-(who may author this frame), and `wasLocalSession()` as well when it is about the
-**player** (whose wall is that, whom should this notice blame).
+Who we *used* to be is remembered in the **model**, not here:
+`rekeySharedWorld` files the outgoing name into `world.formerSelves` and
+`isOurs(world, id)` answers "did this player make this" across every name. The
+transport keeps no second ring on purpose — two memories of one fact can
+disagree, and the one the Save projection consumes is the one that has to be
+true. So ask `localSessionId()` when the question is about the **wire** (who may
+author this frame now) and `isOurs()` when it is about the **player**.
 
 # Part 2 — avatar co-presence (`presence.ts`)
 
@@ -423,7 +422,7 @@ reaching for a wire, so this is where they get wired.
 | `worldSyncWorld()` | The session's world, or null. Read-only: the lanes own every mutation. |
 | `pumpWorldSync()` | Run one outbound tick now. QA and tests only; the interval is the normal path. |
 | `publishWorldSnapshot()` | Queue a heal broadcast (QA / debug HUD). |
-| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / rekeys / busLost / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
+| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / rekeys / staleMints / unsafeNames / busLost / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
 
 **Attach order is load-bearing.** The lanes are attached *before* the
 subscriptions exist and before `session` is set, because a frame that arrives
@@ -544,48 +543,81 @@ Save panel all keep telling the truth about us.
 `pump()` therefore begins with `identityHeld()`, which `resyncNet()`s (see Part
 1: the id alone cannot see this, because the id we can read belongs to the stale
 bus) and compares `localSessionId()` against `world.self`. On a change it counts
-`rekeys`, restarts the session, **carries the lot's `gridStamp` across** —
-without that the fresh world publishes 0 and `slotsOk` refuses every
-slot-addressed record for the rest of the session, since the stamp is only ever
-published when the storey ladder installs — re-mints our fort under the new
-prefix with `reconcileSharedPieces()`, and queues a snapshot so peers hear it
-promptly instead of at the next heal. A vanished bus counts `busLost` and stops.
+`rekeys` and **renames the world in place** — `rekeySharedWorld(world, now)` —
+then queues a snapshot so peers hear anything they missed promptly rather than at
+the next heal. A vanished bus counts `busLost` and stops. A new name that could
+never author a record counts `unsafeNames` and stops, for the same reason
+`startWorldSync` refuses to begin on one: `rekeySharedWorld` rejects it by
+returning `[]`, which is indistinguishable from "nothing was pending", so
+carrying on would leave us publishing under a name no peer will ever vouch for.
 The recovery is never silent: a silent recovery is nearly as bad as the bug.
 
-**What that costs, because it is not obvious.** The work we already published
-under the old name does not come back to us. Peers **keep** those records — they
-are grow-only and still validly authored by an id that existed — and we can no
-longer tombstone them, because killing a record requires owning its prefix. It
-cannot spread or return, either: peers only ever answer a state request with
-their **own** records (Part 1), so an orphan of ours dies with the peers that
-already hold it. Then `reconcileSharedPieces()` re-mints the same pieces under
-the new prefix, so in a peer that saw both, one thing exists twice. What that
-looks like depends entirely on whether the lane is slot-addressed:
+**Rename, never restart — the difference is not cosmetic.** The obvious recovery
+is to tear the session down, start a fresh one and re-mint the local scene under
+the new name. It was implemented that way first and it is wrong on three counts,
+all of which the rename avoids:
 
-| Lane | Outcome of a re-key |
-| --- | --- |
-| **Pieces** | Converge. `PieceRec` carries a `slot`, so `electedPieces()` sees two claimants for one `kind\|slot` and the canonical ascending `(lamport, id)` rule makes the LATER record win — which is always the re-minted one. The loser is not merely hidden: `installPieces` unbinds it, `removePlaced` drops the mesh, `onPieceRemoved` frees the slot registry, and `deposedPieces` remembers it so a later frame cannot resurrect it. No z-fighting, and demolishing the survivor leaves nothing standing. |
-| **Items, apertures** | **Duplicate.** Neither `ItemRec` nor `ApertureRec` has a slot, so nothing elects between them: re-minted furniture genuinely lands twice, co-located, in a peer that saw both. This is the visible cost. |
-| **Strokes** | Harmless. Paint is a G-Set folded per cell, and the same colour *accumulates*, so a re-minted stroke deepens a coat that was already there rather than doubling geometry. |
+- It **republishes work every peer already holds**. Pieces would converge, because
+  `PieceRec` carries a slot and the election keeps the later claimant; items and
+  apertures carry no slot, so nothing elects between the copies and the furniture
+  genuinely lands twice, co-located, in every peer that saw both.
+- It **throws away what only we hold** — `dmg.mine`, `mySegments`, `killedByMe` —
+  so the Save panel silently under-reports the player's own demolition. No
+  single-world test can see that, because they all ask while one world is alive.
+- It **invalidates the damage lane's wire-boundary identity translation**
+  mid-flight: that lane names a placed piece by its record id outbound and
+  resolves the name against the live `placed` list inbound, so re-minting under a
+  new prefix breaks the bindings for frames already in the air.
 
-The deposed-piece notice stays honest, but only just. `installPieces` gates it on
-`isAuthoredBy(id, world.self)`, and after a re-key the orphan's prefix is our
-**old** name, so `mine` is false and nobody reads "Another builder claimed that
-wall slot" about a wall no stranger touched. That is the right outcome reached by
-accident — the record stopped looking like ours — so any future ownership
-question that means *the player* rather than *the wire* must ask
-`wasLocalSession(prefix)` (Part 1) as well as comparing against `world.self`.
+Renaming keeps every record, every tombstone, the journal, the lamport clock
+**and the grid stamp** — so there is deliberately no separate stamp rescue here;
+one invariant, one mechanism. It also files the old name into
+`world.formerSelves`, which is what keeps `isOurs(world, id)` — "did this *player*
+make this", the question Save asks — true across a rename. `isAuthoredBy` stays
+the **wire's** question and stays narrow: one live session vouches for one frame.
 
-Fixing the duplicates properly needs something this design does not have: an
-identity that outlives the transport session (a client id persisted per browser
-and carried in the record prefix, with the session id demoted to a routing
-detail, used only for the authorship gate). `mintRecordId` derives authorship
-from the session id instead, which the host can re-key mid-session — so record
-identity is not stable across the lifetime of the client that authored it. That
-is a Part 3 change to a frozen file, logged here rather than attempted. A re-key
-needs an outbox lease restored mid-game, so it is rare; `rekeys > 0` on
-`__boots.worldSync()` is the first thing to check if anyone reports doubled
-furniture in a lobby.
+**The one thing a rename cannot save** is an add that was minted but still in the
+journal when the re-key landed: no peer has it, and no peer will accept it now
+that our envelope says someone else. It is bounded by one tick (≤66 ms of local
+building) and counted as `staleMints` rather than swallowed. The model will not
+rewrite those ids, because it does not know what the runtime bound them to — that
+map belongs to the build lane — so recovering them means re-publishing that work
+through the lane that owns the binding, and is deliberately not attempted here.
+`staleMints > 0` with no visible loss is the expected reading; `staleMints`
+climbing repeatedly would mean re-keys are not rare and this needs revisiting.
+
+**Two residues, both deliberate.** Our snapshots still carry old-prefixed records
+that peers refuse — wasted bytes and an inflated `dropped` on their side —
+because "two peers answering one request produce byte-identical snapshots" is a
+property of the format worth more than the saving. And a persisted per-browser
+client id, the obvious "stable identity" fix, was **rejected on purpose**:
+authorship here is a *capability*, not a label. A record is admitted only when
+its prefix matches the sender the host's envelope named, and a self-asserted id
+would let a hostile peer mint `<our-id>#<n>` and walk its wall into our own
+`localWork` and from there into a scene write on the owner's disk. Binding a
+persisted id to a session on first sight does not close it either, because two
+tabs of one browser legitimately share the id, so a squatter is indistinguishable
+from a second tab — and the window to squat is the re-key itself. A reload
+therefore makes us a **new author** on purpose; `shared-invariant.test.ts` fences
+the shared trio against `localStorage` / `sessionStorage` / `indexedDB` so the
+rejected design cannot arrive quietly.
+
+**A known limitation, shipped as-is: a peer who joins after our re-key never
+learns our pre-re-key records.** No live session can vouch for them, so the
+authorship gate refuses them on arrival. It is the same hole as "someone builds a
+wall, leaves, and everyone who joins later sees an empty lot" — inherent to
+authorship-by-envelope, and pre-existing rather than introduced by the rename.
+Relaxing the gate is **not** the fix: that gate is what keeps a stranger's wall
+out of `localWork` and therefore off the owner's disk, which is worth more than
+fort persistence in a lobby that is still human-gated and unreachable.
+
+The intended shape, unimplemented, is to **split the gate rather than remove
+it**: authorship gates the *Save projection* only, while visual replication
+accepts relayed records. A relayed wall can be visible, collidable and shootable
+without ever entering any player's `localWork`, which gets a public lobby its
+persistent fort while leaving the scene-write boundary exactly where it is. It
+was deferred because it changes what a record *means* in two different consumers
+at once, and tonight's goal is a lobby that does not lie about what it replicated.
 
 **What is still not handled, stated rather than hidden.** A frame lost to the
 outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a

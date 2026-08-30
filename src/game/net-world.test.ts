@@ -24,7 +24,6 @@ import {
   resetNetIdentity,
   resetNetKinds,
   stopNet,
-  wasLocalSession,
 } from './net'
 import {
   damageSyncActive,
@@ -34,7 +33,14 @@ import {
 } from './shared-damage'
 import { buildSyncOn, resetSharedBuild } from './shared-build'
 import { bytesToBase64, decodeDeltaText, encodeDeltaText, MAX_TEXT_CHARS } from './shared-wire'
-import { cellKey, emptyDelta, setGridStamp, type SharedDelta } from './shared-world'
+import {
+  addLocalStroke,
+  cellKey,
+  emptyDelta,
+  isOurs,
+  setGridStamp,
+  type SharedDelta,
+} from './shared-world'
 
 /**
  * The adapter's own seam: net.ts <-> shared-world.ts. net.test.ts already owns
@@ -535,45 +541,117 @@ describe('our own name is not a constant', () => {
     expect(worldSyncWorld()!.nodes.size).toBe(1)
   })
 
-  test('a re-key re-mints us under the new name', () => {
+  /**
+   * RENAME IN PLACE, never start over. A teardown-and-re-mint recovery looks
+   * equivalent and is not: it republishes records peers already hold (items and
+   * apertures have no slot, so nothing elects between the copies), it invalidates
+   * the damage lane's runtime<->record bindings mid-flight, and it drops the
+   * damage attribution only we hold, so Save would under-report the player's own
+   * demolition. The world object surviving IS the property.
+   */
+  test('a re-key renames us in place and keeps everything', () => {
     installBus('session-old')
     startWorldSync()
-    expect(worldSyncWorld()?.self).toBe('session-old')
+    const world = worldSyncWorld()!
+    expect(world.self).toBe('session-old')
+    // Work only we hold, of both shapes: an authored record and unauthored damage.
+    addLocalStroke(world, { node: 'node-9', color: 3, x: 1, y: 1, z: 1, radius: 0.4 })
+    publishRemovedKeys('node-9', [cellKey(4, 4, 4)])
 
     installBus('session-new')
     pumpWorldSync()
 
     expect(worldSyncDebug().rekeys).toBe(1)
     expect(worldSyncActive()).toBe(true)
-    expect(worldSyncWorld()?.self).toBe('session-new')
+    // The SAME world, renamed — not a fresh one.
+    expect(worldSyncWorld()).toBe(world)
+    expect(world.self).toBe('session-new')
+    expect(world.formerSelves).toEqual(['session-old'])
+    expect(world.strokes.adds.size).toBe(1)
+    expect(world.nodes.get('node-9')?.removed.size).toBe(1)
     // The recovery must not be silent, and it must not look like an error.
     expect(worldSyncDebug().applyErrors).toBe(0)
   })
 
   /**
-   * The records we published under the old name are unreachable afterwards —
-   * peers keep them and we cannot tombstone a prefix we no longer own — so any
-   * code asking "did another builder do this?" about an old record needs to be
-   * able to answer "no, that was me". This is the hook it uses.
+   * The work a rename cannot save: adds minted under the old name that were
+   * still in the journal, so no peer has them and none will now accept them.
+   * Bounded by one tick, and counted rather than swallowed.
    */
-  test('a re-key leaves the old prefix recognisable as ours', () => {
+  test('a re-key counts the mints it could not save', () => {
     installBus('session-old')
     startWorldSync()
-    expect(wasLocalSession('session-old')).toBe(false)
+    const world = worldSyncWorld()!
+    addLocalStroke(world, { node: 'node-9', color: 3, x: 1, y: 1, z: 1, radius: 0.4 })
+    addLocalStroke(world, { node: 'node-9', color: 4, x: 2, y: 1, z: 1, radius: 0.4 })
 
     installBus('session-new')
     pumpWorldSync()
 
-    expect(wasLocalSession('session-old')).toBe(true)
-    expect(wasLocalSession('session-new')).toBe(false)
-    expect(wasLocalSession('session-stranger')).toBe(false)
+    expect(worldSyncDebug().staleMints).toBe(2)
+  })
+
+  test('a re-key with nothing pending loses nothing', () => {
+    installBus('session-old')
+    startWorldSync()
+    pumpWorldSync() // drain first, so the journal is empty
+    installBus('session-new')
+    pumpWorldSync()
+    expect(worldSyncDebug().rekeys).toBe(1)
+    expect(worldSyncDebug().staleMints).toBe(0)
   })
 
   /**
-   * Without this the fix would trade the bug for a permanent version of itself:
-   * slotsOk demands a NON-ZERO stamp equal to the receiver's, and the stamp is
-   * only ever published when the storey ladder installs, so a fresh world would
-   * publish 0 forever and every slot-addressed record would be refused.
+   * rekeySharedWorld refuses an unsafe name by returning [], which reads exactly
+   * like "nothing was pending" — so carrying on would leave us publishing under a
+   * name no peer can ever vouch for. Stop, for the same reason startWorldSync
+   * refuses to begin on one.
+   */
+  test('a re-key to a name that could never author stops the session', () => {
+    installBus('session-old')
+    startWorldSync()
+    installBus('bad#name')
+    pumpWorldSync()
+
+    expect(worldSyncDebug().unsafeNames).toBe(1)
+    expect(worldSyncDebug().rekeys).toBe(0)
+    expect(worldSyncActive()).toBe(false)
+    expect(buildSyncOn()).toBe(false)
+    expect(damageSyncActive()).toBe(false)
+  })
+
+  /**
+   * Records minted under the old name keep it forever — peers hold them and we
+   * cannot rename them — so "did this player make this" has to span names or Save
+   * would disown the fort. The model answers it; this pins that the adapter
+   * actually gives it the old name to remember.
+   */
+  test('a re-key leaves the old prefix recognisable as ours', () => {
+    installBus('session-old')
+    startWorldSync()
+    const world = worldSyncWorld()!
+    const mine = addLocalStroke(world, {
+      node: 'node-9',
+      color: 3,
+      x: 1,
+      y: 1,
+      z: 1,
+      radius: 0.4,
+    })!
+
+    installBus('session-new')
+    pumpWorldSync()
+
+    expect(isOurs(world, mine.id)).toBe(true) // minted under the OLD name
+    expect(isOurs(world, 'session-stranger#4')).toBe(false)
+  })
+
+  /**
+   * The stamp belongs to the LOT, not to us. slotsOk demands a NON-ZERO stamp
+   * equal to the receiver's and it is only ever published when the storey ladder
+   * installs, so losing it would refuse every slot-addressed record for the rest
+   * of the session — the bug traded for a permanent version of itself. Renaming
+   * in place keeps it; this pins that so no future recovery can drop it.
    */
   test('the lot grid fingerprint survives a re-key', () => {
     installBus('session-old')
@@ -586,11 +664,11 @@ describe('our own name is not a constant', () => {
     expect(worldSyncWorld()?.gridStamp).toBe(0xbeef)
   })
 
-  test('a re-key says the whole of it again, so peers get the new prefix', () => {
+  test('a re-key says the whole of it again, so peers hear it before the next heal', () => {
     installBus('session-old')
     startWorldSync()
     const fresh = installBus('session-new')
-    pumpWorldSync() // detects, restarts, queues the snapshot
+    pumpWorldSync() // detects, renames, queues the snapshot
     pumpWorldSync() // publishes one frame of it
     expect(framesOn(fresh, WORLD_SNAP_KIND).length).toBeGreaterThan(0)
   })
