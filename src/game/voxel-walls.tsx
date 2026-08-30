@@ -18,6 +18,7 @@ import {
   Sphere,
   Vector3,
 } from 'three'
+import { passageGeneration, passageHidesCell, passagesTouchSphere } from './collision'
 import { useDestruction, type VoxelTarget } from './destruction'
 import { perfSection } from './perf-monitor'
 import {
@@ -666,11 +667,14 @@ export function coreThicknessAxis(grid: {
   return axis
 }
 
-/** Prime (or re-prime) the skin layer's matrices + colors from the grid.
- * Runs on mount and again whenever `skinRevision` bumps (async roof tone).
- * Clears the mesh's paint gates afterwards so drainPaintTints re-applies
- * any painted cells on top — the paint LEDGER's serials never move. */
-function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
+/**
+ * Load `_scale` and `_quat` with this target's per-cell transform and report
+ * whether it draws in CORE mode. Factored out because TWO writers now compose
+ * instance matrices from it — `primeSkin` and `syncPassageHoles` — and a cell
+ * has to land in exactly the same place whichever one wrote it, or opening a
+ * door would visibly nudge every cube in the wall.
+ */
+function beginCellTransform(wall: VoxelTarget): boolean {
   const { grid } = wall
   // Per-axis scale with a 1.5% inset: anisotropic wall grids have thin
   // skin cells along the thickness axis (a uniform grid.cell cube would
@@ -703,14 +707,108 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
     _quat.set(-grid.q.x, -grid.q.y, -grid.q.z, grid.q.w)
   } else if (grid.yaw === 0) _quat.identity()
   else _quat.setFromAxisAngle(UP, -grid.yaw)
+  return core
+}
+
+/**
+ * Write cell `i`'s instance matrix — its composed transform, or ZERO (hidden)
+ * when the cell is dead, or when it stands inside an OPEN DOORWAY. Returns
+ * whether a doorway is what hid it.
+ *
+ * THE VOXELS IN THE OPEN DOOR (owner report 2026-08-30: "i see voxels when it's
+ * open through it"). A voxel grid carves its OWN target's openings and nothing
+ * else, so scene geometry authored across a neighbour's doorway — on the QA
+ * house the east wall's end stands inside the front opening — renders as a wall
+ * of cubes straight through the aperture the moment that wall wakes. Both
+ * collision lanes already treat those cells as absent; this is the picture
+ * agreeing with the physics, which is the visible half of the reported bug.
+ *
+ * `beginCellTransform(wall)` must have run for this target first (`_scale` and
+ * `_quat` are its output). `hidePassages` is the caller's per-target early-out:
+ * false means no open doorway is anywhere near this grid, so skip the test
+ * entirely rather than ask about every cell in the level on every door toggle.
+ */
+function writeCellMatrix(
+  mesh: InstancedMesh,
+  grid: VoxelTarget['grid'],
+  i: number,
+  hidePassages: boolean,
+): boolean {
+  if (!grid.alive[i]) {
+    mesh.setMatrixAt(i, ZERO)
+    return false
+  }
+  const x = grid.centers[i * 3]!
+  const y = grid.centers[i * 3 + 1]!
+  const z = grid.centers[i * 3 + 2]!
+  if (hidePassages && passageHidesCell(x, y, z)) {
+    mesh.setMatrixAt(i, ZERO)
+    return true
+  }
+  _pos.set(x, y, z)
+  _matrix.compose(_pos, _quat, _scale)
+  mesh.setMatrixAt(i, _matrix)
+  return false
+}
+
+/** Sphere cache keyed by the grid's OWN centers buffer: cell centers are frozen
+ * at bake time, and a re-bake (MAX_VOXELS overflow) allocates a new buffer with
+ * a new count — so a stale entry is impossible, and the O(count) sweep runs once
+ * per grid instead of once per door toggle. */
+const _gridSpheres = new WeakMap<Float32Array, { sphere: Sphere; count: number }>()
+
+/** Could any open doorway reach this target at all? One sphere-vs-prism test per
+ * target keeps a door on the far side of the lot from walking every wall's
+ * cells. Conservative: `gridBoundingSphere` covers dead cells too. */
+function passagesReachGrid(wall: VoxelTarget): boolean {
+  const { grid } = wall
+  let hit = _gridSpheres.get(grid.centers)
+  if (hit === undefined || hit.count !== grid.count) {
+    hit = { sphere: gridBoundingSphere(grid), count: grid.count }
+    _gridSpheres.set(grid.centers, hit)
+  }
+  const { center, radius } = hit.sphere
+  if (radius < 0) return false
+  return passagesTouchSphere(center.x, center.y, center.z, radius)
+}
+
+/**
+ * Re-write every cell's matrix against the CURRENT passage registry — the
+ * per-frame half of the open-doorway hole. Colors are untouched, so paint coats
+ * and the async skin tone survive a door being opened and closed.
+ *
+ * Returns whether any cell is hidden by a doorway right now. The caller keeps
+ * that: once a door CLOSES its prism is gone, so `passagesReachGrid` goes false
+ * and the sweep that has to put the cubes BACK would never run without it.
+ */
+export function syncPassageHoles(mesh: InstancedMesh, wall: VoxelTarget): boolean {
+  const { grid } = wall
+  beginCellTransform(wall)
+  const hide = passagesReachGrid(wall)
+  let holes = false
   for (let i = 0; i < grid.count; i++) {
-    if (grid.alive[i]) {
-      _pos.set(grid.centers[i * 3]!, grid.centers[i * 3 + 1]!, grid.centers[i * 3 + 2]!)
-      _matrix.compose(_pos, _quat, _scale)
-      mesh.setMatrixAt(i, _matrix)
-    } else {
-      mesh.setMatrixAt(i, ZERO)
-    }
+    if (writeCellMatrix(mesh, grid, i, hide)) holes = true
+  }
+  mesh.instanceMatrix.needsUpdate = true
+  return holes
+}
+
+/** Prime (or re-prime) the skin layer's matrices + colors from the grid.
+ * Runs on mount and again whenever `skinRevision` bumps (async roof tone).
+ * Clears the mesh's paint gates afterwards so drainPaintTints re-applies
+ * any painted cells on top — the paint LEDGER's serials never move.
+ * Returns whether an open doorway is hiding cells as of this prime. */
+export function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): boolean {
+  const { grid } = wall
+  const core = beginCellTransform(wall)
+  // A door can already be standing open when a target primes — a wall woken
+  // mid-session, or a dormant replica reached by the budgeted prime queue while
+  // the player is in the doorway — so the prime has to come out with the hole
+  // already punched, not wait for the next door toggle to bump the generation.
+  const hide = passagesReachGrid(wall)
+  let holes = false
+  for (let i = 0; i < grid.count; i++) {
+    if (writeCellMatrix(mesh, grid, i, hide)) holes = true
     // Shared per-cell prime tone (skin-tone.ts) — paint.tsx feathers coats
     // up from exactly this color, so the two must never drift. Shelled
     // targets prime the CORE tone instead (the facade is the shell's);
@@ -728,6 +826,7 @@ function primeSkin(mesh: InstancedMesh, wall: VoxelTarget): void {
   // the next drain re-coat them from the ledger (serials stay intact).
   mesh.userData.__bootsPaintSerial = undefined
   mesh.userData.__bootsPaintTarget = undefined
+  return holes
 }
 
 /** How far below the lot a freshly primed dormant replica renders for its
@@ -746,6 +845,13 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
   const revision = useRef(-1)
   const skinRevision = useRef(0)
   const warmDraw = useRef(0)
+  /** Last passage generation this replica's instance matrices reflect. -1 so the
+   * first awake frame always reconciles (a door may already be open). */
+  const passageGen = useRef(-1)
+  /** Whether an open doorway is currently hiding cells here — the latch that
+   * makes a door CLOSING put its cubes back (by then no prism reaches the grid,
+   * so the cheap sphere early-out would otherwise skip the restore). */
+  const passageHoles = useRef(false)
   const primeEntry = useRef<DormantPrimeEntry>(null!)
   const sandwich = wall as SandwichTarget
   const boards = sandwich.boards
@@ -774,7 +880,8 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
     const entry: DormantPrimeEntry = {
       primed: false,
       prime: () => {
-        primeSkin(mesh, wall)
+        passageHoles.current = primeSkin(mesh, wall)
+        passageGen.current = passageGeneration()
         // primeSkin reads grid.alive directly, so removals queued while the
         // prime waited are already baked in — sync counters, drop the queue.
         revision.current = wall.revision
@@ -862,13 +969,31 @@ const VoxelWallMesh = memo(function VoxelWallMesh({ wall }: { wall: VoxelTarget 
       mesh.instanceMatrix.needsUpdate = true
       perfSection('skin-drain', performance.now() - drainT0)
     }
+    // OPEN DOORWAY HOLES (collision.ts::passageHidesCell): opening or closing a
+    // door changes which of this replica's cells may draw. The registry stamps a
+    // generation on every change, so the steady state costs one integer compare
+    // per target per frame — and the sweep itself only touches replicas a prism
+    // actually reaches (or ones still holding a hole open, which must restore).
+    const gen = passageGeneration()
+    if (passageGen.current !== gen) {
+      passageGen.current = gen
+      if (passageHoles.current || passagesReachGrid(wall)) {
+        const holeT0 = performance.now()
+        passageHoles.current = syncPassageHoles(mesh, wall)
+        perfSection('passage-holes', performance.now() - holeT0)
+      }
+    }
     // Async skin tone landed (roof shingle GPU readback — destruction.ts
     // bumps skinRevision after retinting baseColor): re-prime the whole
     // layer once. Idles at one number compare per target per frame.
     if (skinRevision.current !== (wall.skinRevision ?? 0)) {
       skinRevision.current = wall.skinRevision ?? 0
       const reprimeT0 = performance.now()
-      primeSkin(mesh, wall)
+      // The re-prime is itself a full matrix write against the live registry, so
+      // it doubles as a passage sweep — bank it, or the latch would think a hole
+      // is still owed and sweep the whole grid again next door toggle.
+      passageHoles.current = primeSkin(mesh, wall)
+      passageGen.current = passageGeneration()
       perfSection('skin-reprime', performance.now() - reprimeT0)
     }
   })

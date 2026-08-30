@@ -83,19 +83,39 @@ const passages: Box3[] = []
 /** Make `box` an active passage: capsule contacts whose closest point lies
  * inside it are ignored. Idempotent per instance. */
 export function registerPassage(box: Box3): void {
-  if (!passages.includes(box)) passages.push(box)
+  if (!passages.includes(box)) {
+    passages.push(box)
+    _passageGen++
+  }
 }
 
 /** Retire a passage registered with the SAME Box3 instance. No-op when
  * absent. */
 export function unregisterPassage(box: Box3): void {
   const index = passages.indexOf(box)
-  if (index !== -1) passages.splice(index, 1)
+  if (index !== -1) {
+    passages.splice(index, 1)
+    _passageGen++
+  }
 }
 
 /** Drop every passage (session unmount / test isolation). */
 export function clearPassages(): void {
+  if (passages.length > 0) _passageGen++
   passages.length = 0
+}
+
+/**
+ * Bumped whenever the passage set CHANGES — the render lane's "should I redraw"
+ * gate. Doors open and close a handful of times a session, so a per-frame
+ * integer compare (like `wall.revision`) lets every voxel replica idle for free
+ * and rebuild its instance matrices only on the frames a doorway actually
+ * appeared or vanished.
+ */
+let _passageGen = 0
+
+export function passageGeneration(): number {
+  return _passageGen
 }
 
 /** Is THIS Box3 instance an active passage? (identity, like the registry) */
@@ -212,11 +232,27 @@ const _passageCell = new Vector3()
  * against a prism ending at x 5.40 (cell 0.15). Dropping only the cells whose
  * CENTRES fall inside leaves a fringe one cell thick lining the whole aperture,
  * and a 0.8 m door has just 0.06 m of clearance per side for a 0.68 m capsule —
- * so that fringe alone seals it. Padding the test by the cell's own half-extent
- * is what makes the rule mean "this cube intrudes into the opening", which is
- * the question the collision actually asks. It cannot open a hole in a jamb:
- * a cube more than its own half-extent clear of the prism still resolves, so
- * only cells genuinely overlapping the doorway volume are dropped.
+ * so that fringe alone seals it.
+ *
+ * `cellHalf` is therefore THE RADIUS THIS LANE RESOLVES A CELL WITH, not the
+ * cell's true half-extent — and the distinction is deliberate, because those
+ * differ. `collideVoxelTargets` treats a cell as a SPHERE of `grid.cell * 0.55`
+ * where `grid.cell = max(cellX, cellY, cellZ)`, so on a wall's THICKNESS axis
+ * (pinned to extent/layers, 0.03-0.05 m) that sphere is several times fatter
+ * than the cube it stands for. The set of capsule positions a cell can block is
+ * fixed by that sphere, so the only pad that relieves exactly what this lane
+ * can block — no seal left behind, nothing extra freed — is the sphere's own
+ * radius. Asking about the true anisotropic box here would UNDER-relieve on the
+ * thickness axis and let the fringe seal the door again. (The lanes that are
+ * about what you SEE rather than where you can stand get `passageHidesCell`,
+ * which is deliberately unpadded — see its header for why the trade-off flips.)
+ *
+ * It still cannot open a hole in a jamb. On the axis where jamb leakage is even
+ * possible — the door's WIDTH, where the prism is unpadded — `grid.cell` IS the
+ * in-plane cell size, so the pad equals the true half-extent to within a
+ * percent. On the thickness axis, where the pad is oversized, the prism already
+ * carries PASSAGE_SLACK (0.35 m) of its own, which dwarfs any cell, so the
+ * oversize changes nothing that the slack had not already decided.
  */
 export function passageRelievesCell(
   x: number,
@@ -251,6 +287,58 @@ export function passageReliefStats(): { calls: number; grants: number; passages:
 export function resetPassageReliefStats(): void {
   _reliefCalls = 0
   _reliefGrants = 0
+}
+
+/**
+ * THE SAME QUESTION WITH NO FEET IN IT — for the lanes that are about what you
+ * can SEE THROUGH rather than where you can stand.
+ *
+ * The owner reported two symptoms, not one: "i SEE voxels when it's open
+ * through it AND i can open with E but not walk into it". The walk is
+ * `passageRelievesCell`. The other half is drawn geometry: voxel-walls.tsx
+ * instances every alive cell regardless of relief, so a wall whose grid crosses
+ * a NEIGHBOUR's doorway (a grid never carves someone else's aperture) keeps its
+ * cubes on screen right across the opening once it wakes.
+ *
+ * Two deliberate differences from the walk predicate:
+ *
+ *  - NO `feetY` TERM. A cube you can see through has nothing to do with where
+ *    anyone's feet are; the walk's feet rule exists only to keep a threshold
+ *    slab solid underfoot.
+ *  - NO PADDING AT ALL — a cell is hidden only when its CENTRE stands inside the
+ *    prism. This is the opposite call from the collision lane, and on purpose:
+ *    there, under-relieving leaves a one-cell fringe that SEALS the door (the
+ *    bug), while over-relieving costs nothing visible. Here the trade-off flips.
+ *    Every direction a pad could grow in removes material the player is looking
+ *    straight at: outward on the door's WIDTH notches the jambs, DOWN holes the
+ *    floor of the doorway, UP opens a slot over the header, and on the THICKNESS
+ *    axis the prism already carries PASSAGE_SLACK (0.35 m). Under-hiding, by
+ *    contrast, leaves at most half a cell of genuine wall poking into the edge
+ *    of the aperture — geometry the collision lane has already relieved, so it
+ *    cannot trap anyone, and at 0.02-0.14 m it reads as wall, not as a blockage.
+ *    A centre test also hides EXACTLY the census the browser probe counted (43
+ *    cells on the sculpted lot, 65 on the QA house's bath door): a cube standing
+ *    in an opening is majority-inside it by definition.
+ */
+export function passageHidesCell(x: number, y: number, z: number): boolean {
+  if (passages.length === 0) return false
+  _passageCell.set(x, y, z)
+  return inPassage(_passageCell, PASSAGE_EDGE_EPS)
+}
+
+/**
+ * Could any open doorway possibly touch this sphere? The render lane's cheap
+ * bail-out: a voxel replica whose whole grid is nowhere near a doorway must not
+ * walk its cells just because a door opened on the far side of the lot.
+ */
+export function passagesTouchSphere(cx: number, cy: number, cz: number, r: number): boolean {
+  for (const box of passages) {
+    const dx = Math.max(box.min.x - cx, 0, cx - box.max.x)
+    const dy = Math.max(box.min.y - cy, 0, cy - box.max.y)
+    const dz = Math.max(box.min.z - cz, 0, cz - box.max.z)
+    if (dx * dx + dy * dy + dz * dz <= r * r) return true
+  }
+  return false
 }
 
 function refreshSegments(pos: Vector3, cfg: CapsuleConfig, collider: ColliderEntry): void {
