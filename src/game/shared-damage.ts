@@ -48,6 +48,8 @@
  * `publish` callback and a world; tests drive both directly.
  */
 
+import { useBoots } from '../store'
+import { pieceRecordOf } from './shared-build'
 import { canonicalCellOrder, canonicalNodeOrder } from './shared-derive'
 import {
   cellIx,
@@ -67,6 +69,8 @@ import {
   noteLocalRemoval,
   noteLocalReset,
   noteLocalSegments,
+  pieceTargetId,
+  PIECE_TARGET_PREFIX,
   type CellKey,
   type LocalWork,
   type NodeDelta,
@@ -167,6 +171,88 @@ export function keysOfIndices(grid: DamageGrid, indices: Iterable<number>): Cell
     if (key !== -1) keys.push(key)
   }
   return canonicalCellOrder(keys)
+}
+
+// ── Wire identity ───────────────────────────────────────────────────────────
+
+/**
+ * The game's own namespace for targets it invents at runtime. Everything else
+ * is a host scene node, whose id comes from the document and therefore means
+ * the same thing in every browser in the room.
+ */
+const SESSION_TARGET_PREFIX = '__boots'
+
+/** A local placed-piece target is `__boots-piece-<decimal>`; a shared one is
+ * `__boots-piece-<peer>#<seq>`, and `#` is illegal in a peer id (isSafePeerId),
+ * so the two spaces cannot be confused. */
+const RUNTIME_SUFFIX = /^\d+$/
+
+/**
+ * THE NAME A TARGET TRAVELS UNDER.
+ *
+ * Host nodes need no translation. Session-built ones do, and getting it wrong
+ * is the worst class of bug in this lane because it is silent: store.ts mints
+ * `__boots-piece-<n>` from a counter that restarts at every page load, so MY
+ * third wall and YOURS are both `__boots-piece-3`. Publishing damage under that
+ * name would carve a hole in a DIFFERENT wall at the receiver — geometry that
+ * never converges, from a frame that merges cleanly.
+ *
+ * shared-world.ts already settled the convention: a shared piece keys its
+ * target off its RECORD id, which carries its author and is the same string
+ * everywhere (`pieceTargetId`). So the local id is translated HERE, at the wire
+ * boundary, and nowhere else — the runtime keeps its own numeric ids, which is
+ * why destruction.ts's `__boots-piece-<n>` death parse still sees the number it
+ * expects and needed no change at all.
+ *
+ * The record id is treated as an OPAQUE string: never parsed, never split. What
+ * a peer half looks like is the sync core's business, not this bridge's.
+ *
+ * Returns null for "this target has no room-wide name", which means DO NOT
+ * PUBLISH — never publish under a guess:
+ *   · a piece with no record binding (placed while solo, or not published yet);
+ *   · placed catalog items (`__boots-item-*`), whose runtime→record binding
+ *     shared-build keeps privately and does not expose. Their damage stays
+ *     local until it does; a per-client id on the wire would be worse.
+ *   · the spawn fixtures (`__boots-table*`, `__boots-switch`), which each
+ *     client builds for itself at its own spawn point. They are not the same
+ *     object in two browsers and sharing their damage would be meaningless.
+ */
+function wireNodeId(nodeId: NodeId): NodeId | null {
+  if (!nodeId.startsWith(SESSION_TARGET_PREFIX)) return nodeId
+  if (!nodeId.startsWith(PIECE_TARGET_PREFIX)) return null
+  const suffix = nodeId.slice(PIECE_TARGET_PREFIX.length)
+  // Already room-wide (a piece the build lane named by record): pass through,
+  // so this stays correct if the runtime ever adopts record-keyed ids too.
+  if (suffix.includes('#')) return nodeId
+  if (!RUNTIME_SUFFIX.test(suffix)) return null
+  const record = pieceRecordOf(Number(suffix))
+  return record === null ? null : pieceTargetId(record)
+}
+
+/**
+ * The inverse, for an arriving frame: the local target that a room-wide name
+ * refers to on THIS client, or null when there is nothing here to damage.
+ *
+ * shared-build exposes runtime→record but not the reverse, so this is a scan of
+ * the pieces this session is holding — tens of entries, walked only when an
+ * inbound frame actually names a piece. It is also the more truthful direction
+ * of the two: it can only ever return a piece that is in the store right now,
+ * where a stale record→runtime map could hand back a piece that has since been
+ * shot to bits.
+ *
+ * A peer-numbered `__boots-piece-<decimal>` is REFUSED rather than resolved: it
+ * is either an old build of a peer or a forgery, and the one thing it certainly
+ * is not is a reference to a piece of mine that happens to share the number.
+ */
+function localNodeId(nodeId: NodeId): NodeId | null {
+  if (!nodeId.startsWith(SESSION_TARGET_PREFIX)) return nodeId
+  if (!nodeId.startsWith(PIECE_TARGET_PREFIX)) return null
+  const record = nodeId.slice(PIECE_TARGET_PREFIX.length)
+  if (!record.includes('#')) return null
+  for (const piece of useBoots.getState().placed) {
+    if (pieceRecordOf(piece.id) === record) return `${PIECE_TARGET_PREFIX}${piece.id}`
+  }
+  return null
 }
 
 // ── Injection points ────────────────────────────────────────────────────────
@@ -391,9 +477,11 @@ export function publishRemovedCells(
 export function publishRemovedKeys(nodeId: NodeId, keys: readonly CellKey[]): void {
   if (sync === null || remoteDepth > 0) return
   if (keys.length === 0) return
-  const fresh = noteLocalRemoval(sync.world, nodeId, keys)
+  const wire = wireNodeId(nodeId)
+  if (wire === null) return
+  const fresh = noteLocalRemoval(sync.world, wire, keys)
   if (fresh.length === 0) return
-  const entry = pendingNode(nodeId)
+  const entry = pendingNode(wire)
   for (const key of fresh) entry.removed.push(key)
   autoFlush()
 }
@@ -407,9 +495,11 @@ export function publishRemovedKeys(nodeId: NodeId, keys: readonly CellKey[]): vo
 export function publishBrokenSegments(nodeId: NodeId, ids: readonly number[]): void {
   if (sync === null || remoteDepth > 0) return
   if (ids.length === 0) return
-  const fresh = noteLocalSegments(sync.world, nodeId, ids)
+  const wire = wireNodeId(nodeId)
+  if (wire === null) return
+  const fresh = noteLocalSegments(sync.world, wire, ids)
   if (fresh.length === 0) return
-  const entry = pendingNode(nodeId)
+  const entry = pendingNode(wire)
   for (const id of fresh) entry.segments.push(id)
   autoFlush()
 }
@@ -428,8 +518,10 @@ export function publishBrokenSegment(nodeId: NodeId, id: number): void {
  */
 export function publishKilledNode(nodeId: NodeId): void {
   if (sync === null || remoteDepth > 0) return
-  if (!noteLocalKill(sync.world, nodeId)) return
-  pendingNode(nodeId).killed = true
+  const wire = wireNodeId(nodeId)
+  if (wire === null) return
+  if (!noteLocalKill(sync.world, wire)) return
+  pendingNode(wire).killed = true
   autoFlush()
 }
 
@@ -445,9 +537,11 @@ export function publishKilledNode(nodeId: NodeId): void {
  */
 export function publishNodeReset(nodeId: NodeId): void {
   if (sync === null || remoteDepth > 0) return
+  const wire = wireNodeId(nodeId)
+  if (wire === null) return
   flushDamage()
-  const epoch = noteLocalReset(sync.world, nodeId)
-  const entry = pendingNode(nodeId)
+  const epoch = noteLocalReset(sync.world, wire)
+  const entry = pendingNode(wire)
   entry.reset = true
   entry.epoch = epoch
   entry.removed.length = 0
@@ -534,6 +628,14 @@ export type DamageApplyReport = {
   /** Nodes this client cannot voxelize yet — the effect is dropped, and the
    * next snapshot fold will land it once the node exists. */
   deferred: number
+  /**
+   * Effects naming a session-built target that has no local counterpart: a
+   * piece whose record this client has not installed yet, an item (whose
+   * runtime↔record binding is private to the build lane), a peer's spawn
+   * fixture, or a peer-numbered id that must never be resolved by number.
+   * Dropped, deliberately and countably — see `localNodeId`.
+   */
+  unresolved: number
 }
 
 const emptyReport = (): DamageApplyReport => ({
@@ -544,6 +646,7 @@ const emptyReport = (): DamageApplyReport => ({
   kills: 0,
   unknownCells: 0,
   deferred: 0,
+  unresolved: 0,
 })
 
 /**
@@ -573,14 +676,27 @@ export function applySharedDamage(fx: SharedEffects): DamageApplyReport {
 
   remoteDepth++
   try {
-    for (const nodeId of canonicalNodeOrder(fx.resetNodes)) {
+    // Node ids are ordered as they arrived — the canonical order is over the
+    // WIRE names, so the pass is a pure function of the frame — and translated
+    // to this client's own target ids one at a time (see `localNodeId`).
+    for (const wireId of canonicalNodeOrder(fx.resetNodes)) {
+      const nodeId = localNodeId(wireId)
+      if (nodeId === null) {
+        report.unresolved++
+        continue
+      }
       live.resetNode(nodeId)
       report.resets++
     }
 
-    for (const nodeId of canonicalNodeOrder(fx.removedCells.keys())) {
-      const keys = fx.removedCells.get(nodeId)
+    for (const wireId of canonicalNodeOrder(fx.removedCells.keys())) {
+      const keys = fx.removedCells.get(wireId)
       if (keys === undefined || keys.length === 0) continue
+      const nodeId = localNodeId(wireId)
+      if (nodeId === null) {
+        report.unresolved++
+        continue
+      }
       const target = live.materialize(nodeId)
       if (target === null) {
         report.deferred++
@@ -603,9 +719,14 @@ export function applySharedDamage(fx: SharedEffects): DamageApplyReport {
       report.cells += indices.length
     }
 
-    for (const nodeId of canonicalNodeOrder(fx.brokenSegments.keys())) {
-      const ids = fx.brokenSegments.get(nodeId)
+    for (const wireId of canonicalNodeOrder(fx.brokenSegments.keys())) {
+      const ids = fx.brokenSegments.get(wireId)
       if (ids === undefined || ids.length === 0) continue
+      const nodeId = localNodeId(wireId)
+      if (nodeId === null) {
+        report.unresolved++
+        continue
+      }
       const target = live.materialize(nodeId)
       if (target === null) {
         report.deferred++
@@ -621,7 +742,12 @@ export function applySharedDamage(fx: SharedEffects): DamageApplyReport {
       report.segments += sane.length
     }
 
-    for (const nodeId of canonicalNodeOrder(fx.killedNodes)) {
+    for (const wireId of canonicalNodeOrder(fx.killedNodes)) {
+      const nodeId = localNodeId(wireId)
+      if (nodeId === null) {
+        report.unresolved++
+        continue
+      }
       live.killNode(nodeId)
       report.kills++
     }
