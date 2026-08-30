@@ -304,10 +304,18 @@ function outgoing(): SharedDelta {
 }
 
 /**
- * Hand the accumulated records to the transport. Called at the end of every
- * publish path, so a turbo burst that stamped six walls in one frame leaves
- * as one frame. With no sink installed the records simply stay in the local
- * world, which is all the Save path and the tests need.
+ * Hand the accumulated records to the sink. Called at the end of every publish
+ * path, so a turbo burst that stamped six walls in one frame leaves as one
+ * frame. With no sink installed the records simply stay in the local world,
+ * which is all the Save path and the tests need.
+ *
+ * EXACTLY ONE OUTBOUND PATH AT A TIME. `addLocalPiece`/`killRecord` and their
+ * lane siblings also journal into `world.journal`, which the transport drains
+ * with `takePending(world)` once per tick — so a transport that drains the
+ * journal must NOT also install a sink here, or every record this client
+ * builds goes out twice (idempotent on the receiving side, but double the
+ * bytes on a bus that coalesces). The sink is for a transport that would
+ * rather be pushed, and for the tests, which read the frames it hands over.
  */
 export function flushBuildSync(): void {
   const s = sync
