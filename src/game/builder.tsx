@@ -1277,9 +1277,15 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     }
   }, [])
 
-  // Dev handle for the multiplayer QA scripts, alongside __bootsBuilder.
+  // QA handle for the multiplayer scripts, alongside __bootsBuilder,
+  // __bootsItems and __bootsPaint. Registered UNCONDITIONALLY, like all of
+  // them: `import.meta.env` is a bundler-specific global that the host's
+  // webpack build does not define, so guarding on `import.meta.env.DEV` threw
+  // a TypeError inside this mount effect and took the whole piece tree down
+  // with it — the pieces vanished and `__boots` went with them. It was also
+  // the only `import.meta.env` reference in the plugin. sharedBuildDebug
+  // returns plain copies and holds nothing, so there is nothing to gate.
   useEffect(() => {
-    if (!import.meta.env.DEV) return
     ;(globalThis as Record<string, unknown>).__bootsBuild = sharedBuildDebug
     return () => {
       delete (globalThis as Record<string, unknown>).__bootsBuild
