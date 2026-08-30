@@ -1,12 +1,3 @@
-// ORDERING WORKAROUND, not a dependency. shared-damage.ts imports
-// save-demolition.ts, which imports destruction.ts, which calls
-// setDamageRuntime() at module scope — so with shared-damage as the graph
-// entry, `runtime` is still in its temporal dead zone and the import throws
-// (their own shared-damage.test.ts fails the same way on main). Evaluating
-// destruction first breaks the cycle. Remove this line once the damage lane
-// makes that registration lazy.
-import './destruction'
-
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
   HEAL_PERIOD_MS,
