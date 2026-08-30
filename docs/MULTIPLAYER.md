@@ -663,12 +663,38 @@ The *numbers* do not. `rekeySharedWorld` returns every pending add id regardless
 of prefix, so `staleMints` counts the stranger's work while the re-mint correctly
 recovers none of it, and the loss figure above quietly stops meaning what it says.
 
-**An owed change, deliberately not made here:** the real fix is an authorship check
-inside `restoreLane` — refuse a record this world could not have minted — and that
-is in `shared-world.ts`, the frozen contract. A wiring lane fencing its own
-precondition is the honest move; a wiring lane reaching into the model to relax or
-tighten the contract is not. If a retry path is ever wired, do that check in the
-model first and delete the fence, rather than satisfying the fence by convention.
+**An owed change, deliberately not made here, and it is one line away from a worse
+bug.** The real fix is an authorship refusal inside `restoreLane`, in
+`shared-world.ts` — the frozen contract. A wiring lane fencing its own precondition
+is honest; a wiring lane reaching into the model to change the contract is not. It
+is **held rather than made** because it is unreachable today (no production caller),
+the signature grows a `world` argument that touches every call site and the model's
+internals, and the person who wires the retry path is the one who will know which
+delta they are handing it. When that day comes, the shape is not "add a check" — it
+is these four decisions, and the third is the trap:
+
+- **`isOurs(world, rec.id)`, not `isAuthoredBy(rec.id, world.self)`.** The narrow
+  form refuses our own *pre-rename* adds, which drops work on the one path whose
+  purpose is not to drop work — inside precisely the window `remintSharedRecords`
+  exists to cover, so the two would fight over the same records. `isOurs` spans
+  `formerSelves`, which is the whole reason the rename files the old name at all.
+- **`restoreDead` must NOT get the check.** Tombstones carry the *victim's* prefix,
+  not ours: our legitimate kill of a stranger's piece is a dead-lane id that
+  `isOurs` refuses. And a tombstone is the only thing keeping a demolished wall
+  demolished, so dropping it means a peer who missed the original frame watches the
+  wall come back. **A resurrection bug is strictly worse than the corrupted counter
+  this was fixing** — trading a wrong number for a wrong world.
+- **The node/cell loop needs nothing.** Voxel damage is keyed by `nodeId` + cell and
+  carries no record id, so there is no authorship to check; its epoch guard is
+  already the right refusal and applies whoever sends it.
+- **`MAX_FORMER_SELVES = 8` is the fail-safe bound, and it is a bound on the
+  *check*, not just on memory.** A record minted more than eight renames ago can no
+  longer be vouched for, so it would be refused — correct behaviour (bounded
+  vouching beats unbounded trust), and the reason the refusal must never be
+  described as "vouch forever".
+
+If a retry path is ever wired: make that change in the model first and **delete the
+fence**, rather than satisfying the fence by convention.
 
 **Two residues, both deliberate.** Our snapshots still carry old-prefixed records
 that peers refuse — wasted bytes and an inflated `dropped` on their side —
