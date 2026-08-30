@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Object3D } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
 import {
+  bakedChunkOrders,
+  bakedPaintCensus,
+  bakeNodeSplats,
   drainPaintTints,
+  flushPendingSplatZeros,
+  pendingSplatZeroCensus,
   getPaintedByNode,
   releaseNodeSplats,
   resetPaint,
@@ -216,24 +221,77 @@ describe('stampSplat pool (ring cap, reuse, node eviction)', () => {
     expect(splatSpriteCensus('wall_d2')).toBe(2)
   })
 
-  test('ring cap holds at SPLAT_SPRITE_CAP; overflow reuses the oldest', () => {
+  test('the pool stays at SPLAT_SPRITE_CAP; overflow is BAKED, never dropped', () => {
     expect(SPLAT_SPRITE_CAP).toBe(192)
-    for (let i = 0; i < SPLAT_SPRITE_CAP + 5; i++) {
+    const stamps = SPLAT_SPRITE_CAP + 5
+    for (let i = 0; i < stamps; i++) {
       expect(stamp('wall_r', i * 1.0)).toBe(true)
     }
-    expect(splatSpriteCensus()).toBe(SPLAT_SPRITE_CAP)
-    expect(splatSpriteCensus('wall_r')).toBe(SPLAT_SPRITE_CAP)
+    // Live instances stay bounded by the pool…
+    expect(splatSpriteCensus()).toBeLessThanOrEqual(SPLAT_SPRITE_CAP)
+    // …and every quad the player sprayed is still drawn (live or baked).
+    expect(splatSpriteCensus('wall_r') + bakedPaintCensus('wall_r', 'sprite')).toBe(stamps)
   })
 
-  test('the wrap evicts across nodes — oldest first, bookkeeping intact', () => {
+  test('the wrap PROMOTES the other node instead of erasing it', () => {
     expect(stamp('wall_old', 0)).toBe(true)
     for (let i = 0; i < SPLAT_SPRITE_CAP; i++) {
       expect(stamp('wall_new', i * 1.0)).toBe(true)
     }
-    // The 193rd stamp reused wall_old's slot.
-    expect(splatSpriteCensus('wall_old')).toBe(0)
-    expect(splatSpriteCensus('wall_new')).toBe(SPLAT_SPRITE_CAP)
-    expect(splatSpriteCensus()).toBe(SPLAT_SPRITE_CAP)
+    // The 193rd stamp needed wall_old's slot — so wall_old's quad was baked,
+    // not deleted. It is still on the wall.
+    expect(splatSpriteCensus('wall_old') + bakedPaintCensus('wall_old', 'sprite')).toBe(1)
+    expect(splatSpriteCensus('wall_new') + bakedPaintCensus('wall_new', 'sprite')).toBe(SPLAT_SPRITE_CAP)
+    expect(splatSpriteCensus()).toBeLessThanOrEqual(SPLAT_SPRITE_CAP)
+  })
+
+  test('a baked slot\'s zero-write is DEFERRED one frame (no one-frame hole)', () => {
+    // The chunk mesh that takes a quad over only reaches the scene on the uSES
+    // commit AFTER this frame's render. Zeroing the instance immediately would
+    // leave one frame with neither — so the zero waits for the frame-top flush.
+    for (let i = 0; i < 4; i++) expect(stamp('wall_pz', i * 1.0)).toBe(true)
+    expect(bakeNodeSplats('wall_pz')).toBe(4)
+    expect(pendingSplatZeroCensus()).toBe(4) // still drawn this frame
+    expect(bakedPaintCensus('wall_pz', 'sprite')).toBe(4)
+    flushPendingSplatZeros()
+    expect(pendingSplatZeroCensus()).toBe(0)
+    // Draining twice is a cheap no-op.
+    flushPendingSplatZeros()
+    expect(pendingSplatZeroCensus()).toBe(0)
+  })
+
+  test('releaseNodeSplats frees the node\'s BAKED quads too (dropped target)', () => {
+    expect(stamp('wall_gone', 0)).toBe(true)
+    expect(stamp('wall_stays', 5)).toBe(true)
+    expect(bakeNodeSplats('wall_gone')).toBe(1)
+    expect(bakedPaintCensus('wall_gone', 'sprite')).toBe(1)
+    releaseNodeSplats('wall_gone')
+    // Its surface no longer exists — live AND baked go.
+    expect(splatSpriteCensus('wall_gone')).toBe(0)
+    expect(bakedPaintCensus('wall_gone', 'sprite')).toBe(0)
+    expect(splatSpriteCensus('wall_stays')).toBe(1)
+  })
+
+  test('baked sprite chunks draw UNDER the live pool, in bake order', () => {
+    // The live pool's cover-scan retires an older different-colour quad; a
+    // baked quad can't be retired, so it must never draw OVER newer paint.
+    for (let i = 0; i < 3; i++) expect(stamp('wall_so', i * 1.0, 2)).toBe(true)
+    expect(bakeNodeSplats('wall_so')).toBe(3)
+    for (let i = 0; i < 3; i++) expect(stamp('wall_so', 10 + i, 3)).toBe(true)
+    expect(bakeNodeSplats('wall_so')).toBe(3)
+    const orders = bakedChunkOrders('wall_so', 'sprite')
+    expect(orders.length).toBe(2)
+    expect(orders[1]!).toBeGreaterThan(orders[0]!) // later bake draws later
+    for (const order of orders) expect(order).toBeLessThan(0) // …but under live
+  })
+
+  test('resetPaintSplats clears the BAKED quads as well as the pool', () => {
+    for (let i = 0; i < 3; i++) stamp('wall_rz', i * 1.0)
+    expect(bakeNodeSplats('wall_rz')).toBe(3)
+    resetPaintSplats()
+    expect(splatSpriteCensus()).toBe(0)
+    expect(bakedPaintCensus(undefined, 'sprite')).toBe(0)
+    expect(pendingSplatZeroCensus()).toBe(0)
   })
 
   test('releaseNodeSplats frees exactly one node and its coalesce record', () => {

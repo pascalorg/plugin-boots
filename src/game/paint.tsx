@@ -3,7 +3,8 @@
 import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import {
-  type BufferGeometry,
+  BufferAttribute,
+  BufferGeometry,
   CanvasTexture,
   Color,
   DynamicDrawUsage,
@@ -17,6 +18,7 @@ import {
   Vector3,
 } from 'three'
 import { DecalGeometry } from 'three/examples/jsm/geometries/DecalGeometry.js'
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { useBoots } from '../store'
 import { sfx, type SprayHandle } from './audio'
 import * as destructionModule from './destruction'
@@ -521,13 +523,45 @@ export function selectSplatCells(
   return cells
 }
 
+/** What `paintDebug.census()` reports — every splat this session still owns,
+ * split by representation. `decals + bakedDecals` (and `sprites +
+ * bakedSprites`) is the count of stamps the player can still see; it must only
+ * ever grow while spraying. */
+export type PaintCensus = {
+  /** Live keyed decal meshes (the ring slots). */
+  decals: number
+  /** Stamps merged into baked decal chunks — same triangles, fewer draws. */
+  bakedDecals: number
+  /** Live sprite-quad instances (voxel skins). */
+  sprites: number
+  /** Stamps merged into baked sprite chunks. */
+  bakedSprites: number
+  /** Baked chunk meshes (the draw-call cost of all the baked stamps). */
+  chunks: number
+  /** Geometries awaiting the next frame's disposal (must drain to 0). */
+  retired: number
+  /** Sprite slots whose matrix zero is deferred one frame (must drain to 0). */
+  pendingSplatZeros: number
+}
+
 /**
  * Dev-only handle (published as `globalThis.__bootsPaint` while the tool
  * runs — the `__bootsBuilder` pattern): headless E2E can't engage pointer
  * lock, so `holdFire` stands in for the held LMB (it is OR-ed with the real
- * input each frame).
+ * input each frame). `census()` is read-only, for the losslessness proof.
  */
-export const paintDebug: { holdFire: boolean } = { holdFire: false }
+export const paintDebug: { holdFire: boolean; census: (nodeId?: string) => PaintCensus } = {
+  holdFire: false,
+  census: (nodeId?: string) => ({
+    decals: decalCensus(nodeId),
+    bakedDecals: bakedPaintCensus(nodeId, 'decal'),
+    sprites: splatSpriteCensus(nodeId),
+    bakedSprites: bakedPaintCensus(nodeId, 'sprite'),
+    chunks: bakedChunkCensus(nodeId),
+    retired: retiredDecalCensus(),
+    pendingSplatZeros: pendingSplatZeroCensus(),
+  }),
+}
 
 // ── Aerosol mist (dust.tsx kind 'paint' — tinted cone off the nozzle) ─────
 
@@ -1008,12 +1042,47 @@ export function splatSpriteSlots(): readonly SplatSlot[] {
   return splatSlots
 }
 
-function releaseSplatSlot(index: number): void {
+/**
+ * Slots freed by a BAKE, waiting for their zero-scale write.
+ *
+ * A baked quad must never blink out. Freeing the slot zeroes its instance
+ * matrix in the very next frame loop, but the chunk mesh that took the quad
+ * over only reaches the scene on the uSES commit AFTER this frame's render —
+ * so zeroing immediately leaves one frame with neither. The zero is queued
+ * instead and drained from PaintTool's frame top (the retired-geometry
+ * idiom): worst case a quad is drawn twice for one frame, never zero times.
+ */
+const pendingSplatZeros: number[] = []
+
+/** Mark queued slots for their zero write — the chunk that replaced them has
+ * been in the scene for a frame by now. Slots re-claimed in the meantime are
+ * alive again and skipped. */
+export function flushPendingSplatZeros(): void {
+  if (pendingSplatZeros.length === 0) return
+  for (const index of pendingSplatZeros) {
+    const s = splatSlots[index]!
+    if (s.alive) continue
+    s.dirty = true
+    splatsDirty = true
+  }
+  pendingSplatZeros.length = 0
+}
+
+/** Queued-but-unzeroed baked slots (QA/tests). */
+export function pendingSplatZeroCensus(): number {
+  return pendingSplatZeros.length
+}
+
+function releaseSplatSlot(index: number, defer = false): void {
   const s = splatSlots[index]!
   if (!s.alive) return
   s.alive = false
-  s.dirty = true
-  splatsDirty = true
+  if (defer) {
+    pendingSplatZeros.push(index)
+  } else {
+    s.dirty = true
+    splatsDirty = true
+  }
   const list = nodeSplats.get(s.nodeId)
   if (list) {
     const at = list.indexOf(index)
@@ -1028,6 +1097,9 @@ function releaseSplatSlot(index: number): void {
  * REBUILT node's first tick stamps again. */
 export function releaseNodeSplats(nodeId: string): void {
   lastSplatByNode.delete(nodeId)
+  // The node's BAKED quads go with the live ones — they were clipped to a
+  // surface that no longer exists.
+  releaseNodeChunks(nodeId, 'sprite')
   const indices = nodeSplats.get(nodeId)
   if (!indices || indices.length === 0) return
   for (const index of [...indices]) releaseSplatSlot(index)
@@ -1041,8 +1113,12 @@ export function resetPaintSplats(): void {
   }
   splatCursor = 0
   splatsDirty = false
+  pendingSplatZeros.length = 0
   nodeSplats.clear()
   lastSplatByNode.clear()
+  releaseAllChunks('sprite')
+  // Mount/unmount lane: no chunk mesh survives this commit, dispose now.
+  flushRetiredDecalGeometries()
 }
 
 /**
@@ -1083,9 +1159,7 @@ export function stampSplat(
     radius,
   )
   for (const old of covered) releaseSplatSlot(old)
-  const index = splatCursor
-  splatCursor = (splatCursor + 1) % SPLAT_SPRITE_CAP
-  releaseSplatSlot(index)
+  const index = claimSplatSlot()
   const s = splatSlots[index]!
   s.alive = true
   s.dirty = true
@@ -1403,10 +1477,407 @@ function releaseSlot(index: number): void {
   }
 }
 
+// ── Baked paint: the rings PROMOTE, they never throw paint away ────────────
+//
+// The owner's report: "when i spray too long it starts to remove older spray".
+// Both splat pools are fixed rings — DECAL_CAP/DECAL_NODE_CAP clipped
+// DecalGeometry slots on pristine hosts, SPLAT_SPRITE_CAP quads on voxel
+// skins — and a ring stays bounded one of exactly two ways: DROP the oldest
+// stamp, or PROMOTE it into something that costs O(1) more. It dropped, so the
+// 65th splat on a wall deleted that wall's 1st and a long stroke ate its own
+// beginning.
+//
+// Promotion is a MERGE, not a re-render. Under pressure a node's live stamps
+// are merged — in same-colour runs, in stamp order — into one permanent
+// BufferGeometry per run, and the slots free. The pixels are the same pixels:
+// the very same clipped triangles (or the very same quads), the same
+// per-colour material over the same airbrush texture, drawn in the same order.
+//   · A decal chunk inherits the stamp-serial interval it replaces, so the
+//     blink fix ("newer coat draws later") holds across the bake: a chunk's
+//     stamps form one contiguous, increasing interval, and consolidation only
+//     ever merges into the node's NEWEST chunk.
+//   · A sprite chunk draws UNDER the live pool (renderOrder below zero, in
+//     bake order among chunks). Every baked quad is older than every live one,
+//     which is precisely the layering the live cover-scan used to get by
+//     evicting the covered quad.
+// What changes is the cost: N stamps on one wall are ⌈N / DECAL_BAKE_MAX⌉ draw
+// calls instead of N, the ring stays small and hot, and nothing is ever lost.
+//
+// Chunks are session-scoped like the rings (resetPaint* frees them, through
+// the same deferred-disposal flush) and they carry their stamp geometry
+// (x, y, z, radius) forward — so the two consumers that reach past the rings
+// still see every stamp: paint-keep's area-weighted votes, and the target-live
+// conversion into the cell ledger.
+
+/** Stamps merged into one chunk before a new chunk starts. Bounds the draw
+ * calls per node (⌈stamps / this⌉) AND the per-bake merge cost (a bake
+ * re-merges at most this many stamps' worth of triangles — a fraction of a
+ * millisecond, once per this-many stamps). */
+export const DECAL_BAKE_MAX = 512
+
+/** Baked sprite chunks draw before the live sprite pool (renderOrder 0), in
+ * bake order among themselves. Far enough below zero that the running chunk
+ * serial can never climb out of the band. */
+const SPRITE_CHUNK_ORDER = -1e6
+
+type PaintChunkLayer = 'decal' | 'sprite'
+
+type PaintChunk = {
+  /** React key — kept when a chunk consolidates in place (no remount). */
+  id: number
+  layer: PaintChunkLayer
+  color: number
+  /** Merged world-space geometry; REPLACED, never mutated, on consolidation. */
+  geometry: BufferGeometry
+  /** Transparent draw order (see the layer notes above). */
+  order: number
+  /** (x, y, z, radius) per merged stamp — the area votes and the ledger
+   * conversion read this, exactly as they read a live slot. Float64 (not the
+   * geometry's Float32): these are CPU-only and they must reproduce a live
+   * slot's numbers EXACTLY, or a promoted coat could save a different colour
+   * than the same stroke left unpromoted. */
+  stamps: Float64Array
+  count: number
+}
+
+/** nodeId → the node's baked chunks, oldest first. */
+const nodeChunks = new Map<string, PaintChunk[]>()
+let chunkSerial = 0
+
+/** Baked STAMPS — the paint that used to be evicted. Total, per node, and/or
+ * per layer (QA + tests). */
+export function bakedPaintCensus(nodeId?: string, layer?: PaintChunkLayer): number {
+  let n = 0
+  if (nodeId !== undefined) {
+    const list = nodeChunks.get(nodeId)
+    if (list) for (const chunk of list) if (!layer || chunk.layer === layer) n += chunk.count
+    return n
+  }
+  for (const list of nodeChunks.values()) {
+    for (const chunk of list) if (!layer || chunk.layer === layer) n += chunk.count
+  }
+  return n
+}
+
+/** Baked chunk MESHES — the draw calls promotion costs (QA + tests). */
+export function bakedChunkCensus(nodeId?: string, layer?: PaintChunkLayer): number {
+  let n = 0
+  if (nodeId !== undefined) {
+    const list = nodeChunks.get(nodeId)
+    if (list) for (const chunk of list) if (!layer || chunk.layer === layer) n++
+    return n
+  }
+  for (const list of nodeChunks.values()) {
+    for (const chunk of list) if (!layer || chunk.layer === layer) n++
+  }
+  return n
+}
+
+/** The baked stamps of one node+layer in bake order (tests/QA — plain copies
+ * of the (x, y, z, radius) tuples, never the live buffers). */
+export function bakedStamps(
+  nodeId: string,
+  layer: PaintChunkLayer = 'decal',
+): { x: number; y: number; z: number; radius: number; color: number }[] {
+  const out: { x: number; y: number; z: number; radius: number; color: number }[] = []
+  for (const chunk of nodeChunks.get(nodeId) ?? []) {
+    if (chunk.layer !== layer) continue
+    for (let i = 0; i < chunk.count; i++) {
+      out.push({
+        x: chunk.stamps[i * 4]!,
+        y: chunk.stamps[i * 4 + 1]!,
+        z: chunk.stamps[i * 4 + 2]!,
+        radius: chunk.stamps[i * 4 + 3]!,
+        color: chunk.color,
+      })
+    }
+  }
+  return out
+}
+
+/** The draw orders of one node+layer's chunks, in bake order (tests/QA — the
+ * blink fix's invariant is that these keep climbing and stay under the live
+ * stamps that came after them). */
+export function bakedChunkOrders(nodeId: string, layer: PaintChunkLayer = 'decal'): number[] {
+  const out: number[] = []
+  for (const chunk of nodeChunks.get(nodeId) ?? []) if (chunk.layer === layer) out.push(chunk.order)
+  return out
+}
+
+/**
+ * File a merged run under its node. It joins the node's NEWEST chunk when
+ * that chunk shares its layer and colour and still has room — which keeps a
+ * single-colour spray at ONE growing mesh per DECAL_BAKE_MAX stamps — and
+ * starts a new chunk otherwise. Only ever merging into the newest chunk is
+ * what keeps every chunk's stamp interval contiguous, and therefore the draw
+ * order exact.
+ */
+function pushChunk(
+  layer: PaintChunkLayer,
+  nodeId: string,
+  color: number,
+  geometry: BufferGeometry,
+  order: number,
+  stamps: Float64Array,
+  count: number,
+): void {
+  let list = nodeChunks.get(nodeId)
+  if (!list) {
+    list = []
+    nodeChunks.set(nodeId, list)
+  }
+  const last = list[list.length - 1]
+  if (last && last.layer === layer && last.color === color && last.count + count <= DECAL_BAKE_MAX) {
+    const merged = mergeGeometries([last.geometry, geometry], false)
+    if (merged) {
+      // The old chunk's geometry is still mounted for THIS frame's render and
+      // the fresh input will never render at all — both go through the
+      // deferred flush, never dispose() here (see retiredDecalGeometries).
+      retiredDecalGeometries.push(last.geometry, geometry)
+      const grown = new Float64Array(last.stamps.length + stamps.length)
+      grown.set(last.stamps)
+      grown.set(stamps, last.stamps.length)
+      last.geometry = merged
+      last.stamps = grown
+      last.count += count
+      if (layer === 'decal') last.order = order
+      return
+    }
+  }
+  const id = ++chunkSerial
+  list.push({
+    id,
+    layer,
+    color,
+    geometry,
+    // Sprite chunks live below the live pool; decal chunks keep the serial
+    // interval of the stamps they replace.
+    order: layer === 'sprite' ? SPRITE_CHUNK_ORDER + id : order,
+    stamps,
+    count,
+  })
+}
+
+/** Free a node's chunks (one layer, or all of them) — the surface they were
+ * clipped against is gone or has been taken over by the cell ledger. Returns
+ * the number of stamps freed. Geometry disposal is deferred like the ring's. */
+function releaseNodeChunks(nodeId: string, layer?: PaintChunkLayer): number {
+  const list = nodeChunks.get(nodeId)
+  if (!list || list.length === 0) return 0
+  const kept: PaintChunk[] = []
+  let freed = 0
+  for (const chunk of list) {
+    if (layer && chunk.layer !== layer) {
+      kept.push(chunk)
+      continue
+    }
+    retiredDecalGeometries.push(chunk.geometry)
+    freed += chunk.count
+  }
+  if (kept.length === list.length) return 0
+  if (kept.length === 0) nodeChunks.delete(nodeId)
+  else nodeChunks.set(nodeId, kept)
+  return freed
+}
+
+/** Free every chunk of a layer (session reset). */
+function releaseAllChunks(layer?: PaintChunkLayer): void {
+  for (const nodeId of [...nodeChunks.keys()]) releaseNodeChunks(nodeId, layer)
+}
+
+/**
+ * Promote a node's live decals into permanent chunks: same-colour runs merge
+ * in spawn order, then those slots free. Returns how many stamps were baked.
+ * Cheap and idempotent on a node with nothing live.
+ */
+export function bakeNodeDecals(nodeId: string): number {
+  const indices = nodeDecals.get(nodeId)
+  if (!indices || indices.length === 0) return 0
+  const live: number[] = []
+  for (const index of indices) if (decalSlots[index]!.alive) live.push(index)
+  let baked = 0
+  let run: number[] = []
+  const flushRun = (): void => {
+    if (run.length === 0) return
+    // A refused merge (unseen in practice — every DecalGeometry carries the
+    // same three attributes) leaves the run LIVE rather than dropping paint.
+    if (bakeDecalRun(nodeId, run)) {
+      for (const index of run) releaseSlot(index)
+      baked += run.length
+    }
+    run = []
+  }
+  for (const index of live) {
+    if (decalSlots[index]!.color !== decalSlots[run[0] ?? index]!.color) flushRun()
+    run.push(index)
+  }
+  flushRun()
+  if (baked > 0) emitDecals()
+  return baked
+}
+
+/** Merge one same-colour run into a chunk. False = the merge refused and the
+ * caller must keep the slots. */
+function bakeDecalRun(nodeId: string, run: readonly number[]): boolean {
+  const parts: BufferGeometry[] = []
+  const stamps = new Float64Array(run.length * 4)
+  let order = 0
+  for (let k = 0; k < run.length; k++) {
+    const slot = decalSlots[run[k]!]!
+    if (!slot.geometry) return false
+    parts.push(slot.geometry)
+    stamps[k * 4] = slot.x
+    stamps[k * 4 + 1] = slot.y
+    stamps[k * 4 + 2] = slot.z
+    stamps[k * 4 + 3] = slot.radius
+    if (slot.order > order) order = slot.order
+  }
+  const geometry = mergeGeometries(parts, false)
+  if (!geometry) return false
+  pushChunk('decal', nodeId, decalSlots[run[0]!]!.color, geometry, order, stamps, run.length)
+  return true
+}
+
+/**
+ * A free decal ring slot. Under pressure the ring BAKES instead of evicting:
+ * a node at its quota promotes its own stamps, and a cursor landing on another
+ * node's live stamp promotes THAT node. Either way slots come free and no
+ * paint is lost.
+ */
+function claimDecalSlot(nodeId: string): number {
+  const list = nodeDecals.get(nodeId)
+  if (list && list.length >= DECAL_NODE_CAP) bakeNodeDecals(nodeId)
+  for (let tries = 0; tries < DECAL_CAP; tries++) {
+    const index = decalCursor
+    decalCursor = (decalCursor + 1) % DECAL_CAP
+    if (!decalSlots[index]!.alive) return index
+    bakeNodeDecals(decalSlots[index]!.nodeId)
+    if (!decalSlots[index]!.alive) return index
+  }
+  // Unreachable (a bake frees its node's whole quota) — but coat the wall
+  // rather than refuse the trigger.
+  const index = decalCursor
+  decalCursor = (decalCursor + 1) % DECAL_CAP
+  releaseSlot(index)
+  return index
+}
+
+// ── Sprite quads bake the same way (the pool is the same kind of ring) ─────
+
+/** PlaneGeometry(1,1)'s own vertex order, winding (0,2,1 / 2,3,1) and UVs, so
+ * a baked quad is the SAME two triangles facing the same way as the instance
+ * it replaces. */
+const SPRITE_QUAD_TRIS = [0, 2, 1, 2, 3, 1] as const
+const SPRITE_QUAD_X = [-0.5, 0.5, -0.5, 0.5] as const
+const SPRITE_QUAD_Y = [0.5, 0.5, -0.5, -0.5] as const
+const SPRITE_QUAD_U = [0, 1, 0, 1] as const
+const SPRITE_QUAD_V = [1, 1, 0, 0] as const
+const _bakeQuat = new Quaternion()
+const _bakeRoll = new Quaternion()
+const _bakeNormal = new Vector3()
+const _bakeCorner = new Vector3()
+
+/**
+ * A run of sprite slots → one world-space quad soup, composed exactly the way
+ * stepSplats composes an instance matrix (align +Z to the face normal, roll
+ * around it, scale by the stamp size), so the baked quads land on the same
+ * pixels the instances did.
+ */
+function spriteQuadGeometry(run: readonly number[]): BufferGeometry {
+  const position = new Float32Array(run.length * 18)
+  const normal = new Float32Array(run.length * 18)
+  const uv = new Float32Array(run.length * 12)
+  for (let k = 0; k < run.length; k++) {
+    const s = splatSlots[run[k]!]!
+    _bakeNormal.set(s.nx, s.ny, s.nz)
+    _bakeQuat.setFromUnitVectors(SPLAT_FORWARD, _bakeNormal)
+    _bakeRoll.setFromAxisAngle(SPLAT_FORWARD, s.roll)
+    _bakeQuat.multiply(_bakeRoll)
+    for (let t = 0; t < 6; t++) {
+      const corner = SPRITE_QUAD_TRIS[t]!
+      _bakeCorner.set(SPRITE_QUAD_X[corner]! * s.size, SPRITE_QUAD_Y[corner]! * s.size, 0)
+      _bakeCorner.applyQuaternion(_bakeQuat)
+      const at = (k * 6 + t) * 3
+      position[at] = s.x + _bakeCorner.x
+      position[at + 1] = s.y + _bakeCorner.y
+      position[at + 2] = s.z + _bakeCorner.z
+      normal[at] = s.nx
+      normal[at + 1] = s.ny
+      normal[at + 2] = s.nz
+      const uvAt = (k * 6 + t) * 2
+      uv[uvAt] = SPRITE_QUAD_U[corner]!
+      uv[uvAt + 1] = SPRITE_QUAD_V[corner]!
+    }
+  }
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', new BufferAttribute(position, 3))
+  geometry.setAttribute('normal', new BufferAttribute(normal, 3))
+  geometry.setAttribute('uv', new BufferAttribute(uv, 2))
+  return geometry
+}
+
+/**
+ * Promote a node's live sprite quads into permanent chunks (same-colour runs,
+ * stamp order), then free the slots — with the zero-write DEFERRED so the
+ * quad is never missing for a frame. Returns how many quads were baked.
+ */
+export function bakeNodeSplats(nodeId: string): number {
+  const indices = nodeSplats.get(nodeId)
+  if (!indices || indices.length === 0) return 0
+  const live: number[] = []
+  for (const index of indices) if (splatSlots[index]!.alive) live.push(index)
+  let baked = 0
+  let run: number[] = []
+  const flushRun = (): void => {
+    if (run.length === 0) return
+    const stamps = new Float64Array(run.length * 4)
+    for (let k = 0; k < run.length; k++) {
+      const s = splatSlots[run[k]!]!
+      stamps[k * 4] = s.x
+      stamps[k * 4 + 1] = s.y
+      stamps[k * 4 + 2] = s.z
+      stamps[k * 4 + 3] = s.size * 0.5
+    }
+    pushChunk('sprite', nodeId, splatSlots[run[0]!]!.color, spriteQuadGeometry(run), 0, stamps, run.length)
+    for (const index of run) releaseSplatSlot(index, true)
+    baked += run.length
+    run = []
+  }
+  for (const index of live) {
+    if (splatSlots[index]!.color !== splatSlots[run[0] ?? index]!.color) flushRun()
+    run.push(index)
+  }
+  flushRun()
+  // The chunk meshes render through PaintDecals' store — nudge it, exactly as
+  // a decal spawn does.
+  if (baked > 0) emitDecals()
+  return baked
+}
+
+/**
+ * A free sprite slot. Like the decal ring, the pool bakes the node that owns
+ * the slot under the cursor instead of deleting a live quad.
+ */
+function claimSplatSlot(): number {
+  for (let tries = 0; tries < SPLAT_SPRITE_CAP; tries++) {
+    const index = splatCursor
+    splatCursor = (splatCursor + 1) % SPLAT_SPRITE_CAP
+    if (!splatSlots[index]!.alive) return index
+    bakeNodeSplats(splatSlots[index]!.nodeId)
+    if (!splatSlots[index]!.alive) return index
+  }
+  // Unreachable, same as the decal ring — stamp rather than swallow the tick.
+  const index = splatCursor
+  splatCursor = (splatCursor + 1) % SPLAT_SPRITE_CAP
+  releaseSplatSlot(index)
+  return index
+}
+
 export function resetPaintDecals(): void {
   for (let i = 0; i < DECAL_CAP; i++) releaseSlot(i)
   nodeDecals.clear()
   decalCursor = 0
+  releaseAllChunks('decal')
   emitDecals()
   // Mount/unmount lane: no slot mesh survives this commit, dispose now.
   flushRetiredDecalGeometries()
@@ -1420,25 +1891,48 @@ export function resetPaintDecals(): void {
  * saveable votes come from Save while the decals are live).
  */
 export function releaseNodeDecals(nodeId: string): void {
+  // Baked stamps were clipped against the same swinging leaf — they go too.
+  const freed = releaseNodeChunks(nodeId, 'decal')
   const indices = nodeDecals.get(nodeId)
-  if (!indices || indices.length === 0) return
+  if (!indices || indices.length === 0) {
+    if (freed > 0) emitDecals()
+    return
+  }
   for (const index of [...indices]) releaseSlot(index)
   emitDecals()
 }
 
-/** Area-weighted live-decal votes per node: colorIndex → painted m².
- * paint-keep merges these next to the strength-weighted cell votes. */
+/** Area-weighted decal votes per node: colorIndex → painted m². paint-keep
+ * merges these next to the strength-weighted cell votes.
+ *
+ * BAKED STAMPS VOTE TOO, with the identical π r² arithmetic — promotion moves
+ * a splat between representations, it must never move it off the ballot, or a
+ * long spray would save the colour of its last few seconds. */
 export function getDecalVotesByNode(): Map<string, Map<number, number>> {
   const out = new Map<string, Map<number, number>>()
-  for (const s of decalSlots) {
-    if (!s.alive) continue
-    let votes = out.get(s.nodeId)
+  const voteFor = (nodeId: string): Map<number, number> => {
+    let votes = out.get(nodeId)
     if (!votes) {
       votes = new Map()
-      out.set(s.nodeId, votes)
+      out.set(nodeId, votes)
     }
+    return votes
+  }
+  for (const s of decalSlots) {
+    if (!s.alive) continue
+    const votes = voteFor(s.nodeId)
     const area = Math.PI * s.radius * s.radius
     votes.set(s.color, (votes.get(s.color) ?? 0) + area)
+  }
+  for (const [nodeId, chunks] of nodeChunks) {
+    for (const chunk of chunks) {
+      if (chunk.layer !== 'decal') continue // sprites are visual; cells persist them
+      const votes = voteFor(nodeId)
+      for (let i = 0; i < chunk.count; i++) {
+        const radius = chunk.stamps[i * 4 + 3]!
+        votes.set(chunk.color, (votes.get(chunk.color) ?? 0) + Math.PI * radius * radius)
+      }
+    }
   }
   return out
 }
@@ -1469,6 +1963,33 @@ export function decalMaterialFor(color: number): MeshStandardMaterial | null {
     transparent: true,
   })
   decalMaterials.set(color, material)
+  return material
+}
+
+/** Baked SPRITE chunk materials (module lifetime, ≤ the palette). The live
+ * sprite pool tints one white airbrush map per instance through
+ * instanceColor; a baked chunk gets the same map with the palette colour on
+ * the material — identical pixels — and keeps the pool's own polygonOffset
+ * −3 so it layers over the voxel skin exactly where the instances did. */
+const splatChunkMaterials = new Map<number, MeshStandardMaterial>()
+
+function chunkMaterialFor(layer: PaintChunkLayer, color: number): MeshStandardMaterial | null {
+  if (layer === 'decal') return decalMaterialFor(color)
+  const swatch = PAINT_PALETTE[color]
+  if (!swatch) return null
+  const cached = splatChunkMaterials.get(color)
+  if (cached) return cached
+  const material = new MeshStandardMaterial({
+    color: swatch.hex,
+    depthWrite: false,
+    map: getSplatTexture(),
+    polygonOffset: true,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -3,
+    roughness: 0.55,
+    transparent: true,
+  })
+  splatChunkMaterials.set(color, material)
   return material
 }
 
@@ -1510,19 +2031,11 @@ export function spawnPaintDecal(
     geometry.dispose()
     return false
   }
-  // Slot claim: the node at its cap recycles ITS oldest; otherwise the
-  // global ring advances (evicting whatever lived there).
+  // Slot claim: the ring PROMOTES under pressure (claimDecalSlot bakes the
+  // node at its quota, or the node owning the slot under the cursor) — it
+  // never evicts a stamp, so a long stroke keeps every splat it laid down.
+  const index = claimDecalSlot(nodeId)
   let list = nodeDecals.get(nodeId)
-  let index: number
-  if (list && list.length >= DECAL_NODE_CAP) {
-    index = list[0]!
-    releaseSlot(index)
-  } else {
-    index = decalCursor
-    decalCursor = (decalCursor + 1) % DECAL_CAP
-    releaseSlot(index)
-  }
-  list = nodeDecals.get(nodeId)
   if (!list) {
     list = []
     nodeDecals.set(nodeId, list)
@@ -1553,38 +2066,65 @@ export function spawnPaintDecal(
  */
 export function convertDecalsForNode(nodeId: string): void {
   const indices = nodeDecals.get(nodeId)
-  if (!indices || indices.length === 0) return
+  const chunks = nodeChunks.get(nodeId)
+  const baked = chunks?.some((chunk) => chunk.layer === 'decal') ?? false
+  if ((!indices || indices.length === 0) && !baked) return
   const targets = useDestruction.getState().targets
   const prefix = `${nodeId}#`
   for (const target of targets.values()) {
     if (target.dormant) continue
     if (target.nodeId !== nodeId && !target.nodeId.startsWith(prefix)) continue
     const ledgerId = target.nodeId
-    let painted = paintedByNode.get(ledgerId)
     const serial = nodeSerials.get(ledgerId) ?? 0
     let wrote = false
-    for (const index of indices) {
-      const s = decalSlots[index]!
-      if (!s.alive) continue
-      const coats = splatCoat(target.grid, s.x, s.y, s.z, coatRadiusFor(s.radius))
-      if (coats.length === 0) continue
+    /** One stamp → cell coats. Same arithmetic for a live slot and a baked
+     * one, applied in the same chronological order, so a node that baked
+     * mid-spray converts to the identical ledger an unbaked one would. */
+    const coat = (x: number, y: number, z: number, radius: number, color: number): void => {
+      const coats = splatCoat(target.grid, x, y, z, coatRadiusFor(radius))
+      if (coats.length === 0) return
+      let painted = paintedByNode.get(ledgerId)
       if (!painted) {
         painted = new Map()
         paintedByNode.set(ledgerId, painted)
       }
       for (const { cell, add } of coats) {
         const strength = Math.min(1, add / COAT_ADD)
-        const before = coatBaseStrength(painted.get(cell), s.color)
-        painted.set(cell, paintValue(s.color, Math.min(1, before + strength)))
+        const before = coatBaseStrength(painted.get(cell), color)
+        painted.set(cell, paintValue(color, Math.min(1, before + strength)))
         claimCell(ledgerId, cell) // a decal is always this player's own spray
       }
       wrote = true
     }
+    // BAKED STAMPS FIRST, in bake order: they are the older coats, and
+    // coatBaseStrength's accumulate-or-restart rule is order-dependent.
+    if (chunks) {
+      for (const chunk of chunks) {
+        if (chunk.layer !== 'decal') continue
+        for (let i = 0; i < chunk.count; i++) {
+          coat(
+            chunk.stamps[i * 4]!,
+            chunk.stamps[i * 4 + 1]!,
+            chunk.stamps[i * 4 + 2]!,
+            chunk.stamps[i * 4 + 3]!,
+            chunk.color,
+          )
+        }
+      }
+    }
+    if (indices) {
+      for (const index of indices) {
+        const s = decalSlots[index]!
+        if (!s.alive) continue
+        coat(s.x, s.y, s.z, s.radius, s.color)
+      }
+    }
     if (wrote) nodeSerials.set(ledgerId, serial + 1)
   }
-  // Free the node's slots whether or not a live grid caught them — the
-  // host surface they were clipped against is hidden now.
-  for (const index of [...indices]) releaseSlot(index)
+  // Free the node's slots AND chunks whether or not a live grid caught them —
+  // the host surface they were clipped against is hidden now.
+  if (indices) for (const index of [...indices]) releaseSlot(index)
+  releaseNodeChunks(nodeId, 'decal')
   emitDecals()
 }
 
@@ -1656,11 +2196,32 @@ function targetLiveRegistrar(): ((cb: ((nodeId: string) => void) | null) => void
     .setTargetLiveListener
 }
 
-/** The session's splats — mounted by PaintTool, crater-style keyed slots. */
+/** The session's splats — mounted by PaintTool: the live crater-style keyed
+ * ring slots, plus every BAKED chunk (both layers). A chunk mesh keeps its key
+ * across consolidation, so a growing coat swaps geometry on one mounted mesh
+ * instead of remounting. */
 function PaintDecals() {
   useSyncExternalStore(subscribeDecals, getDecalVersion, getDecalVersion)
   return (
     <group userData={{ __boots: true }}>
+      {Array.from(nodeChunks.values(), (chunks) =>
+        chunks.map((chunk) => {
+          const material = chunkMaterialFor(chunk.layer, chunk.color)
+          if (!material) return null
+          // Geometry lifetime is the chunk's (retired + flushed on release,
+          // replaced on consolidation), the material is module-cached — R3F
+          // must dispose neither.
+          return (
+            <mesh
+              dispose={null}
+              geometry={chunk.geometry}
+              key={`baked:${chunk.id}`}
+              material={material}
+              renderOrder={chunk.order}
+            />
+          )
+        }),
+      )}
       {decalSlots.map((slot, i) => {
         if (!slot.alive || !slot.geometry) return null
         const material = decalMaterialFor(slot.color)
@@ -2272,9 +2833,12 @@ export function PaintTool({ world }: { world: GameWorld }) {
   }, [world])
 
   useFrame((_, rawDt) => {
-    // The render that last drew any ring-evicted decal geometry is over —
-    // safe to dispose now (see retiredDecalGeometries).
+    // The render that last drew any retired decal geometry is over — safe to
+    // dispose now (see retiredDecalGeometries). Same reasoning frees the baked
+    // sprite slots' instance matrices: their chunk has been in the scene for a
+    // frame, so zeroing them can no longer leave a gap.
     flushRetiredDecalGeometries()
+    flushPendingSplatZeros()
     const session = getSession()
     if (!session) return
     const dt = Math.min(rawDt, 1 / 30)

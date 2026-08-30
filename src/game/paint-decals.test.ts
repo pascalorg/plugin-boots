@@ -2,6 +2,11 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Mesh, PlaneGeometry, SphereGeometry, Vector3 } from 'three'
 import { useDestruction, type VoxelTarget } from './destruction'
 import {
+  bakedChunkCensus,
+  bakedChunkOrders,
+  bakedPaintCensus,
+  bakeNodeDecals,
+  DECAL_BAKE_MAX,
   DECAL_CAP,
   DECAL_MAX_TRIS,
   DECAL_NODE_CAP,
@@ -74,19 +79,40 @@ describe('spawnPaintDecal (pristine hosts, P5)', () => {
     expect(decalCensus()).toBe(0)
   })
 
-  test('per-node cap recycles the NODE\'s oldest — never the neighbors', () => {
+  test('the per-node quota PROMOTES this node\'s stamps — neighbors untouched', () => {
     const mesh = wallMesh()
     expect(spawnPaintDecal(mesh, 'wall_b', at(-2), N, 0.2, 1)).toBe(true)
-    for (let i = 0; i < DECAL_NODE_CAP + 6; i++) {
+    const stamps = DECAL_NODE_CAP + 6
+    for (let i = 0; i < stamps; i++) {
       expect(spawnPaintDecal(mesh, 'wall_a', at((i % 12) * 0.25 - 1.5), N, 0.2, 2)).toBe(true)
     }
-    expect(decalCensus('wall_a')).toBe(DECAL_NODE_CAP)
-    // The other node's splat survived the churn.
+    // The live ring stays bounded (that's what the cap is for)…
+    expect(decalCensus('wall_a')).toBeLessThanOrEqual(DECAL_NODE_CAP)
+    expect(decalCensus('wall_a')).toBeGreaterThan(0)
+    // …and every single stamp is still on the wall, baked or live.
+    expect(decalCensus('wall_a') + bakedPaintCensus('wall_a', 'decal')).toBe(stamps)
+    // The other node was never touched: still live, never baked.
     expect(decalCensus('wall_b')).toBe(1)
-    expect(decalCensus()).toBe(DECAL_NODE_CAP + 1)
+    expect(bakedPaintCensus('wall_b')).toBe(0)
   })
 
-  test('global ring cap holds at DECAL_CAP across many nodes', () => {
+  test('THE BUG: a long stroke on ONE wall keeps every early splat', () => {
+    // The owner's repro at scale — ~2.5 minutes of continuous spray, 18×
+    // the old per-node cap. Under the ring this deleted its own beginning.
+    const mesh = wallMesh()
+    const stamps = DECAL_NODE_CAP * 18
+    for (let i = 0; i < stamps; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_long', at((i % 40) * 0.075 - 1.5), N, 0.2, 2)).toBe(true)
+    }
+    expect(decalCensus('wall_long') + bakedPaintCensus('wall_long', 'decal')).toBe(stamps)
+    // And it costs a bounded number of draw calls: one chunk per
+    // DECAL_BAKE_MAX baked stamps, not one mesh per splat.
+    const baked = bakedPaintCensus('wall_long', 'decal')
+    expect(bakedChunkCensus('wall_long', 'decal')).toBe(Math.ceil(baked / DECAL_BAKE_MAX))
+    expect(bakedChunkCensus('wall_long', 'decal')).toBeLessThanOrEqual(3)
+  })
+
+  test('the global ring never drops a stamp either — it bakes across nodes', () => {
     const mesh = wallMesh()
     const nodes = 6
     const per = 50 // 6 × 50 = 300 > 256, per-node stays under 64
@@ -95,7 +121,12 @@ describe('spawnPaintDecal (pristine hosts, P5)', () => {
         expect(spawnPaintDecal(mesh, `wall_${n}`, at((i % 10) * 0.3 - 1.5, n * 0.4 - 1), N, 0.15, n % 7)).toBe(true)
       }
     }
-    expect(decalCensus()).toBe(DECAL_CAP)
+    expect(decalCensus()).toBeLessThanOrEqual(DECAL_CAP)
+    let total = 0
+    for (let n = 0; n < nodes; n++) {
+      total += decalCensus(`wall_${n}`) + bakedPaintCensus(`wall_${n}`, 'decal')
+    }
+    expect(total).toBe(nodes * per)
   })
 })
 
@@ -122,20 +153,52 @@ describe('decal renderOrder (the blink fix — newer coat draws later)', () => {
 })
 
 describe('decal slot lifecycle (deferred dispose + operable release)', () => {
-  test('eviction DEFERS geometry disposal until the flush (VAO-leak regression)', () => {
+  test('a BAKE defers geometry disposal until the flush (VAO-leak regression)', () => {
     const mesh = wallMesh()
     expect(spawnPaintDecal(mesh, 'wall_a', at(0), N, 0.3, 1)).toBe(true)
     flushRetiredDecalGeometries() // clear anything earlier tests queued
-    // Over-spray the node past its cap: each eviction retires a geometry
-    // but must NOT dispose it inside the tick (the slot mesh still renders
-    // once more this frame).
+    expect(retiredDecalCensus()).toBe(0)
+    // Over-spray the node past its quota: the bake merges the slots away and
+    // retires their geometries, but must NOT dispose them inside the tick
+    // (the slot meshes still render once more this frame).
     for (let i = 0; i < DECAL_NODE_CAP; i++) {
       expect(spawnPaintDecal(mesh, 'wall_a', at((i % 12) * 0.25 - 1.5), N, 0.2, 1)).toBe(true)
     }
-    expect(decalCensus('wall_a')).toBe(DECAL_NODE_CAP)
-    expect(retiredDecalCensus()).toBe(1)
+    expect(bakedPaintCensus('wall_a', 'decal')).toBeGreaterThan(0)
+    expect(retiredDecalCensus()).toBeGreaterThan(0)
     flushRetiredDecalGeometries()
     expect(retiredDecalCensus()).toBe(0)
+    // Nothing leaked the other way either: the baked chunk is still there and
+    // the node still owns every stamp.
+    expect(decalCensus('wall_a') + bakedPaintCensus('wall_a', 'decal')).toBe(DECAL_NODE_CAP + 1)
+  })
+
+  test('consolidation retires BOTH inputs and keeps the chunk mounted (same key)', () => {
+    const mesh = wallMesh()
+    // Two bakes of the same colour on one node consolidate into one chunk.
+    for (let i = 0; i < DECAL_NODE_CAP * 2 + 2; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_c', at((i % 20) * 0.15 - 1.5), N, 0.2, 2)).toBe(true)
+    }
+    expect(bakedChunkCensus('wall_c', 'decal')).toBe(1)
+    expect(bakedPaintCensus('wall_c', 'decal')).toBeGreaterThanOrEqual(DECAL_NODE_CAP * 2)
+    flushRetiredDecalGeometries()
+    expect(retiredDecalCensus()).toBe(0)
+  })
+
+  test('a bake keeps the blink fix: chunk orders climb and stay under later paint', () => {
+    const mesh = wallMesh()
+    // Interleaved colours: each same-colour run must become its OWN chunk so
+    // the "newer coat draws later" order survives promotion.
+    for (let i = 0; i < DECAL_NODE_CAP; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_ord', at(0.01 * i), N, 0.2, i < 20 ? 2 : i < 40 ? 3 : 4)).toBe(true)
+    }
+    expect(bakeNodeDecals('wall_ord')).toBe(DECAL_NODE_CAP)
+    const orders = bakedChunkOrders('wall_ord')
+    expect(orders.length).toBe(3) // one chunk per colour run
+    for (let i = 1; i < orders.length; i++) expect(orders[i]!).toBeGreaterThan(orders[i - 1]!)
+    // Fresh paint after the bake still draws on top of all of it.
+    expect(spawnPaintDecal(mesh, 'wall_ord', at(0.2), N, 0.2, 5)).toBe(true)
+    expect(decalRenderOrders('wall_ord')[0]!).toBeGreaterThan(orders[orders.length - 1]!)
   })
 
   test('releaseNodeDecals frees exactly one node (the door-toggle hook)', () => {
@@ -200,6 +263,43 @@ describe('decal → ledger conversion (the target-live hook body)', () => {
     expect(getDecalVotesByNode().has('wall_a')).toBe(false)
   })
 
+  test('PARITY: bake-then-convert lands the IDENTICAL ledger', () => {
+    // The conversion is the other consumer that reaches past the ring. A
+    // promoted stamp must fold into exactly the cells, colours and strengths
+    // it would have folded into while it was still a live slot — including
+    // coatBaseStrength's order dependence, which is why the runs stay ordered.
+    const mesh = wallMesh()
+    const stroke: [number, number, number][] = [
+      [0, 0.4, 3],
+      [0.12, 0.3, 3],
+      [-0.1, 0.35, 5],
+      [0.05, 0.2, 3],
+    ]
+    const run = (nodeId: string, bake: boolean): Map<number, number> => {
+      useDestruction.getState().targets.set(nodeId, fakeTarget(nodeId))
+      for (const [x, radius, color] of stroke) {
+        expect(spawnPaintDecal(mesh, nodeId, at(x), N, radius, color)).toBe(true)
+      }
+      if (bake) {
+        expect(bakeNodeDecals(nodeId)).toBe(stroke.length)
+        expect(decalCensus(nodeId)).toBe(0)
+        expect(bakedPaintCensus(nodeId, 'decal')).toBe(stroke.length)
+      }
+      convertDecalsForNode(nodeId)
+      return new Map(getPaintedByNode().get(nodeId) ?? [])
+    }
+    const live = run('wall_cv1', false)
+    const baked = run('wall_cv2', true)
+    expect(live.size).toBeGreaterThan(0)
+    expect(baked.size).toBe(live.size)
+    for (const [cell, value] of live) expect(baked.get(cell)).toBe(value)
+    // Both representations drained — the ledger owns the paint now, and
+    // nothing can double-count it.
+    expect(decalCensus('wall_cv2')).toBe(0)
+    expect(bakedPaintCensus('wall_cv2')).toBe(0)
+    expect(getDecalVotesByNode().has('wall_cv2')).toBe(false)
+  })
+
   test('dormant members and foreign nodes are untouched', () => {
     const mesh = wallMesh()
     const dormant = fakeTarget('wall_d')
@@ -226,6 +326,46 @@ describe('capturePaint with live decals (area-weighted votes)', () => {
     expect(captured.color).toBe(PAINT_PALETTE[4]!.hex)
     const expectedCells = Math.round((Math.PI * 0.16 * DECAL_VOTE_PER_M2) / 255)
     expect(captured.cells).toBe(expectedCells)
+  })
+
+  test('SAVE PARITY: promotion does not move the saved coat by one pixel', () => {
+    // If paint moves between representations, Save must come out the same.
+    // Same stroke twice: once all-live, once fully promoted.
+    const mesh = wallMesh()
+    const spray = (nodeId: string): void => {
+      for (let i = 0; i < 24; i++) {
+        expect(spawnPaintDecal(mesh, nodeId, at((i % 8) * 0.35 - 1.2, 0.5), N, 0.22, 4)).toBe(true)
+      }
+    }
+    spray('wall_sv1')
+    const liveArea = getDecalVotesByNode().get('wall_sv1')!.get(4)!
+    expect(capturePaint()).toBe(1)
+    const liveSaved = usePaintKeep.getState().painted[0]!
+    const liveCells = liveSaved.cells
+    const liveColor = liveSaved.color
+
+    usePaintKeep.getState().clear()
+    resetPaintDecals()
+    spray('wall_sv2')
+    expect(bakeNodeDecals('wall_sv2')).toBe(24)
+    expect(decalCensus('wall_sv2')).toBe(0) // nothing live left to vote
+    expect(getDecalVotesByNode().get('wall_sv2')!.get(4)!).toBe(liveArea) // EXACT, not close
+    expect(capturePaint()).toBe(1)
+    const bakedSaved = usePaintKeep.getState().painted[0]!
+    expect(bakedSaved.color).toBe(liveColor)
+    expect(bakedSaved.cells).toBe(liveCells)
+  })
+
+  test('SAVE: a half-promoted coat votes its FULL area (baked + live)', () => {
+    const mesh = wallMesh()
+    for (let i = 0; i < 10; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_hb', at(i * 0.3 - 1.4, 0.6), N, 0.2, 6)).toBe(true)
+    }
+    expect(bakeNodeDecals('wall_hb')).toBe(10)
+    for (let i = 0; i < 5; i++) {
+      expect(spawnPaintDecal(mesh, 'wall_hb', at(i * 0.3 - 1.4, -0.6), N, 0.2, 6)).toBe(true)
+    }
+    expect(getDecalVotesByNode().get('wall_hb')!.get(6)!).toBeCloseTo(15 * Math.PI * 0.04, 12)
   })
 
   test('REGRESSION: roof member-id ledger entries save under the BARE scene id', () => {
