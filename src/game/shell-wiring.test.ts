@@ -85,13 +85,14 @@ function prevoxelize(world: GameWorld): void {
 }
 
 afterEach(() => {
-  setShellFlag('wall', false)
+  setShellFlag('wall', true) // restore the S2 default for the next suite
   resetDestruction()
 })
 
 describe('conforming shell wiring (destruction, S0)', () => {
-  test('flag OFF (default): no shell, walls voxelize awake — bit-identical to today', () => {
-    expect(shellFlags.wall).toBe(false)
+  test('kill-switch: setShell(wall, false) restores the voxel-only awake path — bit-identical', () => {
+    expect(shellFlags.wall).toBe(true) // S2 default is ON…
+    setShellFlag('wall', false) // …and OFF is the explicit rollback lever
     const world = makeWorld()
     prevoxelize(world)
     const target = useDestruction.getState().targets.get('wall-1')!
@@ -101,8 +102,7 @@ describe('conforming shell wiring (destruction, S0)', () => {
     for (const collider of world.colliders) expect(Boolean(collider.disabled)).toBe(true)
   })
 
-  test('flag ON: shell attached (lattice-indexed), host materials by reference, wall dormant', () => {
-    setShellFlag('wall', true)
+  test('flag ON (the default): shell attached (lattice-indexed), host materials by reference, wall dormant', () => {
     const world = makeWorld()
     prevoxelize(world)
     const target = useDestruction.getState().targets.get('wall-1')!
@@ -145,6 +145,7 @@ describe('conforming shell wiring (destruction, S0)', () => {
   })
 
   test('mid-session flip only affects the NEXT session (prevoxelize latch)', () => {
+    setShellFlag('wall', false) // the kill-switch, thrown before any voxelize
     const world = makeWorld()
     // First wall voxelize latches the OFF flag for the session…
     expect(ensureVoxelTarget(world, 'wall-1')).not.toBeNull()

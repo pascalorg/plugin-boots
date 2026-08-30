@@ -103,7 +103,7 @@ const latticeKeyOfVoxel = (target: VoxelTarget, i: number): number => {
 }
 
 afterEach(() => {
-  setShellFlag('wall', false)
+  setShellFlag('wall', true) // restore the S2 default for the next suite
   useDemolition.getState().clear()
   resetDestruction()
 })
@@ -228,7 +228,10 @@ describe('integration: synthetic wall world, flag on/off', () => {
     }
   })
 
-  test('flag OFF: no target carries a shell, census reads empty', () => {
+  test('kill-switch OFF: no target carries a shell, census reads empty', () => {
+    setShellFlag('wall', false)
+    setShellFlag('roof', false)
+    setShellFlag('slab', false)
     const world = makeWorld()
     prevoxelize(world)
     for (const target of useDestruction.getState().targets.values()) {
@@ -240,8 +243,12 @@ describe('integration: synthetic wall world, flag on/off', () => {
       targets: 0,
       fragments: 0,
       killed: 0,
+      pending: 0,
       byKind: { wall: empty, roof: empty, slab: empty },
     })
+    // Restore the roof/slab defaults this test flipped (wall rides afterEach).
+    setShellFlag('roof', true)
+    setShellFlag('slab', true)
   })
 
   test('census counts shelled targets, fragments, and killed fragments after a carve', () => {

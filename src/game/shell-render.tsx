@@ -8,6 +8,7 @@ import {
   DynamicDrawUsage,
   type Material,
   type Mesh,
+  Sphere,
 } from 'three'
 import type { ShellData } from './shell'
 
@@ -117,6 +118,48 @@ export function aliveFragmentCount(killed: Uint8Array): number {
   return alive
 }
 
+/**
+ * Shell-frame bounding sphere over the packed vertex positions (exact AABB
+ * of the verts → its circumsphere), the frustum-culling contract for 400+
+ * ShellMesh (S2 renderer hardening): three's Frustum.intersectsObject reads
+ * geometry.boundingSphere through the mesh's matrixWorld — the positioned
+ * group transform — so a correct SHELL-frame sphere culls correctly in
+ * world. Carves only degenerate the INDEX (positions never move), so the
+ * sphere can never go stale. O(verts), mount-time only. Empty shells take
+ * three's empty-sphere convention (radius −1 = always culled).
+ */
+export function shellBoundingSphere(
+  shell: Pick<ShellData, 'positions'>,
+  out = new Sphere(),
+): Sphere {
+  const p = shell.positions
+  if (p.length === 0) {
+    out.center.set(0, 0, 0)
+    out.radius = -1
+    return out
+  }
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  for (let i = 0; i < p.length; i += 3) {
+    const x = p[i]!
+    const y = p[i + 1]!
+    const z = p[i + 2]!
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+    if (z < minZ) minZ = z
+    if (z > maxZ) maxZ = z
+  }
+  out.center.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
+  out.radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2
+  return out
+}
+
 // ─── Component ───────────────────────────────────────────────────────────
 
 /** The narrow live-state contract this milestone codes against — the real
@@ -159,6 +202,10 @@ export function ShellMesh({
     index.setUsage(DynamicDrawUsage)
     geo.setIndex(index)
     for (const group of shell.groups) geo.addGroup(group.start, group.count, group.materialIndex)
+    // Correct sphere at mount (S2 hardening) — three never recomputes a
+    // non-null boundingSphere, so the vert-exact one stands for the shell's
+    // life and the mesh below can frustum-cull.
+    geo.boundingSphere = shellBoundingSphere(shell)
     // The live bookkeeping rides the same identity: a new shell = a fresh
     // carve state (idempotent, so a strict-mode double render is harmless).
     killedRef.current = new Uint8Array(shell.fragments.length)
@@ -201,9 +248,13 @@ export function ShellMesh({
   })
 
   return (
+    // frustumCulled ON (S2 hardening): the geometry carries a correct
+    // shell-frame boundingSphere (set at build above), so off-screen shells
+    // skip _renderObjectDirect and their per-object binding updates — the
+    // same discipline as voxel-walls' gridBoundingSphere culling.
     <mesh
       castShadow
-      frustumCulled={false}
+      frustumCulled
       geometry={geometry}
       material={materials}
       receiveShadow

@@ -232,9 +232,10 @@ const latticeKeyOfVoxel = (target: VoxelTarget, i: number): number => {
 }
 
 afterEach(() => {
-  setShellFlag('wall', false)
-  setShellFlag('roof', false)
-  setShellFlag('slab', false)
+  // Restore the S2 defaults (ON) for whatever suite runs next.
+  setShellFlag('wall', true)
+  setShellFlag('roof', true)
+  setShellFlag('slab', true)
   resetDestruction()
   resetCraters()
   clearDebris()
@@ -242,14 +243,15 @@ afterEach(() => {
 
 // ─── Phase 1: per-kind flags + latches ────────────────────────────────────
 
-describe('per-kind shell flags (S1)', () => {
-  test('all three flags exist and default OFF', () => {
-    expect(shellFlags).toEqual({ wall: false, roof: false, slab: false })
+describe('per-kind shell flags (S1 + S2 default flip)', () => {
+  test('all three flags exist and default ON (S2: the game loads looking like the editor)', () => {
+    expect(shellFlags).toEqual({ wall: true, roof: true, slab: true })
   })
 
   test('latches are per kind, taken at that kind’s first voxelize; reset re-arms all', () => {
-    // Slab flips ON before ANY voxelize; roof stays OFF for now.
+    // Slab ON before ANY voxelize; roof explicitly OFF (kill-switch) for now.
     setShellFlag('slab', true)
+    setShellFlag('roof', false)
     const make = () => {
       const g2 = gableShellMesh()
       g2.position.set(40, 0, 0)
@@ -592,6 +594,7 @@ describe('slab shells (S1b wiring)', () => {
   test('census: wall + slab lanes count separately and sum to the totals', () => {
     setShellFlag('wall', true)
     setShellFlag('slab', true)
+    setShellFlag('roof', false) // pin the enabled-report shape below
     const matA = new MeshStandardMaterial({ color: '#b04030' })
     const wallC = boxCollider('wall-1', 'wall', [2, 2.7, 0.12], [8, 1.35, 0], matA)
     const world = worldOf([wallC, groundSlabCollider()])

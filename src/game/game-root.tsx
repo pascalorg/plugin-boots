@@ -18,6 +18,8 @@ import {
   probeLandingY,
   resetDestruction,
   setShellFlag,
+  shellBuildTick,
+  shellPendingCount,
   useDestruction,
   type VoxelTarget,
 } from './destruction'
@@ -186,9 +188,16 @@ function Prevoxelize({ world }: { world: GameWorld }) {
   const done = useRef(false)
   const frame = useRef(0)
   useFrame(() => {
-    if (done.current) return
     if (frame.current++ === 0) return
-    done.current = prevoxelizeTick(world, undefined, playerRig.position)
+    if (!done.current) {
+      done.current = prevoxelizeTick(world, undefined, playerRig.position)
+      return
+    }
+    // S2 lazy shell tier: once every node has its grid, deferred shells
+    // build nearest-first on their own small budget (~2 ms/tick), near-
+    // gated so far targets stay pending — an empty/idle queue costs one
+    // counter check per frame.
+    shellBuildTick(undefined, playerRig.position)
   })
   return null
 }
@@ -640,13 +649,18 @@ function ActiveGame() {
       // Prevoxelize scheduler live numbers (perf fix 2 QA): frame-dt EMA,
       // the adaptive time budget it picked, and the queue remainder.
       prevoxelize: () => prevoxelizeSchedulerStats(),
-      // Conforming-shell lane (S0 walls + S1 roofs/slabs): census (shelled
-      // targets / fragments / fragments killed, totals + per kind) + the
-      // per-kind flag toggle. setShell is SESSION-LATCHED per kind:
-      // destruction reads each flag once at the session's first voxelize
-      // of that kind, so a flip takes effect on the NEXT Jump in.
+      // Conforming-shell lane (S2 default ON): census (shelled targets /
+      // fragments / fragments killed / S2 pending deferred builds, totals
+      // + per kind) + the per-kind flag toggle. setShell is SESSION-
+      // LATCHED per kind: destruction reads each flag once at the
+      // session's first voxelize of that kind, so a flip takes effect on
+      // the NEXT Jump in — setShell(kind, false) is the kill-switch back
+      // to the voxel-only path, no code revert needed.
       shell: () => shellCensus(),
       setShell: (kind: 'wall' | 'roof' | 'slab', v: boolean) => setShellFlag(kind, v),
+      // S2 lazy tier: deferred shell builds still outstanding (drains as
+      // the player approaches; far targets stay pending by design).
+      shellPending: () => shellPendingCount(),
       // Tone audit (voxel-fidelity QA): every node still wearing a
       // FALLBACK skin tone instead of its surface's real albedo, and why
       // ('pending' entries are still retrying ~1/s). Empty = no voxel

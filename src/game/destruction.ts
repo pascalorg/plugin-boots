@@ -29,6 +29,7 @@ import {
   dominantSlopedMaterial,
   enumerateRoofPlanes,
   type RoofMemberTris,
+  type RoofPlane,
 } from './roof-planes'
 import { hideForGameKeepingRoots, maskForGame, sweepWallBatches } from './session'
 import {
@@ -385,6 +386,17 @@ export type VoxelTarget = {
    * (never clone/mutate/dispose; they outlive the session), indexed by
    * ShellGroup.materialIndex. Present exactly when `shell` is. */
   shellMaterials?: Material[]
+  /** S2 LAZY SHELL TIER: this target's shell build is DEFERRED — it was
+   * beyond SHELL_NEAR_RADIUS of the player at voxelize time. The target
+   * still registers DORMANT exactly like a built shell (the host renders,
+   * so the editor look holds), and the shell builds later — RE-COLLECTED
+   * from the retained host meshes (target.hostMeshes / dormantRoofHide;
+   * zero bytes retained beyond references the dormant lane keeps anyway,
+   * vs ~200-400 B/tri for kept source-tri arrays) — via the budgeted
+   * nearest-first queue (shellBuildTick) once the player approaches, or
+   * synchronously at wakeTarget (per-frame budget-capped, voxel-only
+   * fallback past it). Cleared on build or fallback. */
+  shellPending?: ShellPendingBuild
   /** True for plates SYNTHESIZED under zero-extent ceiling planes: their
    * cells hold another target up only by direct contact (structure.ts
    * PLATE_CONTACT_SLACK), never across the general SUPPORT_GAP band — a
@@ -1657,7 +1669,12 @@ function buildRoofPlaneTargets(
   meshes: Mesh[],
   sources: VoxelSource[],
   dormant?: boolean,
+  deferShell?: boolean,
 ): VoxelTarget | null {
+  // Family AABB snapshot for the deferred-build queue (ensureVoxelTarget's
+  // _bounds scratch still holds the node bounds at entry — copy the queue
+  // inputs out before any other module code can touch the scratch).
+  const familyBounds = deferShell ? _bounds.clone() : null
   const residualTris: number[] = []
   const planes = enumerateRoofPlanes(meshes, residualTris)
   if (planes.length === 0) return null
@@ -1669,9 +1686,13 @@ function buildRoofPlaneTargets(
   // duplicate across the sibling members' shells. The residual member stays
   // voxel-only. Shelled families ALWAYS register dormant below — the
   // first-damage family wake is the host→shell swap moment.
-  const roofShell: RoofMemberTris | null = shellRoofEnabled()
-    ? assignRoofTrisToMembers(meshes, planes)
-    : null
+  // S2 LAZY TIER: a FAR family (deferShell) skips the bucketing + clipping
+  // entirely — members stamp shellPending and the family builds later from
+  // the retained meshes + these planes (see buildPendingRoofFamily).
+  const shellOn = shellRoofEnabled()
+  const shellDeferred = shellOn && deferShell === true
+  const roofShell: RoofMemberTris | null =
+    shellOn && !shellDeferred ? assignRoofTrisToMembers(meshes, planes) : null
   // One flat rafter layout over all planes, split per plane (ids re-based
   // 0..n−1 within each group — the SegmentMember contract per target).
   const rafterGroups = splitRaftersByPlane(buildRafters(null, null, planes), planes.length)
@@ -1705,6 +1726,8 @@ function buildRoofPlaneTargets(
   // averaged tone; compressed maps deliver it via the retint above.
   const roofToneGrid = mapPatternGrid(roofMaterial?.map) ?? undefined
   const built: VoxelTarget[] = []
+  /** Deferred-shell members: [target, planeIndex] to stamp after register. */
+  const pendingPlanes: Array<[VoxelTarget, number]> = []
   for (let p = 0; p < planes.length; p++) {
     const plane = planes[p]!
     const { across, normal, upSlope } = roofPlaneFrame(plane.yaw, plane.pitch)
@@ -1754,7 +1777,7 @@ function buildRoofPlaneTargets(
     const memberShell = roofShell
       ? buildRoofMemberShell(memberId, roofShell.buckets[p]!, grid)
       : undefined
-    built.push({
+    const member: VoxelTarget = {
       nodeId: memberId,
       kind: 'roof',
       roof: true,
@@ -1769,7 +1792,9 @@ function buildRoofPlaneTargets(
       revision: 0,
       shell: memberShell,
       shellMaterials: memberShell ? roofShell!.materials : undefined,
-    })
+    }
+    if (shellDeferred) pendingPlanes.push([member, p])
+    built.push(member)
   }
   if (built.length === 0) return null
 
@@ -1788,8 +1813,9 @@ function buildRoofPlaneTargets(
   // that hide to wakeTarget (group-wide: one map entry per roof node).
   // Shelled families (S1a) ALWAYS defer: the first-damage wake IS the
   // host→shell swap (invisible — the member shells ARE the host surface),
-  // exactly the S0 wall contract.
-  const registerDormant = dormant === true || roofShell !== null
+  // exactly the S0 wall contract. Deferred-shell families (S2) too — the
+  // host renders identically whether the shell is built or pending.
+  const registerDormant = dormant === true || shellOn
   if (registerDormant) {
     dormantRoofHide.set(nodeId, meshes)
     for (const target of built) {
@@ -1809,6 +1835,17 @@ function buildRoofPlaneTargets(
     registerStructureTarget(target, 'roof')
   }
   roofGroups.set(nodeId, ids)
+  // S2 lazy tier: stamp the deferred members + queue the FAMILY build
+  // (one entry per family — the bucketing is shared, so the family is the
+  // build unit; meshes come from dormantRoofHide at build time).
+  if (shellDeferred && pendingPlanes.length > 0 && familyBounds) {
+    for (const [member, planeIndex] of pendingPlanes) {
+      member.shellPending = { kind: 'roof', planeIndex }
+      shellPendingTotal++
+    }
+    pendingRoofShells.set(nodeId, { planes })
+    enqueueShellBuild(nodeId, familyBounds)
+  }
   state.bump()
   // Paint decal lane: the plane family is live under the scene node id.
   if (!registerDormant) targetLiveListener?.(nodeId)
@@ -1912,14 +1949,18 @@ export function setTargetLiveListener(cb: ((nodeId: string) => void) | null): vo
 /** The shell lane's target kinds — one independent flag + latch each. */
 export type ShellKind = 'wall' | 'roof' | 'slab'
 
-/** Live shell toggles (QA: `__boots.setShell('wall', true)`). Each kind is
+/** Live shell toggles (QA: `__boots.setShell('wall', v)`). Each kind is
  * read ONCE per session, at the session's first voxelize of that kind
  * (prevoxelize reaches everything before any damage can) — see
- * shellEnabled. All default OFF. */
+ * shellEnabled. S2: all default ON — the game loads looking exactly like
+ * the editor (host-original walls/roofs/slabs render until first damage;
+ * the wake swaps in the conforming shell, invisibly). `setShell(kind,
+ * false)` is the per-kind KILL-SWITCH: next session runs the voxel-only
+ * path bit-identical to pre-shell, no code revert needed. */
 export const shellFlags: Record<ShellKind, boolean> = {
-  wall: false,
-  roof: false,
-  slab: false,
+  wall: true,
+  roof: true,
+  slab: true,
 }
 
 /** Flip a shell flag — affects the NEXT session only (prevoxelize latch). */
@@ -2119,6 +2160,294 @@ function buildRoofMemberShell(
   }
 }
 
+// ── Lazy shell tier (S2 — the memory lever) ─────────────────────────────────
+// With shells DEFAULT ON, building every target's shell eagerly at voxelize
+// costs ~66k fragments / est. ~140 MB CPU+GPU on the 408-target warner-2
+// scene — for geometry that stays `visible = false` until a wake. Dormant
+// targets don't need their shell until (a) the player gets close enough
+// that a wake is imminent, or (b) an actual wake. So voxelize builds the
+// grid/anatomy as always but SKIPS buildShellData beyond SHELL_NEAR_RADIUS
+// of the player: the target is stamped `shellPending` and still registers
+// dormant (host renders — the look is identical either way). Pending
+// shells then build
+//   - nearest-first from a budgeted queue (shellBuildTick — the
+//     prevoxelize scheduler idioms: ~2 ms/tick, re-sort every
+//     PREVOXELIZE_RESORT_MS around the moving player, near-gated so FAR
+//     targets stay pending instead of eventually all building), or
+//   - synchronously inside wakeTarget, capped per frame
+//     (SHELL_SYNC_BUILD_BUDGET_MS) with a graceful voxel-only fallback —
+//     a grenade waking many pending targets in one frame builds what the
+//     budget allows and the rest wake as voxels (today's look), keeping
+//     the boom frame bounded.
+// MEMORY CHOICE (re-collect, not retain): pending builds re-collect their
+// source triangles from the HOST meshes at build time. The dormant lane
+// already retains those mesh references (target.hostMeshes /
+// dormantRoofHide) for the deferred hide, so deferral retains ZERO extra
+// bytes; keeping the collected shell-frame tris instead would pin
+// ~200-400 B per source triangle per target for the whole session. The
+// re-collect CPU (one O(tris) transform pass) is well inside the build
+// budget.
+
+/** What a deferred shell build needs beyond the retained host meshes. */
+export type ShellPendingBuild =
+  | { kind: 'single' } // walls + slabs: buildWallShell(hostMeshes, grid)
+  | { kind: 'roof'; planeIndex: number } // roof plane member (family build)
+
+/** Shell builds beyond this distance from the player defer (m). Must stay
+ * ≥ BLAST_RADIUS (3.2) + throw/wake-ahead fan-out so a grenade landing
+ * near the player only ever wakes ALREADY-BUILT shells; far grenades ride
+ * the sync-build budget below. */
+export const SHELL_NEAR_RADIUS = 14
+/** Per-tick time budget for the background queue (ms). */
+export const SHELL_BUILD_BUDGET_MS = 2
+/** Wake-path sync builds allowed per frame window (ms of build time);
+ * past it, this frame's remaining wakes fall back voxel-only. */
+export const SHELL_SYNC_BUILD_BUDGET_MS = 3
+/** Sync-budget accounting window — one display frame with slack. */
+const SHELL_SYNC_WINDOW_MS = 12
+
+/** The player position shells measure "near" against — stamped by every
+ * focused prevoxelizeTick / shellBuildTick call. Unset (headless tests,
+ * hand-built worlds) means EVERY shell builds eagerly, the S1 behavior. */
+const shellFocus = { x: 0, y: 0, z: 0 }
+let shellFocusSet = false
+const _shellFocusV = new Vector3()
+
+function stampShellFocus(focus: { x: number; y: number; z: number }): void {
+  shellFocus.x = focus.x
+  shellFocus.y = focus.y
+  shellFocus.z = focus.z
+  shellFocusSet = true
+}
+
+/** Near test at voxelize time: the node's world AABB within
+ * SHELL_NEAR_RADIUS of the focus (no focus ⇒ near ⇒ eager). */
+function shellBuildIsNear(bounds: Box3): boolean {
+  if (!shellFocusSet) return true
+  return (
+    bounds.distanceToPoint(_shellFocusV.set(shellFocus.x, shellFocus.y, shellFocus.z)) <=
+    SHELL_NEAR_RADIUS
+  )
+}
+
+/** One queue entry per pending SINGLE target or roof FAMILY: id (nodeId or
+ * roof group id), world AABB center + half-diagonal for the near gate. */
+type ShellQueueEntry = { id: string; x: number; y: number; z: number; r: number; d2: number }
+
+let shellQueue: ShellQueueEntry[] = []
+let shellQueueCursor = 0
+let shellQueueSortedAt = Number.NEGATIVE_INFINITY
+/** Live count of targets with shellPending (roof members count each). */
+let shellPendingTotal = 0
+/** Deferred roof families: groupId → the voxelize-time plane enumeration
+ * (a few dozen numbers per roof — meshes come from dormantRoofHide). */
+const pendingRoofShells = new Map<string, { planes: RoofPlane[] }>()
+/** Wake-path sync budget window (see SHELL_SYNC_BUILD_BUDGET_MS). */
+let syncShellWindowStart = Number.NEGATIVE_INFINITY
+let syncShellSpentMs = 0
+
+/** QA/tests: pending deferred shell builds still outstanding. */
+export function shellPendingCount(): number {
+  return shellPendingTotal
+}
+
+function clearShellPending(target: VoxelTarget): void {
+  if (!target.shellPending) return
+  target.shellPending = undefined
+  shellPendingTotal--
+}
+
+function enqueueShellBuild(id: string, bounds: Box3): void {
+  shellQueue.push({
+    id,
+    x: (bounds.min.x + bounds.max.x) / 2,
+    y: (bounds.min.y + bounds.max.y) / 2,
+    z: (bounds.min.z + bounds.max.z) / 2,
+    r:
+      Math.hypot(
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z,
+      ) / 2,
+    d2: 0,
+  })
+}
+
+/** Is this queue entry still owed a build? (Sync wakes and drops resolve
+ * pendings out from under the queue — stale entries skip for free.) */
+function shellEntryPending(id: string): boolean {
+  if (pendingRoofShells.has(id)) return true
+  return useDestruction.getState().targets.get(id)?.shellPending !== undefined
+}
+
+/** Build ONE pending single-target shell (walls + slabs): re-collect from
+ * the retained host meshes, attach, and re-prime the core replica
+ * (skinRevision — it may have primed full-size/facade while pending). */
+function buildPendingSingleShell(target: VoxelTarget): void {
+  const meshes = target.hostMeshes
+  clearShellPending(target)
+  if (!meshes || meshes.length === 0) return // already woke — voxel-only
+  const built = buildWallShell(target.nodeId, meshes, target.grid)
+  if (!built) return // S0/S1 fallback semantics: voxel-only, never crash
+  target.shell = built.shell
+  target.shellMaterials = built.materials
+  target.skinRevision = (target.skinRevision ?? 0) + 1
+  useDestruction.getState().bump()
+}
+
+/** Build a deferred roof FAMILY's member shells in one go — the tri
+ * bucketing (assignRoofTrisToMembers) is the shared expensive step, so
+ * the family is the build unit exactly as it is at eager voxelize. */
+function buildPendingRoofFamily(groupId: string): void {
+  const family = pendingRoofShells.get(groupId)
+  pendingRoofShells.delete(groupId)
+  const state = useDestruction.getState()
+  const members: Array<[VoxelTarget, number]> = []
+  for (const id of roofGroups.get(groupId) ?? []) {
+    const member = state.targets.get(id)
+    if (member?.shellPending?.kind === 'roof') {
+      members.push([member, member.shellPending.planeIndex])
+      clearShellPending(member)
+    }
+  }
+  const meshes = dormantRoofHide.get(groupId)
+  if (!family || !meshes || members.length === 0) return
+  let roofShell: RoofMemberTris
+  try {
+    roofShell = assignRoofTrisToMembers(meshes, family.planes)
+  } catch {
+    return // family falls back voxel-only, never crashes
+  }
+  let attached = false
+  for (const [member, planeIndex] of members) {
+    const shell = buildRoofMemberShell(member.nodeId, roofShell.buckets[planeIndex] ?? [], member.grid)
+    if (!shell) continue
+    member.shell = shell
+    member.shellMaterials = roofShell.materials
+    member.skinRevision = (member.skinRevision ?? 0) + 1
+    attached = true
+  }
+  if (attached) state.bump()
+}
+
+function buildPendingShellEntry(id: string): void {
+  if (pendingRoofShells.has(id)) {
+    buildPendingRoofFamily(id)
+    return
+  }
+  const target = useDestruction.getState().targets.get(id)
+  if (target?.shellPending) buildPendingSingleShell(target)
+}
+
+/** Drop a whole pending roof family — the wake-budget fallback. */
+function dropPendingRoofFamily(groupId: string): void {
+  pendingRoofShells.delete(groupId)
+  const state = useDestruction.getState()
+  for (const id of roofGroups.get(groupId) ?? []) {
+    const member = state.targets.get(id)
+    if (member) clearShellPending(member)
+  }
+}
+
+/**
+ * WAKE-PATH sync build: a pending shell must exist BEFORE the host hides
+ * (the wake IS the invisible host→shell swap), so wakeTarget calls this
+ * first. Builds are capped per frame window (SHELL_SYNC_BUILD_BUDGET_MS of
+ * measured build time inside SHELL_SYNC_WINDOW_MS) — a blast waking many
+ * pending targets in one frame builds what the budget allows and the rest
+ * fall back to today's voxel wake, gracefully and permanently for those
+ * targets. Uses the swappable scheduler clock so tests can pin the policy.
+ */
+function syncPendingShellForWake(target: VoxelTarget): void {
+  const groupId = roofMemberOf.get(target.nodeId)
+  const pendingFamily = groupId !== undefined && pendingRoofShells.has(groupId)
+  if (!target.shellPending && !pendingFamily) return
+  const t0 = now()
+  if (t0 - syncShellWindowStart > SHELL_SYNC_WINDOW_MS) {
+    syncShellWindowStart = t0
+    syncShellSpentMs = 0
+  }
+  if (syncShellSpentMs >= SHELL_SYNC_BUILD_BUDGET_MS) {
+    // Budget spent this frame — voxel-only fallback for this wake.
+    if (pendingFamily && groupId !== undefined) dropPendingRoofFamily(groupId)
+    else clearShellPending(target)
+    perfEvent(`shell-sync-skip ${target.nodeId}`)
+    return
+  }
+  if (pendingFamily && groupId !== undefined) buildPendingRoofFamily(groupId)
+  else buildPendingSingleShell(target)
+  const spent = now() - t0
+  syncShellSpentMs += spent
+  perfSection('shell-sync-build', spent)
+}
+
+/**
+ * Background queue drain — one budgeted slice per frame (game-root drives
+ * it after prevoxelize completes; a no-op costs one counter check).
+ * Nearest-first around `focus`, re-sorted every PREVOXELIZE_RESORT_MS, and
+ * NEAR-GATED: the pass stops at the first entry beyond SHELL_NEAR_RADIUS
+ * (entries are sorted, so everything after is farther) — far shells STAY
+ * pending until the player approaches or a wake demands them. That gate is
+ * the memory lever: idle sessions hold shells only for the visited
+ * neighborhood, never all 400+. budgetMs ≤ 0 is the probe/focus-stamp
+ * contract (stamp the focus, never work). Returns true when nothing is
+ * pending anymore.
+ */
+export function shellBuildTick(
+  budgetMs: number = SHELL_BUILD_BUDGET_MS,
+  focus?: { x: number; y: number; z: number },
+): boolean {
+  if (focus) stampShellFocus(focus)
+  if (shellPendingTotal === 0) {
+    if (shellQueue.length > 0) {
+      shellQueue = []
+      shellQueueCursor = 0
+    }
+    return true
+  }
+  if (budgetMs <= 0) return false
+  const start = now()
+  if (
+    start - shellQueueSortedAt >= PREVOXELIZE_RESORT_MS ||
+    shellQueueCursor >= shellQueue.length
+  ) {
+    // Compact stale entries, refresh distances, nearest first.
+    const live: ShellQueueEntry[] = []
+    for (const entry of shellQueue) {
+      if (!shellEntryPending(entry.id)) continue
+      entry.d2 = shellFocusSet
+        ? (entry.x - shellFocus.x) ** 2 +
+          (entry.y - shellFocus.y) ** 2 +
+          (entry.z - shellFocus.z) ** 2
+        : 0
+      live.push(entry)
+    }
+    live.sort((a, b) => a.d2 - b.d2)
+    shellQueue = live
+    shellQueueCursor = 0
+    shellQueueSortedAt = start
+  }
+  const deadline = start + budgetMs
+  let built = 0
+  while (shellQueueCursor < shellQueue.length) {
+    const entry = shellQueue[shellQueueCursor]!
+    if (!shellEntryPending(entry.id)) {
+      shellQueueCursor++
+      continue
+    }
+    // NEAR GATE: sorted order means the first far entry ends the pass.
+    if (shellFocusSet && Math.sqrt(entry.d2) - entry.r > SHELL_NEAR_RADIUS) return false
+    // At least one build lands per funded tick (the prevoxelize contract).
+    if (built > 0 && now() >= deadline) return false
+    const buildT0 = performance.now()
+    buildPendingShellEntry(entry.id)
+    perfSection('shell-queue-build', performance.now() - buildT0)
+    built++
+    shellQueueCursor++
+  }
+  return shellPendingTotal === 0
+}
+
 /**
  * Voxelize ANY collider group on first damage; hides the host meshes via
  * the session ledger. Walls (world.walls) become two drywall skins with
@@ -2181,8 +2510,16 @@ export function ensureVoxelTarget(
   // ROOF PLANE LANE (Phase C2): pitched roof shells decompose into one
   // thin plane-aligned target per slope — see buildRoofPlaneTargets. Flat
   // or degenerate shells return null here and keep the volume lane below.
+  // S2: far roofs defer their family shell build (lazy tier).
   if (!wall && nodeType !== null && ROOF_KINDS.has(nodeType)) {
-    const primary = buildRoofPlaneTargets(world, nodeId, meshes, sources, opts?.dormant)
+    const primary = buildRoofPlaneTargets(
+      world,
+      nodeId,
+      meshes,
+      sources,
+      opts?.dormant,
+      !shellBuildIsNear(_bounds),
+    )
     if (primary) return primary
   }
 
@@ -2324,10 +2661,14 @@ export function ensureVoxelTarget(
   // runs there while the shell + core replicas flip visible off the same
   // `dormant` drop / store bump. Any build fallback keeps today's
   // instant-awake voxel path.
-  const wallShell = wall && shellWallEnabled() ? buildWallShell(nodeId, meshes, grid) : undefined
-  const slabShell =
-    kind === 'slab' && shellSlabEnabled() ? buildWallShell(nodeId, meshes, grid) : undefined
-  const targetShell = wallShell ?? slabShell
+  // S2 LAZY TIER: beyond SHELL_NEAR_RADIUS of the player the build DEFERS
+  // (shellPending) — the target still registers dormant (host renders,
+  // identical look) and the shell arrives via the budgeted queue or the
+  // wake-path sync build.
+  const shellKindOn = wall ? shellWallEnabled() : kind === 'slab' && shellSlabEnabled()
+  const shellDeferred = shellKindOn && !shellBuildIsNear(_bounds)
+  const targetShell =
+    shellKindOn && !shellDeferred ? buildWallShell(nodeId, meshes, grid) : undefined
   const segments = wall
     ? buildSegments(wall, buildStuds(wall, grid, collectWallOpenings(world, nodeId)))
     : kind === 'slab'
@@ -2380,11 +2721,17 @@ export function ensureVoxelTarget(
   // defer the hide to wakeTarget — the host keeps rendering AND colliding.
   // Shelled targets ALWAYS register dormant: the first-damage wake is the
   // host→shell swap moment (invisible — the shell IS the host surface).
-  if (opts?.dormant || targetShell) {
+  // A DEFERRED shell registers dormant too — same look, build later.
+  if (opts?.dormant || targetShell || shellDeferred) {
     target.dormant = true
     dormantCount++
     target.hostMeshes = meshes
     target.hostRoot = wall?.root
+    if (shellDeferred) {
+      target.shellPending = { kind: 'single' }
+      shellPendingTotal++
+      enqueueShellBuild(nodeId, _bounds)
+    }
   } else {
     target.walkOnly = hideHostNode(world, nodeId, meshes, wall?.root, item)
   }
@@ -2434,6 +2781,10 @@ export function wakeTarget(world: GameWorld, target: VoxelTarget): void {
   // name the node, which lets a spike log point at the exact culprit.
   perfEvent(`wake ${target.nodeId}`)
   const wakeT0 = performance.now()
+  // S2 lazy tier: a still-pending shell builds NOW (budget-capped, voxel-
+  // only fallback) — it must exist before the host hides below, because
+  // the wake is the invisible host→shell swap.
+  syncPendingShellForWake(target)
   const groupId = roofMemberOf.get(target.nodeId)
   if (groupId !== undefined) {
     const meshes = dormantRoofHide.get(groupId)
@@ -2696,6 +3047,9 @@ export function prevoxelizeTick(
   focus?: { x: number; y: number; z: number },
 ): boolean {
   const start = now()
+  // S2 lazy shells measure "near" against the same focus the scheduler
+  // sorts by — stamp it for every voxelize this tick performs.
+  if (focus) stampShellFocus(focus)
   let budget: number
   if (budgetMs === undefined) {
     // ADAPTIVE lane (the game driver passes no budget): sample the gap
@@ -3089,7 +3443,12 @@ export function collapseWholeTarget(nodeId: string): number {
   // out from under a wall the blast never touched) — wake it first or the
   // host mesh keeps floating over the falling voxels. sessionWorld is the
   // world every voxelize call stamped (cleared on resetDestruction).
-  if (target.dormant && sessionWorld) wakeTarget(sessionWorld, target)
+  // S2: every cell dies right below — a pending shell would build only to
+  // mount fully dead. Skip it (voxel-only), don't burn the sync budget.
+  if (target.dormant && sessionWorld) {
+    clearShellPending(target)
+    wakeTarget(sessionWorld, target)
+  }
   const { grid } = target
   const total = grid.aliveCount
   const debrisChance = Math.min(1, CRUMBLE_DEBRIS_CAP / total)
@@ -4534,6 +4893,7 @@ export function dropTarget(nodeId: string): void {
   const group = roofGroups.get(nodeId)
   if (group) {
     roofGroups.delete(nodeId)
+    pendingRoofShells.delete(nodeId) // S2: nothing left to build for
     // The group's shingle tone resolved (and audited) under the REAL node
     // id — the member recursion below only clears the member ids.
     clearToneAudit(nodeId)
@@ -4550,7 +4910,9 @@ export function dropTarget(nodeId: string): void {
   // pending texture retry would deliver to a dead target.
   clearToneAudit(nodeId)
   const state = useDestruction.getState()
-  if (state.targets.get(nodeId)?.dormant) dormantCount--
+  const dropping = state.targets.get(nodeId)
+  if (dropping?.dormant) dormantCount--
+  if (dropping) clearShellPending(dropping) // S2 pending census stays true
   if (state.targets.delete(nodeId)) {
     state.bump()
     dropStructureTarget(nodeId)
@@ -4571,6 +4933,15 @@ export function resetDestruction(): void {
   shellLatch.wall = null
   shellLatch.roof = null
   shellLatch.slab = null
+  // Lazy shell tier (S2): pending builds die with their targets.
+  shellQueue = []
+  shellQueueCursor = 0
+  shellQueueSortedAt = Number.NEGATIVE_INFINITY
+  shellPendingTotal = 0
+  pendingRoofShells.clear()
+  shellFocusSet = false
+  syncShellWindowStart = Number.NEGATIVE_INFINITY
+  syncShellSpentMs = 0
   if (sceneSupportTimer !== null) {
     clearTimeout(sceneSupportTimer)
     sceneSupportTimer = null

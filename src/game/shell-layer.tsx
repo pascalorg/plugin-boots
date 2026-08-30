@@ -1,9 +1,15 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { memo, useEffect, useMemo, useRef } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type { Group } from 'three'
-import { probeLandingY, shellFlags, useDestruction, type VoxelTarget } from './destruction'
+import {
+  probeLandingY,
+  shellFlags,
+  shellPendingCount,
+  useDestruction,
+  type VoxelTarget,
+} from './destruction'
 import type { ShellData } from './shell'
 import {
   pickDebrisFragments,
@@ -18,7 +24,7 @@ import {
   type ShellRemovalBatch,
 } from './shell-render'
 import { gridFrameToWorld, rotateByBasisInverse, type VoxelGridData } from './voxel'
-import { coreThicknessAxis } from './voxel-walls'
+import { coreThicknessAxis, freezeStaticSubtree } from './voxel-walls'
 import type { GameWorld } from './world'
 
 /**
@@ -220,14 +226,17 @@ export type ShellKindCensus = { targets: number; fragments: number; killed: numb
  * totals plus a per-kind breakdown (S1: wall / roof / slab lanes toggle
  * independently). `enabled` reports the LIVE flags (the session may be
  * latched differently — targets with shells tell the latched truth).
- * Shelled targets bucket by their VoxelTarget.kind (roof plane members are
- * kind 'roof'; the voxel-only residual member never carries a shell).
- * Plain data only. */
+ * `pending` is the S2 lazy tier's outstanding deferred builds (targets
+ * beyond the near radius whose shells haven't built yet — QA watches it
+ * drain as the player approaches). Shelled targets bucket by their
+ * VoxelTarget.kind (roof plane members are kind 'roof'; the voxel-only
+ * residual member never carries a shell). Plain data only. */
 export function shellCensus(): {
   enabled: { wall: boolean; roof: boolean; slab: boolean }
   targets: number
   fragments: number
   killed: number
+  pending: number
   byKind: Record<'wall' | 'roof' | 'slab', ShellKindCensus>
 } {
   let targets = 0
@@ -261,6 +270,7 @@ export function shellCensus(): {
     targets,
     fragments,
     killed,
+    pending: shellPendingCount(),
     byKind,
   }
 }
@@ -308,6 +318,15 @@ const ShellTargetLayer = memo(function ShellTargetLayer({
   }, [target])
 
   const transform = useMemo(() => gridFrameToWorld(target.grid), [target])
+
+  // Shells never move after mount (S2 hardening, 400+ shells): settle world
+  // matrices once, then opt the wrapper + mesh out of three's per-frame
+  // matrix churn — the voxel-walls static-scene discipline. Visibility
+  // flips and index carves never need a matrix recompose, and the frozen
+  // matrixWorld is exactly what frustum culling reads.
+  useLayoutEffect(() => {
+    freezeStaticSubtree(groupRef.current)
+  }, [target])
 
   // Hoisted once per target (not rebuilt per carve): the debris pick's cell
   // lookup, reusing one tuple — pickDebrisFragments reads the components

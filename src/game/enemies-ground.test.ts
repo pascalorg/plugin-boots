@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { collideCapsule } from './collision'
 import {
@@ -6,6 +6,7 @@ import {
   damageTarget,
   ensureVoxelTarget,
   resetDestruction,
+  setShellFlag,
 } from './destruction'
 import {
   type Bot,
@@ -15,6 +16,24 @@ import {
   settleGroundBot,
 } from './enemies-state'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
+
+// S2 flips conforming shells DEFAULT ON. This suite pins the VOXEL-ONLY
+// lane (awake voxelize, collider hand-over, replica collision/raycasts),
+// so it throws the per-kind kill-switches before every test — the same
+// session-latched setShell(kind, false) rollback QA uses (the latch
+// re-arms via each test's resetDestruction). afterAll restores the
+// defaults for whatever suite runs after this file.
+beforeEach(() => {
+  setShellFlag('wall', false)
+  setShellFlag('roof', false)
+  setShellFlag('slab', false)
+})
+afterAll(() => {
+  setShellFlag('wall', true)
+  setShellFlag('roof', true)
+  setShellFlag('slab', true)
+})
+
 
 /**
  * BOTS ON FLOORS (Phase D slice): ground bots settle toward the live landing
