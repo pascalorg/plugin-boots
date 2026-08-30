@@ -208,11 +208,40 @@ let sync: DamageSync | null = null
 let runtime: DamageRuntime | null = null
 
 /**
+ * THE EVIDENCE, KEPT ACROSS THE DETACH.
+ *
+ * exitGame tears the lane down BEFORE it asks what to save. In session.ts the
+ * order is stopWorldSync() — which is setDamageSync(null) — and only then
+ * captureDemolition(). So a gate that answered "no sync, no evidence, nothing
+ * is foreign" was being consulted after it had been switched off, and the Save
+ * panel offered every fully destroyed node, a stranger's rubble included.
+ *
+ * A live browser run caught exactly that, and it is worth writing down because
+ * no unit test would have: two walls leveled on screen, one of them claimed by
+ * a peer's frame, and the panel offered BOTH.
+ *
+ * So the final projection is snapshotted here at detach and served until the
+ * session's destruction state resets. It is safe to hold: `LocalWork` is plain
+ * arrays of ids and cell keys — no SharedWorld, and nothing of any peer's,
+ * outlives the detach.
+ */
+let farewell: LocalWork | null = null
+
+/**
  * Turn the damage lane on (a shared session started) or off (single player, or
- * session exit). Passing null restores exact single-player behaviour, including
- * in the middle of a session — and closes the Save gate below with it.
+ * session exit).
+ *
+ * Passing null restores single-player behaviour on the HOT PATH exactly —
+ * nothing publishes, nothing allocates — but deliberately NOT for the Save
+ * gate, which keeps the projection until `resetSharedDamage`. Once a session
+ * has had peers in it, some of the rubble on screen may be theirs; forgetting
+ * that at teardown is the one direction that is not safe, because the next
+ * thing that happens is a button that deletes nodes from someone's building.
  */
 export function setDamageSync(next: DamageSync | null): void {
+  // Detaching from a live lane: take the evidence with us. Attaching: a new
+  // session starts with no inherited claims.
+  farewell = next === null && sync !== null ? localWork(sync.world) : null
   sync = next
   pending = null
   batchDepth = 0
@@ -236,7 +265,11 @@ export function setDamageSync(next: DamageSync | null): void {
  * graph's entry point. Import order must not be load-bearing.
  */
 export function sharedLocalWork(): LocalWork | null {
-  return sync === null ? null : localWork(sync.world)
+  if (sync !== null) return localWork(sync.world)
+  // Detached. `farewell` is the projection as it stood when the lane came
+  // down, which is what the exit path actually needs; null in single player,
+  // where it was never set and no gate ever existed.
+  return farewell
 }
 
 /**
@@ -261,11 +294,17 @@ export const damageSyncActive = (): boolean => sync !== null
  * Drop in-flight staging without touching the injected sync or runtime.
  * Called from resetDestruction() so a session teardown mid-batch cannot leak
  * half a frame into the next one.
+ *
+ * This is also where the kept-across-detach evidence ends. resetDestruction
+ * runs when the game tree goes away, which is AFTER captureDemolition has had
+ * its answer — so the gate sees the session it belongs to, and the next
+ * session, shared or solo, starts with no inherited claims.
  */
 export function resetSharedDamage(): void {
   pending = null
   batchDepth = 0
   remoteDepth = 0
+  farewell = null
 }
 
 // ── Publishing ──────────────────────────────────────────────────────────────

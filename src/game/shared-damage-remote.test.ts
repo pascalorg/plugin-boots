@@ -348,6 +348,71 @@ describe("a stranger's rubble cannot reach Save", () => {
     expect(scene.getState().nodes['wall-1']).toBeDefined()
   })
 
+  test('THE EXIT ORDER: the lane is torn down before Save asks, and the gate still answers', () => {
+    // THIS IS THE ONE A LIVE RUN CAUGHT AND NO UNIT TEST DID.
+    //
+    // exitGame does not ask first and tear down after. session.ts calls
+    // stopWorldSync() — setDamageSync(null) — at line 714, and only reaches
+    // captureDemolition() at 742. So on the REAL exit path the gate was being
+    // consulted after it had been switched off: `sharedLocalWork()` answered
+    // null, capture took the single-player loop, and every fully destroyed node
+    // was offered — including a wall a peer had leveled. In the browser that
+    // showed up as "You fully leveled 2 building elements" with only one of them
+    // mine. Encode the order here so it cannot come back.
+    const mine = createSharedWorld('me')
+    setDamageSync({ world: mine, publish: () => {} })
+    const world = makeWorld()
+    prevoxelize(world)
+
+    for (const id of allSegmentsOf('wall-1')) {
+      damageSegment(world, 'wall-1', id, 9999, new Vector3(0, 1.35, 0))
+    }
+    collapseWholeTarget('wall-1')
+
+    const them = peer()
+    noteLocalRemoval(them, 'wall-2', allCellsOf('wall-2'))
+    noteLocalSegments(them, 'wall-2', allSegmentsOf('wall-2'))
+    noteLocalKill(them, 'wall-2')
+    receive(mine, them)
+
+    const targets = useDestruction.getState().targets
+    expect(isFullyDestroyed(targets.get('wall-1')!)).toBe(true)
+    expect(isFullyDestroyed(targets.get('wall-2')!)).toBe(true)
+
+    // ── exitGame, in its real order ──
+    setDamageSync(null) // session.ts:714
+    expect(captureDemolition()).toBe(1) // session.ts:742
+    expect(useDemolition.getState().mine).toEqual(['wall-1'])
+    expect(useDemolition.getState().foreign).toBe(1)
+    expect(deleteDestroyed()).toBe(1)
+    expect(scene.getState().nodes['wall-1']).toBeUndefined()
+    expect(scene.getState().nodes['wall-2']).toBeDefined()
+  })
+
+  test('a new session inherits no claims from the last one', () => {
+    // The evidence outliving the detach must not outlive the SESSION, or a
+    // second Jump-in would offer the first session's rubble as this one's work.
+    const first = createSharedWorld('me')
+    setDamageSync({ world: first, publish: () => {} })
+    const world = makeWorld()
+    prevoxelize(world)
+    for (const id of allSegmentsOf('wall-1')) {
+      damageSegment(world, 'wall-1', id, 9999, new Vector3(0, 1.35, 0))
+    }
+    collapseWholeTarget('wall-1')
+    setDamageSync(null)
+    expect(captureDemolition()).toBe(1) // still mine, same session
+
+    // A fresh lane: the wall is rubble in the runtime but nothing in this
+    // world's ledger says I did it, so it is withheld rather than offered.
+    discardDemolition()
+    setDamageSync({ world: createSharedWorld('me'), publish: () => {} })
+    expect(captureDemolition()).toBe(0)
+    expect(useDemolition.getState().foreign).toBe(1)
+    expect(deleteDestroyed()).toBe(0)
+    expect(scene.getState().nodes['wall-1']).toBeDefined()
+  })
+
   test('the allow-list is re-checked at click time, not trusted from capture', () => {
     // Belt and braces: even if something put a node into `destroyed` behind
     // capture's back, the delete filters against `mine` again.
