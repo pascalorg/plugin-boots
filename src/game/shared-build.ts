@@ -499,6 +499,15 @@ function installPieces(): void {
 
   for (const [id, runtimeId] of [...pieceRuntime]) {
     if (desired.has(id)) continue
+    // "Is this record ours?" asked of our CURRENT identity, deliberately. The
+    // host can re-key a live collab session, and the transport answers by
+    // re-minting our pieces under the new prefix — which deposes the old
+    // records in every peer that saw both. Those losers are ours in spirit but
+    // not by prefix, so `mine` is false and the notice below stays silent. That
+    // is the outcome we want: nobody claimed anything, we renamed ourselves.
+    // If this is ever widened to "was ever mine" (net.ts has wasLocalSession
+    // for exactly that question), the notice must be narrowed in the same
+    // breath, or a re-key starts blaming strangers for walls nobody touched.
     const mine = isAuthoredBy(id, s.world.self)
     const piece = useBoots.getState().placed.find((p) => p.id === runtimeId)
     unbindPiece(runtimeId)
