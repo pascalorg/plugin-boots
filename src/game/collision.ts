@@ -1,4 +1,5 @@
 import { Box3, Line3, Vector3 } from 'three'
+import { lotFloorY } from './ground'
 import { WALKABLE_NORMAL_Y } from './movement'
 import type { ColliderEntry } from './world'
 
@@ -244,12 +245,20 @@ export function collideCapsule(
     if (!corrected) break
   }
 
-  // The lot itself: an infinite ground plane at y = 0.
-  if (pos.y < 0) {
-    pos.y = 0
+  // The lot itself: an infinite ground plane at the LOT FLOOR — y = 0 on a
+  // flat or void scene (exactly the old behaviour), and just under the site's
+  // lowest point when the scene carries sculpted terrain. It stays a single
+  // scalar rather than a per-XZ terrain height on purpose: the heightfield is
+  // already a solid collider resolved above, so it does the real holding-up,
+  // while a per-XZ plane would shove anything inside a basement or a
+  // below-grade room up through its own floor. This is the last-resort
+  // backstop, not the ground.
+  const floor = lotFloorY()
+  if (pos.y < floor) {
+    pos.y = floor
     if (vel.y < 0) vel.y = 0
     grounded = true
-  } else if (pos.y < 0.02 && vel.y <= 0.01) {
+  } else if (pos.y < floor + 0.02 && vel.y <= 0.01) {
     grounded = true
   }
 

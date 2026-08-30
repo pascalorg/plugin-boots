@@ -25,6 +25,15 @@ import {
   runBvhPrimeQueue,
   workerBvhBuilder,
 } from './bvh-worker'
+import {
+  FLAT_LOT_Y,
+  type GroundSurfaceProbe,
+  groundSurfaceY,
+  lotFloorY,
+  resetGround,
+  setGroundSurfaceProbe,
+  setLotFloorY,
+} from './ground'
 import { CELL, type GridAnchor, STOREY } from './grid'
 import { WALKABLE_NORMAL_Y } from './movement'
 import { perfEvent } from './perf-monitor'
@@ -1038,6 +1047,104 @@ export function buildSiteSnapshot(
 }
 
 // ---------------------------------------------------------------------------
+// The session's ground authority (see ground.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ground height at a world XZ on a SCULPTED site: the host core's analytic
+ * terrain field when its version exports one (a bilinear sample of the same
+ * heightfield the editor renders — cheap, exact, and defined everywhere
+ * because the host clamps out-of-range XZ to the edge height), else a
+ * downward BVH raycast of the 'site' colliders. Returns null when the scene
+ * has no site terrain, or when the BVH fallback finds no site under the XZ
+ * (off the lot). Deliberately the ONE place the two existing probes are
+ * ranked, so nothing downstream has to know which host it is running on.
+ */
+export function terrainSurfaceYAt(
+  world: Pick<GameWorld, 'colliders' | 'site'>,
+  x: number,
+  z: number,
+): number | null {
+  const analytic = world.site?.surfaceHeightAt
+  if (analytic) {
+    const y = analytic(x, z)
+    if (Number.isFinite(y)) return y
+  }
+  return siteGroundYAt(world, x, z)
+}
+
+/** BVH-fallback cache cell (m). The terrain is static and indestructible for
+ * the whole session — unlike probe-memo.ts's 400 ms TTL, entries never go
+ * stale, so one raycast per cell serves every bot step, debris chunk and
+ * crater for the rest of the round. */
+const GROUND_CACHE_CELL = 0.25
+/** Cache cap — a 0.25 m grid over a 100 × 100 m lot is 160k cells, far more
+ * than a session actually touches; past this the map is dropped wholesale
+ * (cheaper than LRU bookkeeping and the refill is one raycast per cell). */
+const GROUND_CACHE_MAX = 40000
+/** How far below the terrain's lowest point the lot's hard floor sits, so the
+ * backstop plane never fights the terrain BVH holding a body up. */
+const LOT_FLOOR_MARGIN = 0.5
+
+/**
+ * Point ground.ts at this session's terrain, so every downstream system
+ * (collision backstop, bot settle, debris/dust rest, craters, dropped items)
+ * reads ONE height. Returns whether sculpted terrain was found.
+ *
+ * A scene without site terrain installs NOTHING: `groundSurfaceY` keeps
+ * answering the flat lot plane and `lotFloorY()` stays 0, so every flat and
+ * void scene behaves exactly as it did before the ground authority existed.
+ *
+ * The lot's hard floor comes from the site colliders' own AABBs (their
+ * skirt reaches below the lowest terrain vertex) minus a margin — measured,
+ * not guessed, and clamped to ≤ 0 by setLotFloorY so a site that sits
+ * entirely on high ground can never raise the floor into the scene.
+ */
+export function installGroundProbes(world: Pick<GameWorld, 'colliders' | 'site'>): boolean {
+  if (!world.site?.hasTerrain) {
+    resetGround()
+    return false
+  }
+
+  const analytic = world.site.surfaceHeightAt
+  let probe: GroundSurfaceProbe
+  if (analytic) {
+    probe = (x, z) => {
+      const y = analytic(x, z)
+      return Number.isFinite(y) ? y : FLAT_LOT_Y
+    }
+  } else {
+    // BVH fallback: quantize and memoize, one raycast per 0.25 m cell.
+    const cache = new Map<number, number>()
+    probe = (x, z) => {
+      const cx = Math.round(x / GROUND_CACHE_CELL)
+      const cz = Math.round(z / GROUND_CACHE_CELL)
+      const key = (cx + 32768) * 65536 + (cz + 32768)
+      const hit = cache.get(key)
+      if (hit !== undefined) return hit
+      const y = siteGroundYAt(world, cx * GROUND_CACHE_CELL, cz * GROUND_CACHE_CELL)
+      // Off the lot there is no ground to stand on; the flat plane is the
+      // documented last resort (the analytic path never gets here — the host
+      // field clamps to its edge height instead).
+      const value = y === null ? FLAT_LOT_Y : y
+      if (cache.size >= GROUND_CACHE_MAX) cache.clear()
+      cache.set(key, value)
+      return value
+    }
+  }
+
+  let floor = Number.POSITIVE_INFINITY
+  for (const collider of world.colliders) {
+    if (collider.nodeType !== 'site' || collider.disabled) continue
+    if (collider.worldBox.min.y < floor) floor = collider.worldBox.min.y
+  }
+
+  setGroundSurfaceProbe(probe)
+  setLotFloorY(Number.isFinite(floor) ? floor - LOT_FLOOR_MARGIN : FLAT_LOT_Y)
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // Host-scene vegetation trees (combat replacement — trees-destruct.tsx)
 // ---------------------------------------------------------------------------
 
@@ -1411,22 +1518,24 @@ export function probeSpawnSurfaceY(
 
 /**
  * The Y the spawn's FEET start at for a chosen XZ: the topmost walkable
- * collider surface there (+ SPAWN_SETTLE_EPS), else the lot's terrain plane
- * at 0. Surfaces BELOW the lot plane (recessed patios, EXCAVATED site
- * terrain) clamp up to 0 too — collision.ts's infinite ground plane would
- * fight anything lower. v1 site posture: hills probe to their true height
- * through the 'site' colliders; excavations behave as an invisible floor
- * at 0 (the Math.max stays until the lot plane learns siteMinHeight). This
- * replaces the old lowest-LEVEL-elevation guess, which knew nothing about
- * what actually stands at the spawn XZ: a raised site slab / terrace under
- * the ring spawn left the player waist-deep in it on large real projects
- * ("spawns half into the ground"), and an elevated building floated the
- * spawn in mid-air over flat ground.
+ * collider surface there (+ SPAWN_SETTLE_EPS), else the ground under it.
+ * This replaces the old lowest-LEVEL-elevation guess, which knew nothing
+ * about what actually stands at the spawn XZ: a raised site slab / terrace
+ * under the ring spawn left the player waist-deep in it on large real
+ * projects ("spawns half into the ground"), and an elevated building floated
+ * the spawn in mid-air over flat ground.
+ *
+ * The lower bound is the LOT FLOOR, not zero. It used to be `Math.max(0, …)`
+ * because collision.ts's infinite plane at y = 0 would have fought anything
+ * lower — so a spawn XZ over the owner's −5.1 m excavation started five
+ * metres in the air. Both halves of that pact are gone: the floor is now the
+ * measured underside of the site (0 without terrain, so flat scenes are
+ * unchanged) and the terrain BVH does the real holding-up.
  */
 export function spawnGroundY(colliders: readonly ColliderEntry[], x: number, z: number): number {
   const surface = probeSpawnSurfaceY(colliders, x, z)
-  if (surface === null) return 0
-  return Math.max(0, surface + SPAWN_SETTLE_EPS)
+  if (surface === null) return groundSurfaceY(x, z)
+  return Math.max(lotFloorY(), surface + SPAWN_SETTLE_EPS)
 }
 
 const _usBox = new Box3()
@@ -1772,6 +1881,10 @@ export function collectWorld(): GameWorld {
   // polygon (scatter clamp) and the analytic height (drape) off this —
   // never off the registry at render time.
   const site = buildSiteSnapshot(sitePick)
+  // …and the ground authority adopts it, BEFORE the spawn settle below reads
+  // the lot floor through spawnGroundY. Everything that used to assume
+  // y = 0 asks ground.ts from here on (game-root resets it on teardown).
+  installGroundProbes({ colliders, site })
   // The build lattice adopts the building's frame — identity when nothing
   // dominates (empty lot) or the building already sits on the legacy grid.
   const gridAnchor = deriveGridAnchor(walls.values())
@@ -1784,7 +1897,7 @@ export function collectWorld(): GameWorld {
   // XZ first; Y then SETTLES onto whatever actually stands there —
   // spawnGroundY probes the collected colliders straight down at the spawn
   // XZ (raised lot slabs, terraces, foundation plinths that reach the ring)
-  // and falls back to the lot's terrain plane at 0. The old Y guess (the
+  // and falls back to the ground under it. The old Y guess (the
   // lowest LEVEL's elevation) knew nothing about the ground at the ring:
   // a raised site slab under the spawn buried the player waist-deep on big
   // real projects, and an elevated building floated the spawn mid-air.

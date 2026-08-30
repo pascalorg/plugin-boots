@@ -29,6 +29,7 @@ import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
+import { resetGround } from './ground'
 import { GunTable } from './guntable'
 import { HostPostTuning, hostPostDebug } from './host-post'
 import { GameItems } from './item-place'
@@ -787,6 +788,10 @@ function ActiveGame() {
       setDebrisGroundProbe(null)
       setDustFloorProbe(null)
       setGlassFloorProbe(null)
+      // The ground authority is installed by collectWorld (world.ts) — drop
+      // it with the session so a next Jump-in on a flat scene, or a test,
+      // never inherits the last lot's terrain.
+      resetGround()
       resetDestruction()
       resetGlass()
       clearDebris()

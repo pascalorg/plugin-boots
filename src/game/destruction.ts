@@ -19,6 +19,7 @@ import { spawnFloorBreach } from './craters'
 import { spawnDebris, spawnFlatDebris } from './debris'
 import { spawnDust, spawnHaze } from './dust'
 import { blastDebrisActive, queueDebris } from './grenade'
+import { groundSurfaceY, lotFloorY } from './ground'
 import { perfEvent, perfSection } from './perf-monitor'
 import { notifySceneSupportChanged, onPieceRemoved, pieceReplicaDead, slotOf } from './piece-slots'
 import { buildRafters, rafterObbBasis, roofPlaneFrame, splitRaftersByPlane } from './roof-framing'
@@ -4176,7 +4177,7 @@ export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
  * One-shot landing-plane resolve for debris/dust ("floors for things",
  * MULTILEVEL-PLAN Phase B polish): the HIGHEST live surface at or below
  * (x, y, z) — a live (non-disabled) collider top, a live voxel cell of any
- * target (downward DDA), else the lot's terrain plane at y = 0. Colliders
+ * target (downward DDA), else THE GROUND AT THIS XZ. Colliders
  * whose top is above the probe point are skipped (a probe from inside a
  * wall's box must not "land" on that wall's top), and voxelized nodes are
  * covered by their grids since voxelization disables the host collider.
@@ -4184,19 +4185,47 @@ export function isTearLaneNode(world: GameWorld, nodeId: string): boolean {
  * downward DDA through the source wall's own cells would resolve the wall
  * itself as the floor and leave pieces (and dust) hovering mid-air at the
  * face — floors are slabs/plates/volumes, never wall bodies.
- * Called once per debris piece (at apex) / dust burst — never per frame.
+ * Called once per debris piece (at apex) / dust burst / bot settle step.
+ *
+ * SCULPTED GROUND: the baseline used to be the literal 0 plane, and the
+ * 'site' heightfield could never correct it — a collider box test reduces the
+ * whole lot's terrain to ONE number (its highest vertex), so a probe below
+ * that height skipped terrain entirely and fell through to 0 while a probe
+ * above it "landed" on a phantom flat plane at the summit. Every outdoor
+ * chunk, dust puff, glass plate and ground bot therefore resolved to y = 0:
+ * buried on a knoll, hovering metres over an excavation. The baseline is now
+ * ground.ts's height at this XZ (still exactly 0 on a flat scene) and the
+ * 'site' colliders are skipped so their AABB can't out-vote it.
+ *
+ * The `groundY <= y + 0.02` gate is load-bearing: a room dug into a hillside
+ * has terrain ABOVE its floor, and a piece resting inside it must land on the
+ * floor it is standing on, not on the hill outside the wall. When the terrain
+ * is above the probe point AND nothing else is under it, the body is INSIDE
+ * the ground — the probe reports the point itself, so a settle never drags it
+ * further in (the capsule resolve lifts it out instead). That case used to
+ * report 0 and yanked hillside bots down through the hill they stood on.
  */
 export function probeLandingY(world: GameWorld, x: number, y: number, z: number): number {
-  let best = 0
+  const groundY = groundSurfaceY(x, z)
+  const terrainUnderfoot = groundY <= y + 0.02
+  // Search floor: the ground when it IS underfoot, else the lot's hard floor
+  // (never above the probe point, so `reach` below stays sane).
+  const searchFloor = terrainUnderfoot ? groundY : Math.min(lotFloorY(), y)
+  let best = searchFloor
+  let found = terrainUnderfoot
   for (const collider of world.colliders) {
     // walkOnly planks defer to their voxel target here, same as disabled.
     if (collider.disabled || collider.walkOnly) continue
+    // The terrain is answered analytically above; its AABB top is the whole
+    // lot's summit and would flatten every probe onto it.
+    if (collider.nodeType === 'site') continue
     const box = collider.worldBox
     const top = box.max.y
     if (top <= best || top > y + 0.02) continue
     if (x < box.min.x - 0.02 || x > box.max.x + 0.02) continue
     if (z < box.min.z - 0.02 || z > box.max.z + 0.02) continue
     best = top
+    found = true
   }
   for (const target of useDestruction.getState().targets.values()) {
     const grid = target.grid
@@ -4208,10 +4237,13 @@ export function probeLandingY(world: GameWorld, x: number, y: number, z: number)
     // (a piece would otherwise freeze at its own apex height).
     if (hit && hit.distance >= 0.02) {
       const top = y + 0.01 - hit.distance
-      if (top > best) best = top
+      if (top > best) {
+        best = top
+        found = true
+      }
     }
   }
-  return best
+  return found ? best : y
 }
 
 export type SegmentRayHit = {
