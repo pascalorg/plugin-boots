@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, Color, Matrix4, Mesh, Object3D, Vector3 } from 'three'
+import { Box3, BoxGeometry, Color, Matrix4, Mesh, Object3D, PlaneGeometry, Vector3 } from 'three'
 import { collideCapsule, PLAYER_CAPSULE } from './collision'
 import {
   buildCraterGeometry,
@@ -56,9 +56,11 @@ import { itemDropY, itemProbeFromY } from './item-place'
 import { applyTeleport } from './player'
 import {
   bvhFor,
+  collectRoadFootprints,
   type ColliderEntry,
   type GameWorld,
   installGroundProbes,
+  meshFootprintTriangles,
   spawnGroundY,
   terrainSurfaceYAt,
 } from './world'
@@ -543,6 +545,44 @@ describe('scene walls are held up by the ground under them', () => {
     expect(probeTargetSupport(ensureVoxelTarget(world, 'wall-flat')!, supportCtx(world))).toBe(true)
     addWall(world, 'wall-air', [30, 4.05, 0])
     expect(probeTargetSupport(ensureVoxelTarget(world, 'wall-air')!, supportCtx(world))).toBe(false)
+  })
+})
+
+describe('the hard-surface mask is measured from the dirt', () => {
+  /** A flat quad in the XZ plane at height y, centered on (x, z). */
+  const pad = (x: number, y: number, z: number): Mesh => {
+    const mesh = new Mesh(new PlaneGeometry(4, 4).rotateX(-Math.PI / 2))
+    mesh.position.set(x, y, z)
+    mesh.updateWorldMatrix(true, false)
+    return mesh
+  }
+
+  test('a driveway on high ground still masks the grass', () => {
+    useRampTerrain()
+    // The bench is +2. Against an absolute 1.5 m ceiling the whole road mesh
+    // was dropped and grass grew straight through the pavement.
+    expect(meshFootprintTriangles(pad(-5, 2.05, 0)).length).toBeGreaterThan(0)
+  })
+
+  test('a deck a storey over the ground is still skipped', () => {
+    useRampTerrain()
+    expect(meshFootprintTriangles(pad(-5, 4.8, 0)).length).toBe(0)
+  })
+
+  test('flat lot: the absolute ceiling behaviour is unchanged', () => {
+    expect(meshFootprintTriangles(pad(0, 0.1, 0)).length).toBeGreaterThan(0)
+    expect(meshFootprintTriangles(pad(0, 2.8, 0)).length).toBe(0)
+  })
+
+  test('a flat pad collider on high ground is collected as a pad', () => {
+    useRampTerrain()
+    // 0.12 m asphalt resting on the +2 bench: min.y = 2.0, an absolute
+    // PAD_MAX_BASE_Y of 0.6 threw it out.
+    const asphalt = boxCollider('pad-1', 'item', [4, 0.12, 4], [-5, 2.06, 0])
+    expect(collectRoadFootprints([asphalt]).length).toBe(1)
+    // …and a pad genuinely lifted off the ground is still not one.
+    const table = boxCollider('pad-2', 'item', [4, 0.12, 4], [-5, 3.5, 0])
+    expect(collectRoadFootprints([table]).length).toBe(0)
   })
 })
 

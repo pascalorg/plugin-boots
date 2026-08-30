@@ -704,11 +704,15 @@ const ROAD_MESH_EXCLUDE = /preview|hit|validation|boundary|approach|earthwork|br
 const PAD_KINDS = new Set(['slab', 'item', 'block'])
 /** A pad is "flat" when its world AABB is at most this tall… */
 const PAD_MAX_THICKNESS = 0.35
-/** …and starts at most this far above the ground plane. */
+/** …and starts at most this far above THE GROUND UNDER IT (an absolute
+ * ceiling dropped every driveway on a lot standing higher than 0.6 m, and
+ * grass grew straight through the pavement). */
 const PAD_MAX_BASE_Y = 0.6
 
-/** Triangles whose lowest vertex sits above this are skipped — an elevated
- * deck is not ground the scatter plane (y = 0) could poke through. */
+/** Triangles whose lowest vertex sits more than this above the ground under
+ * them are skipped — an elevated deck is not ground the draped scatter could
+ * poke through. Measured from the dirt, not from the lot plane: on a yard at
+ * +1.7 an absolute 1.5 dropped the road mesh itself. */
 const FOOTPRINT_MAX_Y = 1.5
 /** Degenerate XZ triangles (vertical faces seen from above) carry no area
  * worth testing; the scatter margin already covers their sliver. */
@@ -726,9 +730,13 @@ const _fpC = new Vector3()
 
 /**
  * World-space triangles of a mesh projected to XZ, packed 6 floats per
- * triangle. Elevated (min y > maxY) and XZ-degenerate triangles are dropped.
+ * triangle. XZ-degenerate triangles are dropped, and so are elevated ones:
+ * `rise` is how far a triangle's lowest vertex may sit ABOVE THE GROUND
+ * UNDER IT (one field lookup per triangle, once per session — and on a flat
+ * lot no probe is installed, so the ground is 0 and this is the historical
+ * absolute test).
  */
-export function meshFootprintTriangles(mesh: Mesh, maxY = FOOTPRINT_MAX_Y): Float32Array {
+export function meshFootprintTriangles(mesh: Mesh, rise = FOOTPRINT_MAX_Y): Float32Array {
   const geometry = mesh.geometry
   const position = geometry?.getAttribute?.('position')
   if (!position || position.count < 3) return new Float32Array(0)
@@ -743,7 +751,8 @@ export function meshFootprintTriangles(mesh: Mesh, maxY = FOOTPRINT_MAX_Y): Floa
     _fpA.fromBufferAttribute(position, ia).applyMatrix4(mesh.matrixWorld)
     _fpB.fromBufferAttribute(position, ib).applyMatrix4(mesh.matrixWorld)
     _fpC.fromBufferAttribute(position, ic).applyMatrix4(mesh.matrixWorld)
-    if (Math.min(_fpA.y, _fpB.y, _fpC.y) > maxY) continue
+    const ground = groundSurfaceY((_fpA.x + _fpB.x + _fpC.x) / 3, (_fpA.z + _fpB.z + _fpC.z) / 3)
+    if (Math.min(_fpA.y, _fpB.y, _fpC.y) > ground + rise) continue
     const area = Math.abs(
       (_fpB.x - _fpA.x) * (_fpC.z - _fpA.z) - (_fpC.x - _fpA.x) * (_fpB.z - _fpA.z),
     )
@@ -895,7 +904,10 @@ export function collectRoadFootprints(colliders: readonly ColliderEntry[]): Road
   for (const entry of colliders) {
     if (!PAD_KINDS.has(entry.nodeType)) continue
     entry.worldBox.getSize(size)
-    if (size.y > PAD_MAX_THICKNESS || entry.worldBox.min.y > PAD_MAX_BASE_Y) continue
+    if (size.y > PAD_MAX_THICKNESS) continue
+    const box = entry.worldBox
+    const padGround = groundSurfaceY((box.min.x + box.max.x) / 2, (box.min.z + box.max.z) / 2)
+    if (box.min.y - padGround > PAD_MAX_BASE_Y) continue
     const position = entry.mesh.geometry?.getAttribute?.('position')
     if (position && position.count > FOOTPRINT_VERTEX_BUDGET) {
       push(boxFootprintTriangles(entry.worldBox))
@@ -1875,16 +1887,18 @@ export function collectWorld(): GameWorld {
   }
 
   const overlayRoots = collectOverlayRoots()
-  const roadFootprints = collectRoadFootprints(colliders)
-  const hostTrees = collectHostTrees(nodes)
   // The lot snapshot: nature reads existence (ground-disc suppression),
   // polygon (scatter clamp) and the analytic height (drape) off this —
   // never off the registry at render time.
   const site = buildSiteSnapshot(sitePick)
-  // …and the ground authority adopts it, BEFORE the spawn settle below reads
-  // the lot floor through spawnGroundY. Everything that used to assume
-  // y = 0 asks ground.ts from here on (game-root resets it on teardown).
+  // …and the ground authority adopts it FIRST: the hard-surface mask and the
+  // spawn settle below both ask ground.ts for the dirt under a point, and a
+  // stale (or absent) probe would put a driveway's height ceiling and the
+  // lot floor back on the y = 0 plane. Everything that used to assume y = 0
+  // reads from here on (game-root resets it on teardown).
   installGroundProbes({ colliders, site })
+  const roadFootprints = collectRoadFootprints(colliders)
+  const hostTrees = collectHostTrees(nodes)
   // The build lattice adopts the building's frame — identity when nothing
   // dominates (empty lot) or the building already sits on the legacy grid.
   const gridAnchor = deriveGridAnchor(walls.values())

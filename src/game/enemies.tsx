@@ -164,8 +164,10 @@ function spawnWave(world: GameWorld): void {
     const radius = 22 + Math.random() * 12
     const x = center.x + Math.cos(angle) * radius
     const z = center.z + Math.sin(angle) * radius
-    // Ring points on site-terrain hills spawn ON the hill, not inside it —
-    // spawnGroundY probes the (now solid) terrain and clamps ≥ 0.
+    // Ring points spawn ON the ground, hill or excavation — spawnGroundY
+    // probes the (solid) terrain and falls back to the heightfield off-lot.
+    // It no longer clamps to ≥ 0: that clamp put a whole wave five metres in
+    // the air over the owner's dug-out yards.
     spawnBot(KIND_CYCLE[i % KIND_CYCLE.length]!, x, z, spawnGroundY(world.colliders, x, z))
   }
 }
