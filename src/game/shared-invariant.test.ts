@@ -187,6 +187,49 @@ describe('the shared model cannot write a scene', () => {
       }
     }
   })
+
+  test('and it cannot reach peers work through a re-export either', async () => {
+    // The Save gate PULLS now: save-demolition asks destruction.ts, which asks
+    // shared-damage. That is a better shape than being handed a world — the
+    // bridge holds no SharedWorld handle and there is no module cycle — but it
+    // routes the projection through a module the import check above does not
+    // scan. So scan for the READERS themselves, by name, wherever they came
+    // from. Every one of these answers about the whole room.
+    const peerWide = [
+      'mergeDelta',
+      'snapshotOf',
+      'takePending',
+      'restorePending',
+      'liveRecords',
+      'damagedNodes',
+      'removedCells',
+      'brokenSegments',
+      'sharedWorldDebug',
+      'createSharedWorld',
+      'SharedWorld',
+    ]
+    for (const bridge of BRIDGES) {
+      const code = codeOf(await read(bridge))
+      for (const name of peerWide) {
+        expect(code, `${bridge} reads ${name}`).not.toContain(name)
+      }
+    }
+
+    // And the window a re-exporter opens must stay the projection's shape. Any
+    // function that hands sharedLocalWork()'s answer onwards has to say
+    // LocalWork in its signature; a wider return type is a wider window, and
+    // whoever writes one has to come back here and argue for it.
+    const gate = codeOf(await read('./destruction.ts'))
+    const exported = gate.split(/\nexport (?:async )?function /).slice(1)
+    let windows = 0
+    for (const block of exported) {
+      if (!block.includes('sharedLocalWork()')) continue
+      windows++
+      const signature = block.slice(0, block.indexOf('{'))
+      expect(signature, `${signature.trim()} is not LocalWork-shaped`).toContain('LocalWork')
+    }
+    expect(windows).toBe(1)
+  })
 })
 
 // ── Fence 2: the projection ─────────────────────────────────────────────────
