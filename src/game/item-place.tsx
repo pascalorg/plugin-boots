@@ -32,12 +32,22 @@ import {
   isItemMenuOpen,
   isOpeningEntry,
   type MenuEntry,
+  OPENING_ENTRIES,
   type OpeningEntry,
   openItemMenu,
+  placeableCatalog,
 } from './inventory'
 import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
 import { getSession } from './session'
+import {
+  buildSyncOn,
+  forgetSharedPlacements,
+  isForeignPlacement,
+  publishAperture,
+  publishItem,
+  setBuildAppliers,
+} from './shared-build'
 import {
   bvhFor,
   type ColliderEntry,
@@ -140,7 +150,18 @@ type ItemsState = {
   arm: (asset: MenuEntry) => void
   disarm: () => void
   addItem: (asset: CatalogEntry, position: [number, number, number], yaw: number) => PlacedItem
-  addAperture: (def: OpeningEntry, wallId: string, u: number, v: number) => PlacedAperture
+  /** `size` overrides the entry's nominal dimensions — a REMOTE aperture is
+   * materialized from its record, not re-derived from the local catalog. */
+  addAperture: (
+    def: OpeningEntry,
+    wallId: string,
+    u: number,
+    v: number,
+    size?: { width: number; height: number },
+  ) => PlacedAperture
+  /** Drop one placement. Only the shared lane uses it: a placement whose
+   * record was tombstoned elsewhere goes away here too. */
+  removeItem: (id: number) => void
   /** Save/Discard resolution — forgets every placement. */
   resolveItems: () => void
 }
@@ -157,7 +178,7 @@ export const useItems = create<ItemsState>((set, get) => ({
     set((s) => ({ items: [...s.items, stored] }))
     return stored
   },
-  addAperture: (def, wallId, u, v) => {
+  addAperture: (def, wallId, u, v, size) => {
     const stored: PlacedAperture = {
       kind: 'aperture',
       id: itemId++,
@@ -165,12 +186,13 @@ export const useItems = create<ItemsState>((set, get) => ({
       wallId,
       u,
       v,
-      width: def.width,
-      height: def.height,
+      width: size?.width ?? def.width,
+      height: size?.height ?? def.height,
     }
     set((s) => ({ items: [...s.items, stored] }))
     return stored
   },
+  removeItem: (id) => set((s) => ({ items: s.items.filter((p) => p.id !== id) })),
   resolveItems: () => set({ items: [] }),
 }))
 
@@ -184,6 +206,43 @@ export function itemGhostActive(): boolean {
  * caps); each placement is a full GLB clone worth of draw calls. The ghost
  * refuses ('occupied') at the cap; Save/Discard resets the count. */
 export const MAX_PLACED_ITEMS = 64
+
+/**
+ * How much of the budget THIS player has spent.
+ *
+ * The cap is a draw-call budget on placements you are answerable for, and it
+ * has to be, because with a shared world the list also holds everyone else's
+ * furniture: counting the whole thing would let three other players spend
+ * your allowance and leave you unable to put down a chair. Identical to
+ * `items.length` when sync is off, which is the single-player path unchanged.
+ */
+function ownPlacementCount(items: readonly Placement[]): number {
+  if (!buildSyncOn()) return items.length
+  let n = 0
+  for (const p of items) if (!isForeignPlacement(p.id)) n++
+  return n
+}
+
+/**
+ * Is this placement another player's work?
+ *
+ * item-keep.ts asks THIS instead of shared-build: a Save bridge may import
+ * `localWork` from a shared module and nothing else, and
+ * shared-invariant.test.ts enforces it. The lane owns the authorship
+ * registry, so the bridge asks its own lane. Always false in single-player.
+ */
+export function isForeignItemPlacement(id: number): boolean {
+  return isForeignPlacement(id)
+}
+
+/**
+ * Save/Discard resolved the placements: unbind ours WITHOUT tombstoning them.
+ * Saving turns them into real nodes on this screen; on every other screen they
+ * are still the chairs and doors they always were.
+ */
+export function releaseSharedItemPlacements(): void {
+  forgetSharedPlacements()
+}
 
 /** Max anchor distance from the player (matches the builder's edit reach). */
 export const ITEM_REACH = 6
@@ -1029,6 +1088,47 @@ export function GameItems({ world }: { world: GameWorld }) {
     wallFramesRef.current = null
   }, [world])
 
+  // REMOTE PLACEMENTS. The catalog lane keeps its store module-private, so it
+  // hands shared-build the three functions that can reach it rather than
+  // letting shared-build import this file (which would close an import cycle
+  // through inventory + destruction). Installed for the session; a mounted
+  // applier with no world attached is never called.
+  useEffect(() => {
+    setBuildAppliers({
+      spawnItem: (rec) => {
+        // The catalog is the same on every peer, but a row can still be
+        // missing (a host that ships a different bundle). Refusing the spawn
+        // leaves the record alive and untombstoned — nobody else loses the
+        // chair because this client cannot draw it.
+        const asset = placeableCatalog().find((entry) => entry.id === rec.catalogId)
+        if (!asset) return null
+        return useItems.getState().addItem(asset, [rec.x, rec.y, rec.z], rec.yaw).id
+      },
+      spawnAperture: (rec) => {
+        const def = OPENING_ENTRIES.find((entry) => entry.id === rec.catalogId)
+        if (!def) return null
+        // Size comes from the RECORD, not from the local entry: the outcome
+        // travelled, and a stand-in that quietly resized itself would leave
+        // two players disagreeing about whether the next door fits beside it.
+        // A wall this client does not have renders nothing (PlacedApertureMesh
+        // returns null) while the record stays converged.
+        return useItems
+          .getState()
+          .addAperture(def, rec.host, rec.u, rec.v, { width: rec.width, height: rec.height }).id
+      },
+      removePlacement: (runtimeId) => {
+        useItems.getState().removeItem(runtimeId)
+      },
+    })
+    return () => {
+      setBuildAppliers({
+        spawnItem: undefined,
+        spawnAperture: undefined,
+        removePlacement: undefined,
+      })
+    }
+  }, [])
+
   // Dev/QA handle (the __boots / __bootsBuilder idiom): the catalog lane's
   // live state + an on-demand wall-aim probe — headless QA sees exactly
   // what the aperture ghost sees. Plain data, never live refs.
@@ -1252,7 +1352,7 @@ export function GameItems({ world }: { world: GameWorld }) {
         ]
       }
       const blocked =
-        state.items.length >= MAX_PLACED_ITEMS ||
+        ownPlacementCount(state.items) >= MAX_PLACED_ITEMS ||
         snappedU === null ||
         !apertureFits(rect, wall.length, wall.height, obstacles.rects)
       if (apGhost) {
@@ -1281,7 +1381,13 @@ export function GameItems({ world }: { world: GameWorld }) {
       session.hud.ghostStatus?.(blocked ? 'occupied' : null, 'items')
       const apFiring = session.input.state.firing
       if (apFiring && !prevFire.current && !blocked && !useBoots.getState().staggered) {
-        useItems.getState().addAperture(def, wall.wallId, u, def.sill + def.height / 2)
+        const stored = useItems
+          .getState()
+          .addAperture(def, wall.wallId, u, def.sill + def.height / 2)
+        // Wall-RELATIVE on the wire (host id + u,v + size), so it lands on the
+        // same wall for a peer whose build grid is a different frame entirely
+        // — an opening belongs to its wall, not to the lot.
+        publishAperture(stored.id, def.id, wall.wallId, stored.u, stored.v, stored.width, stored.height)
         sfx.place()
       }
       prevFire.current = apFiring
@@ -1345,7 +1451,7 @@ export function GameItems({ world }: { world: GameWorld }) {
     // would wedge the player inside, with no in-game item undo to escape).
     // The session budget refuses the same way once the cap is hit.
     const blocked =
-      state.items.length >= MAX_PLACED_ITEMS ||
+      ownPlacementCount(state.items) >= MAX_PLACED_ITEMS ||
       itemOverlapsPlayer(
         _anchor.x,
         y,
@@ -1372,7 +1478,11 @@ export function GameItems({ world }: { world: GameWorld }) {
       !blocked &&
       !useBoots.getState().staggered
     ) {
-      useItems.getState().addItem(state.armed as CatalogEntry, [_anchor.x, y, _anchor.z], yaw)
+      const asset = state.armed as CatalogEntry
+      const stored = useItems.getState().addItem(asset, [_anchor.x, y, _anchor.z], yaw)
+      // The wire carries the catalog id, not the asset: every peer runs the
+      // same catalog, and a row is ~1 KB of JSON against 5 numbers.
+      publishItem(stored.id, asset.id, stored.position, stored.yaw)
       sfx.place()
     }
     prevFire.current = firing
