@@ -20,6 +20,7 @@ import {
   type CollabBusMessage,
   ingestBusMessage,
   NET_PROTOCOL,
+  netCounters,
   resetNetKinds,
   stopNet,
 } from './net'
@@ -31,7 +32,7 @@ import {
 } from './shared-damage'
 import { buildSyncOn, resetSharedBuild } from './shared-build'
 import { bytesToBase64, decodeDeltaText, encodeDeltaText, MAX_TEXT_CHARS } from './shared-wire'
-import { cellKey, emptyDelta, type SharedDelta } from './shared-world'
+import { cellKey, emptyDelta, setGridStamp, type SharedDelta } from './shared-world'
 
 /**
  * The adapter's own seam: net.ts <-> shared-world.ts. net.test.ts already owns
@@ -501,6 +502,98 @@ describe('late join', () => {
     await sleep(600)
     expect(framesOn(bus, WORLD_SNAP_KIND).length).toBe(1)
     expect(worldSyncDebug().throttled).toBeGreaterThan(0)
+  })
+})
+
+describe('our own name is not a constant', () => {
+  /**
+   * The host installs a bus per awareness runtime and its scope key includes the
+   * session id, so anything that re-keys the session replaces the bus object.
+   * Bound to the old one we would go deaf — and the id we can read belongs to
+   * that dead bus, so a check on the id alone could never notice.
+   */
+  test('a bus swap rebinds the transport instead of going deaf', () => {
+    installBus('session-me')
+    startWorldSync()
+    const world = worldSyncWorld()
+    const swapsBefore = netCounters().swaps
+
+    // Same name, new object: a plain reconnect.
+    const fresh = installBus('session-me')
+    pumpWorldSync()
+
+    expect(netCounters().swaps).toBe(swapsBefore + 1)
+    // Same identity, so the session and its records are kept.
+    expect(worldSyncWorld()).toBe(world)
+    expect(worldSyncDebug().rekeys).toBe(0)
+    // And we are listening on the NEW bus, not the corpse.
+    expect(fresh.handler).not.toBe(null)
+    inbound(WORLD_KIND, encodeDeltaText(damageDelta('alice')), 'session-alice')
+    expect(worldSyncWorld()!.nodes.size).toBe(1)
+  })
+
+  test('a re-key re-mints us under the new name', () => {
+    installBus('session-old')
+    startWorldSync()
+    expect(worldSyncWorld()?.self).toBe('session-old')
+
+    installBus('session-new')
+    pumpWorldSync()
+
+    expect(worldSyncDebug().rekeys).toBe(1)
+    expect(worldSyncActive()).toBe(true)
+    expect(worldSyncWorld()?.self).toBe('session-new')
+    // The recovery must not be silent, and it must not look like an error.
+    expect(worldSyncDebug().applyErrors).toBe(0)
+  })
+
+  /**
+   * Without this the fix would trade the bug for a permanent version of itself:
+   * slotsOk demands a NON-ZERO stamp equal to the receiver's, and the stamp is
+   * only ever published when the storey ladder installs, so a fresh world would
+   * publish 0 forever and every slot-addressed record would be refused.
+   */
+  test('the lot grid fingerprint survives a re-key', () => {
+    installBus('session-old')
+    startWorldSync()
+    setGridStamp(worldSyncWorld()!, 0xbeef)
+
+    installBus('session-new')
+    pumpWorldSync()
+
+    expect(worldSyncWorld()?.gridStamp).toBe(0xbeef)
+  })
+
+  test('a re-key says the whole of it again, so peers get the new prefix', () => {
+    installBus('session-old')
+    startWorldSync()
+    const fresh = installBus('session-new')
+    pumpWorldSync() // detects, restarts, queues the snapshot
+    pumpWorldSync() // publishes one frame of it
+    expect(framesOn(fresh, WORLD_SNAP_KIND).length).toBeGreaterThan(0)
+  })
+
+  test('the bus disappearing stops the session instead of queueing into a corpse', () => {
+    installBus()
+    startWorldSync()
+    delete g.__pascalCollabBus
+    pumpWorldSync()
+    expect(worldSyncDebug().busLost).toBe(1)
+    expect(worldSyncActive()).toBe(false)
+    expect(buildSyncOn()).toBe(false)
+    expect(damageSyncActive()).toBe(false)
+  })
+
+  test('a steady bus never restarts anything', () => {
+    installBus()
+    startWorldSync()
+    const world = worldSyncWorld()
+    const swapsBefore = netCounters().swaps
+    for (let i = 0; i < 5; i++) pumpWorldSync()
+    expect(worldSyncWorld()).toBe(world)
+    expect(worldSyncDebug().rekeys).toBe(0)
+    expect(worldSyncDebug().busLost).toBe(0)
+    expect(netCounters().swaps).toBe(swapsBefore)
   })
 })
 

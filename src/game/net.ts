@@ -268,6 +268,8 @@ type NetState = {
   published: number
   received: number
   dropped: number
+  /** Times the host replaced the installed bus under us (see resyncNet). */
+  swaps: number
 }
 
 const state: NetState = {
@@ -280,6 +282,7 @@ const state: NetState = {
   published: 0,
   received: 0,
   dropped: 0,
+  swaps: 0,
 }
 
 // ── Registration + subscription ──────────────────────────────────────────────
@@ -638,8 +641,58 @@ export function netAvailable(): boolean {
   return state.active && state.bus !== null
 }
 
-export function netCounters(): { published: number; received: number; dropped: number } {
-  return { published: state.published, received: state.received, dropped: state.dropped }
+/** The bus object we are actually bound to — for identity comparison only. */
+export function netBus(): CollabBus | null {
+  return state.bus
+}
+
+/**
+ * Rebind if the host swapped the bus out from under us. Returns true when the
+ * binding changed, so a caller whose identity depends on the bus can react.
+ *
+ * WHY THIS EXISTS. startNet captures the bus object once, but the host installs
+ * a bus per awareness runtime and uninstalls it on dispose. Its scope key
+ * includes the session id, so anything that re-keys the session — the outbox
+ * lease adopting a restored pending operation's id is the real path — tears the
+ * old bus down and installs a NEW object carrying the NEW id. Bound to the dead
+ * one we would go silently deaf: its subscribe closure is gone, so no frame ever
+ * arrives again, while publish still reaches the wire through the host's live
+ * send and gets stamped with the id we no longer know about.
+ *
+ * That is why identity is compared by OBJECT and not by session id. The id we
+ * can read is the stale bus's own field, so it would keep answering with the old
+ * value forever and a check against it could never fire.
+ */
+export function resyncNet(): boolean {
+  if (!state.active) return false
+  const installed = getCollabBus()
+  if (installed === state.bus) return false
+  // startNet zeroes the traffic counters; a rebind is not a fresh session, so
+  // the history carries across or a swap would erase the evidence of itself.
+  const carried = { published: state.published, received: state.received, dropped: state.dropped }
+  stopNet()
+  // A bus that is simply gone (collab turned off, editor teardown) leaves us
+  // stopped and honest rather than bound to a corpse.
+  if (installed) startNet()
+  state.published = carried.published
+  state.received = carried.received
+  state.dropped = carried.dropped
+  state.swaps++
+  return true
+}
+
+export function netCounters(): {
+  published: number
+  received: number
+  dropped: number
+  swaps: number
+} {
+  return {
+    published: state.published,
+    received: state.received,
+    dropped: state.dropped,
+    swaps: state.swaps,
+  }
 }
 
 /** Test-only: forget registered kinds so suites do not bleed into each other

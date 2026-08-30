@@ -154,6 +154,26 @@ The two late-join kinds are owned by the **transport**, not by a kind owner,
 and are always registered: you ask for state precisely because you have
 none, so `requestState` must work before you have subscribed to anything.
 
+## The installed bus is not forever
+
+`startNet()` caches `globalThis.__pascalCollabBus` once. The host builds one bus
+per awareness runtime and that runtime's scope key **includes the session id**,
+so anything that re-keys the session uninstalls the old bus and installs a new
+object. Holding the old one we are bound to a corpse: nothing inbound arrives,
+while `publish` still reaches the wire stamped with the *new* id.
+
+`resyncNet()` closes that. It compares the installed bus against `netBus()` by
+**object identity** and rebinds if they differ, carrying `published` / `received`
+/ `dropped` across so a swap cannot erase the evidence of itself, and counting
+the swap in `netCounters().swaps`. A bus that is simply gone (collab off, editor
+teardown) leaves the transport stopped and honest rather than bound to a corpse.
+
+Identity is compared by object and **not** by session id, because the id we can
+read is the stale bus's own field: it would answer with the old value forever, so
+a check against it could never fire. Any subsystem that keys long-lived state on
+`localSessionId()` must call `resyncNet()` before trusting it — `net-world.ts`
+does this at the top of every publish tick (Part 4).
+
 # Part 2 — avatar co-presence (`presence.ts`)
 
 While a Boots session runs, the plugin publishes a tiny pose frame ~12 times
@@ -394,7 +414,7 @@ reaching for a wire, so this is where they get wired.
 | `worldSyncWorld()` | The session's world, or null. Read-only: the lanes own every mutation. |
 | `pumpWorldSync()` | Run one outbound tick now. QA and tests only; the interval is the normal path. |
 | `publishWorldSnapshot()` | Queue a heal broadcast (QA / debug HUD). |
-| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
+| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / rekeys / busLost / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
 
 **Attach order is load-bearing.** The lanes are attached *before* the
 subscriptions exist and before `session` is set, because a frame that arrives
@@ -496,6 +516,51 @@ later frame lands and nothing is lost; the honest fix belongs to the notice, not
 the transport: *do not surface a grid-mismatch notice while `world.gridStamp` is
 0*, because 0 means unknown, not different.
 
+**Our own name is not a constant, so it is checked every tick.** `world.self` is
+the prefix on every record id we mint, and a *peer* gates each inbound record
+with `isAuthoredBy(rec.id, msg.sessionId)` — the sender read live off the
+envelope. So the model quietly depends on our session id never moving, and the
+host does not promise that: the collab runtime adopts a restored pending
+operation's session id when the outbox lease comes back
+(`runtime.sessionId = runtime.pendingOperation.sessionId`), and the awareness
+bus scope key includes the session id, so the whole bus is replaced with one
+carrying the new name.
+
+Left alone the symptom is **"his holes appear, his walls don't"**, and it reads
+as a build-lane bug. Damage cells are unauthored, so they keep landing; every
+piece, item, aperture and stroke is refused by every peer. Nothing looks wrong
+locally — our prefix stays self-consistent, so `localWork`, `fullyMine()` and the
+Save panel all keep telling the truth about us.
+
+`pump()` therefore begins with `identityHeld()`, which `resyncNet()`s (see Part
+1: the id alone cannot see this, because the id we can read belongs to the stale
+bus) and compares `localSessionId()` against `world.self`. On a change it counts
+`rekeys`, restarts the session, **carries the lot's `gridStamp` across** —
+without that the fresh world publishes 0 and `slotsOk` refuses every
+slot-addressed record for the rest of the session, since the stamp is only ever
+published when the storey ladder installs — re-mints our fort under the new
+prefix with `reconcileSharedPieces()`, and queues a snapshot so peers hear it
+promptly instead of at the next heal. A vanished bus counts `busLost` and stops.
+The recovery is never silent: a silent recovery is nearly as bad as the bug.
+
+**What that costs, because it is not obvious.** The work we already published
+under the old name does not come back to us. Peers **keep** those records — they
+are grow-only and still validly authored by an id that existed — and we can no
+longer tombstone them, because killing a record requires owning its prefix. Then
+`reconcileSharedPieces()` re-mints the same pieces under the new prefix and the
+snapshot publishes them, so in every peer that saw both, **the same wall can
+exist twice**: once orphaned under the dead name, once live under ours. Locally
+we see one. The pieces are co-located, so it shows up as z-fighting or doubled
+paint rather than clutter, and demolishing ours leaves the orphan standing.
+
+Fixing that properly needs something this design does not have: a stable identity
+independent of the transport session (a per-client build id minted once and
+carried in the record prefix, with the session id used only for the authorship
+gate). That is a Part 3 change to a frozen file, so it is logged here rather than
+attempted. A re-key is rare — it needs an outbox lease to be restored mid-game —
+and `rekeys > 0` on the QA handle is the thing to look at first if anyone reports
+duplicated geometry in a lobby.
+
 **What is still not handled, stated rather than hidden.** A frame lost to the
 outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a
 timer — it heals when the next snapshot goes out, up to `HEAL_PERIOD_MS` later.
@@ -512,3 +577,16 @@ copy, which is a discipline problem rather than a design one; if flag-on testing
 ever spans two machines, fold a codec fingerprint in beside `gridStamp` rather
 than trusting that everyone copied the same files. Logged as a deliberate
 deferral, not a surprise.
+
+**Hot-deploy discipline (how this file breaks the host bundle).** Testing
+flag-on means `cp`-ing changed files per-file into **both** host copies of the
+package (`editor/apps/editor/node_modules/@pascal-app/plugin-boots/...` and
+`apps/community/node_modules/@pascal-app/plugin-boots/...`); never rsync
+directories. Two traps: a **new** file needs its own `cp` — nothing else will
+carry it — and so does **every file that imports it**, or the host bundle fails
+to resolve a module that exists in the repo and the editor route returns 500.
+This bit once already: `net-world.ts` importing a never-deployed
+`shared-build.ts` was harmless while nothing called `startWorldSync()`, and became
+a hard 500 the moment `game-root.tsx` wired it up. If `localhost:3002` starts
+answering 500 with "Can't resolve './shared-…'", the repo is fine and the copies
+are stale.

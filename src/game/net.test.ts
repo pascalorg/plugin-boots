@@ -15,6 +15,7 @@ import {
   MAX_PAYLOAD_SERIALIZED,
   NET_PROTOCOL,
   netAvailable,
+  netBus,
   netCounters,
   type NetMessage,
   onFrame,
@@ -29,6 +30,7 @@ import {
   registerFrameKind,
   requestState,
   resetNetKinds,
+  resyncNet,
   sendStateSnapshot,
   SEQ_TRACK_MAX,
   serializedLength,
@@ -873,5 +875,84 @@ describe('late join — request, election, snapshot', () => {
       state: { removed: ['cell-1', 'cell-2'] },
     })
     offRequest()
+  })
+})
+
+// ── Rebinding: the host may replace the bus under us ─────────────────────────
+
+describe('the installed bus is not forever', () => {
+  /**
+   * The host builds one bus per awareness runtime and its scope key includes the
+   * session id, so a re-key uninstalls the old bus and installs a new object.
+   * `startNet` caches that object, so without a resync we hold a corpse: deaf
+   * inbound, while `localSessionId()` keeps confidently reporting the dead bus's
+   * old name — which is exactly why the check is on OBJECT identity.
+   */
+  test('a swapped bus is rebound, and the swap is counted', () => {
+    installBus()
+    startNet()
+    registerFrameKind('pose', echo)
+    const { got } = collect('pose')
+    // `swaps` deliberately survives startNet — a rebind is not a fresh session —
+    // so it is a lifetime counter and the suite measures it as a delta.
+    const swaps = netCounters().swaps
+
+    const next = makeBus()
+    next.sessionId = 'session-new'
+    g.__pascalCollabBus = next
+
+    expect(resyncNet()).toBe(true)
+    expect(netBus()).toBe(next)
+    expect(netCounters().swaps).toBe(swaps + 1)
+    expect(localSessionId()).toBe('session-new')
+    // Registered kinds and their handlers survive: a rebind is not a reset.
+    next.handler!(inbound(frame('pose', 1, { x: 1 }), { sessionId: 'session-a' }))
+    expect(got.length).toBe(1)
+  })
+
+  test('a rebind keeps the traffic history, or a swap would erase its own evidence', () => {
+    const bus = installBus()
+    startNet()
+    registerFrameKind('pose', echo)
+    const { got } = collect('pose')
+    publishFrame('pose', { x: 1 })
+    bus.handler!(inbound(frame('pose', 1, { x: 1 }), { sessionId: 'session-a' }))
+    expect(got.length).toBe(1)
+    const before = netCounters()
+    expect(before.published).toBeGreaterThan(0)
+    expect(before.received).toBeGreaterThan(0)
+
+    g.__pascalCollabBus = makeBus()
+    resyncNet()
+
+    const after = netCounters()
+    expect(after.published).toBe(before.published)
+    expect(after.received).toBe(before.received)
+    expect(after.dropped).toBe(before.dropped)
+  })
+
+  test('the same bus is not a swap', () => {
+    installBus()
+    startNet()
+    const swaps = netCounters().swaps
+    expect(resyncNet()).toBe(false)
+    expect(netCounters().swaps).toBe(swaps)
+  })
+
+  test('a bus that vanished leaves us stopped rather than bound to a corpse', () => {
+    installBus()
+    startNet()
+    delete g.__pascalCollabBus
+    expect(resyncNet()).toBe(true)
+    expect(netAvailable()).toBe(false)
+    expect(netBus()).toBe(null)
+    expect(localSessionId()).toBe(null)
+  })
+
+  test('nothing to rebind before anything started', () => {
+    installBus()
+    const swaps = netCounters().swaps
+    expect(resyncNet()).toBe(false)
+    expect(netCounters().swaps).toBe(swaps)
   })
 })

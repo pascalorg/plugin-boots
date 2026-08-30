@@ -85,10 +85,16 @@ import {
   publishFrame,
   registerFrameKind,
   requestState,
+  resyncNet,
   startNet,
 } from './net'
 import { applySharedDamage, setDamageSync } from './shared-damage'
-import { applyBuildEffects, attachBuildSync, detachBuildSync } from './shared-build'
+import {
+  applyBuildEffects,
+  attachBuildSync,
+  detachBuildSync,
+  reconcileSharedPieces,
+} from './shared-build'
 import {
   createOutbox,
   decodeDeltaText,
@@ -102,6 +108,7 @@ import {
   createSharedWorld,
   isSafePeerId,
   mergeDelta,
+  setGridStamp,
   type SharedDelta,
   type SharedWorld,
   snapshotOf,
@@ -152,6 +159,15 @@ type Counters = {
    * It is the measure of exactly how many frames the journal saved us.
    */
   laneSinkIgnored: number
+  /**
+   * Times the host re-keyed our session id mid-game and we re-minted under the
+   * new name. Never silent: a recovery nobody can see is nearly as bad as the
+   * bug, because our earlier records are now orphaned in peers' worlds under a
+   * name we no longer own.
+   */
+  rekeys: number
+  /** Times the bus disappeared entirely and the session stopped. */
+  busLost: number
   /** Exceptions escaping an applier (counted, never rethrown into the host). */
   applyErrors: number
 }
@@ -175,6 +191,8 @@ const counters: Counters = {
   snapshots: 0,
   throttled: 0,
   laneSinkIgnored: 0,
+  rekeys: 0,
+  busLost: 0,
   applyErrors: 0,
 }
 
@@ -213,6 +231,65 @@ function queueSnapshot(s: Session, now: number): void {
 }
 
 /**
+ * OUR NAME IS NOT A CONSTANT, SO IT IS CHECKED EVERY TICK.
+ *
+ * `world.self` is the prefix on every record id we mint, and peers gate an
+ * inbound record with `isAuthoredBy(rec.id, msg.sessionId)` — sender read from
+ * the envelope, live, per frame. So the model quietly depends on our session id
+ * staying put for the life of the game. The host does not promise that: the
+ * collab runtime adopts a restored pending operation's session id when the
+ * outbox lease comes back, and its bus scope key includes the session id, so the
+ * whole bus is replaced with one carrying the new name.
+ *
+ * Left alone the symptom is "his holes appear, his walls don't", and it reads as
+ * a build-lane bug. Damage cells are unauthored so they keep landing; every
+ * piece, item, aperture and stroke is refused by every peer. Nothing looks wrong
+ * locally — our own prefix stays self-consistent, so the Save panel keeps
+ * telling the truth about us.
+ *
+ * Returns false when this session is gone and the caller must stop touching it.
+ */
+function identityHeld(s: Session): boolean {
+  // Rebind first: comparing session ids alone cannot see this, because the id we
+  // can read belongs to the stale bus and would answer with the old value.
+  resyncNet()
+  const now = localSessionId()
+  if (!netAvailable() || now === null) {
+    // The bus went away entirely. Stop rather than requeue into a dead wire.
+    counters.busLost++
+    stopWorldSync()
+    return false
+  }
+  if (now === s.world.self) return true
+
+  counters.rekeys++
+  // The lot's grid fingerprint belongs to the LOT, not to us, so it must survive
+  // a change of name. Without it the new world publishes gridStamp 0 and peers
+  // refuse every slot-addressed record forever (slotsOk demands a non-zero
+  // stamp), which would trade this bug for a permanent version of it — the grid
+  // stamp is only ever published when the storey ladder installs, so nothing
+  // would set it again this session.
+  const stamp = s.world.gridStamp
+  stopWorldSync()
+  if (!startWorldSync()) return false
+  const fresh = session
+  if (!fresh) return false
+  if (stamp !== 0) setGridStamp(fresh.world, stamp)
+  // Re-mint our existing work under the new prefix. The old world went with the
+  // old name, so without this our fort is absent from everything we publish
+  // from now on, and only a fresh placement would ever bring it back.
+  try {
+    reconcileSharedPieces()
+  } catch {
+    counters.applyErrors++
+  }
+  // Say the whole of it once, so peers get the re-minted records promptly rather
+  // than at the next heal.
+  queueSnapshot(fresh, Date.now())
+  return false
+}
+
+/**
  * One tick: drain the journal into the outbox, then publish exactly one frame.
  *
  * A frame the host did not take goes back to the FRONT of the queue — the
@@ -222,6 +299,7 @@ function queueSnapshot(s: Session, now: number): void {
 function pump(): void {
   const s = session
   if (!s) return
+  if (!identityHeld(s)) return
 
   const out = takePending(s.world)
   if (out !== null && queueDelta(s.outbox, out) === 0) {
@@ -445,5 +523,7 @@ export function resetWorldSyncCounters(): void {
   counters.snapshots = 0
   counters.throttled = 0
   counters.laneSinkIgnored = 0
+  counters.rekeys = 0
+  counters.busLost = 0
   counters.applyErrors = 0
 }
