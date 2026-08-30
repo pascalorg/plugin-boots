@@ -619,6 +619,29 @@ slot" fires. And the rebind is deliberately not unbind-then-bind: `unbindPiece`
 drops the published fingerprint, so reconcile would read the piece as a *moved*
 wall, tombstone the record just minted and mint a third.
 
+**What makes that accounting trustworthy is an invariant, not luck.** Read on its
+own, `remintSharedRecords` looks able to swallow work the adapter already counted:
+it reads the build lane's own `sync` and returns `[]` when the lane is detached, so
+a re-key taken before the piece tree mounts would report `staleMints` with nothing
+recovered and no way to tell that apart from a genuine loss. It cannot happen, for
+two reasons that are both worth re-checking before either is changed:
+
+- `rekeySharedWorld` scans exactly the four record lanes (`LANES`), and
+  `shared-build.ts` is the **only** production caller of `addLocalPiece` /
+  `addLocalItem` / `addLocalAperture` / `addLocalStroke` — the one hit elsewhere,
+  in `paint.tsx`, is a comment. The ids the accounting names and the ids the
+  re-mint can act on therefore come from a single module, so a detached lane means
+  those journals are necessarily empty and both numbers are zero in the same
+  breath. **Mint into a record lane from outside that module and this stops
+  holding**: `staleMints` would count work the lane has never heard of, and the
+  loss figure would blame the re-mint for records it could never have seen.
+- `attachBuildSync` / `detachBuildSync` are called from `startWorldSync` /
+  `stopWorldSync` and nowhere else in production, so for as long as `pump` runs the
+  lane is attached — and attached to the *same world object* the adapter just
+  renamed. That is one more thing rename-in-place buys quietly: a
+  teardown-and-re-mint recovery would have left `sync.world` pointing at a world we
+  had already discarded, and the re-mint would have read the dead one.
+
 **Two residues, both deliberate.** Our snapshots still carry old-prefixed records
 that peers refuse — wasted bytes and an inflated `dropped` on their side —
 because "two peers answering one request produce byte-identical snapshots" is a

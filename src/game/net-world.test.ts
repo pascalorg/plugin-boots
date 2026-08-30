@@ -667,6 +667,41 @@ describe('our own name is not a constant', () => {
     expect(worldSyncDebug().staleReminted).toBe(0)
   })
 
+  /**
+   * WHAT MAKES THE STALE-MINT ACCOUNTING TRUSTWORTHY, fenced.
+   *
+   * `staleMints` is counted from the four record lanes rekeySharedWorld scans,
+   * while `staleReminted` can only ever cover what the BUILD LANE can re-mint —
+   * it reads its own `sync` and returns [] when detached. Those two numbers stay
+   * comparable for one reason: shared-build.ts is the only place in the plugin
+   * that mints into a record lane, so nothing can land in a journal that the
+   * re-mint has never heard of.
+   *
+   * Mint from a fifth site and `staleMints - staleReminted` silently stops being
+   * the loss figure documented in MULTIPLAYER.md Part 4 — it starts blaming the
+   * re-mint for records it could never have seen. Cheaper to fail here.
+   */
+  test('only the build lane mints into a record lane', async () => {
+    const glob = new Bun.Glob('*.{ts,tsx}')
+    const dir = new URL('.', import.meta.url).pathname
+    // shared-world.ts declares them; shared-build.ts is the one caller.
+    const allowed = new Set(['shared-world.ts', 'shared-build.ts'])
+    let callers = 0
+    for await (const file of glob.scan({ cwd: dir })) {
+      if (file.includes('.test.')) continue
+      const source = await Bun.file(`${dir}${file}`).text()
+      // Comments discuss these functions by name at length; scan code only.
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+      for (const match of code.matchAll(/(function\s+)?\baddLocal(?:Piece|Item|Aperture|Stroke)\s*\(/g)) {
+        if (match[1]) continue // the declaration itself
+        callers++
+        expect(allowed.has(file), `${file} mints into a record lane`).toBe(true)
+      }
+    }
+    // The fence is worthless if it scanned nothing.
+    expect(callers).toBeGreaterThan(0)
+  })
+
   test('a re-key with nothing pending loses nothing', () => {
     installBus('session-old')
     startWorldSync()
