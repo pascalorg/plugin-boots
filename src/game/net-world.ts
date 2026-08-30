@@ -89,7 +89,12 @@ import {
   startNet,
 } from './net'
 import { applySharedDamage, setDamageSync } from './shared-damage'
-import { applyBuildEffects, attachBuildSync, detachBuildSync } from './shared-build'
+import {
+  applyBuildEffects,
+  attachBuildSync,
+  detachBuildSync,
+  remintSharedRecords,
+} from './shared-build'
 import {
   createOutbox,
   decodeDeltaText,
@@ -165,6 +170,12 @@ type Counters = {
    * exactly the work a rename cannot save, bounded by one tick.
    */
   staleMints: number
+  /**
+   * How many of those the build lane could re-mint under the new name. The
+   * remainder, `staleMints - staleReminted`, is the work that genuinely never
+   * reaches a peer: strokes, and records whose runtime object is gone.
+   */
+  staleReminted: number
   /** Re-keys to a name that could never author a record. We stop instead. */
   unsafeNames: number
   /** Times the bus disappeared entirely and the session stopped. */
@@ -194,6 +205,7 @@ const counters: Counters = {
   laneSinkIgnored: 0,
   rekeys: 0,
   staleMints: 0,
+  staleReminted: 0,
   unsafeNames: 0,
   busLost: 0,
   applyErrors: 0,
@@ -285,10 +297,22 @@ function identityHeld(s: Session): boolean {
   // grid stamp; `formerSelves` keeps "is this mine?" answerable afterwards, so
   // Save still recognises the fort we built under the old name.
   const stale = rekeySharedWorld(s.world, now)
-  // The one thing a rename cannot save: adds still in the journal, minted under
-  // the old name, which no peer has and none will now accept. At most one tick's
-  // worth. Counted rather than swallowed — see MULTIPLAYER.md Part 4.
+  // Adds still in the journal when the rename landed carry the old name, so no
+  // peer has them and none will now accept them. Counted rather than swallowed.
   counters.staleMints += stale.length
+  // Then give that work a name peers WILL accept: the build lane re-mints each id
+  // it still has a runtime object for, through the ordinary local path, so the new
+  // records land in the journal and this tick drains them like any other. It skips
+  // what it cannot honestly recover — an unbound id (already resolved into the
+  // document, or deleted: resurrecting those is worse than losing them) and every
+  // stroke, which has no runtime object to re-read. Before queueSnapshot, so the
+  // snapshot we are about to queue already contains the re-minted records.
+  try {
+    counters.staleReminted += remintSharedRecords(stale).length
+  } catch {
+    // It contains its own failures per id; this is the belt for the braces.
+    counters.applyErrors++
+  }
   // Say the whole of it once, so a peer that missed anything gets it promptly
   // rather than at the next heal.
   queueSnapshot(s, Date.now())
@@ -532,6 +556,7 @@ export function resetWorldSyncCounters(): void {
   counters.laneSinkIgnored = 0
   counters.rekeys = 0
   counters.staleMints = 0
+  counters.staleReminted = 0
   counters.unsafeNames = 0
   counters.busLost = 0
   counters.applyErrors = 0

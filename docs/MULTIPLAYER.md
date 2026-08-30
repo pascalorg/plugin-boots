@@ -422,7 +422,7 @@ reaching for a wire, so this is where they get wired.
 | `worldSyncWorld()` | The session's world, or null. Read-only: the lanes own every mutation. |
 | `pumpWorldSync()` | Run one outbound tick now. QA and tests only; the interval is the normal path. |
 | `publishWorldSnapshot()` | Queue a heal broadcast (QA / debug HUD). |
-| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / rekeys / staleMints / unsafeNames / busLost / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
+| `worldSyncDebug()` | `sent / deferred / lost / oversize / merged / snapshots / throttled / laneSinkIgnored / rekeys / staleMints / staleReminted / unsafeNames / busLost / applyErrors`, plus `active`, `self`, and the outbox's `depth / overflow / superseded / requeued` and the world's `unsent`. |
 
 **Attach order is load-bearing.** The lanes are attached *before* the
 subscriptions exist and before `session` is set, because a frame that arrives
@@ -576,18 +576,48 @@ one invariant, one mechanism. It also files the old name into
 make this", the question Save asks — true across a rename. `isAuthoredBy` stays
 the **wire's** question and stays narrow: one live session vouches for one frame.
 
-**The one thing a rename cannot save** is an add that was minted but still in the
-journal when the re-key landed: no peer has it, and no peer will accept it now
-that our envelope says someone else. The bound is **"since the last
-`takePending`"**, which in play is one tick (≤66 ms of building) because the tick
-drains the journal unconditionally — but a harness that installs a lane sink
-instead of pumping never drains, so there every record it ever made is pending and
-`staleMints` counts all of them. It is counted rather than swallowed. The model will not
-rewrite those ids, because it does not know what the runtime bound them to — that
-map belongs to the build lane — so recovering them means re-publishing that work
-through the lane that owns the binding, and is deliberately not attempted here.
-`staleMints > 0` with no visible loss is the expected reading; `staleMints`
-climbing repeatedly would mean re-keys are not rare and this needs revisiting.
+**The work a rename leaves stranded, and how much of it comes back.** An add that
+was minted but still in the journal when the re-key landed carries the old name:
+no peer has it, and no peer will accept it now that our envelope says someone
+else. The bound is **"since the last `takePending`"**, which in play is one tick
+(≤66 ms of building) because the tick drains the journal unconditionally — but a
+harness that installs a lane sink instead of pumping never drains, so there every
+record it ever made is pending and `staleMints` counts all of them.
+
+`identityHeld` hands those ids straight to `remintSharedRecords(stale)`, which
+re-publishes each one it can through the ordinary **local** path, so the new
+records land in the journal and this tick drains them like any other — the adapter
+remains the only thing that publishes. Four properties of that call are the
+adapter's to keep, and are tested here rather than in the lane:
+
+- **It runs before `queueSnapshot`.** The snapshot a re-key queues has to already
+  contain the re-minted records, or a peer waits a whole heal period for work it
+  could have had in the same breath.
+- **It cannot cost us the snapshot.** Each id re-mints inside its own `try` in the
+  lane, and the call site wraps the whole thing again and counts `applyErrors`, so
+  a lane that falls over loses its own work and nothing else. Tested by making it
+  throw and asserting the rename and the snapshot both still happened.
+- **It is asked for exactly the stale ids**, and for nothing when the journal was
+  empty.
+- **What it skips, it skips on purpose.** An id with no runtime object left is
+  gone or already resolved into the document, and re-publishing it would resurrect
+  a wall the player deleted or saved. Strokes have no runtime object to re-read at
+  all, only the coat ledger they already folded into.
+
+So `staleReminted` is what came back and **`staleMints - staleReminted` is the
+honest loss**: strokes, plus anything whose runtime object had already gone. Both
+are on `__boots.worldSync()`. `staleMints > 0` with a matching `staleReminted` is
+the ordinary reading of a re-key; either climbing repeatedly means re-keys are not
+rare and this design needs revisiting.
+
+Two choices inside the re-mint are worth knowing at this seam, because they look
+like omissions. It does **not** tombstone the record it replaces: nobody ever saw
+that record, and for pieces the election collapses the pair on its own — the
+re-mint is canonically later, so it wins, and nothing is bound to the loser, so
+`installPieces` uninstalls nothing and no false "Another builder claimed that wall
+slot" fires. And the rebind is deliberately not unbind-then-bind: `unbindPiece`
+drops the published fingerprint, so reconcile would read the piece as a *moved*
+wall, tombstone the record just minted and mint a third.
 
 **Two residues, both deliberate.** Our snapshots still carry old-prefixed records
 that peers refuse — wasted bytes and an inflated `dropped` on their side —

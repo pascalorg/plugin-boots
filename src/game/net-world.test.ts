@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   HEAL_PERIOD_MS,
   MAX_WIRE_TEXT,
@@ -31,6 +31,7 @@ import {
   publishRemovedKeys,
   resetSharedDamage,
 } from './shared-damage'
+import * as build from './shared-build'
 import { buildSyncOn, resetSharedBuild } from './shared-build'
 import { bytesToBase64, decodeDeltaText, encodeDeltaText, MAX_TEXT_CHARS } from './shared-wire'
 import {
@@ -589,6 +590,81 @@ describe('our own name is not a constant', () => {
     pumpWorldSync()
 
     expect(worldSyncDebug().staleMints).toBe(2)
+    // Strokes cannot be re-minted: there is no runtime object to re-read, only
+    // the coat ledger they already folded into. So they are the honest remainder.
+    expect(worldSyncDebug().staleReminted).toBe(0)
+    expect(worldSyncDebug().applyErrors).toBe(0)
+  })
+
+  /**
+   * The re-mint runs BEFORE the snapshot on purpose: the snapshot a re-key queues
+   * has to already contain the records minted under the new name, or a peer waits
+   * a whole heal period for work it could have had in the same breath. Proven at
+   * this seam rather than in the lane, because the ORDER is the adapter's to keep.
+   */
+  test('the stale ids go to the re-mint, and before the snapshot is queued', () => {
+    installBus('session-old')
+    startWorldSync()
+    const world = worldSyncWorld()!
+    const mine = addLocalStroke(world, {
+      node: 'node-9',
+      color: 3,
+      x: 1,
+      y: 1,
+      z: 1,
+      radius: 0.4,
+    })!
+    const calls: Array<{ ids: readonly string[]; snapshots: number }> = []
+    const spy = spyOn(build, 'remintSharedRecords').mockImplementation((ids) => {
+      calls.push({ ids: [...ids], snapshots: worldSyncDebug().snapshots })
+      return []
+    })
+
+    installBus('session-new')
+    const snapsBefore = worldSyncDebug().snapshots
+    pumpWorldSync()
+    spy.mockRestore()
+
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.ids).toEqual([mine.id])
+    // No snapshot had been queued yet when the re-mint ran.
+    expect(calls[0]!.snapshots).toBe(snapsBefore)
+    expect(worldSyncDebug().snapshots).toBe(snapsBefore + 1)
+  })
+
+  test('a re-mint that blows up costs its own work, not the snapshot', () => {
+    installBus('session-old')
+    startWorldSync()
+    addLocalStroke(worldSyncWorld()!, { node: 'node-9', color: 3, x: 1, y: 1, z: 1, radius: 0.4 })
+    const spy = spyOn(build, 'remintSharedRecords').mockImplementation(() => {
+      throw new Error('the lane fell over')
+    })
+
+    installBus('session-new')
+    const snapsBefore = worldSyncDebug().snapshots
+    pumpWorldSync()
+    spy.mockRestore()
+
+    expect(worldSyncDebug().applyErrors).toBe(1)
+    expect(worldSyncDebug().staleReminted).toBe(0)
+    // The rename still happened and the room still gets told.
+    expect(worldSyncWorld()?.self).toBe('session-new')
+    expect(worldSyncDebug().snapshots).toBe(snapsBefore + 1)
+  })
+
+  test('nothing pending means the re-mint is asked for nothing', () => {
+    installBus('session-old')
+    startWorldSync()
+    pumpWorldSync() // drain, so the journal is empty
+    const spy = spyOn(build, 'remintSharedRecords')
+
+    installBus('session-new')
+    pumpWorldSync()
+    const ids = spy.mock.calls.map((c) => c[0])
+    spy.mockRestore()
+
+    expect(ids).toEqual([[]])
+    expect(worldSyncDebug().staleReminted).toBe(0)
   })
 
   test('a re-key with nothing pending loses nothing', () => {
