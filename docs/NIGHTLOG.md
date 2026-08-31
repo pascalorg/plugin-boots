@@ -1602,12 +1602,37 @@ maps polygonOffsetUnits/Factor to depthBias/depthBiasSlopeScale in
 WebGPUPipelineUtils (triangle-list only), so the decal lane's separation
 from the wall is real, not a silent no-op.
 
-WHAT IS LEFT. The remaining uncontrolled variable is the GPU: this
-harness runs headless Chromium, the report is a real Metal device, and a
-one-frame pipeline/texture-readiness artifact is exactly the class of bug
-that differs between them. Deliberately NOT shipping a speculative
-pre-warm "fix" for an artifact no measurement here has seen. Next step
-needs one thing only the owner can give: whether it happens on the FIRST
-click of a session or on EVERY click, and whether the wall was already
-shot up. Re-run with NOPROBE=1 CYCLE=n (cold, per-colour) or VOXELIZE=1
-(sprite lane) once that is known.
+FOURTH NEGATIVE — ON THE REAL GPU (2026-08-31). The variable named below
+as the one left is now controlled: `GPU=1` runs the same harness HEADED,
+with WebGPU enabled, on the owner's own Metal device (window parked
+off-screen so it does not take the desktop). 441 recorder frames, 155
+screencast frames, 17 decal stamps over a 2.2 s sweeping hold: every stamp
+reads #e5443b on its first frame, every live dust instance wears the coat
+(#b5..#d3 red at alpha 0.06-0.22), and there is no near-white frame in the
+crosshair patch after the trigger. The captured frames are real pixels —
+checked by eye, not just by the threshold — so this is a negative and not
+an empty canvas.
+
+WHAT IS LEFT. Two differences from the owner's session remain, and neither
+is the GPU:
+  1. BUILD — the harness drives `localhost:3002` (the editor app in dev).
+     The report is a production bundle: no dev double-effects, different
+     scheduling. Not run here because `next build` writes the same
+     `.next/` the running dev server is using, and taking that server
+     down is not worth a speculative test.
+  2. ROUTE — the owner enters through `/play` (lobby lease, host-app
+     mount) or `/editor`; the harness enters through `/scene`.
+Still deliberately NOT shipping a speculative pre-warm "fix" for an
+artifact four measured runs have not seen. The cheapest thing that would
+end this is still one answer only the owner can give: FIRST click of a
+session or EVERY click, and was the wall already shot up. Re-run with
+NOPROBE=1 CYCLE=n (cold, per-colour), VOXELIZE=1 (sprite lane), or GPU=1
+(real device) once that is known.
+
+NOTE FOR WHOEVER READS THE PALETTE. `PAINT_PALETTE[0]` is WHITE, and two
+paths fall back to index 0: `SPLAT_TINTS[s.color] ?? SPLAT_TINTS[0]` in
+stepSplats, and `colorIndex`'s own initial value. Neither explains the
+report (a local stamp always carries the live index, and a session that
+starts on WHITE stays white until R is pressed), but a wire colour from a
+peer running a longer palette WOULD land on white — a permanent wrong
+coat, not a flash. Worth a clamp if the palette ever grows.
