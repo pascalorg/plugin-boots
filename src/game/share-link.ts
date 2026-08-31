@@ -10,17 +10,33 @@
  *
  * So two jobs, and only the first one is the plugin's alone.
  *
- * ── THE LINK IS THE PAGE YOU ARE ON ───────────────────────────────────────
- * The URL is built from `location`, not assembled from a route template. That
- * is deliberate: the same project is reachable at `/editor/<id>` in
- * production, `/play/<id>` on the lobby route and `/scene/<id>` on a local
- * dev server, and a hand-built `/editor/...` link would hand a 404 to
- * whoever is testing locally. Whatever route got YOU here is the route that
- * works, so the share link keeps it and only appends the drop-in marker.
+ * ── THE LINK IS THE ROUTE THAT WORKS FOR *THEM* ───────────────────────────
+ * The URL is derived from `location` — the origin and the project id are read
+ * off the page rather than configured — but the ROUTE is not kept as-is, and
+ * that distinction cost us a broken share (owner report 2026-08-31: "my
+ * friend clicked it and got to that editor screen, nothing happened").
  *
- * `?boots=drop` is that marker (drop-gate.tsx): the friend lands in the
- * editor and the gate offers the game immediately instead of making them
- * find the plugin rail.
+ * `/editor/<id>` is the route that works for ME, an insider. For a stranger
+ * the same URL renders the read-only public project view: no plugin rail, no
+ * drop gate, nothing to click. The route that works for THEM is `/play/<id>`
+ * — the open-lobby route, which checks the lobby marker, sends them through
+ * sign-in and arms the gate. So a shared `/editor/<id>` is silently useless
+ * to the only person who receives it, and this module normalizes it away.
+ *
+ *   /editor/<id>  →  /play/<id>?boots=drop     (share the lobby, not my desk)
+ *   /play/<id>    →  /play/<id>?boots=drop     (already right)
+ *   /scene/<id>   →  /scene/<id>?boots=drop    (local dev has no /play)
+ *
+ * `?boots=drop` is the marker (drop-gate.tsx) that offers the game on arrival
+ * instead of making them hunt for the plugin rail. On `/play` it is also the
+ * canonical form the route redirects to (`lobby-drop-link.ts`), so emitting it
+ * here costs the recipient one fewer redirect and never loops.
+ *
+ * A LIMIT WORTH KNOWING: `/play` additionally requires the project to carry
+ * the host's open-lobby marker, which is a reviewed allowlist entry and NOT
+ * something visibility implies or this plugin can see. Public-but-unmarked
+ * still 404s, so the copy below never promises the link works — only what is
+ * true from here.
  *
  * ── VISIBILITY IS THE HOST'S, NOT OURS ────────────────────────────────────
  * Whether a project is private, and the right to change that, belong to the
@@ -47,6 +63,19 @@ export const DROP_VALUE = 'drop'
  * window scopes by (pending-store.ts). Anything else is not a project page
  * and there is no link to share. */
 const SHAREABLE_ROUTE = /^\/(editor|play|scene)\/([A-Za-z0-9_-]{1,120})(?:\/|$)/
+
+/**
+ * Where a visitor should be sent for each route we might be standing on.
+ *
+ * `editor → play` is the whole point: see the header. `scene` stays itself
+ * because a local dev server has no `/play` route at all, and a link to a dev
+ * server is only ever shared with yourself or a machine on the same LAN.
+ */
+const SHARE_ROUTE_FOR: Record<string, string> = {
+  editor: 'play',
+  play: 'play',
+  scene: 'scene',
+}
 
 /**
  * The host's project-share bridge. Version-gated like the collab bus: an
@@ -91,7 +120,9 @@ export function dropInUrlFrom(href: string): string | null {
   }
   const match = SHAREABLE_ROUTE.exec(url.pathname)
   if (!match) return null
-  const share = new URL(`${url.origin}/${match[1]}/${match[2]}`)
+  const route = SHARE_ROUTE_FOR[match[1]!]
+  if (!route) return null
+  const share = new URL(`${url.origin}/${route}/${match[2]}`)
   share.searchParams.set(DROP_PARAM, DROP_VALUE)
   return share.toString()
 }
@@ -156,7 +187,7 @@ export function shareMessage(state: ShareState): string {
     case 'copied':
       if (state.visibility === 'private') return 'Link copied.'
       if (state.visibility === 'public') {
-        return 'Link copied — anyone with it lands in the editor and can jump straight into your game.'
+        return 'Link copied — anyone with it signs in and drops straight into your game.'
       }
       return 'Link copied. Your friend needs the project to be public (or shared with them) to open it.'
     case 'manual':
@@ -164,7 +195,7 @@ export function shareMessage(state: ShareState): string {
     case 'publishing':
       return 'Making the project public…'
     case 'published':
-      return 'Public now — anyone with the link can open the project and jump in.'
+      return 'Public now — anyone with the link signs in and drops straight into your game.'
     case 'publish-failed':
       return `Could not make the project public: ${state.error}`
   }

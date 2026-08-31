@@ -15,11 +15,16 @@ import {
 /**
  * SHARE LINK — the one-link drop-in.
  *
- * What these tests protect is mostly ONE mistake: handing a friend a URL that
- * 404s. The link is derived from the page you are standing on precisely
- * because the same project answers on three different routes (`/editor/` in
- * production, `/play/` on the lobby, `/scene/` on a dev server), and a
- * template would be right on exactly one of them.
+ * What these tests protect is ONE mistake, and an earlier version of this file
+ * asserted the mistake instead of catching it: handing a friend a URL that
+ * opens for YOU and does nothing for THEM.
+ *
+ * `/editor/<id>` is the route the owner is standing on. Shared, it renders a
+ * stranger the read-only public project view — no plugin rail, no drop gate,
+ * so "nothing happened" (owner report 2026-08-31). The recipient's route is
+ * `/play/<id>`, the open-lobby one. Hence: the origin and project id are read
+ * off the page, but the route is normalized to the one that works for whoever
+ * receives the link. `/scene/` is left alone — a dev server has no `/play`.
  *
  * The second thing they protect is the sentence under the button. A private
  * project only opens for its owner; a share flow that says "link copied!" and
@@ -54,24 +59,31 @@ afterEach(() => {
   delete globals.navigator
 })
 
-describe('the link is the page you are on', () => {
-  test('production, lobby and local dev each keep their own route', () => {
-    // The whole reason this is derived and not templated.
+describe('the link is the route that works for them', () => {
+  test('the editor route is normalized to the lobby route', () => {
+    // THE REGRESSION. Standing at my desk, the link I hand out is the lobby.
     expect(dropInUrlFrom('https://editor.pascal.app/editor/project_AHyVrpVr3g1jUXpr')).toBe(
-      'https://editor.pascal.app/editor/project_AHyVrpVr3g1jUXpr?boots=drop',
+      'https://editor.pascal.app/play/project_AHyVrpVr3g1jUXpr?boots=drop',
     )
+  })
+
+  test('a lobby link stays a lobby link', () => {
     expect(dropInUrlFrom('https://editor.pascal.app/play/project_AHyVrpVr3g1jUXpr')).toBe(
       'https://editor.pascal.app/play/project_AHyVrpVr3g1jUXpr?boots=drop',
     )
+  })
+
+  test('a local dev link keeps /scene — there is no /play to send anyone to', () => {
     expect(dropInUrlFrom('http://localhost:3002/scene/project_ahyvrpvr3g1juxpr')).toBe(
       'http://localhost:3002/scene/project_ahyvrpvr3g1juxpr?boots=drop',
     )
   })
 
   test('the drop marker is set, not appended twice', () => {
-    // Sharing a link you were yourself given must not compound.
-    expect(dropInUrlFrom('https://editor.pascal.app/editor/p_1?boots=drop')).toBe(
-      'https://editor.pascal.app/editor/p_1?boots=drop',
+    // Sharing a link you were yourself given must not compound. Already-lobby
+    // input is the realistic case here: it is what a recipient re-shares.
+    expect(dropInUrlFrom('https://editor.pascal.app/play/p_1?boots=drop')).toBe(
+      'https://editor.pascal.app/play/p_1?boots=drop',
     )
   })
 
@@ -79,13 +91,13 @@ describe('the link is the page you are on', () => {
     // A `?follow=` or a `?publish=1` from your visit is noise at best and a
     // wrong instruction at worst; the hash is yours too.
     expect(dropInUrlFrom('https://editor.pascal.app/editor/p_1?follow=abc&publish=1#node_9')).toBe(
-      'https://editor.pascal.app/editor/p_1?boots=drop',
+      'https://editor.pascal.app/play/p_1?boots=drop',
     )
   })
 
   test('a trailing segment is dropped, not carried into the id', () => {
     expect(dropInUrlFrom('https://editor.pascal.app/editor/p_1/settings')).toBe(
-      'https://editor.pascal.app/editor/p_1?boots=drop',
+      'https://editor.pascal.app/play/p_1?boots=drop',
     )
   })
 
@@ -105,7 +117,7 @@ describe('the link is the page you are on', () => {
   test('currentDropInUrl reads location, and is null when there is none', () => {
     expect(currentDropInUrl()).toBeNull() // bun: no location
     globals.location = { href: 'https://editor.pascal.app/editor/p_1' }
-    expect(currentDropInUrl()).toBe('https://editor.pascal.app/editor/p_1?boots=drop')
+    expect(currentDropInUrl()).toBe('https://editor.pascal.app/play/p_1?boots=drop')
   })
 })
 
