@@ -1558,3 +1558,56 @@ Integration notes: local main already carried the floor-white fix
 into BOTH host copies. QA leads: headed visual pass on species + enemy
 looks batched next round; shell flag stays dark until its own QA night;
 pre-existing light wall-body texture cells (out of scope above).
+
+SPRAY WHITE-FLASH — NOT REPRODUCIBLE ON LOCALHOST (2026-08-31, open).
+Owner report, prod: "quand je spray paint, ca clignote en blanc au niveau
+de la ou le spray touche le mur (cercle) au moment ou je click. apres la
+couleur reste tout bien." Harness:
+private-editor/qa-boots-spraywhite.mjs (untracked, alongside the other
+qa-boots-*.mjs). It aims yaw/pitch only from where the player already
+stands (never teleports into geometry), probes candidate walls by
+broad-face area until one takes a stamp, arms a self-rescheduling rAF
+recorder (scene.onAfterRender never fires here) plus a CDP screencast,
+and files per frame every mounted paint lane by its polygonOffset
+fingerprint (craters -2, sprites -3, decals -4) with material/instance
+colours, plus live dust instances by instanceAlpha.
+
+THREE NEGATIVES, 887 captured frames, zero white pixels at the crosshair
+(threshold: max channel > 236 with saturation < 16, in a 90x90 patch):
+  1. warm pristine wall, one 2.6 s click-and-hold with the aim sweeping,
+     16 decal stamps -> every stamp reads #e5443b on its first frame;
+  2. wall voxelized first with 14 rifle rounds so the spray takes the
+     SPRITE lane instead (census sprites 8 / decals 0 -> the fork really
+     flipped) -> every sprite reads #c80f0b (that is #e5443b in linear
+     working space), the _splatWhite priming is never what draws;
+  3. COLD: no warm-up probe at all, six bursts each preceded by R, so the
+     first stamp of RED/ORANGE/YELLOW is the first ever use of that
+     palette entry's lazily-built MeshStandardMaterial (decalMaterialFor)
+     and of the airbrush CanvasTexture -> #e5443b, #f28a2e, #f5c542, each
+     correct on its debut frame.
+
+RULED OUT BY READING: spawnPaintDecal writes slot.color BEFORE
+emitDecals(); stepSplats and stepPool both write matrix and colour in the
+same pass; refreshMistTint() is unconditional before the impact puff, so
+mist/bounce dust always wears the live coat (and _mistTint inits to black,
+not white); drainPaintTints starts from primedCellColor, not a white
+default; the ADS crosshair morph is gated to pistol/rifle so paint never
+touches it; paint calls no hitmarker.
+
+ALSO ESTABLISHED: the app renders with three.js WebGPURenderer /
+WebGPUBackend (isWebGPU true, coordinateSystem 2001) — there is no WebGL
+context, so gl.readPixels is unavailable and pixel truth has to come from
+the screencast. polygonOffset IS honoured on this path: three 0.185.1
+maps polygonOffsetUnits/Factor to depthBias/depthBiasSlopeScale in
+WebGPUPipelineUtils (triangle-list only), so the decal lane's separation
+from the wall is real, not a silent no-op.
+
+WHAT IS LEFT. The remaining uncontrolled variable is the GPU: this
+harness runs headless Chromium, the report is a real Metal device, and a
+one-frame pipeline/texture-readiness artifact is exactly the class of bug
+that differs between them. Deliberately NOT shipping a speculative
+pre-warm "fix" for an artifact no measurement here has seen. Next step
+needs one thing only the owner can give: whether it happens on the FIRST
+click of a session or on EVERY click, and whether the wall was already
+shot up. Re-run with NOPROBE=1 CYCLE=n (cold, per-colour) or VOXELIZE=1
+(sprite lane) once that is known.
