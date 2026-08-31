@@ -1653,3 +1653,94 @@ swatches — so nothing is being changed for it. The day the palette grows,
 the choice to make is fold-to-a-known-index (both clients agree the wall
 is coated, hue may differ) over drop (one client never sees it), and this
 paragraph is the argument for it.
+
+────────────────────────────────────────────────────────────────────────
+THE FIFTH NEGATIVE, AND THE BUG IT TURNED UP INSTEAD
+────────────────────────────────────────────────────────────────────────
+
+BUILD is now eliminated as well. The editor app was built and served in
+PRODUCTION mode on :3002 and the spray harness re-run against it on the
+real GPU: 441 frames, all 17 decals `#e5443b` on their first frame, dust
+red at alpha 0.06–0.22. NOT reproduced. Five runs, five negatives. The
+only named difference left from the owner's session is the ROUTE — the
+community app's `/play` / `/editor` versus the open-source app's `/scene`
+— and the question that would end it is still the one only the owner can
+answer: FIRST click of a session or EVERY click, and was the wall already
+shot up.
+
+That production run did report something the four dev runs never had:
+
+    ReferenceError: window is not defined
+        at module evaluation (…/chunks/3wa_bin88y_vc.js:1:301299)
+
+Two runs were spent misattributing it to the harness (a pointer-lock
+`addInitScript` shim, which got a `typeof window` guard it should have had
+anyway — but the error survived). Adding stack capture to the harness is
+what settled it: a real app chunk, evaluated through the turbopack loader.
+
+Read at that offset, the code is three's own module-eval epilogue. three
+r185's SOURCE guards it:
+
+    if ( typeof window !== 'undefined' ) { … window.__THREE__ = REVISION }
+
+The production bundle does not. The optimizer kept the neighbouring
+`typeof __THREE_DEVTOOLS__` guard and folded the `typeof window` one away,
+because for a browser target it is always true — on the main thread. The
+same chunk is also what a WORKER loads.
+
+plugin-boots ships exactly one worker: `bvh-worker.ts` →
+`three-mesh-bvh/worker`. A probe that enters the game and watches worker
+traffic confirmed it, from the worker's own chunk list inwards:
+
+    8.0s  created …turbopack-worker-….js#params=[[…,"…/3wa_bin88y_vc.js",…]]
+    8.0s  ReferenceError: window is not defined (module evaluation)
+    37.6s [boots] BVH worker unavailable — builds stay on the main thread
+    37.6s CLOSED …turbopack-worker-….js
+
+So off-main-thread BVH building had NEVER ONCE WORKED in production. Perf
+fix #3 shipped on 2026-08-29, was verified in dev, and was inert in prod
+from that day to this one: every main-thread build stall it was written to
+remove was still there. Dev builds skip the fold, so nothing about a dev
+session could have shown it.
+
+The degradation path did hold — correctness never depended on the worker,
+and the queue fell back to lazy synchronous builds, which is the behaviour
+that predates the perf fix. But it cost 30 s to engage, and those are the
+same first 30 s of a session that background priming exists to protect.
+
+THE FIX is two things.
+
+`bvh-worker-entry.ts` is now the worker's script instead of the package's:
+define `window` (aliased to the worker global — everything three could
+reach through it lives there anyway), THEN let three evaluate. Its
+load-bearing property is that it has NO STATIC IMPORTS, since those are
+evaluated before its first statement and one of them reaching three would
+restore the bug exactly, in production only. `bvh-worker.test.ts` pins
+that by reading the source: not the type check, not a dev run, and not the
+diff can see it otherwise. The PROTOCOL stays three-mesh-bvh's —
+`runTask` borrowed off `GenerateMeshBVHWorker.prototype` instead of
+reimplemented (verified byte-identical between the 0.9.14 here and the
+0.9.10 the host resolves), so there is one place for the two ends to drift
+and it is upstream's.
+
+And a boot handshake, because the 30 s was its own defect. A throw during
+module evaluation does NOT fire the parent's `Worker.onerror` — verified;
+the dead worker sat there alive until we terminated it — so silence is a
+dead worker's only symptom. The worker now sends one unsolicited message
+once its handler is installed, and the builder gives up on THAT instead of
+on a task reply. A future bundler surprise costs 10 s, not 30.
+
+VERIFIED on a production build, real GPU, from inside the worker itself:
+
+    {hasWindow:true, windowIsGlobal:true, threeRevision:"185",
+     handlerInstalled:true}
+
+`threeRevision:"185"` is the point — the exact line that used to throw now
+completes. Zero page errors, no fall back to the main thread, worker still
+alive at 53 s where it used to be disposed at 37.6 s. 2116 pass / 0 fail,
+tsc clean.
+
+WORTH REMEMBERING GENERALLY: any worker in this app that imports three has
+this problem, and it will not show up in dev. If one is ever added, it
+needs the same entry treatment — or `bvh-worker-entry.ts` needs to become
+a shared one.
