@@ -1744,3 +1744,40 @@ WORTH REMEMBERING GENERALLY: any worker in this app that imports three has
 this problem, and it will not show up in dev. If one is ever added, it
 needs the same entry treatment — or `bvh-worker-entry.ts` needs to become
 a shared one.
+
+AND A SECOND REASON, IN THE OTHER ENVIRONMENT. Fixing prod is not the
+same as knowing dev still works, so dev got the same probe — and the
+worker died there too, 100 ms in, for an unrelated reason:
+
+    [boots] BVH worker unavailable — builds stay on the main thread
+    Error: [boots] BVH worker: already running a job
+
+React mounts the game twice in development, so `collectWorld` runs twice
+and two `primeColliderBvhs` queues overlap. `activeBvhPrime.cancel()`
+cannot recall a build already posted, so the second queue asks while the
+first is in flight, and the worker takes one task at a time. This
+predates the shim — three-mesh-bvh's own class throws `Already running
+job.` in the same situation, and `generateInWorker` read any rejection as
+a broken worker and latched it off for the page's life.
+
+So there were TWO independent reasons the perf fix never ran, one per
+environment: `window` in production, contention in development. Neither
+was visible from the other side, and the second only turned up because
+the first fix was checked in both directions instead of one.
+
+Contention is not breakage. Callers queue now, bounded by their callers
+(runBvhPrimeQueue is sequential, a cancelled queue schedules nothing
+more). The task timer moved inside `generate` at the same time: a job must
+not be timed out for time spent queued behind someone else's build, and
+waiting for boot is not the task taking long either — one budget for
+coming up, one for the work.
+
+Re-entering the game (Esc → Jump in) is the same shape in production, so
+this was not a dev-only defect waiting to matter.
+
+The test for it uses a fake worker that ANSWERS the protocol on the main
+thread — real serialize/deserialize round trip — which makes overlap
+observable as post/reply/post/reply instead of post/post/reply/reply, and
+covers the borrowed `runTask` end to end into the bargain. That borrow is
+the module's one coupling to a package it does not control, and until now
+nothing exercised it outside a browser.
