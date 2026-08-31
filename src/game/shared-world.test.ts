@@ -961,6 +961,55 @@ describe('the outbound journal', () => {
     expect(hasPending(world)).toBe(false)
   })
 
+  /**
+   * The retry path used to carry an unstated precondition — hand `restorePending`
+   * ONLY the exact delta `takePending` returned — enforced by a source-scanning
+   * fence in net-world.test.ts that forbade any caller at all. The precondition is
+   * now enforced by the model, so the fence is gone and these tests replace it:
+   * a natural "apply failed, put the frame back" written against a RECEIVED frame
+   * is now safe, because a stranger's records are refused instead of journaled.
+   */
+  test("a restored frame keeps our records and refuses another peer's", () => {
+    const world = worldFor(ALICE)
+    const mine = idOf(addLocalPiece(world, piece('ignored')))
+    const sent = takePending(world) as SharedDelta
+    expect(sent.pieces.map((r) => r.id)).toEqual([mine])
+
+    // The shape the fence existed to forbid: our frame with a peer's records in
+    // it, which is what "put back whatever was in hand" produces on the receive
+    // side. Our own work must survive; theirs must not enter our outbox.
+    restorePending(world, {
+      ...sent,
+      items: [...sent.items, { id: `${BOB}#9`, lamport: 3 } as unknown as SharedDelta['items'][0]],
+      pieces: [...sent.pieces, piece(`${BOB}#1`)],
+    })
+    const again = takePending(world) as SharedDelta
+    expect(again.pieces.map((r) => r.id)).toEqual([mine])
+    expect(again.items).toEqual([])
+    expect(localWork(world).pieces.map((r) => r.id)).toEqual([mine])
+  })
+
+  test('a re-key does not make our own pending work a stranger to us', () => {
+    // `isOurs`, not `isAuthoredBy(id, world.self)`: the record was minted a tick
+    // ago under the name the transport has since taken away, and it is still this
+    // player's wall. The narrow test belongs on the wire, not here.
+    const world = worldFor(ALICE)
+    const mine = idOf(addLocalPiece(world, piece('ignored')))
+    const sent = takePending(world) as SharedDelta
+    rekeySharedWorld(world, 'alice-2')
+    restorePending(world, sent)
+    expect((takePending(world) as SharedDelta).pieces.map((r) => r.id)).toEqual([mine])
+  })
+
+  test("a tombstone goes back even though it kills someone else's piece", () => {
+    // Destruction is symmetric: we shoot other people's walls all night. A dead
+    // set carries no authorship of ours, so authorship must not gate it — that
+    // would silently drop legitimate kills on the retry path.
+    const world = worldFor(ALICE)
+    restorePending(world, deltaWith(ALICE, { deadPieces: [`${BOB}#4`] }))
+    expect((takePending(world) as SharedDelta).deadPieces).toEqual([`${BOB}#4`])
+  })
+
   test('the journal is local work only — a merge never puts bytes in it', () => {
     // Otherwise every peer would rebroadcast every other peer's frames, and a
     // three-player room would multiply its own traffic.

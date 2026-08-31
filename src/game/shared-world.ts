@@ -1098,6 +1098,9 @@ function stampedOrder<T extends Stamped>(lane: Map<RecordId, T>): T[] {
  * `world.unsent` counts these, because a lost frame that nobody can see is a
  * desync nobody can explain. The 15 s heal snapshot is the safety net; this is
  * the fast path that usually means the player never notices.
+ *
+ * Safe to call with a frame that is not ours: records another peer authored are
+ * refused rather than journaled — see `restoreLane`.
  */
 export function restorePending(world: SharedWorld, delta: SharedDelta): void {
   if (delta === null || typeof delta !== 'object') return
@@ -1120,19 +1123,48 @@ export function restorePending(world: SharedWorld, delta: SharedDelta): void {
     entry.killed = entry.killed || nd.killed === true
     entry.reset = entry.reset || nd.reset === true
   }
-  restoreLane(j.pieces, delta.pieces)
-  restoreLane(j.items, delta.items)
-  restoreLane(j.apertures, delta.apertures)
-  restoreLane(j.strokes, delta.strokes)
+  restoreLane(world, j.pieces, delta.pieces)
+  restoreLane(world, j.items, delta.items)
+  restoreLane(world, j.apertures, delta.apertures)
+  restoreLane(world, j.strokes, delta.strokes)
   restoreDead(j.deadPieces, delta.deadPieces)
   restoreDead(j.deadItems, delta.deadItems)
   restoreDead(j.deadApertures, delta.deadApertures)
   restoreDead(j.deadStrokes, delta.deadStrokes)
 }
 
-function restoreLane<T extends Stamped>(into: Map<RecordId, T>, recs: T[] | undefined): void {
+/**
+ * THE JOURNAL IS OUR OUTBOX, SO ONLY OUR OWN RECORDS MAY GO BACK INTO IT.
+ *
+ * The honest caller hands back the exact delta `takePending` returned, and every
+ * record in that is ours by construction. But "the send failed, put it back,
+ * retry" is a shape someone will write again, and the tempting thing to put back
+ * is whatever frame was in hand — which on the receive side is a PEER's. Nothing
+ * downstream would reject it: peers refuse a record whose author prefix does not
+ * match the envelope, so a stranger's wall re-published under our name is dropped
+ * by everyone and the world stays correct. What silently rots is the accounting —
+ * `unsent`, the pending counts, the heal snapshot's idea of what we owe — and a
+ * desync nobody can explain is exactly what those numbers exist to explain.
+ * Refusing here makes the precondition unnecessary rather than merely documented.
+ *
+ * `isOurs`, not `isAuthoredBy(id, world.self)`: a re-key mid-tick renames us, and
+ * a record minted a moment ago under the former name is still the player's own
+ * work. The narrow test belongs on the wire, where one live session vouches for
+ * one frame; this is the "did this player make this?" question.
+ *
+ * Deliberately NOT applied to `restoreDead`: a tombstone carries no authorship of
+ * ours — we kill other people's pieces all the time, and destruction is symmetric
+ * by design. Gating tombstones on authorship would drop legitimate kills.
+ */
+function restoreLane<T extends Stamped>(
+  world: SharedWorld,
+  into: Map<RecordId, T>,
+  recs: T[] | undefined,
+): void {
   for (const rec of Array.isArray(recs) ? recs : []) {
-    if (rec && isSafeId(rec.id, MAX_RECORD_ID_LEN) && !into.has(rec.id)) into.set(rec.id, rec)
+    if (!rec || !isSafeId(rec.id, MAX_RECORD_ID_LEN)) continue
+    if (!isOurs(world, rec.id) || into.has(rec.id)) continue
+    into.set(rec.id, rec)
   }
 }
 

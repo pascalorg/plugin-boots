@@ -649,29 +649,32 @@ two reasons that are both worth re-checking before either is changed:
   teardown-and-re-mint recovery would have left `sync.world` pointing at a world we
   had already discarded, and the re-mint would have read the dead one.
 
-**The other door into a journal, and the precondition it will arrive with.**
+**The other door into a journal, and the precondition it no longer carries.**
 `restorePending` re-journals record adds without going near `addLocal*`, so the
-mint fence structurally cannot see it. It has no production caller today, and a
-second fence keeps that true — because the day a send-failure retry path wants
-one, this lane's numbers acquire an unstated rule: **hand `restorePending` only
-the exact delta `takePending` returned.** Its `restoreLane` validates id *shape*,
-never authorship. Give it a *received* frame instead — exactly what a natural
-"apply failed, put it back, retry" path does — and a stranger's records enter our
-journal. The world survives that: peers refuse them, because `isAuthoredBy`
-compares the record prefix against the envelope sender and our envelope says us.
-The *numbers* do not. `rekeySharedWorld` returns every pending add id regardless
-of prefix, so `staleMints` counts the stranger's work while the re-mint correctly
-recovers none of it, and the loss figure above quietly stops meaning what it says.
+mint fence structurally cannot see it. It had no production caller, and a second
+source fence kept that true — because the day a send-failure retry path wanted one,
+this lane's numbers acquired an unstated rule: *hand `restorePending` only the exact
+delta `takePending` returned.* `restoreLane` validated id *shape* only, never
+authorship. Give it a *received* frame instead — exactly what a natural "apply
+failed, put it back, retry" path does — and a stranger's records enter our journal.
+The world survives that: peers refuse them, because `isAuthoredBy` compares the
+record prefix against the envelope sender and our envelope says us. The *numbers* do
+not. `rekeySharedWorld` returns every pending add id regardless of prefix, so
+`staleMints` counts the stranger's work while the re-mint correctly recovers none of
+it, and the loss figure above quietly stops meaning what it says.
 
-**An owed change, deliberately not made here, and it is one line away from a worse
-bug.** The real fix is an authorship refusal inside `restoreLane`, in
-`shared-world.ts` — the frozen contract. A wiring lane fencing its own precondition
-is honest; a wiring lane reaching into the model to change the contract is not. It
-is **held rather than made** because it is unreachable today (no production caller),
-the signature grows a `world` argument that touches every call site and the model's
-internals, and the person who wires the retry path is the one who will know which
-delta they are handing it. When that day comes, the shape is not "add a check" — it
-is these four decisions, and the third is the trap:
+**That refusal is now in the model, and the fence is gone (2026-08-31).**
+`restoreLane` takes the world and drops any record that is not ours, so the
+precondition is *unnecessary* rather than merely documented, and the retry path is
+safe to write against whatever frame is in hand. The source scan
+(`nothing outside the model puts records back into a journal`) was **deleted**
+rather than kept as a belt: a fence that forbids all callers of a now-safe function
+only blocks the path it was warning about. Its replacement is behavioural and lives
+with the model, in `shared-world.test.ts`: `a restored frame keeps our records and
+refuses another peer's`, `a re-key does not make our own pending work a stranger to
+us` (trap 1), and `a tombstone goes back even though it kills someone else's piece`
+(trap 2); traps 3 and 4 were already fenced by the epoch test beside them and by
+`isOurs`'s own. The four decisions the change turned on, the third being the trap:
 
 - **`isOurs(world, rec.id)`, not `isAuthoredBy(rec.id, world.self)`.** The narrow
   form refuses our own *pre-rename* adds, which drops work on the one path whose
@@ -693,8 +696,8 @@ is these four decisions, and the third is the trap:
   vouching beats unbounded trust), and the reason the refusal must never be
   described as "vouch forever".
 
-If a retry path is ever wired: make that change in the model first and **delete the
-fence**, rather than satisfying the fence by convention.
+`world.unsent` still counts a restore whatever the frame held, because it counts
+*frames that did not go out*, which is the question the counter answers.
 
 **Two residues, both deliberate.** Our snapshots still carry old-prefixed records
 that peers refuse — wasted bytes and an inflated `dropped` on their side —
