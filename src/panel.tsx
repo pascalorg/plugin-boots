@@ -13,7 +13,7 @@ const runAsOneHistoryStep = <T,>(run: () => T): T => {
   ).runAsSingleSceneHistoryStep
   return step ? step(useScene, run) : run()
 }
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { type BuildPiece, type PlacedPiece, useBoots } from './store'
 import { isForeignPlacedPiece } from './game/builder'
 import { applyItems, discardItems } from './game/item-keep'
@@ -28,6 +28,16 @@ import {
   useDemolition,
 } from './game/save-demolition'
 import { enterGame } from './game/session'
+import {
+  copyText,
+  currentDropInUrl,
+  getShareBridge,
+  publishProject,
+  type ShareState,
+  shareMessage,
+  shareVisibility,
+  showsPrivateWarning,
+} from './game/share-link'
 
 // ── The pending-changes list ────────────────────────────────────────────────
 //
@@ -421,6 +431,110 @@ export function discardSessionChanges(bridges: DiscardBridges = LIVE_DISCARD): s
   return 'Discarded — your building is exactly as it was'
 }
 
+// ── Share link ──────────────────────────────────────────────────────────────
+//
+// One link, and a friend is standing next to you (owner call 2026-08-31). The
+// button copies the drop-in URL for THIS page; all of the thinking lives in
+// game/share-link.ts, pure and tested, so this is only the markup plus three
+// handlers.
+//
+// It appears twice in the rail — once under Jump in, once under the Controls —
+// because that is where he asked for it. Two instances, two independent bits
+// of local state: whichever one you click is the one that answers you, and a
+// stale "copied" from the other end of the sidebar never sits there implying
+// something happened just now.
+
+/** Shared button skin with Jump in, one weight down. */
+const SHARE_BUTTON =
+  'flex w-full items-center justify-center gap-2 rounded-md border border-sidebar-border/60 px-3 py-2 font-semibold text-xs hover:bg-sidebar-accent/60'
+
+export function ShareLink() {
+  const [state, setState] = useState<ShareState>({ kind: 'idle' })
+
+  // The owner can also flip visibility from the host's own navbar while our
+  // warning is on screen. When that happens the warning is simply wrong, so
+  // re-read the bridge instead of leaving it up until the next click.
+  useEffect(() => {
+    const bridge = getShareBridge()
+    if (!bridge) return
+    return bridge.subscribe(() => {
+      setState((prev) => {
+        if (prev.kind !== 'copied' && prev.kind !== 'manual') return prev
+        const visibility = shareVisibility(getShareBridge())
+        return visibility === prev.visibility ? prev : { ...prev, visibility }
+      })
+    })
+  }, [])
+
+  const copy = async () => {
+    const url = currentDropInUrl()
+    if (!url) {
+      setState({ kind: 'no-link' })
+      return
+    }
+    // Snapshot the visibility BEFORE the await: the warning has to describe
+    // the project the link points at, not whatever the host reports a tick
+    // later.
+    const visibility = shareVisibility(getShareBridge())
+    const copied = await copyText(url)
+    setState({ kind: copied ? 'copied' : 'manual', url, visibility })
+  }
+
+  const publish = async (url: string) => {
+    setState({ kind: 'publishing', url })
+    setState(await publishProject(getShareBridge(), url))
+  }
+
+  const message = shareMessage(state)
+
+  return (
+    <div className="flex flex-col gap-2">
+      <button className={SHARE_BUTTON} onClick={copy} type="button">
+        🔗 Share link
+      </button>
+
+      {showsPrivateWarning(state) && 'url' in state && (
+        <div className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5">
+          {/* His words, kept as-is: the sentence has to say who CAN'T get in. */}
+          <p className="font-medium text-[11px] text-amber-200/90 leading-relaxed">
+            Project is private, only you can join.
+          </p>
+          <button
+            className="rounded-md bg-amber-500/20 px-2 py-1.5 font-semibold text-[11px] text-amber-100 hover:bg-amber-500/30"
+            onClick={() => publish(state.url)}
+            type="button"
+          >
+            Make it public
+          </button>
+        </div>
+      )}
+
+      {state.kind === 'manual' && (
+        // Clipboard refused (an http:// dev host over a LAN address does that).
+        // The link still exists, so show it rather than pretending it copied.
+        <input
+          className="w-full rounded border border-sidebar-border/60 bg-sidebar-accent/40 px-2 py-1 font-mono text-[10px] text-sidebar-foreground/80"
+          onFocus={(event) => event.currentTarget.select()}
+          readOnly
+          value={state.url}
+        />
+      )}
+
+      {message && (
+        <p
+          className={
+            state.kind === 'publish-failed'
+              ? 'text-[11px] text-amber-300/80 leading-relaxed'
+              : 'text-[11px] text-sidebar-foreground/50 leading-relaxed'
+          }
+        >
+          {message}
+        </p>
+      )}
+    </div>
+  )
+}
+
 /**
  * The Boots left-rail panel. One big verb: Jump in — the whole editor
  * becomes a game. After a session where you built pieces, the panel offers
@@ -489,6 +603,8 @@ export default function BootsPanel() {
         ⏵ Jump in
       </button>
 
+      <ShareLink />
+
       {phase === 'editor' && groups.length > 0 && (
         <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
           <p className="font-semibold text-[10px] text-sidebar-foreground/70 uppercase tracking-wider">
@@ -552,6 +668,17 @@ export default function BootsPanel() {
           corner heights on roofs (raise or drop corners for slopes, valleys and flat caps).
         </p>
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
+      </section>
+
+      <section className="flex flex-col gap-2">
+        <p className="font-semibold text-[10px] text-sidebar-foreground/70 uppercase tracking-wider">
+          Play together
+        </p>
+        <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
+          Send this link to a friend: they land in this project and can jump straight into the game
+          with you. Builds and destruction are shared live.
+        </p>
+        <ShareLink />
       </section>
     </div>
   )

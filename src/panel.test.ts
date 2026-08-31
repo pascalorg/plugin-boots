@@ -387,6 +387,22 @@ describe('the list as a whole', () => {
     expect(renderToString(createElement(PendingChanges, { groups: all }))).toContain('#52b24c')
   })
 
+  test('Share link sits under Jump in and under the Controls', () => {
+    // Both placements were asked for by name, so both are pinned. The private
+    // warning and the copy confirmation are CLICK state — they must not be on
+    // screen before anyone touches the button (share-link.test.ts owns what
+    // they then say).
+    const text = renderToString(createElement(BootsPanel))
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/\s+/g, ' ')
+
+    expect(text.match(/Share link/g)).toHaveLength(2)
+    expect(text.indexOf('Share link')).toBeGreaterThan(text.indexOf('Jump in'))
+    expect(text.lastIndexOf('Share link')).toBeGreaterThan(text.indexOf('Controls'))
+    expect(text).not.toContain('only you can join')
+    expect(text).not.toContain('Link copied')
+  })
+
   test('the panel still renders, and shows no decision before there is one', () => {
     const text = renderToString(createElement(BootsPanel))
       .replace(/<[^>]*>/g, ' ')
