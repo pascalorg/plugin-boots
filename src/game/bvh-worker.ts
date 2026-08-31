@@ -154,7 +154,8 @@ const borrowedRunTask = (GenerateMeshBVHWorker.prototype as unknown as { runTask
  */
 class ShimmedBvhWorker {
   private worker: Worker | null
-  private running = false
+  /** The end of the job queue — see `generate`. */
+  private tail: Promise<unknown> = Promise.resolve()
   /** Resolves when the worker installed its message handler; rejects when it
    * did not, which is how a worker killed at module evaluation is detected. */
   private readonly booted: Promise<void>
@@ -195,19 +196,50 @@ class ShimmedBvhWorker {
     this.booted.catch(() => {})
   }
 
-  async generate(geometry: BufferGeometry): Promise<MeshBVH> {
-    if (this.running) throw new Error('[boots] BVH worker: already running a job')
+  /**
+   * Build one BVH, waiting its turn.
+   *
+   * The worker takes one task at a time, and three-mesh-bvh's own class turns a
+   * second concurrent caller into a THROW (`Already running job.`) — which this
+   * module then read as a broken worker and latched off for the rest of the
+   * page's life. Contention is not breakage, and it is routine: React mounts the
+   * game twice in development, so two `primeColliderBvhs` queues overlap, and
+   * `activeBvhPrime.cancel()` cannot recall a build already in flight. Measured
+   * in a dev session: the worker was written off 100 ms into the first mount,
+   * every time. Re-entering the game (Esc, Jump in) is the same shape in
+   * production.
+   *
+   * So callers queue instead of colliding. The queue is bounded by its callers:
+   * `runBvhPrimeQueue` is sequential, a cancelled queue schedules nothing more,
+   * and a finished BVH is worth landing whoever asked for it.
+   */
+  generate(geometry: BufferGeometry, taskTimeoutMs: number): Promise<MeshBVH> {
+    const job = this.tail.then(() => this.runOne(geometry, taskTimeoutMs))
+    // The chain must survive a failed job, and must not report the same
+    // rejection twice — `job` is the one the caller handles.
+    this.tail = job.catch(() => {})
+    return job
+  }
+
+  private async runOne(geometry: BufferGeometry, taskTimeoutMs: number): Promise<MeshBVH> {
     if (!borrowedRunTask) throw new Error('[boots] BVH worker: three-mesh-bvh has no runTask to borrow')
     const worker = this.worker
     if (!worker) throw new Error('[boots] BVH worker has been disposed')
-    // Claim the slot before the await: two concurrent callers must not both get
-    // past the guard while the first one is still waiting for boot.
-    this.running = true
+    // Boot has its own budget, and waiting for it is not the task taking long —
+    // so the task timer starts after it, on the work itself. A queued job whose
+    // predecessor is slow must not be timed out for someone else's build either.
+    await this.booted
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      await this.booted
-      return await borrowedRunTask.call(this, worker, geometry, {})
+      return await new Promise<MeshBVH>((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('[boots] BVH worker build timed out')), taskTimeoutMs)
+        // runTask throws synchronously on geometry it cannot transfer
+        // (interleaved attributes); inside the executor that becomes a
+        // rejection like any other.
+        borrowedRunTask.call(this, worker, geometry, {}).then(resolve, reject)
+      })
     } finally {
-      this.running = false
+      clearTimeout(timer)
     }
   }
 
@@ -274,21 +306,16 @@ export function workerBvhBuilder(): BvhAsyncBuilder | null {
 async function generateInWorker(geometry: BufferGeometry): Promise<MeshBVH> {
   const worker = workerInstance
   if (!worker || workerBroken) throw new Error('[boots] BVH worker is not available')
-  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    return await new Promise<MeshBVH>((resolve, reject) => {
-      timer = setTimeout(
-        () => reject(new Error('[boots] BVH worker build timed out')),
-        WORKER_TASK_TIMEOUT_MS,
-      )
-      // generate() throws synchronously when already running / disposed —
-      // the promise executor turns that into a rejection too.
-      worker.generate(geometry).then(resolve, reject)
-    })
+    // The timers live inside `generate`: one budget for coming up, one for the
+    // build itself, neither of them charged for time spent queued behind another
+    // caller's build.
+    return await worker.generate(geometry, WORKER_TASK_TIMEOUT_MS)
   } catch (error) {
+    // Anything that gets here — dead worker, timed-out build, geometry the
+    // protocol cannot transfer — writes the worker off and puts every remaining
+    // collider back on the lazy synchronous path.
     breakWorker(error)
     throw error
-  } finally {
-    clearTimeout(timer)
   }
 }

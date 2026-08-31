@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { BoxGeometry, BufferAttribute, BufferGeometry } from 'three'
+import { MeshBVH } from 'three-mesh-bvh'
 import { resetBvhWorkerForTests, workerBvhBuilder } from './bvh-worker'
 import { BVH_WORKER_BOOTED } from './bvh-worker-protocol'
 
@@ -63,17 +65,20 @@ describe('the BVH worker entry shims `window` before three can look for it', () 
 
 // ── 2. Giving up on a dead worker ──────────────────────────────────────────
 
+type Listener = (event: { data: unknown }) => void
+
 /** A worker that loads nothing and says nothing — the exact shape of a worker
  * whose module graph died on evaluation: alive, silent, never errors. */
 class SilentWorker {
   static instances = 0
   terminated = false
+  onmessage: Listener | null = null
   constructor() {
     SilentWorker.instances++
   }
-  addEventListener(): void {}
-  removeEventListener(): void {}
-  postMessage(): void {}
+  addEventListener(_type: string, _listener: Listener): void {}
+  removeEventListener(_type: string, _listener: Listener): void {}
+  postMessage(_data?: unknown, _transfer?: unknown): void {}
   terminate(): void {
     this.terminated = true
   }
@@ -81,8 +86,8 @@ class SilentWorker {
 
 /** …and one that boots, to prove the handshake is a handshake and not a wait. */
 class BootingWorker extends SilentWorker {
-  private listeners: Array<(event: { data: unknown }) => void> = []
-  override addEventListener(type: string, listener: (event: { data: unknown }) => void): void {
+  private listeners: Listener[] = []
+  override addEventListener(type: string, listener: Listener): void {
     if (type === 'message') {
       this.listeners.push(listener)
       // Next tick, like a real script finishing evaluation.
@@ -91,8 +96,38 @@ class BootingWorker extends SilentWorker {
       })
     }
   }
-  override removeEventListener(_type: string, listener: (event: { data: unknown }) => void): void {
+  override removeEventListener(_type: string, listener: Listener): void {
     this.listeners = this.listeners.filter((l) => l !== listener)
+  }
+}
+
+/**
+ * A worker that actually ANSWERS: three-mesh-bvh's task protocol, performed on
+ * the main thread. Nothing else here exercises the borrowed `runTask` end to end
+ * — the transfer shape it posts, the serialize/deserialize pair, the restore of
+ * the arrays a real transfer would neuter — and that borrow is this module's one
+ * coupling to a package it does not control.
+ *
+ * The reply is deferred a tick, which is what makes overlap observable: a driver
+ * that serializes logs post/reply/post/reply, one that does not logs
+ * post/post/reply/reply.
+ */
+class ProtocolWorker extends BootingWorker {
+  static log: string[] = []
+  override postMessage(data?: unknown): void {
+    const { index, position } = data as { index: Uint32Array | null; position: Float32Array }
+    ProtocolWorker.log.push('posted')
+    const geometry = new BufferGeometry()
+    geometry.setAttribute('position', new BufferAttribute(position, 3, false))
+    if (index) geometry.setIndex(new BufferAttribute(index, 1, false))
+    // Upstream passes `copyIndexBuffer: false` here to avoid a copy it is about
+    // to transfer anyway; nothing is transferred on this thread, and the option
+    // is not in the package's types, so the default stands.
+    const serialized = MeshBVH.serialize(new MeshBVH(geometry))
+    queueMicrotask(() => {
+      ProtocolWorker.log.push('replied')
+      this.onmessage?.({ data: { error: null, serialized, position, progress: 1 } })
+    })
   }
 }
 
@@ -146,6 +181,25 @@ describe('a worker that never reports ready is abandoned, not waited on', () => 
     // queue stops, colliders keep the lazy synchronous path.
     expect(workerBvhBuilder()).toBeNull()
     expect(SilentWorker.instances).toBe(1)
+  })
+
+  test('two overlapping builds both land, one after the other', async () => {
+    restore = withFakeWorkerEnv(ProtocolWorker, 30)
+    ProtocolWorker.log = []
+    const build = workerBvhBuilder()
+    expect(build).not.toBeNull()
+
+    // React mounts the game twice in development, so two prime queues overlap
+    // and the second asks for a build while the first is still in flight —
+    // `activeBvhPrime.cancel()` cannot recall a build already posted. That used
+    // to throw `Already running job.`, which this module read as a broken worker
+    // and latched off for the rest of the page's life: measured 100 ms into the
+    // first mount, every dev session.
+    const [first, second] = await Promise.all([build!(new BoxGeometry(1, 1, 1)), build!(new BoxGeometry(2, 1, 1))])
+    expect(first).toBeInstanceOf(MeshBVH)
+    expect(second).toBeInstanceOf(MeshBVH)
+    // Serialized, not interleaved — the worker takes one task at a time.
+    expect(ProtocolWorker.log).toEqual(['posted', 'replied', 'posted', 'replied'])
   })
 
   test('a worker that does report ready gets its task posted', async () => {
