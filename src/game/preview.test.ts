@@ -120,21 +120,27 @@ afterEach(() => {
 // --- 1. The gate ------------------------------------------------------------
 
 describe('the mount condition', () => {
-  test('open decision in the editor + any one lane — and nothing when every lane is empty', () => {
-    expect(shouldPreview('editor', true, NO_LANES)).toBe(false)
+  test('in the editor + any one lane — and nothing when every lane is empty', () => {
+    expect(shouldPreview('editor', NO_LANES)).toBe(false)
     for (const lane of ['pieces', 'items', 'destroyed', 'painted'] as const) {
-      expect(shouldPreview('editor', true, { ...NO_LANES, [lane]: 1 }), lane).toBe(true)
+      expect(shouldPreview('editor', { ...NO_LANES, [lane]: 1 }), lane).toBe(true)
     }
   })
 
-  test('never during play, never once the decision is closed', () => {
+  test('never during play', () => {
     const busy = { pieces: 3, items: 2, destroyed: 1, painted: 4 }
     // The game renders the real thing; a preview on top would be a second,
     // stale copy of every piece.
-    expect(shouldPreview('game', true, busy)).toBe(false)
-    // Nothing is pending — the lists survive re-entry on purpose (store.ts
-    // resetSession), so the flag is the only honest signal.
-    expect(shouldPreview('editor', false, busy)).toBe(false)
+    expect(shouldPreview('game', busy)).toBe(false)
+  })
+
+  test('a lane that outlives its session still shows', () => {
+    // The regression this replaces: the gate used to need a `pendingDecision`
+    // flag that only Esc set and re-entry cleared, so pieces the player had
+    // never decided about became invisible — after a re-entry, and after every
+    // reload once the lanes became durable (pending-store.ts). Non-empty lanes
+    // in the editor IS the condition.
+    expect(shouldPreview('editor', { ...NO_LANES, pieces: 7 })).toBe(true)
   })
 })
 
@@ -146,30 +152,28 @@ describe('Save and Discard close the preview', () => {
 
   /** The pieces lane as the gate sees it. */
   const gate = () =>
-    shouldPreview(useBoots.getState().phase, useBoots.getState().pendingDecision, {
+    shouldPreview(useBoots.getState().phase, {
       ...NO_LANES,
       pieces: useBoots.getState().placed.length,
     })
 
-  test('discardPlaced clears pendingDecision', () => {
+  test('discardPlaced empties the lane', () => {
     useBoots.getState().addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
-    useBoots.getState().setPendingDecision(true)
     expect(gate()).toBe(true)
     discardPlaced()
-    expect(useBoots.getState().pendingDecision).toBe(false)
+    expect(useBoots.getState().placed).toEqual([])
     expect(gate()).toBe(false)
   })
 
-  test('keepPlaced clears pendingDecision', () => {
+  test('keepPlaced empties the lane', () => {
     // The registry-less give-up path (keep.ts) — it resolves the session
     // exactly like the schema path does, and writes no nodes, so this pins
     // the lifecycle without a host schema fixture (keep.test.ts owns those).
     nodeRegistry._reset()
     useBoots.getState().addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
-    useBoots.getState().setPendingDecision(true)
     expect(gate()).toBe(true)
     keepPlaced()
-    expect(useBoots.getState().pendingDecision).toBe(false)
+    expect(useBoots.getState().placed).toEqual([])
     expect(gate()).toBe(false)
   })
 })

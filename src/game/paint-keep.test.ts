@@ -212,7 +212,7 @@ describe('mergePendingPaint (coats accumulate across sessions)', () => {
 
   test('a session that paints nothing leaves the pending list untouched', () => {
     expect(mergePendingPaint([coat('wall_a', '#3b4a63')])).toBe(1)
-    // Non-zero is what keeps exitGame's pendingDecision true.
+    // Non-zero is what keeps the panel's offer on screen back in the editor.
     expect(mergePendingPaint([])).toBe(1)
     expect(usePaintKeep.getState().painted).toEqual([coat('wall_a', '#3b4a63')])
   })

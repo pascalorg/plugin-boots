@@ -107,7 +107,8 @@ export const DECAL_VOTE_PER_M2 = 255 / (0.15 * 0.15)
  * and silently dropped the first session's coats from the panel AND from Save.
  * Cleared only by the explicit decision — `applyPaint` or `discardPaint`.
  *
- * Returns the TOTAL pending count for the pendingDecision gate.
+ * Returns the TOTAL pending count — a non-empty lane back in the editor IS
+ * the panel's offer (panel.tsx, preview.tsx).
  */
 export function capturePaint(): number {
   const painted: PaintedNode[] = []

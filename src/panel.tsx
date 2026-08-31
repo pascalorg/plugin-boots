@@ -20,6 +20,7 @@ import { applyItems, discardItems } from './game/item-keep'
 import { isForeignItemPlacement, type Placement, useItems } from './game/item-place'
 import { discardPlaced, keepPlaced } from './game/keep'
 import { applyPaint, discardPaint, type PaintedNode, usePaintKeep } from './game/paint-keep'
+import { persistPendingChanges } from './game/pending-lanes'
 import {
   deleteDestroyed,
   type DestroyedNode,
@@ -330,6 +331,12 @@ export type SaveBridges = {
   applyPaint: typeof applyPaint
   applyItems: typeof applyItems
   runStep: <T>(run: () => T) => T
+  /** Re-writes the durable pending window — which, the lanes now being empty,
+   * DELETES it. Part of the bridge set rather than the click handler on
+   * purpose: a Save that wrote real nodes and left the stored window behind
+   * would resurrect the whole decision on the next load, on top of the nodes
+   * it just created. It has to be impossible to forget. */
+  persist: typeof persistPendingChanges
 }
 
 const LIVE_SAVE: SaveBridges = {
@@ -337,6 +344,7 @@ const LIVE_SAVE: SaveBridges = {
   deleteDestroyed,
   applyPaint,
   applyItems,
+  persist: persistPendingChanges,
   runStep: runAsOneHistoryStep,
 }
 
@@ -359,6 +367,9 @@ export function saveSessionChanges(bridges: SaveBridges = LIVE_SAVE): string {
     const itemsResult = bridges.applyItems()
     return { result, removed, repainted, itemsResult }
   })
+  // Outside the history step: browser storage is not part of the document and
+  // has no business inside an undo batch.
+  bridges.persist()
   // `kept` counts every converted piece; roofs and floors are also tallied
   // separately, so walls = the remainder.
   const walls = result.kept - result.roofs - result.floors
@@ -386,6 +397,9 @@ export type DiscardBridges = {
   discardDemolition: typeof discardDemolition
   discardPaint: typeof discardPaint
   discardItems: typeof discardItems
+  /** Same reason as the Save side: the stored window has to go too, or the
+   * next load offers a decision the player already made. */
+  persist: typeof persistPendingChanges
 }
 
 const LIVE_DISCARD: DiscardBridges = {
@@ -393,6 +407,7 @@ const LIVE_DISCARD: DiscardBridges = {
   discardDemolition,
   discardPaint,
   discardItems,
+  persist: persistPendingChanges,
 }
 
 /** Discard: drop all four lanes and touch nothing in the document. Same
@@ -402,6 +417,7 @@ export function discardSessionChanges(bridges: DiscardBridges = LIVE_DISCARD): s
   bridges.discardDemolition()
   bridges.discardPaint()
   bridges.discardItems()
+  bridges.persist()
   return 'Discarded — your building is exactly as it was'
 }
 
@@ -412,7 +428,15 @@ export function discardSessionChanges(bridges: DiscardBridges = LIVE_DISCARD): s
  * discard everything.
  */
 export default function BootsPanel() {
-  const pendingDecision = useBoots((s) => s.pendingDecision)
+  // The phase is the gate the decision UI needs, and the ONLY one. It used to
+  // be a `pendingDecision` flag set at Esc and cleared on re-entry, which made
+  // the offer a moment rather than a state: reload the editor, or come back
+  // tomorrow, and a fort you never decided about was simply gone from the
+  // sidebar. The lanes are durable now (pending-store.ts), so the honest gate
+  // is "you are in the editor and something is pending" — offered for as long
+  // as it is true. What the flag actually protected is still protected: during
+  // play `phase === 'game'`, so no Save click can reach the scene store.
+  const phase = useBoots((s) => s.phase)
   const allPlaced = useBoots((s) => s.placed)
   const destroyed = useDemolition((s) => s.destroyed)
   const painted = usePaintKeep((s) => s.painted)
@@ -465,12 +489,15 @@ export default function BootsPanel() {
         ⏵ Jump in
       </button>
 
-      {pendingDecision && groups.length > 0 && (
+      {phase === 'editor' && groups.length > 0 && (
         <section className="flex flex-col gap-2 rounded-md border border-sidebar-border/60 p-3">
+          <p className="font-semibold text-[10px] text-sidebar-foreground/70 uppercase tracking-wider">
+            Pending changes
+          </p>
           <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
             Nothing was saved while you played — shooting, breaking, all of it stays in the game.
-            Only the button below writes anything, and Discard leaves your building exactly as it
-            was.
+            This list waits here until you decide, reloads included: only the buttons below write
+            anything, and Discard leaves your building exactly as it was.
           </p>
           {/* One group per non-empty lane, so the decision is about things he
               can see. `groups.length > 0` is also the section's own gate: it is

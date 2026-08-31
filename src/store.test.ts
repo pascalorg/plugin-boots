@@ -94,15 +94,23 @@ describe('slotId survives every piece-mutating action', () => {
   })
 })
 
-describe('resetSession: re-entry must retract the Save/Discard offer', () => {
-  test('clears pendingDecision, keeps placed for the resumed session', () => {
-    // Regression: exit with pieces placed (pendingDecision true), re-enter
-    // without deciding — the sidebar Save button stayed clickable DURING
-    // play, and keepPlaced() mid-game is a scene-store invariant violation.
+describe('resetSession: re-entry resumes an undecided session', () => {
+  test('keeps placed, and resets only the loadout', () => {
+    // Two things at once, and they pull opposite ways:
+    //  - `placed` MUST survive, or re-entering without deciding silently
+    //    throws away the fort the offer was about.
+    //  - the Save button MUST NOT be clickable during play — keepPlaced()
+    //    mid-game is a scene-store invariant violation. That is the PHASE's
+    //    job, not a flag's: the sidebar and the viewport preview both gate on
+    //    `phase === 'editor'` (panel.tsx, preview.tsx). The `pendingDecision`
+    //    flag this test used to assert was the bug — set at Esc, cleared here,
+    //    it made the offer a moment instead of a state.
     const a = useBoots.getState().addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
-    useBoots.getState().setPendingDecision(true)
+    useBoots.getState().setHealth(11)
+    useBoots.getState().setWeapon('knife')
     useBoots.getState().resetSession()
-    expect(useBoots.getState().pendingDecision).toBe(false)
     expect(useBoots.getState().placed).toEqual([a])
+    expect(useBoots.getState().health).toBe(100)
+    expect(useBoots.getState().weapon).toBe('builder')
   })
 })

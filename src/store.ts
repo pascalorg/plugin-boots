@@ -62,8 +62,6 @@ type BootsState = {
   buildPiece: BuildPiece
   /** Pieces placed in build mode this session (or awaiting Keep/Discard). */
   placed: PlacedPiece[]
-  /** True right after a session that placed pieces — the panel offers Keep/Discard. */
-  pendingDecision: boolean
 
   setPhase: (phase: BootsPhase) => void
   giveWeapon: (weapon: WeaponId) => void
@@ -101,7 +99,6 @@ type BootsState = {
    * undefined when the id is already gone (double-collapse is a no-op). */
   removePlaced: (id: number) => PlacedPiece | undefined
   resolvePlaced: () => void
-  setPendingDecision: (pending: boolean) => void
   resetSession: () => void
 }
 
@@ -121,7 +118,6 @@ export const useBoots = create<BootsState>((set, get) => ({
   staggered: false,
   buildPiece: 'wall',
   placed: [],
-  pendingDecision: false,
 
   setPhase: (phase) => set({ phase }),
   giveWeapon: (weapon) =>
@@ -163,8 +159,7 @@ export const useBoots = create<BootsState>((set, get) => ({
     if (piece) set({ placed: s.placed.filter((p) => p.id !== id) })
     return piece
   },
-  resolvePlaced: () => set({ placed: [], pendingDecision: false }),
-  setPendingDecision: (pendingDecision) => set({ pendingDecision }),
+  resolvePlaced: () => set({ placed: [] }),
   resetSession: () =>
     set({
       owned: ['knife', 'builder', 'paint'],
@@ -174,9 +169,10 @@ export const useBoots = create<BootsState>((set, get) => ({
       health: 100,
       staggered: false,
       buildPiece: 'wall',
-      // `placed` deliberately survives re-entry (an undecided Keep/Discard
-      // resumes), but the sidebar's decision UI must not — a mid-game Save
-      // click would write the scene store during play.
-      pendingDecision: false,
+      // `placed` deliberately survives re-entry — an undecided Keep/Discard
+      // resumes. It also survives a RELOAD now (pending-store.ts), so the
+      // decision is offered for as long as it is open, not just on the Esc
+      // that produced it. What keeps a Save click from writing the scene
+      // mid-game is the phase, which the sidebar's own gate reads.
     }),
 }))

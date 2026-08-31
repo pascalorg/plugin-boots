@@ -110,7 +110,7 @@ export function buildAperturePayload(
 }
 
 /** Placements awaiting the panel's decision (furniture AND apertures) —
- * session.ts folds this into the pendingDecision gate on exit. */
+ * a non-empty lane back in the editor is what puts the offer on screen. */
 export function placedItemCount(): number {
   return ownPlacements().length
 }
@@ -119,8 +119,8 @@ export function placedItemCount(): number {
  * The placements THIS player is answerable for. Everything downstream reads
  * this rather than the store: a Save writes the work of whoever pressed the
  * button, and a session where the only furniture was carried in by other
- * players has nothing to decide about — so the pendingDecision gate must not
- * fire either. Identical to the store's list in single-player.
+ * players has nothing to decide about — so the panel must not offer a
+ * decision either. Identical to the store's list in single-player.
  */
 function ownPlacements(): Placement[] {
   return useItems.getState().items.filter((placed) => !isForeignItemPlacement(placed.id))

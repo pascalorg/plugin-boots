@@ -8,8 +8,8 @@ import { sfx } from './audio'
 import { Hud } from './hud'
 import { GameInput } from './input'
 import { closeItemMenu, isItemMenuOpen } from './inventory'
-import { placedItemCount } from './item-keep'
 import { capturePaint } from './paint-keep'
+import { persistPendingChanges } from './pending-lanes'
 import { stopWorldSync } from './net-world'
 import { stopPresence } from './presence'
 import { captureDemolition } from './save-demolition'
@@ -736,18 +736,18 @@ export function exitGame(): void {
   if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
   if (document.pointerLockElement) document.exitPointerLock()
 
-  const placed = useBoots.getState().placed
   // Snapshot leveled scene nodes BEFORE the game tree (and the destruction
   // state with it) unmounts — the panel offers to save the demolition too.
-  const leveled = captureDemolition()
+  // Both captures ACCUMULATE across sessions (the runtime state they read is
+  // rebuilt from the restored scene on every Jump in, so a session-local
+  // capture would strand the earlier work with no way to Save or Discard it).
+  captureDemolition()
   // Same deal for paint: snapshot sprayed coats before the ledger resets.
-  const painted = capturePaint()
-  // Both captures return the TOTAL still pending, not just this session's, so
-  // the gate below survives a re-entry that touched nothing: the runtime state
-  // they read is rebuilt from the restored scene on every Jump in, and a
-  // session-local count would have flipped pendingDecision back to false and
-  // stranded the earlier work with no way to Save or Discard it.
-  useBoots
-    .getState()
-    .setPendingDecision(placed.length > 0 || leveled > 0 || painted > 0 || placedItemCount() > 0)
+  capturePaint()
+
+  // The pending window is now durable: whatever is still undecided survives a
+  // reload, a link back into the project, tomorrow morning. This is the ONLY
+  // write, and it writes browser storage — never the document (see
+  // pending-store.ts, and docs/SESSION-CHANGES.md for the promise it keeps).
+  persistPendingChanges()
 }

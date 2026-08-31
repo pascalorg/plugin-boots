@@ -443,12 +443,21 @@ describe('Save', () => {
       calls.push('step closes')
       return out
     },
+    persist: () => {
+      calls.push('persist')
+    },
   })
 
   test('the four bridges run in order, all inside one history step', () => {
     // Paint MUST apply after the demolition delete (nodes removed above are
     // skipped instead of patched), and a bridge that escaped the step would cost
     // the owner a second Cmd+Z — both show up here as a different sequence.
+    //
+    // `persist` is the fifth bridge and it sits OUTSIDE the step on purpose:
+    // it writes browser storage (pending-store.ts), which has no business in
+    // an undo batch. It runs LAST and unconditionally — a Save that left the
+    // stored pending window behind would offer the decision again, on top of
+    // the very nodes it just created.
     const calls: string[] = []
     saveSessionChanges(stub(calls))
 
@@ -459,6 +468,7 @@ describe('Save', () => {
       'applyPaint',
       'applyItems',
       'step closes',
+      'persist',
     ])
   })
 
@@ -483,7 +493,7 @@ describe('Save', () => {
 
 describe('the live Save and Discard paths', () => {
   beforeEach(() => {
-    useBoots.setState({ placed: [], pendingDecision: false })
+    useBoots.setState({ placed: [], phase: 'editor' })
     useDemolition.getState().clear()
     usePaintKeep.getState().clear()
     useItems.getState().resolveItems()
@@ -500,29 +510,28 @@ describe('the live Save and Discard paths', () => {
     useDemolition.getState().setDestroyed([leveled('wall_1')], ['wall_1'], 0)
     usePaintKeep.getState().setPainted([coat('wall_1', '#52b24c', 'GREEN')])
     useItems.getState().addItem(asset('Couch'), [3, 0, 5], 0)
-    useBoots.setState({ pendingDecision: true })
   }
 
-  test('Save clears the decision and empties all four lanes', () => {
-    // The viewport preview mounts on this same flag: a decision left pending
-    // would outlive the click that resolved it.
+  test('Save empties all four lanes', () => {
+    // Emptying the lanes IS closing the offer: the sidebar's decision section
+    // and the viewport preview both mount on `phase === 'editor'` + a
+    // non-empty lane, so a lane left behind would offer the same decision
+    // again on top of the nodes Save just wrote.
     seedSession()
 
     saveSessionChanges()
 
-    expect(useBoots.getState().pendingDecision).toBe(false)
     expect(useBoots.getState().placed).toEqual([])
     expect(useDemolition.getState().destroyed).toEqual([])
     expect(usePaintKeep.getState().painted).toEqual([])
     expect(useItems.getState().items).toEqual([])
   })
 
-  test('Discard clears the decision, empties the lanes and writes nothing', () => {
+  test('Discard empties the lanes and writes nothing', () => {
     seedSession()
     const before = useScene.getState().nodes
 
     expect(discardSessionChanges()).toBe('Discarded — your building is exactly as it was')
-    expect(useBoots.getState().pendingDecision).toBe(false)
     expect(useBoots.getState().placed).toEqual([])
     expect(useDemolition.getState().destroyed).toEqual([])
     expect(usePaintKeep.getState().painted).toEqual([])

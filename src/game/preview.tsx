@@ -38,7 +38,7 @@ import { collectMeshes, collectSolidRoots, type WallNodeLike } from './world'
  *    enemies, colliders and the frame booster. This is a purpose-built tree:
  *    meshes, one imperative item mount, and a restore ledger. No useFrame,
  *    no camera, no colliders, no input.
- *  - NOT a new phase. `phase === 'editor' && pendingDecision` already means
+ *  - NOT a new phase. "in the editor with something pending" already means
  *    exactly "the Boots menu is showing the Save/Discard choice"; BootsPhase
  *    stays two values.
  *  - NOT a per-item toggle. Granularity is VIEW-ONLY (owner call): Save and
@@ -86,7 +86,7 @@ import { collectMeshes, collectSolidRoots, type WallNodeLike } from './world'
  * is exported because the seams, not the call sites, are what preview.test.ts
  * pins — each one is pure or purely imperative, and none of them reads a
  * store:
- *   shouldPreview(phase, pendingDecision, lanes)   the mount condition.
+ *   shouldPreview(phase, lanes)                    the mount condition.
  *   applyNodePreview(destroyed, painted)           → PreviewLedger
  *   restoreNodePreview(ledger)                     idempotent round-trip.
  *   PENDING_TINT                                   the pieces' material.
@@ -108,22 +108,21 @@ export type PreviewLanes = {
 
 /**
  * Show the pending preview? Pure — this IS the mount condition, and it is
- * deliberately the same gate the panel's decision UI uses (panel.tsx),
- * plus `phase === 'editor'`:
+ * deliberately the same gate the panel's decision UI uses (panel.tsx):
  *
  *  - `phase !== 'editor'` — during play the game renders the real thing;
  *    a preview on top would be a second, stale copy of every piece.
- *  - `!pendingDecision` — the choice is not open (never played, or Save /
- *    Discard already resolved it, both of which clear the flag through
- *    `resolvePlaced`), so there is nothing pending to show.
- *  - every lane empty — nothing was changed; render no objects at all.
+ *  - every lane empty — nothing is pending (never played, or Save / Discard
+ *    already resolved it, both of which empty the lanes); render no objects.
+ *
+ * It used to take a `pendingDecision` flag as well, set at Esc and cleared on
+ * re-entry. That made the preview a moment instead of a state: the lanes
+ * survive a reload now (pending-store.ts), and a fort you can no longer SEE is
+ * a fort you cannot make a decision about. Non-empty lanes in the editor is
+ * the whole condition.
  */
-export function shouldPreview(
-  phase: string,
-  pendingDecision: boolean,
-  lanes: PreviewLanes,
-): boolean {
-  if (phase !== 'editor' || !pendingDecision) return false
+export function shouldPreview(phase: string, lanes: PreviewLanes): boolean {
+  if (phase !== 'editor') return false
   return lanes.pieces > 0 || lanes.items > 0 || lanes.destroyed > 0 || lanes.painted > 0
 }
 
@@ -423,7 +422,6 @@ export function PreviewTree({
  */
 export function PendingPreview() {
   const phase = useBoots((s) => s.phase)
-  const pendingDecision = useBoots((s) => s.pendingDecision)
   const allPlaced = useBoots((s) => s.placed)
   const allItems = useItems((s) => s.items)
   const destroyed = useDemolition((s) => s.destroyed)
@@ -440,7 +438,7 @@ export function PendingPreview() {
   )
 
   if (
-    !shouldPreview(phase, pendingDecision, {
+    !shouldPreview(phase, {
       pieces: placed.length,
       items: items.length,
       destroyed: destroyed.length,

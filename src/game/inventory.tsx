@@ -36,7 +36,8 @@ import type { GameSession } from './session'
  *   opens — keyboard nav is simply inert and clicks are eaten by input.ts.
  * - Esc: with pointer lock already released the browser spends Esc on
  *   FULLSCREEN exit, which the session rightly treats as "leave the game"
- *   (pendingDecision keeps the placed items). I is the in-menu close key.
+ *   (the placed items survive the exit and wait in the sidebar). I is the
+ *   in-menu close key.
  */
 
 /** The bundled catalog rows; the live host types this AssetInput & {tool?}. */

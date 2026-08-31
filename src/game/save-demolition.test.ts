@@ -92,7 +92,7 @@ describe('captureDemolition (member ids fold onto scene nodes)', () => {
 
     resetDestruction()
     seed('wall-9', 'wall', 12, [false]) // shot at, nowhere near leveled
-    // Non-zero is what keeps exitGame's pendingDecision true.
+    // Non-zero is what keeps the panel's offer on screen back in the editor.
     expect(captureDemolition()).toBe(1)
     expect(useDemolition.getState().destroyed).toEqual([{ nodeId: 'wall-1', kind: 'wall' }])
   })

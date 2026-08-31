@@ -119,8 +119,8 @@ function fullyMine(work: LocalWork, target: VoxelTarget): boolean {
  * (only `resolvePlaced` clears it), and the two clear paths here are the same
  * explicit decision: `deleteDestroyed` (Save) and `discardDemolition`.
  *
- * Returns the TOTAL pending count, not this session's, because `exitGame`
- * derives `pendingDecision` from it.
+ * Returns the TOTAL pending count, not this session's, because the panel's
+ * offer is "in the editor with a non-empty lane" — this lane, all of it.
  */
 export function captureDemolition(): number {
   const work = localDemolitionWork()
