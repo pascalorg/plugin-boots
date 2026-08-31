@@ -14,7 +14,7 @@ import {
   PistolModel,
   RifleModel,
 } from './weapon-models'
-import type { GameWorld } from './world'
+import { type GameWorld, isBvhPriming } from './world'
 
 /**
  * WebGPU pipeline pre-warm. Materials/lights that first appear MID-session
@@ -62,12 +62,82 @@ function readWorldHandle(): GameWorld | null {
   return handle?.world ?? null
 }
 
+/** Where the main-thread drain got to. Carried in refs by the component; a
+ * plain value here so the frame step can be tested without a renderer. */
+export type BvhDrainState = {
+  /** Next collider index to touch. */
+  cursor: number
+  /** Walked the whole array — idle until the tail changes. */
+  done: boolean
+  /** The array's last entry when it finished, to notice arrivals. */
+  seenTail: unknown
+}
+
+export const FRESH_BVH_DRAIN: BvhDrainState = { cursor: 0, done: false, seenTail: undefined }
+
+/**
+ * One frame of the main-thread BVH drain.
+ *
+ * Extracted from the useFrame body for one reason: this loop now has to STAND
+ * DOWN, and that rule is worth a test. world.ts's prime queue builds the very
+ * same set in the worker, off the main thread — and until 2026-08-31 the worker
+ * was dead in production, so this loop was the only thing filling the cache and
+ * nobody could tell. With the worker alive it turned out this loop still won the
+ * race: of 122 collider geometries in the owner's scene, the worker had built 7.
+ * Perf fix #3's work was landing on the main thread anyway, one 4 ms slice per
+ * frame, exactly as before it shipped.
+ *
+ * So while the queue is priming, this yields. It stays the fallback for
+ * everything the queue cannot cover — no Worker at all, a worker that broke
+ * mid-session, and colliders that ARRIVE after the queue drained (item GLBs
+ * replacing their shot proxies) — which is also why it must not simply be
+ * deleted.
+ *
+ * `touch` is the caller's side effect (`void collider.bvh`, the lazy getter that
+ * builds and caches); `now` is the clock, injectable for tests.
+ */
+export function stepBvhDrain<T extends { disabled?: boolean }>(input: {
+  colliders: readonly T[]
+  state: BvhDrainState
+  /** Is the worker's prime queue still working? Then do nothing. */
+  priming: boolean
+  budgetMs: number
+  now: () => number
+  touch: (collider: T) => void
+}): BvhDrainState {
+  const { colliders, state, priming, budgetMs, now, touch } = input
+  if (state.done) {
+    // Colliders can arrive mid-session, so a finished drain re-opens when the
+    // array's TAIL entry changes (pushes append; a same-length splice+push —
+    // proxy out, GLB in — moves it too). While nothing changes this is one
+    // identity compare per frame.
+    const tail = colliders.length > 0 ? colliders[colliders.length - 1] : undefined
+    if (tail === state.seenTail) return state
+    // Re-walk from 0: a same-length splice+push can land NEW entries below a
+    // completed cursor, and re-touching a built entry is a WeakMap hit.
+    return stepBvhDrain({ ...input, state: { cursor: 0, done: false, seenTail: undefined } })
+  }
+  if (priming) return state
+  const deadline = now() + budgetMs
+  let i = state.cursor
+  while (i < colliders.length && now() < deadline) {
+    const collider = colliders[i]!
+    // Disabled colliders handed collision to their voxel grids already.
+    if (!collider.disabled) touch(collider)
+    i++
+  }
+  if (i < colliders.length) return { ...state, cursor: i }
+  return {
+    cursor: i,
+    done: true,
+    seenTail: colliders.length > 0 ? colliders[colliders.length - 1] : undefined,
+  }
+}
+
 export function PipelineWarmup({ world }: { world?: GameWorld } = {}) {
   const [done, setDone] = useState(false)
   const frames = useRef(0)
-  const bvhCursor = useRef(0)
-  const bvhDone = useRef(false)
-  const bvhSeenTail = useRef<unknown>(undefined)
+  const bvhDrain = useRef<BvhDrainState>(FRESH_BVH_DRAIN)
 
   // First-use audio costs move into the session-start beat (finding A3).
   useEffect(() => {
@@ -96,39 +166,23 @@ export function PipelineWarmup({ world }: { world?: GameWorld } = {}) {
     // the prevoxelize pass has finished (both tick at ~4 ms; never stack).
     const w = world ?? readWorldHandle()
     if (!w) return
-    const colliders = w.colliders
-    if (bvhDone.current) {
-      // Colliders can ARRIVE mid-session: item GLBs replace their shot
-      // proxies after async load and push fresh entries (item-place.tsx).
-      // A one-shot warm left those to build their Draco-mesh BVH inside
-      // the first shot that touched them — the untagged ~106 ms "item
-      // window" spike (QA 2026-08-28). Re-open the drain when the array's
-      // TAIL entry changes (pushes append, so any arrival moves it; a
-      // same-length splice+push — proxy out, GLB in — moves it too).
-      // While nothing changes this is one identity compare per frame.
-      const tail = colliders.length > 0 ? colliders[colliders.length - 1] : undefined
-      if (tail === bvhSeenTail.current) return
-      bvhDone.current = false
-      // Re-walk from 0: a same-length splice+push (proxy out, GLB in) can
-      // land NEW entries below a completed cursor, and bvhFor's WeakMap
-      // makes re-touching already-built entries nearly free.
-      bvhCursor.current = 0
-    }
+    // The item-window spike (QA 2026-08-28): a one-shot warm left colliders
+    // that arrive mid-session — item GLBs replacing their shot proxies after
+    // async load — to build their Draco-mesh BVH inside the first shot that
+    // touched them. stepBvhDrain re-opens on the array's tail changing.
     if (!prevoxelizeTick(w, 0)) return
-    const deadline = performance.now() + BVH_BUDGET_MS
-    let i = bvhCursor.current
-    while (i < colliders.length && performance.now() < deadline) {
-      const collider = colliders[i]!
-      // Touching the lazy getter builds + caches (WeakMap in world.ts);
-      // disabled colliders handed collision to their voxel grids already.
-      if (!collider.disabled) void collider.bvh
-      i++
-    }
-    bvhCursor.current = i
-    if (i >= colliders.length) {
-      bvhDone.current = true
-      bvhSeenTail.current = colliders.length > 0 ? colliders[colliders.length - 1] : undefined
-    }
+    bvhDrain.current = stepBvhDrain({
+      colliders: w.colliders,
+      state: bvhDrain.current,
+      // Yield to the worker: it is building the same set off the main thread.
+      priming: isBvhPriming(),
+      budgetMs: BVH_BUDGET_MS,
+      now: () => performance.now(),
+      // The lazy getter builds + caches (WeakMap in world.ts).
+      touch: (collider) => {
+        void collider.bvh
+      },
+    })
   })
 
   // Re-warm on every session (component remounts with ActiveGame).

@@ -287,6 +287,7 @@ const tmpBox = new Box3()
 const _aimRay = new Ray()
 const _localRay = new Ray()
 const _inverse = new Matrix4()
+const _boxHit = new Vector3()
 
 /** Once a node voxelizes AWAKE, destruction owns its colliders and its
  * mesh is hidden — the interact system must stand down (no prompt, no pose,
@@ -741,7 +742,8 @@ export function unmountInteract(states: Map<string, OperableState>): void {
 
 /**
  * The operable under the crosshair: cast origin→direction against every
- * state's collider BVHs — in their LIVE frames: the swing refreshes each
+ * state's collider BVHs — behind a ray-vs-AABB cull, and in their LIVE
+ * frames: the swing refreshes each
  * collider's inverse/worldBox (refreshColliderTransforms), so an open door
  * answers at its actual swung pose, exactly where the bullet lane tests it.
  * Closing through the empty doorway still works via the point-blank door
@@ -762,6 +764,19 @@ export function pickAimedOperable(
   for (const state of states) {
     if (standsDown(state)) continue
     for (const collider of state.colliders) {
+      // Broadphase, the same one the bullet lane has had since the minigun
+      // first-fire freeze (shooting.ts fireShot): a ray that never ENTERS the
+      // collider's world AABB cannot hit the geometry inside it, and the test
+      // costs nanoseconds. Cull on a miss only — a ray whose origin is INSIDE
+      // the box gets an exit point back, so the point-blank door still answers.
+      //
+      // It matters far past the cull: `collider.bvh` is a lazy getter that
+      // BUILDS on read, and this probe runs every frame over every operable.
+      // Measured 2026-08-31 in the owner's scene: 76 of the 118 main-thread
+      // BVH builds in a session came from right here, which is most of what the
+      // background worker queue exists to keep OFF the main thread. The queue
+      // was not failing — this loop was simply asking first.
+      if (_aimRay.intersectBox(collider.worldBox, _boxHit) === null) continue
       _inverse.copy(collider.inverse)
       _localRay.origin.copy(_aimRay.origin).applyMatrix4(_inverse)
       _localRay.direction.copy(_aimRay.direction).transformDirection(_inverse)

@@ -60,6 +60,25 @@ function buildOperable(
   }
 }
 
+/** Re-shape each collider's `bvh` as the LAZY GETTER production has (world.ts:
+ * `get bvh() { return bvhFor(this.mesh) }` — it builds on read). buildOperable
+ * sets a plain property, which makes a wasted read invisible. Returns the
+ * read counter. */
+function countBvhReads(colliders: ColliderEntry[]): () => number {
+  let reads = 0
+  for (const collider of colliders) {
+    const built = collider.bvh
+    Object.defineProperty(collider, 'bvh', {
+      configurable: true,
+      get() {
+        reads++
+        return built
+      },
+    })
+  }
+  return () => reads
+}
+
 type WorldSpec = {
   doors?: Array<{ built: BuiltOperable; nodeId: string; node?: Record<string, unknown> }>
   operables?: Array<{
@@ -386,6 +405,44 @@ describe('aim-pick priority', () => {
     expect(pickAimedOperable(states.values(), origin, forward)).toBeNull() // ~3.97 m > 2.5
     expect(pickAimedOperable(states.values(), origin, forward, 4.5)?.nodeId).toBe('door-a')
     expect(AIM_RANGE).toBeCloseTo(2.5)
+    unmountInteract(states)
+  })
+
+  test('the ray-vs-AABB cull keeps the per-frame probe off untouched BVHs', () => {
+    // In production `collider.bvh` is a lazy getter that BUILDS a MeshBVH on
+    // read (world.ts), and this probe runs EVERY FRAME over every operable —
+    // so a read the ray could never need is a synchronous main-thread build.
+    // Measured in the owner's scene 2026-08-31, before the cull: 76 builds
+    // from this one call site, most of the work the background worker queue
+    // exists to keep off the main thread. The helper below restores the shape
+    // the real ColliderEntry has, which buildOperable's plain property hides.
+    const near = buildOperable('door-near', 'door', [1, 2.1, 0.06], [0, 1.05, -1])
+    const aside = buildOperable('door-aside', 'door', [1, 2.1, 0.06], [8, 1.05, -1])
+    const world = makeWorld({
+      doors: [
+        { built: near, nodeId: 'door-near', node: { doorType: 'hinged', openingKind: 'door' } },
+        { built: aside, nodeId: 'door-aside', node: { doorType: 'hinged', openingKind: 'door' } },
+      ],
+    })
+    const states = mountInteract(world)
+    const reads = countBvhReads([...states.values()].flatMap((s) => s.colliders))
+    const eyes = new Vector3(0, 1.05, 0.5)
+
+    // Aimed at the near leaf: one read, its own. The door 8 m to the side is
+    // culled by its AABB and never asked for a BVH.
+    expect(pickAimedOperable(states.values(), eyes, new Vector3(0, 0, -1))?.nodeId).toBe('door-near')
+    expect(reads()).toBe(1)
+
+    // Aimed at empty air: both AABBs answer, nothing builds.
+    expect(pickAimedOperable(states.values(), eyes, new Vector3(0, 0, 1))).toBeNull()
+    expect(reads()).toBe(1)
+
+    // Shoulders against the leaf — origin INSIDE its own AABB. Ray.intersectBox
+    // hands back the exit point rather than null, so the cull cannot swallow
+    // the point-blank case the crosshair depends on.
+    expect(pickAimedOperable(states.values(), new Vector3(0, 1.05, -1), new Vector3(0, 0, -1))?.nodeId).toBe(
+      'door-near',
+    )
     unmountInteract(states)
   })
 

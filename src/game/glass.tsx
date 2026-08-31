@@ -3,6 +3,7 @@
 import { useFrame } from '@react-three/fiber'
 import { useLayoutEffect, useMemo, useRef } from 'react'
 import {
+  Box3,
   CanvasTexture,
   Color,
   DynamicDrawUsage,
@@ -58,6 +59,9 @@ export function resetGlass(): void {
 
 let crackId = 1
 const _ray = new Ray()
+const _worldRay = new Ray()
+const _worldBox = new Box3()
+const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _normalMat = new Vector3()
 
@@ -71,8 +75,26 @@ export function raycastGlass(
 ): GlassHit | null {
   const shattered = useGlass.getState().shattered
   let best: GlassHit | null = null
+  _worldRay.origin.copy(origin)
+  _worldRay.direction.copy(direction)
   for (const pane of world.glass) {
     if (shattered.has(pane.mesh)) continue
+    // Broadphase, for the same reason the bullet lane has one (shooting.ts):
+    // `bvhFor` BUILDS the pane's MeshBVH on a miss exactly as readily as on a
+    // hit, so without this cull the first shot fired anywhere in the house paid
+    // a synchronous build for EVERY pane in it. Panes are not colliders, so the
+    // background prime queue never covers them — this lane is the only one that
+    // ever builds them.
+    //
+    // The box comes off the live matrixWorld rather than a cached one: an
+    // operation window's panes swing with their root, and a stale box would cull
+    // a pane the round really passes through.
+    const geometry = pane.mesh.geometry
+    if (!geometry.boundingBox) geometry.computeBoundingBox()
+    _worldBox.copy(geometry.boundingBox!).applyMatrix4(pane.mesh.matrixWorld)
+    // A box entry beyond maxDist can never beat it either (entry ≤ true hit).
+    const entry = _worldRay.intersectBox(_worldBox, _boxHit)
+    if (entry === null || (entry.distanceTo(origin) > maxDist && !_worldBox.containsPoint(origin))) continue
     _inverse.copy(pane.mesh.matrixWorld).invert()
     _ray.origin.copy(origin).applyMatrix4(_inverse)
     _ray.direction.copy(direction).transformDirection(_inverse)

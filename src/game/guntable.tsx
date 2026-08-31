@@ -1045,7 +1045,13 @@ function useFixtureColliders(world: GameWorld, solidRefs: { current: (Mesh | nul
       if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
       const entry: ColliderEntry = {
         mesh,
-        bvh: bvhFor(mesh),
+        // Lazy, like world.ts's host colliders: this effect registers every
+        // depot mesh at once, and an eager build made all of them synchronously
+        // at mount whether a ray ever came near them or not. The rays that need
+        // one are broadphased (shooting.ts, interact.tsx), so most never build.
+        get bvh() {
+          return bvhFor(this.mesh)
+        },
         inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
         worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
         root: mesh,
