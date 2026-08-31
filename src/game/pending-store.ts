@@ -261,6 +261,18 @@ export function parsePendingSnapshot(raw: unknown): PendingParse | null {
   const mine = takeArray(raw.mine, MAX_PENDING_NODES).filter(
     (value): value is string => typeof value === 'string' && value.length > 0,
   )
+  // ROWS PAST A LANE CAP ARE DROPPED, SO THEY ARE COUNTED. The caller prints
+  // `skipped`; a cap that truncated in silence would read back as a smaller
+  // fort with nothing to explain it, which is the one thing this module
+  // promises not to do (docs/SESSION-CHANGES.md: pruning is reported, never
+  // silent). `mine` counts too — an allow-list quietly cut short is a Save
+  // that refuses to delete what it offered.
+  skipped +=
+    overflow(raw.placed, MAX_PENDING_PIECES) +
+    overflow(raw.destroyed, MAX_PENDING_NODES) +
+    overflow(raw.painted, MAX_PENDING_NODES) +
+    overflow(raw.items, MAX_PENDING_ITEMS) +
+    overflow(raw.mine, MAX_PENDING_NODES)
 
   return {
     skipped,
@@ -451,6 +463,12 @@ function isText(value: unknown, maxLength: number): value is string {
 
 function takeArray(value: unknown, cap: number): unknown[] {
   return Array.isArray(value) ? value.slice(0, cap) : []
+}
+
+/** How many rows `takeArray` left behind. A non-array lane is not truncation —
+ * it is a missing lane, which parses as empty and is not a loss to report. */
+function overflow(value: unknown, cap: number): number {
+  return Array.isArray(value) ? Math.max(0, value.length - cap) : 0
 }
 
 function copyPiece(piece: PlacedPiece): PlacedPiece {
