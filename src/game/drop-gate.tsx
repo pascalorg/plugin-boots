@@ -35,6 +35,29 @@ export function shouldOfferDrop(search: string, phase: string, consumed: boolean
   return new URLSearchParams(search).get('boots') === 'drop'
 }
 
+/**
+ * Pure gate: offer the RE-ENTRY pill? Exported for tests.
+ *
+ * The exact mirror of `shouldOfferDrop`, and the answer to a trap the one-shot
+ * created (owner report 2026-08-31: dropped in from a share link, pressed Esc,
+ * and found an empty "Plugins" panel).
+ *
+ * On the lobby route the host registers NO panels — that is deliberate, it is
+ * how the rail stays out of a visitor's way — so there is no "Jump in" button
+ * to go back to. Combined with the gate being consumed on its first click,
+ * leaving the game left a visitor stranded on a read-only canvas with no way
+ * back in short of reloading the page.
+ *
+ * `?boots=drop` is precisely the right condition: it means "this page was
+ * reached by a share link", which is the same set of pages that have no rail.
+ * On `/editor` the owner has the panel and needs no pill, and there the marker
+ * is absent (the share link normalizes to `/play` — see share-link.ts).
+ */
+export function shouldOfferReentry(search: string, phase: string, consumed: boolean): boolean {
+  if (!consumed || phase !== 'editor') return false
+  return new URLSearchParams(search).get('boots') === 'drop'
+}
+
 /** Poll cadence + stability window for the readiness census. */
 const POLL_MS = 250
 const STABLE_POLLS = 4
@@ -146,5 +169,32 @@ export function DropGate() {
       veil.remove()
     }
   }, [phase])
+
+  // ── Back in, after Esc ────────────────────────────────────────────────────
+  // Separate effect, same `phase` dependency: this one runs on the way OUT,
+  // when the first one has already latched. Deliberately NOT the opaque veil —
+  // a visitor who just left the game wants to see the building, so this is a
+  // small pill and nothing else. Bottom-centre keeps it clear of the floor
+  // selector at top-left.
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return
+    if (!shouldOfferReentry(window.location.search, phase, dropConsumed)) return
+
+    const pill = document.createElement('button')
+    pill.textContent = '⏵ JUMP BACK IN'
+    pill.setAttribute('data-boots-reentry', '')
+    pill.style.cssText =
+      `position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:9998;` +
+      `font:700 15px/1 ${FONT};letter-spacing:0.1em;color:#0f1113;background:#e8c229;` +
+      'border:none;border-radius:8px;padding:13px 30px;cursor:pointer;' +
+      'box-shadow:0 6px 20px rgba(0,0,0,0.35)'
+    // The click is the user gesture fullscreen and pointer lock require — the
+    // same reason the first-arrival gate is a button and not an auto-enter.
+    pill.onclick = () => enterGame()
+    document.body.appendChild(pill)
+
+    return () => pill.remove()
+  }, [phase])
+
   return null
 }

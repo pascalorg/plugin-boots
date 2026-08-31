@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { dropProgress, shouldOfferDrop } from './drop-gate'
+import { dropProgress, shouldOfferDrop, shouldOfferReentry } from './drop-gate'
 
 /**
  * The shareable-link gate: `?boots=drop` on the editor URL offers ONE
@@ -17,6 +17,49 @@ describe('drop gate (shareable game link)', () => {
   })
   test('one-shot: a consumed gate stays quiet (Esc must not nag)', () => {
     expect(shouldOfferDrop('?boots=drop', 'editor', true)).toBe(false)
+  })
+})
+
+/**
+ * Re-entry: the one-shot must not become a trap. On a shared link there is no
+ * plugin rail — the lobby route registers no host panels — so once the gate is
+ * consumed, leaving the game left a visitor with nothing to click (owner
+ * report 2026-08-31). The pill is the way back, and it is the exact complement
+ * of the gate: never both, always one of the two, on a drop link in editor
+ * phase.
+ */
+describe('re-entry pill (Esc on a shared link is not a dead end)', () => {
+  test('offers once the gate is consumed and we are back in editor phase', () => {
+    expect(shouldOfferReentry('?boots=drop', 'editor', true)).toBe(true)
+    expect(shouldOfferReentry('?a=1&boots=drop&b=2', 'editor', true)).toBe(true)
+  })
+
+  test('stays quiet before the gate is consumed — the gate itself is showing', () => {
+    expect(shouldOfferReentry('?boots=drop', 'editor', false)).toBe(false)
+  })
+
+  test('never during the game', () => {
+    expect(shouldOfferReentry('?boots=drop', 'game', true)).toBe(false)
+  })
+
+  test('only on a drop link — the owner in the editor has a real panel', () => {
+    expect(shouldOfferReentry('', 'editor', true)).toBe(false)
+    expect(shouldOfferReentry('?boots=jump', 'editor', true)).toBe(false)
+  })
+
+  test('gate and pill are mutually exclusive, and one always covers the case', () => {
+    // The property that makes this a fix and not a second surface to reason
+    // about: on a drop link in editor phase, exactly one of them is on.
+    for (const consumed of [false, true]) {
+      const gate = shouldOfferDrop('?boots=drop', 'editor', consumed)
+      const pill = shouldOfferReentry('?boots=drop', 'editor', consumed)
+      expect(gate !== pill, `consumed=${consumed}`).toBe(true)
+    }
+    // And off a drop link, neither ever shows.
+    for (const consumed of [false, true]) {
+      expect(shouldOfferDrop('', 'editor', consumed)).toBe(false)
+      expect(shouldOfferReentry('', 'editor', consumed)).toBe(false)
+    }
   })
 })
 
