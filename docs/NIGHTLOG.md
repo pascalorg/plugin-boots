@@ -1632,7 +1632,24 @@ NOPROBE=1 CYCLE=n (cold, per-colour), VOXELIZE=1 (sprite lane), or GPU=1
 NOTE FOR WHOEVER READS THE PALETTE. `PAINT_PALETTE[0]` is WHITE, and two
 paths fall back to index 0: `SPLAT_TINTS[s.color] ?? SPLAT_TINTS[0]` in
 stepSplats, and `colorIndex`'s own initial value. Neither explains the
-report (a local stamp always carries the live index, and a session that
-starts on WHITE stays white until R is pressed), but a wire colour from a
-peer running a longer palette WOULD land on white — a permanent wrong
-coat, not a flash. Worth a clamp if the palette ever grows.
+report: a local stamp always carries the live index, and a session that
+starts on WHITE stays white until R is pressed.
+
+A first draft of this note went further and claimed a wire colour from a
+peer on a longer palette would land on white. IT WOULD NOT, and the claim
+is retracted here rather than left to send the next reader chasing it.
+`foldRemoteStrokes` filters `rec.color < PAINT_PALETTE.length` before
+anything indexes the palette, and skips the node when nothing survives —
+already pinned by shared-build.test.ts "a colour outside this client's
+palette is refused". The `??` and the `null` from `decalMaterialFor` are
+defence behind that gate, not the gate.
+
+What the gate DOES cost is worth writing down, because it is the opposite
+of a wrong colour: in a mixed-palette lobby the older client shows NO
+paint where the newer one shows a coat. That is a silent divergence, and
+this game's rule is that builds and destruction are synchronous. It cannot
+happen today — one global pin means every client carries the same twelve
+swatches — so nothing is being changed for it. The day the palette grows,
+the choice to make is fold-to-a-known-index (both clients agree the wall
+is coated, hue may differ) over drop (one client never sees it), and this
+paragraph is the argument for it.
