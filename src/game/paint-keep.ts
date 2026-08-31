@@ -282,11 +282,21 @@ type SceneWriteView = {
  * scene materials (slot-modelled walls) land materials + node patches in a
  * single store set instead — zundo records one history entry, so one undo
  * removes the refs AND their now-orphaned materials together (the host's
- * slot-paint commit pattern). Returns the number of nodes patched.
+ * slot-paint commit pattern). Returns the number of nodes patched — 0 when
+ * nothing was written, which the receipt line depends on.
+ *
+ * A READ-ONLY STORE IS ASKED BEFORE WRITING, NOT AFTER. Both write paths
+ * no-op on `readOnly` — the host's `updateNodes` guards internally, and the
+ * minting branch's `setState` returns the state unchanged — and this function
+ * then cleared the captures and returned `updates.length` regardless, so the
+ * panel printed "repainted 7" for a coat nobody could see AND the session's
+ * paint was gone with it. Refusing up front keeps the captures, so releasing
+ * whatever lease made the scene read-only leaves the same Save still workable.
  */
 export function applyPaint(): number {
   const painted = usePaintKeep.getState().painted
   if (painted.length === 0) return 0
+  if ((useScene.getState() as unknown as SceneWriteView).readOnly) return 0
   const { updates, minted } = buildPaintPatches(useScene.getState().nodes, painted)
   if (minted.length === 0) {
     if (updates.length > 0) {

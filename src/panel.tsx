@@ -347,6 +347,11 @@ export type SaveBridges = {
    * would resurrect the whole decision on the next load, on top of the nodes
    * it just created. It has to be impossible to forget. */
   persist: typeof persistPendingChanges
+  /** Can the document be written at all? Required, not optional: every bridge
+   * below no-ops on a read-only store and then clears its captures anyway, so
+   * a bridge set that forgot to answer this would print a receipt for a save
+   * that never happened. */
+  writable: () => boolean
 }
 
 const LIVE_SAVE: SaveBridges = {
@@ -356,6 +361,7 @@ const LIVE_SAVE: SaveBridges = {
   applyItems,
   persist: persistPendingChanges,
   runStep: runAsOneHistoryStep,
+  writable: () => !(useScene.getState() as unknown as { readOnly?: boolean }).readOnly,
 }
 
 /**
@@ -368,6 +374,16 @@ const LIVE_SAVE: SaveBridges = {
  * was two undo steps (container + segment).
  */
 export function saveSessionChanges(bridges: SaveBridges = LIVE_SAVE): string {
+  // NOTHING IS ATTEMPTED ON A DOCUMENT THAT REFUSES WRITES. Every bridge
+  // no-ops on `readOnly` — the host's node actions guard internally — and then
+  // clears its own captures, so running them here would print a full receipt
+  // ("Kept 4 walls · repainted 7") for a scene that changed in no way, and the
+  // session's work would be gone with the captures. Refuse instead and keep
+  // everything pending: the read-only lease is not always permanent, so the
+  // same button works once it is released.
+  if (!bridges.writable()) {
+    return 'Nothing saved — this project is read-only right now. Your changes are still pending.'
+  }
   const { result, removed, repainted, itemsResult } = bridges.runStep(() => {
     const result = bridges.keepPlaced()
     const removed = bridges.deleteDestroyed()

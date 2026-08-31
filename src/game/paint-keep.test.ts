@@ -279,4 +279,40 @@ describe('applyPaint against the REAL core store (minting path)', () => {
     expect(wall.material).toEqual({ preset: 'custom', properties: { color: '#3b4a63' } })
     expect(usePaintKeep.getState().painted).toEqual([])
   })
+
+  test('a read-only store is refused up front, and the captures survive it', () => {
+    // The store no-ops both write paths on `readOnly`, so returning
+    // `updates.length` claimed a coat nobody could see — and the `clear()` that
+    // followed threw the session's paint away, which is the worse half. The
+    // captures have to outlive the refusal: a read-only lease can be released.
+    useScene.setState({
+      nodes: {
+        wall_ro: {
+          id: 'wall_ro',
+          type: 'wall',
+          slots: { interior: 'scene:mat_before' },
+          material: { preset: 'plaster', properties: { color: '#ffffff' } },
+        },
+      },
+      readOnly: true,
+    } as never)
+    const captures: PaintedNode[] = [
+      { nodeId: 'wall_ro', color: '#3b4a63', colorName: 'NAVY', cells: 9 },
+    ]
+    usePaintKeep.getState().setPainted(captures)
+
+    expect(applyPaint()).toBe(0)
+    expect(usePaintKeep.getState().painted).toEqual(captures)
+    const wall = useScene.getState().nodes['wall_ro' as never] as unknown as {
+      slots: Record<string, string>
+      material: { preset: string }
+    }
+    expect(wall.slots.interior).toBe('scene:mat_before')
+    expect(wall.material.preset).toBe('plaster')
+
+    // And the same Save works once the lease is gone — the point of keeping them.
+    useScene.setState({ readOnly: false } as never)
+    expect(applyPaint()).toBe(1)
+    expect(usePaintKeep.getState().painted).toEqual([])
+  })
 })

@@ -462,6 +462,7 @@ describe('Save', () => {
     persist: () => {
       calls.push('persist')
     },
+    writable: () => true,
   })
 
   test('the four bridges run in order, all inside one history step', () => {
@@ -504,6 +505,19 @@ describe('Save', () => {
     })
 
     expect(receipt).toBe('Kept 0 walls — 3 piece(s) had no node type yet')
+  })
+
+  test('a read-only document is refused, not silently reported as saved', () => {
+    // Every bridge no-ops on `readOnly` and then clears its captures, so the
+    // old shape printed a full receipt for a scene that changed in no way and
+    // threw the session's work away with it. No bridge may even run.
+    const calls: string[] = []
+    const receipt = saveSessionChanges({ ...stub(calls), writable: () => false })
+
+    expect(calls).toEqual([])
+    expect(receipt).toBe(
+      'Nothing saved — this project is read-only right now. Your changes are still pending.',
+    )
   })
 })
 

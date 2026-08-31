@@ -81,3 +81,22 @@ back tomorrow still shows the same list with the same two buttons.
   decision again, on top of the nodes it just wrote.
 - Caps are explicit (bytes, rows per lane, number of scopes) and pruning is
   reported, never silent.
+
+## A read-only document is refused, never reported as saved (shipped 2026-08-31)
+
+Every bridge writes through host node actions that **no-op on `readOnly`** and
+then clears its own captures, so a Save on a read-only scene used to print a
+full receipt — *"Kept 4 walls · repainted 7"* — for a document that changed in
+no way, and the session's work went out with the captures. The worse half is the
+loss, not the wrong number.
+
+`saveSessionChanges` now asks `writable()` first and runs **no bridge at all**,
+returning *"Nothing saved — this project is read-only right now. Your changes
+are still pending."* `persist` is skipped with the rest, so the stored window
+survives and the same button works once the lease is released. `applyPaint`
+carries the same refusal on its own, because it is the one bridge that writes
+through a raw `setState` and so cannot inherit the host's guard.
+
+Unreachable in the product today — the panel only renders for the owner, and
+`/play` registers no panel — which is exactly why it was worth closing before a
+retry path or a shared-editor session makes it reachable.
