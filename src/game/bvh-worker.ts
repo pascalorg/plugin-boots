@@ -1,6 +1,7 @@
 import type { BufferGeometry } from 'three'
 import type { MeshBVH } from 'three-mesh-bvh'
 import { GenerateMeshBVHWorker } from 'three-mesh-bvh/worker'
+import { BVH_WORKER_BOOTED } from './bvh-worker-protocol'
 
 /**
  * Off-main-thread BVH building (perf fix #3, 2026-08-29).
@@ -22,9 +23,18 @@ import { GenerateMeshBVHWorker } from 'three-mesh-bvh/worker'
  * node_modules): the host is a Next.js app where that pattern is supported,
  * but this module must never make the game WORSE where it isn't — every
  * failure mode (no Worker global, headless test run, constructor throw,
- * worker-script 404, hung task) degrades to `null` / a rejected build, and
- * world.ts's queue then simply stops: colliders keep their original
- * lazy-synchronous build path, which is exactly today's behavior.
+ * worker-script 404, worker that never boots, hung task) degrades to `null` /
+ * a rejected build, and world.ts's queue then simply stops: colliders keep
+ * their original lazy-synchronous build path, which is exactly today's
+ * behavior.
+ *
+ * The worker script is OURS (bvh-worker-entry.ts), not three-mesh-bvh's, for
+ * one reason: three's module evaluation touches `window` unguarded once the
+ * production optimizer folds its `typeof window` check away, so loading
+ * three-mesh-bvh's entry directly kills the worker in production — and did,
+ * from the day this landed until 2026-08-31. Read that file for the whole
+ * story. The PROTOCOL is still three-mesh-bvh's, borrowed rather than
+ * reimplemented, so there is only one place either end can drift.
  */
 
 /** Builds a MeshBVH for a BVH-only geometry copy, asynchronously. */
@@ -102,8 +112,113 @@ export function runBvhPrimeQueue(
  * mesh is in the same ballpark, so 30 s only ever trips on pathology. */
 const WORKER_TASK_TIMEOUT_MS = 30_000
 
+/**
+ * A worker that has not said it booted within this long is presumed dead.
+ *
+ * It has to fetch and parse the whole three chunk before it can answer, so this
+ * cannot be tight; but it is the only symptom a broken worker has, since a throw
+ * during module evaluation does not fire the parent's `Worker.onerror`. Before
+ * the boot handshake existed, the same failure surfaced as a task that never
+ * replied — WORKER_TASK_TIMEOUT_MS, i.e. the queue idle for the first 30 s of a
+ * session, which is precisely the stretch background priming exists to cover.
+ */
+let workerBootTimeoutMs = 10_000
+
+/**
+ * three-mesh-bvh's `WorkerBase.runTask` — the extension point its own subclasses
+ * implement, and the only part of `GenerateMeshBVHWorker` this file wants: the
+ * buffer transfer, the serialize/deserialize pair and the neutered-array
+ * restore, all of which are protocol details best left to the package that
+ * defines them. It is absent from the package's `.d.ts` (which declares only
+ * `generate`/`dispose`/`running`), so the shape is spelled out here.
+ *
+ * `runTask` reads nothing off `this` in 0.9.x, but it is called as a method
+ * anyway so a future version that reaches for `this.name` still works.
+ */
+type RunTask = (
+  this: unknown,
+  worker: Worker,
+  geometry: BufferGeometry,
+  options?: Record<string, unknown>,
+) => Promise<MeshBVH>
+
+const borrowedRunTask = (GenerateMeshBVHWorker.prototype as unknown as { runTask?: RunTask }).runTask
+
+/**
+ * The BVH worker: three-mesh-bvh's protocol driving a worker script of ours.
+ *
+ * Same surface as `GenerateMeshBVHWorker` (`generate`, `dispose`, one job at a
+ * time) so the rest of this module did not have to change shape, plus the boot
+ * handshake that class has no way to offer — it cannot know whether its worker
+ * ever came up.
+ */
+class ShimmedBvhWorker {
+  private worker: Worker | null
+  private running = false
+  /** Resolves when the worker installed its message handler; rejects when it
+   * did not, which is how a worker killed at module evaluation is detected. */
+  private readonly booted: Promise<void>
+
+  constructor() {
+    // `new URL(..., import.meta.url)` is the pattern bundlers recognise to emit
+    // a worker chunk. The host app is Next/Turbopack, which supports it for a
+    // TS entry; anywhere it is not supported the constructor throws or the
+    // script 404s, and either way we fall back to main-thread builds.
+    const worker = new Worker(new URL('./bvh-worker-entry.ts', import.meta.url), { type: 'module' })
+    this.worker = worker
+    this.booted = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error('[boots] BVH worker never reported ready')),
+        workerBootTimeoutMs,
+      )
+      const settle = (outcome: () => void) => {
+        clearTimeout(timer)
+        worker.removeEventListener('message', onMessage)
+        outcome()
+      }
+      const onMessage = (event: MessageEvent) => {
+        // Task replies are objects; only the boot ping is this string. Anything
+        // else on the wire before boot is not ours to interpret.
+        if (event.data === BVH_WORKER_BOOTED) settle(resolve)
+      }
+      worker.addEventListener('message', onMessage)
+      // Fires for a script that fails to FETCH or PARSE. A script that parses
+      // and then throws does not fire it, hence the timeout above. Kept because
+      // when it does fire it is both instant and specific.
+      worker.addEventListener('error', (event) =>
+        settle(() => reject(new Error(`[boots] BVH worker failed to start: ${event.message || 'unknown error'}`))),
+      )
+    })
+    // Nobody awaits `booted` until the first build, and a rejection sitting
+    // unobserved until then is reported as unhandled. The real handling is in
+    // `generate`, which awaits it and lets `generateInWorker` break the worker.
+    this.booted.catch(() => {})
+  }
+
+  async generate(geometry: BufferGeometry): Promise<MeshBVH> {
+    if (this.running) throw new Error('[boots] BVH worker: already running a job')
+    if (!borrowedRunTask) throw new Error('[boots] BVH worker: three-mesh-bvh has no runTask to borrow')
+    const worker = this.worker
+    if (!worker) throw new Error('[boots] BVH worker has been disposed')
+    // Claim the slot before the await: two concurrent callers must not both get
+    // past the guard while the first one is still waiting for boot.
+    this.running = true
+    try {
+      await this.booted
+      return await borrowedRunTask.call(this, worker, geometry, {})
+    } finally {
+      this.running = false
+    }
+  }
+
+  dispose(): void {
+    this.worker?.terminate()
+    this.worker = null
+  }
+}
+
 let workerBroken = false
-let workerInstance: GenerateMeshBVHWorker | null = null
+let workerInstance: ShimmedBvhWorker | null = null
 
 function breakWorker(reason: unknown): void {
   if (workerBroken) return
@@ -117,25 +232,37 @@ function breakWorker(reason: unknown): void {
   workerInstance = null
 }
 
-/** Test-only: forget the singleton so a fresh environment can be probed. */
-export function resetBvhWorkerForTests(): void {
+/**
+ * Test-only: forget the singleton so a fresh environment can be probed, and
+ * optionally shorten the boot budget — a test for "the worker never came up"
+ * should not take ten real seconds to make its point.
+ */
+export function resetBvhWorkerForTests(bootTimeoutMs?: number): void {
   workerBroken = false
   workerInstance = null
+  if (bootTimeoutMs !== undefined) workerBootTimeoutMs = bootTimeoutMs
 }
 
 /**
  * The shared background builder, or null where workers can't work: no
  * Worker global, no document (SSR / bun test — spawning real workers under
  * the test runner risks hangs), a broken worker from earlier in the page's
- * life, or a constructor throw (bundlers that don't emit the worker chunk
- * fail here or via the first task's onerror → rejection → queue stop).
+ * life, a three-mesh-bvh with no `runTask` to borrow, or a constructor throw
+ * (bundlers that don't emit the worker chunk fail here, or the worker never
+ * boots → rejection → queue stop).
  */
 export function workerBvhBuilder(): BvhAsyncBuilder | null {
   if (typeof Worker === 'undefined' || typeof document === 'undefined') return null
   if (workerBroken) return null
+  if (!borrowedRunTask) {
+    // An upstream refactor moved the protocol. Better to keep building on the
+    // main thread than to spawn a worker nothing can drive.
+    breakWorker(new Error('[boots] three-mesh-bvh: GenerateMeshBVHWorker has no runTask'))
+    return null
+  }
   if (!workerInstance) {
     try {
-      workerInstance = new GenerateMeshBVHWorker()
+      workerInstance = new ShimmedBvhWorker()
     } catch (error) {
       breakWorker(error)
       return null
