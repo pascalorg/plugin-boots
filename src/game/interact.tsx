@@ -220,6 +220,13 @@ type HingedRig = {
   /** Hinge pivot in parent-local space + the original pivot→position arm. */
   hingeLocal: Vector3
   arm0: Vector3
+  /** `arm0` in the LEAF's own frame. The swing is a rotation about the leaf's
+   * local vertical (that is the edge buildHingedRig picked, and the side the
+   * player is on is judged in the same frame — see toggleOperable), so the arm
+   * has to cross into that frame before being swung and back out after. For a
+   * yaw-only rest pose it equals `arm0` turned by −yaw; for a tilted one it is
+   * the only version that keeps the pivot still. */
+  armBody: Vector3
   /** Swing direction chosen when the door opens (±1). */
   sign: number
 }
@@ -435,7 +442,14 @@ function applyPose(state: OperableState): void {
     const angle = rig.sign * OPEN_ANGLE * state.value
     tmpQuat.setFromAxisAngle(UP, angle)
     state.root.quaternion.multiplyQuaternions(rig.quaternion0, tmpQuat)
-    tmpVec.copy(rig.arm0).applyQuaternion(tmpQuat)
+    // Orientation and position have to be swung in the SAME frame or the
+    // pivot walks. The line above turns the leaf about its own vertical
+    // (quaternion0 · swing); the arm therefore has to be swung there too and
+    // brought back to parent space, which is what armBody + quaternion0 do.
+    // Rotating the parent-space arm by the body-space swing directly is only
+    // right when the two commute — i.e. when the rest pose is yaw-only, which
+    // hid this for as long as every door hung in an upright wall.
+    tmpVec.copy(rig.armBody).applyQuaternion(tmpQuat).applyQuaternion(rig.quaternion0)
     state.root.position.copy(rig.hingeLocal).add(tmpVec)
     return
   }
@@ -594,12 +608,14 @@ function buildHingedRig(root: Object3D, colliders: ColliderEntry[]): HingedRig {
   const hingeLocal = root.parent ? root.parent.worldToLocal(hingeWorld.clone()) : hingeWorld.clone()
   const position0 = root.position.clone()
   const quaternion0 = root.quaternion.clone()
+  const arm0 = position0.clone().sub(hingeLocal)
   return {
     position0,
     quaternion0,
     inverse0,
     hingeLocal,
-    arm0: position0.clone().sub(hingeLocal),
+    arm0,
+    armBody: arm0.clone().applyQuaternion(quaternion0.clone().invert()),
     sign: 1,
   }
 }
