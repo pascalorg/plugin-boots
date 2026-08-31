@@ -67,7 +67,22 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * inside a still frame, a tilt out of world Y) must fall back to the handback.
  */
 
+let mounted: Map<string, OperableState> | null = null
+
+/** The destruction ledger and the passage set are module singletons, so a file
+ * that ran before this one can leave targets standing in them. Cleaning up
+ * after ourselves is not enough: a raycast that finds a stranger's ghost —
+ * or misses ours behind one — reads exactly like the bug this file exists to
+ * fence, so the state is cleared going IN as well as coming out. */
+const isolate = () => {
+  if (mounted) unmountInteract(mounted)
+  mounted = null
+  resetDestruction()
+  clearPassages()
+}
+
 beforeEach(() => {
+  isolate()
   setShellFlag('wall', false)
   setShellFlag('roof', false)
   setShellFlag('slab', false)
@@ -78,13 +93,7 @@ afterAll(() => {
   setShellFlag('slab', true)
 })
 
-let mounted: Map<string, OperableState> | null = null
-afterEach(() => {
-  if (mounted) unmountInteract(mounted)
-  mounted = null
-  resetDestruction()
-  clearPassages()
-})
+afterEach(isolate)
 
 const targets = () => useDestruction.getState().targets
 

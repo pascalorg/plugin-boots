@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Vector3 } from 'three'
 import {
   clearDust,
@@ -20,6 +20,10 @@ import {
  * is DOM-bound and covered by review.
  */
 
+// The particle pools are module singletons, and several tests here count what
+// is in them, so they have to start from an EMPTY pool rather than trusting
+// whoever ran last to have swept up.
+beforeEach(clearDust)
 afterEach(clearDust)
 
 const P = new Vector3(1, 2, 3)

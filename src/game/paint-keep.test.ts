@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { useScene } from '@pascal-app/core'
 import {
   applyPaint,
@@ -16,6 +16,19 @@ import {
  * "one color per cell" ledger read). */
 const coats = (pairs: [number, number, number?][]) =>
   new Map<number, number>(pairs.map(([cell, color, s]) => [cell, (color << 8) | (s ?? 255)]))
+
+/**
+ * `usePaintKeep` is a module singleton, and bun shares module instances across
+ * every file named in ONE `bun test` invocation. So the coats another file left
+ * pending are ours on arrival: `mergePendingPaint` counted them and reported 2
+ * where the test said 1, only when run alongside `panel.test.ts` (whose Save
+ * tests leave paint pending on purpose). Cleaning up after ourselves is not
+ * enough — a test has to start from a state it set, not one it inherited.
+ */
+beforeEach(() => {
+  discardPaint()
+  useScene.setState({ readOnly: false } as never)
+})
 
 describe('dominantPaint (the save-the-paint aggregator)', () => {
   test('per-cell majority wins', () => {
