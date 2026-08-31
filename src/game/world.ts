@@ -22,6 +22,7 @@ import {
   type BvhAsyncBuilder,
   type BvhPrimeHandle,
   type BvhPrimeTask,
+  bvhWorkerStats,
   runBvhPrimeQueue,
   workerBvhBuilder,
 } from './bvh-worker'
@@ -360,6 +361,10 @@ function overlayKinds(): string[] {
 
 const bvhCache = new WeakMap<BufferGeometry, MeshBVH>()
 
+/** Cache-miss builds that ran on THIS thread — the other half of the split
+ * bvhPrimeStats reports. Counted in bvhFor; page-lifetime, never reset. */
+let mainThreadBuilds = 0
+
 let emptyBvh: MeshBVH | null = null
 
 /** Never-throwing fallback: a degenerate BVH that no ray/shape ever hits. */
@@ -467,6 +472,7 @@ export function bvhFor(mesh: Mesh): MeshBVH {
     // Attribution for the perf monitor: a cache-miss build inside a shot /
     // wake frame is a known first-hit cost — tag it so spikes name it.
     perfEvent('bvh-build')
+    mainThreadBuilds++
     try {
       bvh = new MeshBVH(sanitizeGeometryForBvh(mesh.geometry))
     } catch (error) {
@@ -485,6 +491,8 @@ export function bvhBuilt(mesh: Mesh): boolean {
 }
 
 let activeBvhPrime: BvhPrimeHandle | null = null
+/** Whether the CURRENT queue is still working — see bvhPrimeStats. */
+let bvhPrimeRunning = false
 
 /**
  * Background BVH fill (perf fix #3): hand every collider geometry to the
@@ -512,6 +520,7 @@ export function primeColliderBvhs(
 ): BvhPrimeHandle | null {
   activeBvhPrime?.cancel()
   activeBvhPrime = null
+  bvhPrimeRunning = false
   if (!buildAsync) return null
   const seen = new Set<BufferGeometry>()
   const tasks: BvhPrimeTask[] = []
@@ -530,7 +539,78 @@ export function primeColliderBvhs(
     onBuilt: (geometry, bvh) => bvhCache.set(geometry, bvh),
   })
   activeBvhPrime = handle
+  bvhPrimeRunning = true
+  // `done` never rejects and also resolves on cancel — "running" means this
+  // queue is still working, not that it succeeded. A superseded queue's `done`
+  // must not clear the flag for the queue that replaced it.
+  handle.done.then(() => {
+    if (activeBvhPrime === handle) bvhPrimeRunning = false
+  })
   return handle
+}
+
+/**
+ * Is the worker's prime queue still working? The frame-loop form of
+ * bvhPrimeStats' `priming` — warmup.tsx asks this every frame to know whether to
+ * stand down (see stepBvhDrain), so it must cost nothing and take no arguments.
+ */
+export function isBvhPriming(): boolean {
+  return bvhPrimeRunning
+}
+
+/**
+ * How far the background prime actually got.
+ *
+ * This reading is what nothing had: a dead worker and a drained queue look
+ * IDENTICAL from inside a session — the cache fills either way, correctness
+ * never changes, and the only difference is which thread paid for it. That is
+ * how off-main-thread building shipped broken and stayed broken for two days
+ * (bvh-worker-entry.ts has the story). `built` climbing while `priming` is true
+ * is the queue working; `priming` false with `built` short of `geometries` is
+ * the queue stopped, which is a builder that failed. And `workerBuilds` is what
+ * a full cache alone cannot tell you: WHICH THREAD paid for it — 0 with
+ * everything built means every BVH was built synchronously, the broken state
+ * exactly.
+ *
+ * Reads the CACHE ONLY. Never `entry.bvh` — that getter BUILDS, so a reading
+ * taken through it would synchronously create the very thing it reports, on the
+ * main thread, which is the stall this whole lane exists to avoid.
+ *
+ * Exposed as `__boots.bvhPrime()`.
+ */
+export function bvhPrimeStats(colliders: readonly ColliderEntry[]): {
+  /** Distinct collider geometries — many colliders share one geometry. */
+  geometries: number
+  /** …of which how many hold a BVH, from either path. */
+  built: number
+  /** Is a queue still working? False both before the first prime and after the
+   * last one drained, was cancelled, or stopped on a builder failure. */
+  priming: boolean
+  /** BVHs handed back by the worker since page load (across sessions). */
+  workerBuilds: number
+  /** …against cache-miss builds that ran on this thread, same window. The two
+   * together are the split the cache alone hides. */
+  mainThreadBuilds: number
+  /** Has the worker been written off? Then everything left is main-thread. */
+  workerBroken: boolean
+} {
+  const seen = new Set<BufferGeometry>()
+  let built = 0
+  for (const collider of colliders) {
+    const geometry = collider.mesh.geometry
+    if (!geometry || seen.has(geometry)) continue
+    seen.add(geometry)
+    if (bvhCache.has(geometry)) built++
+  }
+  const worker = bvhWorkerStats()
+  return {
+    geometries: seen.size,
+    built,
+    priming: isBvhPriming(),
+    workerBuilds: worker.builds,
+    mainThreadBuilds,
+    workerBroken: worker.broken,
+  }
 }
 
 /** Is this mesh's material glass-like? transparent with opacity < 0.95, or

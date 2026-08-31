@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { BoxGeometry, BufferAttribute, BufferGeometry } from 'three'
 import { MeshBVH } from 'three-mesh-bvh'
-import { resetBvhWorkerForTests, workerBvhBuilder } from './bvh-worker'
+import { bvhWorkerStats, resetBvhWorkerForTests, workerBvhBuilder } from './bvh-worker'
 import { BVH_WORKER_BOOTED } from './bvh-worker-protocol'
 
 /**
@@ -181,6 +181,9 @@ describe('a worker that never reports ready is abandoned, not waited on', () => 
     // queue stops, colliders keep the lazy synchronous path.
     expect(workerBvhBuilder()).toBeNull()
     expect(SilentWorker.instances).toBe(1)
+    // The reading a session can take (`__boots.bvhPrime()`): written off,
+    // disposed, nothing ever came back. This is what production looked like.
+    expect(bvhWorkerStats()).toEqual({ builds: 0, broken: true, live: false })
   })
 
   test('two overlapping builds both land, one after the other', async () => {
@@ -200,6 +203,10 @@ describe('a worker that never reports ready is abandoned, not waited on', () => 
     expect(second).toBeInstanceOf(MeshBVH)
     // Serialized, not interleaved — the worker takes one task at a time.
     expect(ProtocolWorker.log).toEqual(['posted', 'replied', 'posted', 'replied'])
+    // Counted where it means "a BVH reached the main thread": two builds asked
+    // for, two arrived. A session reads this to know the cache was filled OFF
+    // the main thread rather than by the synchronous fallback.
+    expect(bvhWorkerStats()).toEqual({ builds: 2, broken: false, live: true })
   })
 
   test('a worker that does report ready gets its task posted', async () => {

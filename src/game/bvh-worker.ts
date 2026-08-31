@@ -251,6 +251,8 @@ class ShimmedBvhWorker {
 
 let workerBroken = false
 let workerInstance: ShimmedBvhWorker | null = null
+/** Builds that came BACK from the worker — see bvhWorkerStats. */
+let workerBuildsCompleted = 0
 
 function breakWorker(reason: unknown): void {
   if (workerBroken) return
@@ -272,7 +274,22 @@ function breakWorker(reason: unknown): void {
 export function resetBvhWorkerForTests(bootTimeoutMs?: number): void {
   workerBroken = false
   workerInstance = null
+  workerBuildsCompleted = 0
   if (bootTimeoutMs !== undefined) workerBootTimeoutMs = bootTimeoutMs
+}
+
+/**
+ * How many BVHs the worker has actually handed back, and whether it is still
+ * trusted.
+ *
+ * The count is the one fact that separates "off the main thread" from "on it":
+ * world.ts's cache fills from either path, and the QUEUE draining says only
+ * that the BVHs exist, not who built them. `builds: 0` with a full cache means
+ * every build ran synchronously — which is precisely the state production was
+ * in, undetected, from 2026-08-29 to 08-31. Reported by `__boots.bvhPrime()`.
+ */
+export function bvhWorkerStats(): { builds: number; broken: boolean; live: boolean } {
+  return { builds: workerBuildsCompleted, broken: workerBroken, live: workerInstance !== null }
 }
 
 /**
@@ -310,7 +327,11 @@ async function generateInWorker(geometry: BufferGeometry): Promise<MeshBVH> {
     // The timers live inside `generate`: one budget for coming up, one for the
     // build itself, neither of them charged for time spent queued behind another
     // caller's build.
-    return await worker.generate(geometry, WORKER_TASK_TIMEOUT_MS)
+    const bvh = await worker.generate(geometry, WORKER_TASK_TIMEOUT_MS)
+    // Counted here rather than in `generate` so it means "a BVH reached the main
+    // thread", not "a task was posted".
+    workerBuildsCompleted++
+    return bvh
   } catch (error) {
     // Anything that gets here — dead worker, timed-out build, geometry the
     // protocol cannot transfer — writes the worker off and puts every remaining

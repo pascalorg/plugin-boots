@@ -61,6 +61,7 @@ import { PipelineWarmup } from './warmup'
 import { dormantPrimeQueueSize, VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
 import {
+  bvhPrimeStats,
   collectMeshes,
   collectOverlayRoots,
   collectSolidRoots,
@@ -688,6 +689,10 @@ function ActiveGame() {
       // Prevoxelize scheduler live numbers (perf fix 2 QA): frame-dt EMA,
       // the adaptive time budget it picked, and the queue remainder.
       prevoxelize: () => prevoxelizeSchedulerStats(),
+      // Background BVH prime progress. The only reading that tells a working
+      // queue apart from a stopped one — the cache fills either way, so a
+      // broken worker is invisible without it (it hid for two days).
+      bvhPrime: () => bvhPrimeStats(world.colliders),
       // Conforming-shell lane (S2 default ON): census (shelled targets /
       // fragments / fragments killed / S2 pending deferred builds, totals
       // + per kind) + the per-kind flag toggle. setShell is SESSION-

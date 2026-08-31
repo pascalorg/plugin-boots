@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import {
   Box3,
   BoxGeometry,
@@ -19,6 +19,7 @@ import type { ColliderEntry } from './world'
 import {
   bvhBuilt,
   bvhFor,
+  bvhPrimeStats,
   primeColliderBvhs,
   probeSpawnSurfaceY,
   sanitizeGeometryForBvh,
@@ -439,5 +440,113 @@ describe('primeColliderBvhs — deferred background builds', () => {
     const collider = boxCollider(6)
     expect(primeColliderBvhs([collider], spawn)).toBeNull()
     expect(bvhBuilt(collider.mesh)).toBe(false)
+  })
+
+  /**
+   * The reading that would have caught the two-day-dead production worker:
+   * a stopped queue and a finished one differ in nothing a session can feel.
+   */
+  describe('bvhPrimeStats — telling a working queue from a stopped one', () => {
+    /** Every reading in this describe comes from an INJECTED builder, which is
+     * not the worker — so the worker fields stay at their untouched values, and
+     * spelling that out is half the point: a full cache with `workerBuilds: 0`
+     * is the shape of a session that built everything on the main thread. */
+    const idle = (reading: { geometries: number; built: number; priming: boolean }) => ({
+      ...reading,
+      workerBuilds: 0,
+      // Whatever earlier tests in this file built synchronously — the count is
+      // page-lifetime by design, so the reading is about the SPLIT, not a total.
+      mainThreadBuilds: expect.any(Number),
+      workerBroken: false,
+    })
+
+    // `priming` is module state, and these tests deliberately leave a queue
+    // mid-build. An empty prime is the honest reset — a session with nothing to
+    // do cancels the previous queue and returns null — and it keeps the
+    // assertions true under `--randomize` as well as in file order.
+    beforeEach(() => {
+      expect(primeColliderBvhs([], spawn, recordingBuilder().build)).toBeNull()
+    })
+
+    test('reports progress without ever building anything itself', async () => {
+      const near = boxCollider(2)
+      const far = boxCollider(25)
+
+      // THE load-bearing property. `ColliderEntry.bvh` is a getter that BUILDS;
+      // a diagnostic that read colliders through it would synchronously build
+      // the whole world on the main thread — the exact stall the prime lane
+      // exists to remove — and then report 100% primed, every time.
+      const before = bvhPrimeStats([near, far])
+      expect(before).toEqual(idle({ geometries: 2, built: 0, priming: false }))
+      expect(bvhBuilt(near.mesh)).toBe(false)
+      expect(bvhBuilt(far.mesh)).toBe(false)
+
+      const { build } = recordingBuilder()
+      const handle = primeColliderBvhs([near, far], spawn, build)
+      // Synchronously after the call the queue is running and nothing landed.
+      expect(bvhPrimeStats([near, far])).toEqual(idle({ geometries: 2, built: 0, priming: true }))
+
+      await handle!.done
+      // `done` resolving is not the flag clearing — that happens in a `then`
+      // callback of its own, one microtask behind.
+      await Promise.resolve()
+      expect(bvhPrimeStats([near, far])).toEqual(idle({ geometries: 2, built: 2, priming: false }))
+    })
+
+    test('counts geometries, not colliders', async () => {
+      // Every wall of one type shares a geometry; counting colliders would
+      // report a number with no relation to the work the queue has to do.
+      const shared = new BoxGeometry(1, 1, 1)
+      const a = colliderFor(shared)
+      const b = colliderFor(shared)
+      const own = boxCollider(9)
+      expect(bvhPrimeStats([a, b, own]).geometries).toBe(2)
+
+      const { build } = recordingBuilder()
+      await primeColliderBvhs([a, b, own], spawn, build)!.done
+      await Promise.resolve()
+      expect(bvhPrimeStats([a, b, own])).toEqual(idle({ geometries: 2, built: 2, priming: false }))
+    })
+
+    test('a builder that fails leaves the stopped-queue signature', async () => {
+      // This is what a dead worker looks like from the outside, and the whole
+      // reason the reading exists: not priming, and short of the total.
+      const first = boxCollider(1)
+      const second = boxCollider(11)
+      const build = mock(async () => {
+        throw new Error('worker exploded')
+      })
+      const handle = primeColliderBvhs([first, second], spawn, build)
+      await handle!.done
+      await Promise.resolve()
+      const stats = bvhPrimeStats([first, second])
+      expect(stats.priming).toBe(false)
+      expect(stats.built).toBeLessThan(stats.geometries)
+    })
+
+    test("a superseded queue's completion does not clear the live queue's flag", async () => {
+      // Esc → Jump in: the old session's queue finishes (its in-flight build
+      // lands, then cancellation stops it) AFTER the new session's queue has
+      // started. If the flag were set by whichever `done` fires last, the new
+      // session would report "not priming" for the whole time it primes —
+      // which reads exactly like the dead-worker signature above.
+      const old = boxCollider(3)
+      const { build: quick } = recordingBuilder()
+      const oldHandle = primeColliderBvhs([old, boxCollider(30)], spawn, quick)
+
+      const next = boxCollider(7)
+      // Still building when the assertion runs, like a real worker mid-task.
+      const nextHandle = primeColliderBvhs([next], spawn, mock(() => new Promise<MeshBVH>(() => {})))
+      expect(nextHandle).not.toBeNull()
+
+      await oldHandle!.done
+      await Promise.resolve()
+      expect(bvhPrimeStats([next]).priming).toBe(true)
+      // The old queue did stop where cancellation caught it: the in-flight
+      // build landed, the second one was never started. (`priming` is about the
+      // live queue whatever colliders are passed — there is only ever one.)
+      expect(bvhPrimeStats([old]).built).toBe(1)
+      expect(quick.mock.calls.length).toBe(1)
+    })
   })
 })
