@@ -820,6 +820,8 @@ export function nearestDoorFallback(
 // ---------------------------------------------------------------------------
 
 const _aimDir = new Vector3()
+/** interactDebug.aimed()'s own direction — never the frame loop's. */
+const _dbgAim = new Vector3()
 
 export function Interact({ world }: { world: GameWorld }) {
   const statesRef = useRef<Map<string, OperableState> | null>(null)
@@ -969,6 +971,30 @@ export const interactDebug = {
     // toggleOperable self-guards the voxelized case (including the sealed-
     // door handback), so bots fumbling a lightly-shot door open it too.
     if (state) toggleOperable(state)
+  },
+  /**
+   * What the crosshair is on RIGHT NOW — the frame loop's own two-step, run on
+   * demand: pickAimedOperable, then the point-blank door fallback, with `via`
+   * saying which answered.
+   *
+   * The aim lane had no headless reading at all: QA could only infer it from
+   * whether pressing E happened to open a door, which also depends on where the
+   * teleport landed and whether the walk that followed worked (doorsweep's
+   * `openedVia`). That is far too noisy to certify a change to the pick itself —
+   * and pickAimedOperable now culls each collider against its world AABB before
+   * touching the lazy `bvh` getter, which is exactly the kind of change that
+   * needs a direct, quiet measurement on the real scene.
+   */
+  aimed: (): { nodeId: string; kind: OperableKind; open: boolean; via: 'aim' | 'fallback' } | null => {
+    if (!activeStates) return null
+    const cp = Math.cos(playerRig.pitch)
+    // Its own scratch vector: _aimDir belongs to the frame loop, and a debug
+    // call landing between frames must not write to it.
+    _dbgAim.set(-Math.sin(playerRig.yaw) * cp, Math.sin(playerRig.pitch), -Math.cos(playerRig.yaw) * cp)
+    const aim = pickAimedOperable(activeStates.values(), playerRig.position, _dbgAim)
+    const state = aim ?? nearestDoorFallback(activeStates.values(), playerRig.position)
+    if (!state) return null
+    return { nodeId: state.nodeId, kind: state.kind, open: state.open, via: aim ? 'aim' : 'fallback' }
   },
   /** Every live passage prism as plain data (what collision.ts is relieving). */
   passages: () => passageBoxes(),
