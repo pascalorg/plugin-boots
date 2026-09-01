@@ -13,6 +13,7 @@ import { persistPendingChanges } from './pending-lanes'
 import { stopWorldSync } from './net-world'
 import { stopPresence } from './presence'
 import { captureDemolition } from './save-demolition'
+import { TouchControls, touchPlayLikely } from './touch'
 
 /**
  * The out-of-React session singleton: DOM concerns (canvas, fullscreen,
@@ -511,6 +512,78 @@ export function armSceneWriteSentinel(teardown: Array<() => void>): void {
   teardown.push(unsub)
 }
 
+/**
+ * FAKE FULLSCREEN — the phone's version of `requestFullscreen`.
+ *
+ * iOS Safari gives the Fullscreen API to <video> and nothing else, so on an
+ * iPhone the game runs inside the editor's layout with the host's own chrome
+ * (view-mode switch, floor rail, tab bar, catalog sheet) painted on top of it.
+ * That is what the cofounder photographed and read as "the link just opens the
+ * editor": a live session behind the furniture.
+ *
+ * So promote the canvas's container to the viewport by hand — `position:fixed`
+ * over everything, which R3F follows because it sizes the canvas from the
+ * container. The host chrome keeps its layout and its state; it is simply
+ * BEHIND an opaque canvas, and every style written here is ledgered and put
+ * back on exit, so the editor still round-trips untouched.
+ *
+ * A `transform`, `filter` or `will-change` on any ancestor re-parents a fixed
+ * box to that ancestor instead of the viewport, which would leave the canvas
+ * half-promoted and clipped. There is no clean way to test for that up front,
+ * so this MEASURES the result and stands down if the box did not land on the
+ * viewport — worst case the session is exactly as windowed as it is today.
+ *
+ * Returns whether the promotion stuck.
+ */
+export function promoteContainer(container: HTMLElement, teardown: Array<() => void>): boolean {
+  if (typeof window === 'undefined') return false
+  const style = container.style
+  const KEYS = [
+    'position',
+    'top',
+    'left',
+    'right',
+    'bottom',
+    'width',
+    'height',
+    'margin',
+    'zIndex',
+    'background',
+  ] as const
+  const prev: Record<string, string> = {}
+  for (const key of KEYS) prev[key] = style[key]
+  const restore = () => {
+    for (const key of KEYS) style[key] = prev[key] ?? ''
+    delete container.dataset.bootsFakeFullscreen
+  }
+
+  style.position = 'fixed'
+  style.top = '0'
+  style.left = '0'
+  style.right = '0'
+  style.bottom = '0'
+  style.width = '100%'
+  style.height = '100%'
+  style.margin = '0'
+  // Under the HUD (…646) and the touch layer (…647), over every host overlay.
+  style.zIndex = '2147483640'
+  style.background = '#0c0e10'
+  container.dataset.bootsFakeFullscreen = '1'
+
+  const box = container.getBoundingClientRect()
+  const stuck =
+    Math.abs(box.left) <= 1 &&
+    Math.abs(box.top) <= 1 &&
+    Math.abs(box.width - window.innerWidth) <= 2 &&
+    Math.abs(box.height - window.innerHeight) <= 2
+  if (!stuck) {
+    restore()
+    return false
+  }
+  teardown.push(restore)
+  return true
+}
+
 export function enterGame(): boolean {
   if (current || useBoots.getState().phase === 'game') return false
   if (typeof document === 'undefined') return false
@@ -562,8 +635,24 @@ export function enterGame(): boolean {
   // gizmo rig is unmounted before collectWorld snapshots the scene.
   guardSelectionForGame(teardownList)
 
-  // Position context for the HUD overlay.
-  if (getComputedStyle(container).position === 'static') {
+  // THUMBS OR KEYS. Decided once, up front: it picks the input source, the HUD
+  // layout, whether the pointer lock is ever asked for, and whether the "click
+  // to capture the mouse" line makes any sense.
+  const thumbs = touchPlayLikely()
+
+  // Fullscreen the real way if the browser has it for a <div> (desktop), by
+  // hand if it does not (iOS) — either way the host chrome must not be on top
+  // of the game. The real request needs the click's transient activation, so it
+  // is fired below with the rest of the entry sequence; this is only the
+  // no-API case, which has to happen BEFORE the HUD and the touch layer mount
+  // so both size themselves to the promoted box.
+  const canFullscreen =
+    typeof container.requestFullscreen === 'function' && document.fullscreenEnabled !== false
+  let promoted = canFullscreen ? false : promoteContainer(container, teardownList)
+
+  // Position context for the HUD overlay (the promotion above already gives it
+  // one — and its own `position` ledger, which a second one would fight).
+  if (!promoted && getComputedStyle(container).position === 'static') {
     const prev = container.style.position
     container.style.position = 'relative'
     teardownList.push(() => {
@@ -634,22 +723,43 @@ export function enterGame(): boolean {
   // the "can't place a ramp" live report). attach() below fires the first
   // attempt anyway (harmless if it loses the race); these retries land
   // once the document is stable. relock-on-click remains the backstop.
-  const fullscreen: Promise<unknown> =
-    container.requestFullscreen?.().catch(() => {}) ?? Promise.resolve()
-  input.attach(canvas)
-  void fullscreen.then(() => {
-    input.requestLock()
-    window.setTimeout(() => {
-      if (current === session && document.pointerLockElement !== canvas) input.requestLock()
-    }, 350)
+  const requested = canFullscreen ? container.requestFullscreen?.() : null
+  // A REJECTED request is the windowed session — until now that meant the game
+  // ran under the editor's chrome with a "click to capture the mouse" line. Now
+  // it falls back to the same hand promotion the phone uses.
+  const fullscreen: Promise<unknown> = (requested ?? Promise.resolve()).catch(() => {
+    if (current === session && !promoted) promoted = promoteContainer(container, session.teardown)
   })
-  input.onEscape = () => {
-    // Esc with the catalog up closes the menu, not the game (this path only
-    // fires with the pointer lock already released — exactly the menu case).
+  const leave = () => {
+    // Esc/EXIT with the catalog up closes the menu, not the game (the keyboard
+    // path only fires with the pointer lock already released — exactly the menu
+    // case; the touch EXIT button has no lock to speak of).
     if (closeItemMenu()) return
     if (current === session) exitGame()
   }
+  // THE TOUCH LAYER GOES ON BEFORE input.attach. Both listen on window in the
+  // capture phase, and input.ts stops propagation there so the host editor
+  // never sees a pointer event — a same-target, same-phase listener only runs
+  // first if it REGISTERED first. Reversed, every thumb control goes dead.
+  if (thumbs) {
+    input.touchMode = true
+    const touch = new TouchControls()
+    touch.attach(container, input, { onExit: leave })
+    session.teardown.push(() => touch.detach())
+  }
+  input.attach(canvas)
+  if (!thumbs) {
+    void fullscreen.then(() => {
+      input.requestLock()
+      window.setTimeout(() => {
+        if (current === session && document.pointerLockElement !== canvas) input.requestLock()
+      }, 350)
+    })
+  }
+  input.onEscape = leave
   hud.mount(container)
+  // Phone HUD: retire the two desktop-width blocks, scale the rest in.
+  if (thumbs) hud.setCompact(true)
 
   // Esc unwinds pointer lock and/or fullscreen — treat either as "exit",
   // but only once it was actually engaged (both engage async after enter).
@@ -667,11 +777,15 @@ export function enterGame(): boolean {
   // Never-locked sessions stay playable (input.ts flows buttons/deltas
   // regardless) but the cursor can hit the screen edge — say so instead of
   // leaving the player to wonder. Cleared the moment the lock engages.
-  window.setTimeout(() => {
-    if (current === session && !hadLock && document.pointerLockElement !== canvas) {
-      hud.prompt('click to capture the mouse', 'lock')
-    }
-  }, 900)
+  // …but a phone has no mouse to capture and no lock to grant: the thumb layer
+  // is the input source there, so the line would be a lie.
+  if (!thumbs) {
+    window.setTimeout(() => {
+      if (current === session && !hadLock && document.pointerLockElement !== canvas) {
+        hud.prompt('click to capture the mouse', 'lock')
+      }
+    }, 900)
+  }
   let hadFullscreen = false
   const onFullscreenChange = () => {
     if (document.fullscreenElement) {

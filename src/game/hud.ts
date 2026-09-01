@@ -849,6 +849,71 @@ export class Hud {
   }
 
   /**
+   * PHONE LAYOUT. The HUD is laid out for a desktop viewport: the keybind bar
+   * and the weapon hotbar are `white-space:nowrap` blocks ~700 px wide, so on a
+   * 390 px screen they overflow both edges and cross the health and weapon
+   * readouts — the "HUD is just noise on my phone" half of the cofounder's
+   * screenshot. Both are RETIRED rather than shrunk, because touch.ts replaces
+   * them with something better: a tappable weapon strip and labelled thumb
+   * buttons. What is left (crosshair, health, weapon, wave, prompts, edge
+   * glow) is corner-anchored, so a modest uniform scale is enough to pull it
+   * clear of the thumb clusters.
+   *
+   * The scale is a transform on the root with a compensating size, NOT `zoom`:
+   * every child positions itself in percentages of the root, so growing the box
+   * to 1/scale and scaling it back down leaves each element exactly where it
+   * was relative to the container, at a fraction of the size. `inset:0` still
+   * pins the top-left; width/height win over right/bottom when both are given.
+   */
+  setCompact(on: boolean, scale = 0.86): void {
+    const root = this.root
+    if (!root) return
+    root.dataset.bootsHudCompact = on ? '1' : '0'
+    if (on) {
+      root.style.transformOrigin = '0 0'
+      root.style.transform = `scale(${scale})`
+      root.style.width = `${100 / scale}%`
+      root.style.height = `${100 / scale}%`
+    } else {
+      root.style.transform = ''
+      root.style.width = ''
+      root.style.height = ''
+    }
+    if (this.keybarEl) this.keybarEl.style.display = on ? 'none' : ''
+    if (this.hotbarEl) this.hotbarEl.style.display = on ? 'none' : 'flex'
+
+    // THE BOTTOM OF A PHONE BELONGS TO THE THUMBS. Health sits bottom-left and
+    // the weapon/grenade/paint stack bottom-right — exactly where the stick and
+    // the FIRE cluster now live, so the first phone build had the grenade pip
+    // painted on top of the trigger. Both columns move to the free top-left
+    // rail (the two session buttons only occupy its first 54 px), and the two
+    // transient hint lines move up under the wave banner, off the JUMP button.
+    // Corner anchors, so this holds in portrait and landscape alike.
+    const COMPACT: ReadonlyArray<[HTMLDivElement | null, string]> = [
+      [this.healthEl, 'left:14px;top:64px'],
+      [this.weaponEl, 'left:14px;top:96px;text-align:left'],
+      [this.pipEl, 'left:14px;top:120px'],
+      [this.paintEl, 'left:14px;top:146px'],
+      [this.paintCarouselEl, 'left:14px;top:172px'],
+      // Centred, so they clear the rail on x — but they must still start below
+      // the session buttons, because a long hint is wide enough to reach them.
+      [this.hintEl, 'left:50%;top:58px'],
+      [this.editHintEl, 'left:50%;top:82px'],
+    ]
+    for (const [el, css] of COMPACT) {
+      if (!el) continue
+      if (on) {
+        // Clear the anchors the mounted rule set, then apply the phone one:
+        // `right:28px;bottom:24px` plus `left:14px;top:64px` is over-constrained
+        // and the element would keep its original corner.
+        el.style.right = 'auto'
+        el.style.bottom = 'auto'
+        el.style.cssText += `;${css}`
+      }
+    }
+  }
+
+  /**
    * Phase lock from the audio side: retimes the NEXT visual beat to fire
    * `delayMs` from now (audio.ts calls this once per scheduled audible lub,
    * with the lookahead delay). The beat then re-arms itself as usual, so if

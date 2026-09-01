@@ -16,7 +16,10 @@ export type GameInputState = {
   actions: string[]
 }
 
-const GAME_KEYS = new Set([
+/** Every physical code the game claims. Exported so touch.ts's button table
+ * can be proved to press codes that actually exist (a typo'd code is a button
+ * that silently does nothing). */
+export const GAME_KEYS = new Set([
   'KeyW',
   'KeyA',
   'KeyS',
@@ -69,6 +72,16 @@ export class GameInput {
    * nothing sticks. */
   menuOpen = false
   onMenuKey: ((code: string) => void) | null = null
+
+  /** THUMB MODE (touch.ts owns the input). A touch reports `buttons & 1`, so
+   * the mouse lane below would read every tap — a stick nudge, a look drag, a
+   * button press — as the trigger held down, and iOS's compatibility mousemove
+   * would double-apply the look drag it already fed us. With this set, pointer
+   * and mouse events are still swallowed (the host editor must never see them)
+   * but they no longer WRITE anything: fire bits, look deltas and the
+   * relock-on-click all come from the touch layer instead. Keys still work, so
+   * a phone with a bluetooth keyboard keeps them. */
+  touchMode = false
 
   private canvas: HTMLCanvasElement | null = null
   private detachFns: Array<() => void> = []
@@ -140,6 +153,7 @@ export class GameInput {
     // down/up-only tracking loses "left-click while aiming" entirely (the
     // 2026-08-25 "can't fire while ADS" bug).
     const syncButtons = (buttons: number) => {
+      if (this.touchMode) return
       this.state.firing = (buttons & 1) !== 0
       this.state.altFiring = (buttons & 2) !== 0
     }
@@ -153,6 +167,7 @@ export class GameInput {
     on('mousemove', (e) => {
       if (this.menuOpen) return
       e.stopImmediatePropagation()
+      if (this.touchMode) return
       this.state.lookX += e.movementX
       this.state.lookY += e.movementY
       syncButtons(e.buttons)
@@ -174,7 +189,7 @@ export class GameInput {
       e.preventDefault()
       e.stopImmediatePropagation()
       syncButtons(e.buttons)
-      if (!this.pointerLocked && this.relockOnClick) this.requestLock()
+      if (!this.touchMode && !this.pointerLocked && this.relockOnClick) this.requestLock()
     })
     on('pointerup', (e) => {
       if (this.menuOpen) {
@@ -221,7 +236,10 @@ export class GameInput {
     })
 
     this.relockOnClick = true
-    this.requestLock()
+    // Thumb mode never asks for the lock: on a phone it is absent (iOS) or
+    // grantable-then-lost (Android), and a lost lock is what the session's exit
+    // watcher treats as "the player pressed Esc".
+    if (!this.touchMode) this.requestLock()
   }
 
   requestLock(): void {
