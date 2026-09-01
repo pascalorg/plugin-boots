@@ -38,6 +38,7 @@ import {
   attachBuildSync,
   buildSyncOn,
   detachBuildSync,
+  forgetGridStamp,
   forgetSharedPieces,
   isForeignPiece,
   isForeignPlacement,
@@ -248,6 +249,96 @@ const isolate = () => {
 beforeEach(isolate)
 afterEach(isolate)
 
+// ── The grid frame, in PRODUCTION mount order ───────────────────────────────
+
+/**
+ * THE BUG THIS BLOCK EXISTS FOR (production, reported live 2026-09-01: "MASSIVE
+ * problem that others couldn't see my constructions / only some destructions").
+ *
+ * `PlacedPieces` publishes the grid fingerprint from the effect that installs
+ * the anchor. `ActiveGame` — its PARENT — is what calls startWorldSync() →
+ * attachBuildSync. React runs a child's effects BEFORE its parent's, so the
+ * publish always ran against a lane that did not exist yet, and the old
+ * `publishGridStamp` answered that by returning 0 and doing nothing at all.
+ *
+ * It nevertheless worked on every machine it was tested on, because StrictMode
+ * double-invokes effects and the second pass found the lane attached — and
+ * StrictMode's double-invoke is DEVELOPMENT ONLY. In a production build the
+ * stamp stayed 0 for the whole session, and the grid gate reads
+ * `delta.gridStamp !== 0 && delta.gridStamp === world.gridStamp`, so BOTH
+ * directions failed at once: nobody saw anybody's walls, floors or slopes, while
+ * grid-free voxel damage kept landing. Two clients on a dev server could never
+ * catch it.
+ *
+ * So these tests call the seams in the order PRODUCTION calls them — child
+ * first, exactly once — and the fix is that the frame is retained rather than
+ * published.
+ */
+describe('the grid frame survives the mount order', () => {
+  test('publishing BEFORE the lane attaches still reaches the world (the prod order)', () => {
+    setGridAnchor({ x: 0, z: 0, yaw: 0 })
+    setStoreyLadder(LADDER)
+    // 1. the child effect: no lane yet, and it is never called again.
+    const stamp = publishGridStamp(0, 0, 0, LADDER)
+    expect(stamp).toBe(gridStamp(0, 0, 0, LADDER))
+    expect(stamp).not.toBe(0)
+
+    // 2. the parent effect: the transport arrives.
+    const world = createSharedWorld('us')
+    attachBuildSync(world)
+
+    // THE ASSERTION THE PRODUCTION BUG WOULD HAVE FAILED.
+    expect(world.gridStamp).toBe(stamp)
+    expect(sharedBuildDebug().gridStamp).toBe(stamp)
+    expect(sharedBuildDebug().gridFrameHeld).toBe(true)
+
+    // …and it is a real grid, so a peer on the same lot is believed.
+    const them = createSharedWorld('them')
+    const rec = addLocalPiece(them, {
+      kind: 'wall',
+      slot: OTHER_SLOT,
+      mask: 511,
+      yaw: 0,
+      height: 2.8,
+      corners: null,
+    })!
+    const frame = emptyDelta('them')
+    frame.gridStamp = stamp
+    frame.pieces.push(rec)
+    const fx = receiveBuildDelta(frame, 'them')
+    expect(fx.refusedGrid).toBe(false)
+    expect(fx.addedPieces).toHaveLength(1)
+  })
+
+  test('a stamp published while attached lands immediately, as it always did', () => {
+    const world = createSharedWorld('us')
+    attachBuildSync(world)
+    const stamp = publishGridStamp(3, -4, 0, LADDER)
+    expect(world.gridStamp).toBe(stamp)
+  })
+
+  test('the transport may detach and re-attach mid-session without losing the lot', () => {
+    // The frame belongs to the piece tree, not to the wire: a bus that goes away
+    // and comes back (the host re-keys a session and replaces the whole bus) must
+    // not leave us unable to name our own lot.
+    publishGridStamp(0, 0, 0, LADDER)
+    const first = createSharedWorld('us')
+    attachBuildSync(first)
+    detachBuildSync()
+    const second = createSharedWorld('us-renamed')
+    attachBuildSync(second)
+    expect(second.gridStamp).toBe(gridStamp(0, 0, 0, LADDER))
+  })
+
+  test('a session that ends forgets the frame, so the next lot is not adopted', () => {
+    publishGridStamp(9, 9, 0, LADDER)
+    forgetGridStamp()
+    const world = createSharedWorld('us')
+    attachBuildSync(world)
+    expect(world.gridStamp).toBe(0)
+  })
+})
+
 // ── Sync off: single-player is not touched ──────────────────────────────────
 
 describe('with sync off the build lane does not exist', () => {
@@ -273,7 +364,12 @@ describe('with sync off the build lane does not exist', () => {
     })
 
     // Every seam the wiring touches, called exactly as the game calls it.
-    expect(publishGridStamp(0, 0, 0, LADDER)).toBe(0)
+    // publishGridStamp is the one that ANSWERS with sync off: the frame is
+    // retained for a later attach (see its own comment), and computing a
+    // fingerprint touches no world and no store — which is what this test is
+    // about. That it lands nowhere is asserted below.
+    expect(publishGridStamp(0, 0, 0, LADDER)).toBe(gridStamp(0, 0, 0, LADDER))
+    expect(sharedBuildDebug().gridStampPublishes).toBe(0)
     reconcileSharedPieces()
     expect(publishItem(id, 'crate-small', [0, 0, 0], 0)).toBeNull()
     expect(publishAperture(id, 'opening-door-hinged', 'wall-1', 1, 1, 0.9, 2)).toBeNull()

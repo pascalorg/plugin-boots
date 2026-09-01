@@ -1071,12 +1071,31 @@ export function queueDelta(box: WireOutbox, delta: SharedDelta): number {
   return frames.length
 }
 
-/** The next frame to publish, or null. Call once per tick. */
-export function takeWireFrame(box: WireOutbox): WireFrame | null {
-  const frame = box.queue.shift()
-  if (!frame) return null
+/**
+ * The next frame to publish, or null. Call once per tick PER KIND.
+ *
+ * `kind` is the difference between the two events being two slots and being one
+ * queue wearing two hats. The host coalesces per (plugin, event), so
+ * 'boots/world' and 'boots/world-snap' drain independently — but a caller that
+ * only ever took the head of one queue serialized them anyway: a 20-part heal
+ * snapshot in front meant the wall you placed next waited twenty ticks behind
+ * bytes every peer already had. Taking by kind lets a tick spend both slots, so
+ * live increments never queue behind a heal.
+ *
+ * Omit `kind` to take the head whatever it is (the tests' simple path).
+ */
+export function takeWireFrame(box: WireOutbox, kind?: SharedDelta['kind']): WireFrame | null {
+  if (kind === undefined) {
+    const frame = box.queue.shift()
+    if (!frame) return null
+    box.taken++
+    return frame
+  }
+  const at = box.queue.findIndex((frame) => frame.kind === kind)
+  if (at < 0) return null
+  const [frame] = box.queue.splice(at, 1)
   box.taken++
-  return frame
+  return frame!
 }
 
 /**

@@ -283,6 +283,29 @@ describe('outbound is the journal, one frame per tick', () => {
     expect(worldSyncDebug().depth).toBe(0)
   })
 
+  /**
+   * TWO EVENTS ARE TWO SLOTS, SO A TICK SPENDS BOTH.
+   *
+   * The host coalesces per (plugin, event), and the two kinds are two events on
+   * purpose — but taking only the head of one queue serialized them anyway, so a
+   * heal snapshot sitting in front made the wall a player had just placed wait
+   * for the next tick (or for twenty of them, once the snapshot is chunked).
+   * That is latency invented by the queue, not imposed by the transport.
+   */
+  test('a queued heal snapshot does not make a live delta wait a tick', () => {
+    const bus = installBus()
+    startWorldSync()
+    // The heal fires first and is already waiting...
+    publishWorldSnapshot()
+    // ...then the player does something, which journals.
+    publishRemovedKeys('node-7', [cellKey(2, 2, 2)])
+    pumpWorldSync()
+    // ONE tick, BOTH slots spent.
+    expect(framesOn(bus, WORLD_KIND).length).toBe(1)
+    expect(framesOn(bus, WORLD_SNAP_KIND).length).toBe(1)
+    expect(worldSyncDebug().depth).toBe(0)
+  })
+
   test('a snapshot lands on its OWN kind, never the delta kind', () => {
     const bus = installBus()
     startWorldSync()

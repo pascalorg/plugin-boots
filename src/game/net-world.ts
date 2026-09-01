@@ -43,11 +43,13 @@
  *    another road, and wiring both would put every piece, item, stroke and
  *    cell on the bus twice.
  *
- * 4. ONE FRAME PER TICK, AND LOSSES STAY VISIBLE. The host keeps only the
- *    latest value per (plugin, event) per ~66 ms and DROPS the rest of a
+ * 4. ONE FRAME PER KIND PER TICK, AND LOSSES STAY VISIBLE. The host keeps only
+ *    the latest value per (plugin, event) per ~66 ms and DROPS the rest of a
  *    burst, so a burst is not a queue unless someone makes it one. The outbox
- *    is that queue: one frame per tick, requeued at the front when the publish
- *    did not happen, bounded and counted.
+ *    is that queue: requeued at the front when the publish did not happen,
+ *    bounded and counted. Deltas and snapshots are two events, hence two
+ *    independent slots, so a tick spends BOTH — a multi-part heal snapshot must
+ *    never make the wall a player just placed wait behind it.
  *
  * 5. BOTH KINDS ARE CONVERGENT, NOT ORDERED. The merge is a lattice join, so
  *    reorder, duplicate and drop are all safe, and each part of a split delta
@@ -61,13 +63,20 @@
  * HOW LATE JOIN WORKS HERE, AND WHY IT IS NOT THE ADDRESSED CHANNEL
  *
  * net.ts offers an addressed reply (`sendStateSnapshot` -> `onStateSnapshot`),
- * but the shared world does not use it. A peer can only ever answer with its
- * OWN records — an aggregate of other peers' records could not pass the
- * authorship gate anyway — and a snapshot of one peer's own records is equally
- * useful to EVERY peer, not just the one who asked. So a request is answered by
- * queueing a snapshot on 'boots/world-snap', which is what that kind is for.
- * The request channel still earns its keep: it turns "you will learn the world
- * within the next heal period" into "you will learn it in a few hundred ms".
+ * but the shared world does not use it. A peer answers with THE WHOLE MAP AS IT
+ * KNOWS IT, and that answer is equally useful to every peer in the room rather
+ * than only to the one who asked. So a request is answered by queueing a
+ * snapshot on 'boots/world-snap', which is what that kind is for. The request
+ * channel still earns its keep: it turns "you will learn the world within the
+ * next heal period" into "you will learn it in a few hundred ms".
+ *
+ * The whole map, not just our own work, is the point — see mergeDelta's RELAY
+ * GATE. An authored-only answer makes each record's only courier the peer who
+ * wrote it, so the moment that peer leaves, their walls stop being re-published
+ * and the next visitor finds a lot that has forgotten what was built on it. Every
+ * peer relaying the whole lattice is what makes the map outlive its builders,
+ * and it costs nothing extra on the wire: `snapshotOf` always emitted every
+ * lane in full — the receiver just used to throw the other authors away.
  *
  * Answering is jittered and rate-limited: a public lobby must not let one
  * joiner — or one attacker replaying a request — trigger a synchronized burst
@@ -148,6 +157,26 @@ type Counters = {
   oversize: number
   /** Inbound frames that reached the merge. */
   merged: number
+  /**
+   * Frames whose slot-addressed pieces the grid gate refused. In a healthy room
+   * this is 0 for the whole session; anything else means two peers disagree
+   * about the lot, and every wall in those frames was invisible.
+   */
+  refusedGrid: number
+  /**
+   * Refusals that happened while OUR OWN stamp was still 0 — i.e. we were the
+   * one who could not name the lot. This is the exact signature of the bug that
+   * cost production the entire pieces lane (see shared-build's
+   * `publishGridStamp`): it must stay at 0, and if it ever climbs again the
+   * grid frame is not reaching the world.
+   */
+  blindGrid: number
+  /**
+   * Records accepted from a snapshot on someone else's behalf — the mechanism
+   * that makes a fort outlive the peer who built it (see mergeDelta's relay
+   * gate).
+   */
+  relayed: number
   /** Snapshots queued (join answers + heals). */
   snapshots: number
   /** Snapshot answers suppressed by the rate limit. */
@@ -200,6 +229,9 @@ const counters: Counters = {
   lost: 0,
   oversize: 0,
   merged: 0,
+  refusedGrid: 0,
+  blindGrid: 0,
+  relayed: 0,
   snapshots: 0,
   throttled: 0,
   laneSinkIgnored: 0,
@@ -340,17 +372,25 @@ function pump(): void {
     counters.oversize++
   }
 
-  const frame = takeWireFrame(s.outbox)
-  if (frame === null) return
-  const kind = frame.kind === 'snapshot' ? WORLD_SNAP_KIND : WORLD_KIND
-  const result = publishFrame(kind, frame.text, { part: frame.part, parts: frame.parts })
-  if (result === 'sent') {
-    counters.sent++
-    return
+  // ONE FRAME PER KIND, because the host gives one slot PER (plugin, event) and
+  // there are two events. Spending only one of them per tick made a heal
+  // snapshot block live increments behind it — the wall you just placed waiting
+  // out twenty ticks of bytes every peer already had. The two slots are
+  // independent, so a tick spends both: 'delta' first, because that is the one a
+  // player is watching for.
+  for (const kind of ['delta', 'snapshot'] as const) {
+    const frame = takeWireFrame(s.outbox, kind)
+    if (frame === null) continue
+    const event = frame.kind === 'snapshot' ? WORLD_SNAP_KIND : WORLD_KIND
+    const result = publishFrame(event, frame.text, { part: frame.part, parts: frame.parts })
+    if (result === 'sent') {
+      counters.sent++
+      continue
+    }
+    if (result === 'deferred') counters.deferred++
+    else counters.lost++
+    requeueWireFrame(s.outbox, frame)
   }
-  if (result === 'deferred') counters.deferred++
-  else counters.lost++
-  requeueWireFrame(s.outbox, frame)
 }
 
 // ── Inbound ─────────────────────────────────────────────────────────────────
@@ -370,6 +410,12 @@ function ingest(msg: NetMessage<SharedDelta>): void {
   // THE AUTHORSHIP GATE'S INPUT. Host-stamped, not payload-supplied.
   const fx = mergeDelta(s.world, msg.data, msg.sessionId)
   counters.merged++
+  if (fx.refusedGrid) {
+    counters.refusedGrid++
+    // Whose fault it was, recorded at the only moment anyone can tell.
+    if (s.world.gridStamp === 0) counters.blindGrid++
+  }
+  counters.relayed += fx.relayed
   try {
     applyBuildEffects(fx)
   } catch {
@@ -551,6 +597,9 @@ export function resetWorldSyncCounters(): void {
   counters.lost = 0
   counters.oversize = 0
   counters.merged = 0
+  counters.refusedGrid = 0
+  counters.blindGrid = 0
+  counters.relayed = 0
   counters.snapshots = 0
   counters.throttled = 0
   counters.laneSinkIgnored = 0

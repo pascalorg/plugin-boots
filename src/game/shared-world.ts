@@ -1247,6 +1247,12 @@ export type SharedEffects = {
    * slot-addressed pieces were refused. Surfaced so the HUD can say so
    * instead of the player wondering where the walls went. */
   refusedGrid: boolean
+  /**
+   * Records accepted from a snapshot whose AUTHOR is not the sender — the map
+   * outliving its builders. Counted rather than inferred so QA can prove the
+   * relay is doing work, and so a suspicious number is visible.
+   */
+  relayed: number
 }
 
 export function emptyEffects(): SharedEffects {
@@ -1265,6 +1271,7 @@ export function emptyEffects(): SharedEffects {
     deadStrokes: [],
     dropped: 0,
     refusedGrid: false,
+    relayed: 0,
   }
 }
 
@@ -1460,6 +1467,40 @@ export function mergeDelta(
 
   mergeNodes(world, delta, fx)
 
+  // ── THE RELAY GATE ────────────────────────────────────────────────────────
+  //
+  // "We should always all see the state of the map as it is currently" (owner,
+  // 2026-09-01). A per-frame authorship gate cannot deliver that on its own,
+  // because it makes every record's ONLY courier the peer who wrote it: when
+  // that peer leaves the room, their walls stop being re-published, and the next
+  // visitor arrives to a lot that has forgotten half of what was built on it.
+  //
+  // So the gate is SPLIT rather than removed, exactly as MULTIPLAYER.md's
+  // deferred design says. A DELTA is still strictly authored — an increment is a
+  // claim about what the sender just did, and nobody may put words in another
+  // peer's mouth. A SNAPSHOT is a different speech act: it is "here is the whole
+  // world as I know it", which is precisely the aggregate a joiner needs, and
+  // `snapshotOf` has always emitted the whole lane (every peer's records, not
+  // just our own) — the receiver simply threw the rest away. Accepting it turns
+  // every peer in the room into a replica of the map, which is what makes the
+  // map outlive its builders.
+  //
+  // WHAT THIS DOES NOT GIVE AWAY. It is not a hole, because the powers it grants
+  // a hostile peer are powers that peer already had:
+  //  - Make a wall appear: it could always do that under its own name.
+  //  - Change or move somebody else's wall: tombstones are UNAUTHORED by design
+  //    ("a piece can always be destroyed"), so it could already delete that
+  //    wall. Editing is strictly less destructive than the delete it already had.
+  //  - Resurrect a destroyed record: it CANNOT. `dead` is monotone and checked
+  //    below, so a tombstoned id stays tombstoned however it arrives.
+  //  - Claim a stranger's work as ours in the document: it CANNOT. The Save
+  //    projection (`localWork`) reads authorship from the record id's own prefix
+  //    against `self`/`formerSelves` — never from who sent the frame — so a
+  //    relayed record is foreign to Save no matter which road it came in on.
+  // The authorship gate's real job was always the Save boundary. This leaves it
+  // there, in full, and stops it censoring the view.
+  const relay = delta.kind === 'snapshot'
+
   // GRID GATE. `pieces` are addressed by slot id ("Wx:3,-1,0"), which is only
   // a world address relative to grid.ts's module-level anchor and storey
   // ladder. If the sender's grid does not fingerprint the same as ours, its
@@ -1488,8 +1529,19 @@ export function mergeDelta(
     fx,
     fx.addedPieces,
     fx.deadPieces,
+    relay,
   )
-  mergeLane(world, 'items', delta.items, delta.deadItems, sender, fx, fx.addedItems, fx.deadItems)
+  mergeLane(
+    world,
+    'items',
+    delta.items,
+    delta.deadItems,
+    sender,
+    fx,
+    fx.addedItems,
+    fx.deadItems,
+    relay,
+  )
   mergeLane(
     world,
     'apertures',
@@ -1499,6 +1551,7 @@ export function mergeDelta(
     fx,
     fx.addedApertures,
     fx.deadApertures,
+    relay,
   )
   mergeLane(
     world,
@@ -1509,6 +1562,7 @@ export function mergeDelta(
     fx,
     fx.addedStrokes,
     fx.deadStrokes,
+    relay,
   )
   world.applied++
   world.dropped += fx.dropped
@@ -1619,6 +1673,8 @@ function mergeLane<T extends Stamped>(
   fx: SharedEffects,
   added: T[],
   removed: RecordId[],
+  /** Snapshot frames relay other authors' records — see mergeDelta's relay gate. */
+  relay = false,
 ): void {
   const set = world[lane] as unknown as OrSet<T>
   const sane = SANE[lane] as unknown as (rec: T) => boolean
@@ -1634,12 +1690,19 @@ function mergeLane<T extends Stamped>(
         fx.dropped++
         continue
       }
-      // AUTHORSHIP: a peer may only mint ids under its own prefix. This is
-      // the whole defence against "peer B overwrites peer A's wall" — B
-      // cannot even name A's record, let alone replace it.
+      // AUTHORSHIP: in a DELTA a peer may only mint ids under its own prefix.
+      // A snapshot is exempt (`relay`) because it is a statement about the whole
+      // map rather than about what the sender just did, and a map nobody may
+      // relay dies with its builders — see mergeDelta's relay gate for the full
+      // argument, and for why the Save boundary is unaffected either way.
+      // The id must still PARSE as authored by somebody: `authorOf` rejects a
+      // record whose id carries no author at all.
       if (sender !== null && !isAuthoredBy(rec.id, sender)) {
-        fx.dropped++
-        continue
+        if (!relay || !isSafePeerId(authorOf(rec.id))) {
+          fx.dropped++
+          continue
+        }
+        fx.relayed++
       }
       const prior = set.adds.get(rec.id)
       if (prior) {

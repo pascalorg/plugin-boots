@@ -171,6 +171,12 @@ export function attachBuildSync(
   sync = { world, sink: opts?.sink ?? null, pending: null }
   if (opts?.notice) noticeSink = opts.notice
   resetBindings()
+  // THE GRID FRAME IS A RETAINED FACT, so attaching late cannot lose it. See
+  // `publishGridStamp` for the production bug this line exists to close.
+  if (gridFrame) {
+    setGridStamp(world, gridStamp(gridFrame.x, gridFrame.z, gridFrame.yaw, gridFrame.ys))
+    gridStampPublishes++
+  }
 }
 
 /** Turn it off and forget every binding (session exit). The world itself is
@@ -193,23 +199,68 @@ function say(text: string): void {
 }
 
 /**
- * Publish this client's build-grid fingerprint. Slot ids are addresses
- * RELATIVE to grid.ts's module anchor (point AND rotation) and storey ladder,
- * so a peer whose stamp differs is speaking a different coordinate system and
- * mergeDelta refuses its slot-addressed pieces (raising `refusedGrid`, which we
- * surface as a line the player can read). Called from PlacedPieces the moment
- * the anchor and ladder are installed, which is the only moment they change.
+ * THE BUILD GRID'S FINGERPRINT — A RETAINED FACT, NOT A ONE-SHOT PUBLISH.
+ *
+ * Slot ids are addresses RELATIVE to grid.ts's module anchor (point AND
+ * rotation) and storey ladder, so a peer whose stamp differs is speaking a
+ * different coordinate system and mergeDelta refuses its slot-addressed pieces
+ * (raising `refusedGrid`, which we surface as a line the player can read).
+ * PlacedPieces calls this from the effect that installs the anchor, which is the
+ * only moment the frame changes.
+ *
+ * IT USED TO NO-OP WHEN THE LANE WAS NOT ATTACHED YET, AND THAT WAS THE BUG.
+ * React runs a CHILD component's effect before its parent's, and the parent
+ * (ActiveGame) is the one that calls startWorldSync() → attachBuildSync. So the
+ * publish ALWAYS lost that race. The only thing that ever saved it was
+ * StrictMode's double-invoke of effects — which happens in DEVELOPMENT ONLY. In
+ * a production build `world.gridStamp` stayed 0 for the entire session, and the
+ * grid gate reads
+ *
+ *     slotsOk = delta.gridStamp !== 0 && delta.gridStamp === world.gridStamp
+ *
+ * so BOTH directions failed: our outbound deltas carried stamp 0 and every peer
+ * refused them, and every inbound stamp mismatched our 0 and we refused theirs.
+ * A total, silent, bidirectional refusal of the pieces lane — walls, floors and
+ * slopes invisible to everyone, while grid-free damage kept landing. Reported
+ * live on 2026-09-01 as "others couldn't see my constructions / only some
+ * destructions", which is this file's own documented symptom almost word for
+ * word (see net-world.ts's `identityHeld`), reached by a second road.
+ *
+ * The fix is to stop treating it as an event. The frame is a fact about the
+ * running game, so it is HELD here across attach/detach and `attachBuildSync`
+ * republishes it. Mount order stops mattering in either direction, and a session
+ * that attaches its transport ten seconds late still speaks the right grid.
  */
+type GridFrame = { x: number; z: number; yaw: number; ys: readonly number[] }
+let gridFrame: GridFrame | null = null
+/** How many times a stamp reached a world (QA: 0 means the frame never landed). */
+let gridStampPublishes = 0
+
 export function publishGridStamp(
   anchorX: number,
   anchorZ: number,
   anchorYaw: number,
   storeyYs: readonly number[],
 ): number {
-  if (!sync) return 0
+  // Retained BEFORE the attach check: the whole point is that it survives the
+  // window in which there is nothing to publish to.
+  gridFrame = { x: anchorX, z: anchorZ, yaw: anchorYaw, ys: [...storeyYs] }
   const stamp = gridStamp(anchorX, anchorZ, anchorYaw, storeyYs)
-  setGridStamp(sync.world, stamp)
+  if (sync) {
+    setGridStamp(sync.world, stamp)
+    gridStampPublishes++
+  }
   return stamp
+}
+
+/**
+ * Forget the retained frame — PlacedPieces' cleanup, i.e. session teardown or a
+ * change of building. Deliberately NOT called by `detachBuildSync`: the frame
+ * belongs to the game's piece tree, not to the transport, and the transport
+ * attaching and detaching mid-session must not lose it.
+ */
+export function forgetGridStamp(): void {
+  gridFrame = null
 }
 
 // ── Registries (authorship, and runtime ↔ record) ────────────────────────────
@@ -927,6 +978,10 @@ export function sharedBuildDebug(): {
   pieces: { bound: number; foreign: number; deposed: number }
   placements: { bound: number; foreign: number }
   gridStamp: number
+  /** Is the grid frame retained? False mid-session means no slot can replicate. */
+  gridFrameHeld: boolean
+  /** Times a stamp actually reached a world. 0 with a live lane is the bug. */
+  gridStampPublishes: number
 } {
   return {
     on: sync !== null,
@@ -938,6 +993,8 @@ export function sharedBuildDebug(): {
     },
     placements: { bound: placementRecord.size, foreign: foreignPlacements.size },
     gridStamp: sync?.world.gridStamp ?? 0,
+    gridFrameHeld: gridFrame !== null,
+    gridStampPublishes,
   }
 }
 
@@ -948,4 +1005,6 @@ export function resetSharedBuild(): void {
   clearBuildAppliers()
   noticeSink = null
   refusedGridSaid = false
+  gridFrame = null
+  gridStampPublishes = 0
 }

@@ -40,6 +40,7 @@ import {
   damagedNodes,
   emptyDelta,
   liveRecords,
+  localWork,
   mergeDelta,
   noteLocalKill,
   noteLocalRemoval,
@@ -516,21 +517,106 @@ describe('hostile bytes', () => {
     expect(decodeDeltaText('aGVsbG8=')).toBeNull()
   })
 
-  test('a decoded frame is safe to merge and cannot smuggle authorship', () => {
+  test('a decoded DELTA is safe to merge and cannot smuggle authorship', () => {
     const snap = wreckedLot()
-    const bytes = encodeDelta(snap)
-    const back = decodeDelta(bytes)
-    expect(back).not.toBeNull()
+    // Same bytes, declared as an increment rather than a statement about the
+    // whole map — which is the frame kind the authorship gate is strict about.
+    const delta = { ...(decodeDelta(encodeDelta(snap)) as SharedDelta), kind: 'delta' as const }
 
     const world = createSharedWorld('observer')
     setGridStamp(world, STAMP)
-    // The bus says this came from ONE peer, so only that peer records survive.
+    // The bus says this came from ONE peer, so only that peer's records survive.
     const sender = '5a1b2c3d-9e8f-4a7b-b6c5-d4e3f2a1b0c9'
-    mergeDelta(world, back as SharedDelta, sender)
+    const fx = mergeDelta(world, delta, sender)
     expect(liveRecords(world.pieces).every((r) => r.id.startsWith(sender))).toBe(true)
     expect(liveRecords(world.strokes).every((r) => r.id.startsWith(sender))).toBe(true)
+    expect(fx.relayed).toBe(0)
     // Damage has no author, so all of it applies.
     expect(damagedNodes(world).length).toBe(snap.nodes.length)
+  })
+
+  test('a decoded SNAPSHOT relays every author, and Save still claims none of it', () => {
+    // THE MAP OUTLIVES ITS BUILDERS (owner ask 2026-09-01: "we should always all
+    // see the state of the map as it is currently"). A snapshot is a statement
+    // about the whole lattice, so a peer may carry a record it did not write —
+    // otherwise a wall's only courier is its author, and it disappears from the
+    // room the moment that author leaves.
+    const snap = wreckedLot()
+    const back = decodeDelta(encodeDelta(snap))
+    expect(back).not.toBeNull()
+    expect((back as SharedDelta).kind).toBe('snapshot')
+
+    const world = createSharedWorld('observer')
+    setGridStamp(world, STAMP)
+    const sender = '5a1b2c3d-9e8f-4a7b-b6c5-d4e3f2a1b0c9'
+    const fx = mergeDelta(world, back as SharedDelta, sender)
+
+    // Both authors landed — including the one who is not on the envelope.
+    const authors = new Set(liveRecords(world.pieces).map((r) => r.id.split('#')[0]))
+    expect(authors.size).toBe(2)
+    expect(authors.has(sender)).toBe(true)
+    expect(fx.relayed).toBeGreaterThan(0)
+
+    // …AND THE SAVE BOUNDARY IS UNMOVED. Authorship for the document is read
+    // from the record's own prefix against our name, never from who relayed it,
+    // so nothing a stranger sends can be written to this player's scene.
+    const mine = localWork(world)
+    expect(mine.pieces).toEqual([])
+    expect(mine.items).toEqual([])
+    expect(mine.apertures).toEqual([])
+    expect(mine.strokes).toEqual([])
+  })
+
+  test('a relay cannot resurrect a record somebody tombstoned', () => {
+    // The one power the relay must NOT grant. `dead` is monotone, so an id that
+    // has been killed stays killed however it arrives and whoever carries it.
+    const world = createSharedWorld('observer')
+    setGridStamp(world, STAMP)
+    const victim = 'aaaa1111-2222-3333-4444-555566667777#3'
+    const kill = emptyDelta('bbbb1111-2222-3333-4444-555566667777', 'delta')
+    kill.gridStamp = STAMP
+    kill.deadPieces = [victim]
+    mergeDelta(world, kill, 'bbbb1111-2222-3333-4444-555566667777')
+
+    const relay = emptyDelta('cccc1111-2222-3333-4444-555566667777', 'snapshot')
+    relay.gridStamp = STAMP
+    relay.pieces = [
+      {
+        id: victim,
+        lamport: 9999,
+        kind: 'wall',
+        slot: 'Wx:1,0,0',
+        mask: 511,
+        yaw: 0,
+        height: 2.7,
+        corners: null,
+      },
+    ]
+    const fx = mergeDelta(world, relay, 'cccc1111-2222-3333-4444-555566667777')
+    expect(liveRecords(world.pieces)).toEqual([])
+    expect(fx.addedPieces).toEqual([])
+  })
+
+  test('a relayed record whose id names no author is still refused', () => {
+    const world = createSharedWorld('observer')
+    setGridStamp(world, STAMP)
+    const relay = emptyDelta('dddd1111-2222-3333-4444-555566667777', 'snapshot')
+    relay.gridStamp = STAMP
+    relay.pieces = [
+      {
+        // No '#', so `authorOf` cannot name anybody: it is not a record id.
+        id: 'nobody-in-particular',
+        lamport: 5,
+        kind: 'wall',
+        slot: 'Wx:1,0,0',
+        mask: 511,
+        yaw: 0,
+        height: 2.7,
+        corners: null,
+      },
+    ]
+    mergeDelta(world, relay, 'dddd1111-2222-3333-4444-555566667777')
+    expect(liveRecords(world.pieces)).toEqual([])
   })
 
   test('a re-encoded decoded frame is byte-identical (the format is canonical)', () => {
@@ -803,6 +889,33 @@ describe('the outbox', () => {
     expect(box.superseded).toBe(2)
     expect(outboxDepth(box)).toBe(parts)
     for (let i = 0; i < parts; i++) expect(takeWireFrame(box)?.kind).toBe('snapshot')
+  })
+
+  test('taking BY KIND lets a live delta overtake a chunked snapshot', () => {
+    // The host gives one slot per (plugin, event) and the two kinds are two
+    // events, so the only thing that ever serialized them was this queue. A
+    // 4-part heal in front used to cost a freshly-placed wall four ticks.
+    const box = createOutbox()
+    const parts = queueDelta(box, bigLot())
+    expect(parts).toBeGreaterThan(1)
+    queueDelta(box, shotFrame('__boots-node-live', rifleShot(9)))
+    expect(outboxDepth(box)).toBe(parts + 1)
+
+    // One tick, both slots: the delta does not wait behind the snapshot.
+    expect(takeWireFrame(box, 'delta')?.kind).toBe('delta')
+    expect(takeWireFrame(box, 'snapshot')?.part).toBe(1)
+    expect(takeWireFrame(box, 'delta')).toBeNull() // that kind is drained
+    expect(outboxDepth(box)).toBe(parts - 1)
+    // …and the snapshot's remaining parts are still IN ORDER.
+    for (let i = 2; i <= parts; i++) expect(takeWireFrame(box, 'snapshot')?.part).toBe(i)
+  })
+
+  test('a requeued frame is still the first of its kind to go next', () => {
+    const box = createOutbox()
+    queueDelta(box, bigLot())
+    const first = takeWireFrame(box, 'snapshot')
+    requeueWireFrame(box, first as NonNullable<typeof first>)
+    expect(takeWireFrame(box, 'snapshot')?.text).toBe(first?.text)
   })
 
   test('the queue is capped, and every drop is counted', () => {
