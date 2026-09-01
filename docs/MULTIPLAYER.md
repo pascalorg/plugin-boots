@@ -152,8 +152,9 @@ be told what happened before they arrived. The handshake:
 
 | Strategy | When it is sound |
 | --- | --- |
-| **Every peer answers with its OWN records** | Whenever the receiver gates records by author. An aggregate snapshot cannot pass a per-frame authorship check, so only the sender's own records would survive anyway. N answers for N peers, bounded by the roster. **This is what `shared-world.ts` uses.** |
-| One peer answers for the room (`shouldAnswerStateRequest`, pure — lowest live `sessionId`, requester never answers itself) | Only where the transport **vouches** for the relay. This bus stamps who sent a frame; it does not vouch that a peer faithfully relayed others' records. Never use it for authorship-gated state. |
+| **Every peer answers with THE WHOLE MAP as it knows it** | Once the receiver splits its gate (see *The relay gate*, Part 4): a snapshot is a different speech act from a delta, so it may carry other authors' records and still be admitted for the *view*. N answers for N peers, bounded by the roster, and each answer is useful to the whole room rather than only to the asker. **This is what `shared-world.ts` uses.** |
+| Every peer answers with its OWN records only | Whenever the receiver gates *every* record by author — the shape this file described before 2026-09-01. It is sound, and it is why a fort used to vanish with the peer who built it: the author was each record's only courier. |
+| One peer answers for the room (`shouldAnswerStateRequest`, pure — lowest live `sessionId`, requester never answers itself) | Only where the transport **vouches** for the relay, i.e. promises that the answerer relayed others' records faithfully. This bus stamps who *sent* a frame and promises nothing more, so a single answerer is still the wrong shape here — what makes aggregate answers safe below is the receiver's own monotonicity, not trust in the sender. |
 
 The two late-join kinds are owned by the **transport**, not by a kind owner,
 and are always registered: you ask for state precisely because you have
@@ -519,14 +520,32 @@ question.
 act. There is no goodbye frame for the world: records are grow-only, so leaving
 removes our avatar, not our fort. `__boots.worldSync()` is the QA handle.
 
-**One known interaction with the grid stamp.** `startWorldSync()` attaches in
-`game-root.tsx`'s effect, but the lot's grid fingerprint is published later, from
-`builder.tsx`'s grid effect when the piece tree mounts. Until then
-`world.gridStamp` is 0, and the merge gate refuses any frame whose stamp is
-non-zero — which is correct (we do not yet know our own lot) but reads to the
-player as "a builder is on a different lot grid". Records are grow-only so a
-later frame lands and nothing is lost; the honest fix belongs to the notice, not
-the transport: *do not surface a grid-mismatch notice while `world.gridStamp` is
+**The grid stamp was a DEVELOPMENT-ONLY success, and that is why the pieces lane
+died in production.** `startWorldSync()` attaches in `game-root.tsx`'s effect,
+while the lot's grid fingerprint is published from `builder.tsx`'s grid effect —
+a CHILD, whose effect React runs *before* the parent's. So the publish always
+lost the race, and the only thing that ever hid it was StrictMode's
+double-invoke, which is a dev build. In production `world.gridStamp` stayed 0 for
+the whole session, and since the gate reads
+`delta.gridStamp !== 0 && delta.gridStamp === world.gridStamp`, both directions
+failed at once: our deltas carried 0 and every peer refused them, and every
+inbound stamp mismatched our 0 and we refused theirs. Total, silent, bidirectional
+refusal of the pieces lane — walls, floors and slopes invisible to everyone,
+while grid-free damage kept landing. That is the owner's "others couldn't see my
+constructions / only some destructions", word for word, reached by a second road
+(the first is `identityHeld`'s re-key).
+
+The fix is to stop treating the frame as an *event*: it is a **retained fact**
+about the running game, held in `shared-build.ts` across attach/detach, and
+`attachBuildSync` republishes it. Mount order stops mattering in either
+direction, and a session whose transport attaches ten seconds late still speaks
+the right grid. Two observables guard it: `gridStampPublishes` (0 means the frame
+never landed at all) and `net-world.ts`'s **`blindGrid`** — refusals that
+happened while *our own* stamp was still 0, which is this bug's exact signature
+and must stay 0 for a whole session. `refusedGrid` is only raised when the frame
+actually spelled a slot, so a rifle shot from a peer whose ladder has not
+installed yet cannot make the notice accuse anyone of standing on a different
+lot. And still: *do not surface a grid-mismatch notice while `world.gridStamp` is
 0*, because 0 means unknown, not different.
 
 **Our own name is not a constant, so it is checked every tick.** `world.self` is
@@ -720,22 +739,35 @@ therefore makes us a **new author** on purpose; `shared-invariant.test.ts` fence
 the shared trio against `localStorage` / `sessionStorage` / `indexedDB` so the
 rejected design cannot arrive quietly.
 
-**A known limitation, shipped as-is: a peer who joins after our re-key never
-learns our pre-re-key records.** No live session can vouch for them, so the
-authorship gate refuses them on arrival. It is the same hole as "someone builds a
-wall, leaves, and everyone who joins later sees an empty lot" — inherent to
-authorship-by-envelope, and pre-existing rather than introduced by the rename.
-Relaxing the gate is **not** the fix: that gate is what keeps a stranger's wall
-out of `localWork` and therefore off the owner's disk, which is worth more than
-fort persistence in a lobby that is still human-gated and unreachable.
+**This used to be a known limitation, and it was the owner's headline bug.**
+"MASSIVE problem that others couldnt see my constructions… We should always all
+see the state of the map as it is currently" (2026-09-01). A peer who joined
+after our re-key never learned our pre-re-key records, because no live session
+could vouch for them; the same hole made a fort vanish with the peer who built
+it. Both are one cause: under a per-frame authorship gate, a record's ONLY
+courier is its author.
 
-The intended shape, unimplemented, is to **split the gate rather than remove
-it**: authorship gates the *Save projection* only, while visual replication
-accepts relayed records. A relayed wall can be visible, collidable and shootable
-without ever entering any player's `localWork`, which gets a public lobby its
-persistent fort while leaving the scene-write boundary exactly where it is. It
-was deferred because it changes what a record *means* in two different consumers
-at once, and tonight's goal is a lobby that does not lie about what it replicated.
+**The gate is now SPLIT rather than relaxed** — the design this section used to
+defer. A **delta** stays strictly authored: an increment is a claim about what
+the sender just did, and nobody may put words in another peer's mouth. A
+**snapshot** is a different speech act — "here is the whole world as I know it"
+— which is exactly the aggregate a joiner needs, and `snapshotOf` always emitted
+every peer's records anyway; the receiver simply threw the rest away. Accepting
+them makes every peer a replica of the map, so the map outlives its builders.
+See `mergeDelta`'s *relay gate* comment in `shared-world.ts` for the full
+argument, and `net-world.ts`'s `relayed` counter for the observable.
+
+**Why that is not a hole.** Every power it grants a hostile peer is one that peer
+already had: it could always make a wall appear under its own name, and it could
+always *delete* a stranger's wall, since tombstones are unauthored by design ("a
+piece can always be destroyed") — editing is strictly less destructive than the
+delete it already had. What it still cannot do: **resurrect** a destroyed record
+(`dead` is monotone and checked on every merge), or **claim a stranger's work in
+the document** — the Save projection reads authorship from the record id's own
+prefix against `self`/`formerSelves`, never from who sent the frame, so a relayed
+record is foreign to Save whichever road it arrived on. The authorship gate's
+real job was always the Save boundary; it is still there in full, and it has
+stopped censoring the view.
 
 **What is still not handled, stated rather than hidden.** A frame lost to the
 outbox cap (`overflow`) or to a host `'suppressed'` is never retransmitted on a

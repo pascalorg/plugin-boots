@@ -2322,3 +2322,152 @@ still 0 failures, `check-types` clean, `bun test` 2331 pass / 0 fail.
 Left alone on purpose: `definition.ts`'s `boots:job` keeps
 `icon: { kind: 'iconify', name: 'lucide:traffic-cone' }`. The node is
 `hidden: true` and that icon never reaches a screen.
+
+## FOUR BUGS FROM PLAYING WITH A FRIEND (2026-09-01)
+
+The first report from two real people in one lobby, verbatim: avatars should be
+Pascalines told apart by colour; floors placed as ceilings go wrong, and a
+transparent preview should come before every placement; **"MASSIVE problem that
+others couldnt see my constructions / only some destructions"**; and the build
+menu should offer doors and windows that E can then open.
+
+Three of the four were the same kind of mistake in different clothes — a rule
+that was right about the thing it was written for and silent about the thing the
+player actually meant.
+
+### The pieces lane was dead in production, and green in development
+
+Root cause of the headline bug, and the finding worth carrying: **StrictMode was
+the only thing that ever made it work.** `publishGridStamp` used to no-op when
+the build lane was not attached yet. React runs a child's effect before its
+parent's, and the parent (`ActiveGame`) is the one that calls
+`startWorldSync()` → `attachBuildSync`, so the publish lost that race *every
+time*. In development, StrictMode's double-invoke ran the effect again after the
+parent had attached and the stamp landed. In a production build `world.gridStamp`
+stayed 0 for the whole session — and the grid gate reads
+
+    slotsOk = delta.gridStamp !== 0 && delta.gridStamp === world.gridStamp
+
+so both directions failed at once: our deltas carried 0 and every peer refused
+them, every inbound stamp mismatched our 0 and we refused theirs. A total,
+silent, **bidirectional** refusal of the slot-addressed lane. Damage cells are
+grid-free, so they kept landing. "Only some destructions" is not an approximate
+description of that failure, it is an exact one.
+
+The fix is a change of category, not a reorder: the grid frame is a **retained
+fact** about the running game, not an event. It is held in `shared-build.ts`
+across attach/detach and republished by `attachBuildSync`, so mount order stops
+mattering in either direction. Two counters now make the bug impossible to ship
+twice: `gridStampPublishes` (0 = the frame never reached a world) and
+`blindGrid` — refusals that happened while *our own* stamp was still 0, which is
+this bug's signature and nothing else's. `refusedGrid` deliberately stays quiet
+for frames that never spelled a slot, so a rifle shot from a peer whose ladder
+has not installed cannot make the notice accuse them of being on another lot.
+
+**A dev-only guard that hides a race is worse than no guard.** StrictMode exists
+to *surface* effect bugs; here its double-invoke was load-bearing. Anything that
+must happen once per session and can be published late belongs in a held fact
+with a republish on attach, not in an effect that gives up when its peer is not
+ready.
+
+### A fort has to outlive its builder
+
+Second road to the same complaint, and the one that survived the first fix: the
+authorship gate made each record's **only courier** the peer who wrote it. Leave
+the room and your walls stop being re-published; the next visitor finds a lot
+that has forgotten what was built on it. MULTIPLAYER.md had carried the answer as
+a deferred design for weeks — **split the gate rather than remove it** — and it
+is now implemented, at the seam between two speech acts. A *delta* stays strictly
+authored: an increment is a claim about what the sender just did, and nobody puts
+words in another peer's mouth. A *snapshot* is "here is the whole world as I know
+it", which is the aggregate a joiner needs — and `snapshotOf` had **always**
+emitted every author's records; the receiver simply threw the rest away. So
+accepting them cost nothing on the wire and turned every peer into a replica of
+the map.
+
+It gives a hostile peer nothing new: it could always make a wall appear under its
+own name, and it could always *delete* a stranger's wall, because tombstones are
+unauthored by design ("a piece can always be destroyed") — editing is strictly
+less destructive than the delete it already had. It still cannot resurrect a
+tombstoned record (`dead` is monotone, checked on every merge) and it still
+cannot get a stranger's work into anyone's document: the Save projection reads
+authorship off the record id's own prefix, never off the envelope. The gate's
+real job was always the Save boundary. It kept that job and lost the censorship.
+
+### The ray picks the cell; the pitch picks the storey
+
+"Problem placing floors as ceiling." The grid resolved the storey from where the
+aim ray crossed, which is the right rule when the player has expressed no
+preference — and the wrong one the moment they tilt up. Looking up past the pitch
+band **is** the statement "one level up"; that intent now overrides the crossing
+height (one up, one down for walls and ramps, or the slab under your own feet for
+floors). Inside the band there is no intent and the crossing height stands. One
+rule, three cases, and the ceiling lands where the player is looking.
+
+### A door is a wall with its middle column knocked out
+
+The cheapest true model available: an aperture is a plain `'wall'` whose 3×3 cell
+mask — nine bits it already carried — is pocketed. `DOOR_MASK = 493`,
+`WINDOW_MASK = 495`. Nothing new reaches the wire, the support graph, slot
+occupancy or Keep's mask → node mapping, and yet the hole is **real** in the
+mesh, in the collider and in the voxel grid, because all three already derive
+from the mask (`geometryForMask`). Z steps solid → door → window inside the wall
+family, the ghost previews the pocket before the click, and the leaf or sash the
+mask implies registers on the same E lane as a host door.
+
+### The E lane was quietly measuring height
+
+Found while proving item 4, and it had been wrong for host doors too. The
+point-blank fallback measured a **3-D** distance from the player to the leaf's
+**centre** — and `playerRig.position` is the EYE, 1.58 m up, while a doorway
+built on this 2.5 m storey is 1.67 m tall, so its centre sits ~0.7 m *below* the
+eye and over half of the 1.2 m budget was spent going straight up. E stopped
+answering at arm's length in front of an open doorway. "Shoulders against the
+leaf" is a **horizontal** notion: the fallback now stands the player against the
+doorway's own box in x/z, with a vertical band (`DOOR_FALLBACK_RISE`) whose only
+job is to rule out the door one storey above or below. It also measures the
+**mount** box, not the leaf: a doorway stays where its frame is however far the
+leaf has swung out of it.
+
+### THE HEADLESS CLOCK IS NOT THE GAME CLOCK — a QA finding that wrote a fake bug
+
+Run 2 of `qa-boots-aperture.mjs` reported that the player could not walk through
+a perfectly open doorway. It was the harness. Headless Chromium renders this
+scene at **~3 fps**, and every frame loop clamps its delta (`dt = Math.min(rawDt,
+1/30)`, the standard tunnelling guard, in eleven places). Game time therefore
+runs ~10× slower than the wall clock: at the 6.5 m/s run speed each rendered
+frame advances ~0.22 m, so a 1.8 s `KeyW` hold buys four frames — **0.8 m** —
+which is *shorter* than the 1.15 m the harness stood back from the wall. Proven
+on open ground with a throwaway probe: 1.48 m travelled in 1.8 s, ~0.21 m per
+300 ms poll. The same error made the close look broken, because a passage prism
+retires on the swing's **settle**, also measured in game seconds.
+
+**Rule: never measure a game event in wall-clock milliseconds.** Both waits are
+now polls on the thing itself — `walkUntil(displacement)` and
+`settlePassages(count)` — which are frame-rate blind. And when the crossing
+*does* fail, the harness dumps the occupancy of the **clear** volume only (inside
+the pocket's width, under its lintel, pulled in by a cell), because the first
+dump included the jambs and the lintel course and 70 legitimately solid cells
+read as a filled doorway for an hour.
+
+Same class of self-inflicted wound in section 6: the sash sits exactly half a
+storey up, 1.25 m, which is 0.26 m *below* the eye — the harness tilted +0.18 rad
+up and sailed clean over it, which looks precisely like a broken E lane. It now
+derives the pitch from the sash's own centre.
+
+### Left open, deliberately
+
+**The storey rung on a sloped lot.** At the spawn on this lot the ghost's baseY
+is 0 while the player's feet are at 1.23, so a wall placed there is half buried
+and its doorway is underground — nothing to aim at, nothing to walk through. The
+aperture harness walks out to flat ground and does its work there rather than
+pretending otherwise. Separate bug, separate fix.
+
+Green on the record: `qa-boots-aperture.mjs` end to end — Z cycles the wall
+family with the HUD naming the selection, Q walks all six entries, the ghost
+previews 493/495/511, the piece lands `mask 493`, its fitting registers among 20
+operables, the crosshair finds it, E swings it, the prism's ceiling reaches the
+wall top (the lintel fix), **crossed while OPEN: true / while SHUT: false**, E
+re-closes it point-blank via the fixed fallback, the prism retires, and the
+window sash swings while adding no prism. 0 page errors. `check-types` clean,
+`bun test` 2377 pass / 0 fail.
