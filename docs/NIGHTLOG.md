@@ -1855,3 +1855,187 @@ every question about it had to be asked through a walk, a teleport and a
 keypress. `__boots.doors.aimed()` (afd6ef6) runs the frame loop's own
 two-step on demand and reports which lane answered. A change to a pick
 needs a measurement OF the pick.
+
+---
+
+## THE SUITE WAS READING STATE IT NEVER SET — nine files, one shape
+
+`bun test` passes 2133/2133 in the default file order. `bun test --randomize`
+does not, and every failure it produced was the same bug wearing a different
+coat: a test file whose assertions depend on a module singleton it never sets,
+inheriting whatever an earlier file happened to leave there. bun runs every
+test file in ONE process, so every module-level store, pool, latch and registry
+is shared. The default order is not a specification — it is the alphabet.
+
+Nine files fixed, and the interesting part is that the failures were not test
+noise. Two of them were the suite asserting the wrong thing, and one was a
+production asymmetry.
+
+### 1. A door swings away from the player — and the player is a singleton
+
+`--seed=42`: four failures in `door-stale-pose.test.ts`, every one a voxel
+raycast that found nothing where the leaf should be. The file passes 8/8 alone.
+A pairwise sweep over all 120 files named exactly one culprit:
+`enemies-drone.test.ts`.
+
+Two hypotheses died first, both measured rather than argued: leftover
+registered passages masking the ray through `_skipOpenDoorway`, and leftover
+destruction targets. A probe printed `passages: 0 targets: 0` — identical alone
+and paired.
+
+What the grid dump showed instead: same cell size, same 3×14×6 dims, same 168
+cells, same 160 alive — and `yaw` NEGATED. `-0.4636` alone, `+0.4636` paired.
+The grid was MIRRORED.
+
+`toggleOperable` decides which way a leaf swings from where the player stands
+(interact.tsx: `state.hinged.sign = tmpVec.z >= 0 ? 1 : -1`, the player's
+position in the hinge frame). `enemies-drone.test.ts` parks `playerRig` at
+(0, 1.6, −0.5) and never puts it back. The next file's doors then open the
+other way. `door-stale-pose` and `door-repose` both build their entire geometry
+on "the leaf sweeps into the room along −Z, and the aim line at z = −0.5
+crosses it" — true only for a player on the +Z side. They were relying on the
+default rig sitting at the ORIGIN, where z = 0 lands on the `>= 0` side of that
+comparison by luck.
+
+Both now state the stance they need; the five files that move the rig hand it
+back at the origin.
+
+### 2. `debrisDump()[0]` is only "my chunk" if the pool is empty
+
+`ground.test.ts` and `roof-framing.test.ts` read the debris pool by index and
+by delta. The pool is a fixed ring that only recycles on an update tick, and
+nothing in a test ticks it: arriving full, it REFUSES every new particle, so
+`debrisCensus().live` stops rising — which is exactly what the rafter-chip
+assertion measures (768 before, 768 after, seed 246810). Arriving merely
+non-empty, `debrisDump()[0]` is a stranger's chunk (seed 65536).
+
+Same fix as the damage-parity harness got earlier tonight: EMPTY is a state,
+so take it going IN, not just coming out. Both files now run their teardown as
+`beforeEach` and `afterEach`.
+
+### 3. A pool that clears its slots and keeps its cursor is not empty
+
+This one was a production bug, and the only failure of the night that was not
+order-dependent: `debris.test.ts`'s "identical spawn sequences shed identical
+shapes" failed about one run in eight IN A FIXED ORDER.
+
+`clearDebris()` reset `alive`, `liveCount` and `spawnSeq` — but not `cursor`.
+So the next burst started writing wherever the last one stopped, and every
+slot-ordered reader (the dump probe, the instance matrices) saw the same pieces
+in a ROTATED order — including a wrap that splits a burst across the ends of
+the ring. Whether it wrapped depended on how far the cursor had travelled,
+which depended on how many rim nibbles earlier carves happened to roll. Hence
+one in eight.
+
+`clearGlassShards()` had the identical asymmetry. Both now reset the cursor:
+one clear, one state.
+
+### 4. Whole-store assertions, foreign rows
+
+The rest were files asserting on the ENTIRE contents of a singleton — which is
+the right assertion, made against the wrong population:
+
+- `builder.test.ts` — `placed.length` is 0 once everything cascaded, and
+  `before[1]` is a specific wall. A stranger's piece shifts every index.
+- `shared-build.test.ts` — `reconcileSharedPieces` walks the whole placed
+  store, so a leftover piece publishes a record the file never asked for.
+- `save-demolition.test.ts` / `shared-damage-remote.test.ts` —
+  `captureDemolition` counts the whole destruction ledger and the whole
+  pending list. "Only wall-1 is offered" saw two.
+- `world-levels.test.ts` — asserted `world.levelId === 'level-test'`, the
+  preload stub's DEFAULT. `keep`/`item-keep` re-pin the viewer's selected level
+  per test and never hand it back, so seed 11111 read `level_test`. The test
+  now SETS the selection and asserts the mirror, which is what its name always
+  claimed: `collectWorld` mirrors the viewer, whatever the viewer says.
+- `preview.test.ts` — `shouldPreview` reads the PHASE as well as the lanes. A
+  file that left the store mid-session made the gate refuse for the right
+  reason and the wrong test.
+
+### The rule this leaves
+
+A test file may not read a singleton it did not set. Teardown after yourself is
+politeness; setup before yourself is correctness — the file that fails is
+downstream of the file that leaks, and only the reader can defend itself.
+
+Verified across the default order and 40 `--randomize` seeds.
+
+---
+
+## TWO SESSIONS, ONE BUILDING — the claim nobody had ever tested
+
+"Everything must be synchronous in multiplayer — builds AND destruction" is one
+sentence, and until tonight nothing in this repo could answer it. The unit
+suite drives ONE copy of the world with a scripted transport: it proves the
+merge, the authorship gate, the lattice join and the chunker, and it cannot
+prove that two real runtimes in two real browsers end up holding the same
+house. Those are different claims, and only the second one is the product.
+
+`docs/qa/qa-boots-twoclient.mjs` closes that. Two tabs, two live game
+runtimes, one wire — and the wire is the interesting part.
+
+### The shim mirrors the host, not an idealised wire
+
+`:3002` is the editor dev server, not the app: there is no collaboration bus
+there, and net.ts is feature-detected, so Boots on `:3002` is deliberately
+solo. So the harness installs the missing half — a `__pascalCollabBus` v1 over
+two BroadcastChannels.
+
+A test transport that delivered everything instantly would have proved nothing,
+because the real bus is LOSSY BY DESIGN. So the shim reproduces, from the host
+module it stands in for: latest-value coalescing per (pluginId, event) behind
+the host's window — intermediate payloads for one key are DROPPED; the
+8 000-byte serialized frame budget, measured on the same probe shape, with an
+over-budget publish returning 'suppressed' rather than throwing; host-stamped
+identity, so the receiver's sessionId/clientId/userId come from the transport
+and never from the payload; and no echo to the sender's own session.
+
+### Four legs, because a one-way wire looks exactly like a working one
+
+From whichever end happens to be driving, a wire that only carries traffic one
+way is indistinguishable from a wire that works. So all four:
+
+    BUILD  A→B  slot Wx:3,6,0    both 0 → 1     ✓
+    BUILD  B→A  slot Wz:3,6,0    both 1 → 2     ✓
+    LEVEL  B→A  wall_5a1q…       both  0/685    ✓
+    LEVEL  A→B  wall_zij1…       both  0/170    ✓
+
+`worldSync` on both ends: lost 0, oversize 0, applyErrors 0, unsent 0,
+overflow 0, busLost 0, throttled 0, rekeys 0, staleMints 0, unsafeNames 0.
+Zero page errors on either tab.
+
+### Two ways the harness lied before it told the truth
+
+**The piece `id` is not a piece's identity.** The first version of the build
+leg compared `pieces()[].id` across peers. That is a PER-SESSION runtime
+counter — shared-build binds a locally minted runtime id to the shared record —
+so A's first wall is `1` on A and whatever B was up to on B. The assertion
+would have failed a working wire. `slotId` is `${kind}:${i},${k},${s}` straight
+off the grid: a pure function of where the piece sits, therefore the same
+string on every peer that holds it. That is the cross-peer identity, and
+comparing counts instead would pass two peers each building their own wall
+somewhere else.
+
+**Both sessions spawn at the same point facing the same way.** So the second
+builder aimed at the slot the first one had just filled, the placement was
+refused as `occupied`, and the leg read as "nothing synced". The reverse leg
+now turns first (under pointer lock a mouse sweep IS a yaw).
+
+### Two counters that look wrong and are not
+
+`laneSinkIgnored: 35` on the peer that did the damage. By design: net-world
+hands DamageSync a publish that only increments a counter, because damage
+already journals itself through `noteLocal*` and the tick drains the journal —
+letting that lane send would publish the same cells twice. Counted rather than
+empty so a future rewiring shows up as a number instead of a silent doubling.
+
+`[A] remotes 0` in one co-presence sample, with almost no poses published.
+That was the HARNESS: Chromium throttles a tab it believes nobody is looking
+at — rAF stops, timers are clamped — and only one of two pages is ever focused.
+`--disable-background-timer-throttling --disable-backgrounding-occluded-windows
+--disable-renderer-backgrounding` plus a sampler that alternates which tab is
+in front made the counters symmetric. Every "the peer never sent anything"
+reading before that was an artefact.
+
+One real observation survives it: at ~1.5 fps on a 485 k-triangle scene the
+keep-alive cannot outrun the 3 s staleness window, and a remote avatar can
+blink out and back. Not a wire fault — a note for the frame budget.
