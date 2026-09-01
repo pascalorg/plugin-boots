@@ -493,6 +493,38 @@ function marchYPlanes(o: number, d: number): void {
   }
 }
 
+/**
+ * THE ONE STOREY RULE. The ray picks the CELL; the pitch band picks the
+ * STOREY. Past ±PITCH_BAND the player has said which level they mean —
+ * exactly one up, or (walls and ramps) one down, or (floors) the slab under
+ * their own feet — and that intent OVERRIDES the crossing height. Inside the
+ * band there is no intent and the crossing height stands (null).
+ *
+ * WHY IT IS A CLAMP AND NOT A NUDGE (owner report 2026-09-01, "problem
+ * placing floors as ceiling"). The ray's height is measured from the EYE, and
+ * the eye is 1.58 m up: on any lot whose ground sits more than
+ * (first boundary − 1.58 m) above the grid origin — which is most real lots,
+ * this one has its terrain at 1.24 m with 2.5 m storeys — the eye is already
+ * ABOVE the first storey boundary while the feet are still on storey 0. So
+ * looking up at your own ceiling crossed boundary TWO, and the ceiling
+ * resolved 5 m overhead: out of reach, unsupported, a red ghost that never
+ * placed anything. Every unit test put the player's feet at y=0, where eye
+ * 1.58 < boundary 2.8 hides the whole failure — which is why this shipped.
+ *
+ * Bumping "only when they disagree" (the old R-slot rule) cannot fix that: 2
+ * and 1 disagree in the wrong direction. Clamping to the intent can, and it
+ * makes the ray path agree with `defaultSlot` by construction — they used to
+ * differ, which is why the fallback rescued the aim on some pitches and not
+ * on others.
+ */
+function intentStorey(piece: BuildPieceKind, playerS: number, pitch: number): number | null {
+  if (pitch > PITCH_BAND) return playerS + 1
+  // Looking down with a FLOOR means the slab under your feet (s = your own
+  // storey); with a wall or a ramp it means the level below.
+  if (pitch < -PITCH_BAND) return Math.max(0, playerS - (piece === 'floor' ? 0 : 1))
+  return null
+}
+
 function rayOverride(input: TargetInput): Slot | null {
   const [px, py, pz] = input.position
   const ox = px
@@ -502,6 +534,7 @@ function rayOverride(input: TargetInput): Slot | null {
   const dx = -Math.sin(input.yaw) * cp
   const dy = Math.sin(input.pitch)
   const dz = -Math.cos(input.yaw) * cp
+  const intent = intentStorey(input.piece, Math.max(0, storeyOf(py)), input.pitch)
 
   _crossings.length = 0
   marchAxis(ox, dx, CELL, 'x')
@@ -514,13 +547,13 @@ function rayOverride(input: TargetInput): Slot | null {
     const y = oy + dy * c.t
     const z = oz + dz * c.t
     if (input.piece === 'wall' && c.axis === 'x') {
-      return { kind: 'Wx', i: c.plane, k: cellOf(z), s: Math.max(0, storeyOf(y)) }
+      return { kind: 'Wx', i: c.plane, k: cellOf(z), s: intent ?? Math.max(0, storeyOf(y)) }
     }
     if (input.piece === 'wall' && c.axis === 'z') {
-      return { kind: 'Wz', i: cellOf(x), k: c.plane, s: Math.max(0, storeyOf(y)) }
+      return { kind: 'Wz', i: cellOf(x), k: c.plane, s: intent ?? Math.max(0, storeyOf(y)) }
     }
     if (input.piece === 'floor' && c.axis === 'y') {
-      return { kind: 'F', i: cellOf(x), k: cellOf(z), s: Math.max(0, c.plane) }
+      return { kind: 'F', i: cellOf(x), k: cellOf(z), s: intent ?? Math.max(0, c.plane) }
     }
   }
   return null
@@ -533,10 +566,14 @@ function rayOverride(input: TargetInput): Slot | null {
  * - an occupied/unsupported cell no longer dead-ends the aim — one placed
  *   ramp used to make EVERY pitch from the same spot read "occupied"; the
  *   march walks on to the next cell the ray crosses, ≤ REACH;
- * - the storey honors the PITCH-BAND intent: the raw crossing height is
- *   erratic at mid pitches (a wall-top aim from outside resolved a GROUND
- *   cell), so beyond ±PITCH_BAND a crossing that disagrees with the intent
- *   is bumped one storey up/down from the player's own.
+ * - the storey obeys THE ONE STOREY RULE (intentStorey): the raw crossing
+ *   height is erratic at mid pitches (a wall-top aim from outside resolved a
+ *   GROUND cell), so beyond ±PITCH_BAND the pitch band CLAMPS the storey
+ *   instead of nudging it. The nudge shipped as "bump only when they
+ *   disagree", which silently did nothing on a raised lot: with the eye
+ *   already above the first boundary a +50° aim crossed boundary TWO, that is
+ *   ABOVE the intent, so nothing was bumped and the ramp resolved two storeys
+ *   overhead — unsupported, out of reach. See intentStorey for the full story.
  * Returns the NEAREST failing result when nothing along the ray is
  * placeable (its reason drives the HUD status line), or null when the ray
  * exits reach without entering a new cell (caller falls back to the
@@ -564,8 +601,7 @@ function resolveRayRSlot(
   const startCellI = cellOf(ox + dx * RAY_START)
   const startCellK = cellOf(oz + dz * RAY_START)
   const playerS = Math.max(0, storeyOf(py))
-  const up = input.pitch > PITCH_BAND
-  const down = input.pitch < -PITCH_BAND
+  const intent = intentStorey(input.piece, playerS, input.pitch)
 
   _crossings.length = 0
   marchAxis(ox, dx, CELL, 'x')
@@ -583,11 +619,8 @@ function resolveRayRSlot(
     const i = c.axis === 'x' ? (dx > 0 ? c.plane : c.plane - 1) : cellOf(x)
     const k = c.axis === 'z' ? (dz > 0 ? c.plane : c.plane - 1) : cellOf(z)
     if (i === startCellI && k === startCellK) continue // never your own cell
-    let s = Math.max(0, storeyOf(y))
-    // Pitch-band intent beats the erratic crossing height — but only when
-    // they DISAGREE (a crossing already a storey up is never double-bumped).
-    if (up && s <= playerS) s = playerS + 1
-    else if (down && s >= playerS) s = Math.max(0, playerS - 1)
+    // Pitch-band intent beats the erratic crossing height outright.
+    const s = intent ?? Math.max(0, storeyOf(y))
     if (i === prevI && k === prevK && s === prevS) continue // x/z pair, same cell
     prevI = i
     prevK = k
@@ -604,10 +637,11 @@ function defaultSlot(input: TargetInput): Slot {
   const [px, py, pz] = input.position
   const i = cellOf(px)
   const k = cellOf(pz)
-  let s = Math.max(0, storeyOf(py))
-  if (input.pitch > PITCH_BAND) s += 1
+  // Same storey rule as the ray paths — one source of truth, so the fallback
+  // can never land on a different level than the aim it is rescuing.
+  const playerS = Math.max(0, storeyOf(py))
+  const s = intentStorey(input.piece, playerS, input.pitch) ?? playerS
   const down = input.pitch < -PITCH_BAND
-  if (down) s = Math.max(0, s - (input.piece === 'floor' ? 0 : 1))
   const d = yawCardinal(input.yaw)
 
   if (input.piece === 'floor') {

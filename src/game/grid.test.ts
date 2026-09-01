@@ -5,8 +5,10 @@ import {
   isTerrainGrounded,
   parseSlotId,
   resetGridAnchor,
+  resetStoreyLadder,
   resolveTargetSlot,
   setGridAnchor,
+  setStoreyLadder,
   type Slot,
   slotId,
   slotPose,
@@ -340,6 +342,85 @@ describe('resolveTargetSlot — R-slot ray march (ramp aim-feel)', () => {
     const slot = parseSlotId(result.slotId)!
     expect(slot.kind).toBe('R')
     expect([slot.i, slot.k]).not.toEqual([0, 0])
+  })
+})
+
+/**
+ * THE RAISED-LOT BLIND SPOT (owner report 2026-09-01, "problem placing floors
+ * as ceiling"). Every test above stands the player's feet at y = 0, where the
+ * eye at 1.58 m is still below the first boundary — so the ray's crossing
+ * height and the pitch-band intent happen to agree and the storey rule is
+ * never actually tested. Raise the feet past (boundary1 − EYE) and they
+ * disagree by a whole storey in the direction the old "bump only when they
+ * disagree" rule could not fix: the aim resolves TWO storeys up, out of reach
+ * and unsupported, which is exactly the red ghost that placed nothing.
+ *
+ * One storey up per look-up, whatever the ground elevation. Every piece.
+ */
+describe('resolveTargetSlot — one storey up from a RAISED stance', () => {
+  afterEach(() => {
+    resetStoreyLadder()
+  })
+
+  test('uniform storeys: eye above the first boundary still resolves s=1', () => {
+    // Feet 1.5 → eye 3.08, above STOREY (2.8). The feet are on storey 0.
+    for (const piece of ['wall', 'floor', 'stairs', 'roof'] as const) {
+      const result = resolveTargetSlot(
+        { position: [1.5, 1.5, 1.5], yaw: -Math.PI / 2, pitch: 0.87, piece, rotState: 0 },
+        OPEN,
+      )
+      const slot = parseSlotId(result.slotId)!
+      expect(slot.s).toBe(1)
+      expect(result.valid).toBe(true)
+      expect(result.pose.position[1]).toBeCloseTo(STOREY)
+    }
+  })
+
+  test('the ceiling lands ON the storey ladder, not a storey over it', () => {
+    // The reported lot: 2.5 m storeys, ground at 1.24 m. Aiming up at the
+    // ceiling used to resolve boundary TWO (y = 5) — 3.76 m over the player's
+    // head, past REACH.
+    setStoreyLadder([0, 2.5, 5, 7.5, 10])
+    const result = resolveTargetSlot(
+      { position: [1.5, 1.24, 1.5], yaw: -Math.PI / 2, pitch: 0.87, piece: 'floor', rotState: 0 },
+      OPEN,
+    )
+    expect(parseSlotId(result.slotId)!.s).toBe(1)
+    expect(result.pose.position[1]).toBeCloseTo(2.5)
+    expect(result.valid).toBe(true)
+    expect(result.reason).toBe('ok')
+  })
+
+  test('looking DOWN from a raised stance: floor under the feet, wall below', () => {
+    const floor = resolveTargetSlot(
+      { position: [1.5, 1.5, 1.5], yaw: -Math.PI / 2, pitch: -0.87, piece: 'floor', rotState: 0 },
+      OPEN,
+    )
+    expect(parseSlotId(floor.slotId)!.s).toBe(0) // your own slab
+    // A wall (or a ramp) means the level below — clamped at ground, never −1.
+    const wall = resolveTargetSlot(
+      { position: [1.5, 1.5, 1.5], yaw: -Math.PI / 2, pitch: -0.87, piece: 'wall', rotState: 0 },
+      OPEN,
+    )
+    expect(parseSlotId(wall.slotId)!.s).toBe(0)
+  })
+
+  test('the aim and its fallback never disagree about the storey', () => {
+    // The fallback used to rescue some pitches and not others precisely
+    // because defaultSlot and the ray path computed the storey differently.
+    // Sweep the whole band edge on a raised stance: same storey, always.
+    for (const y of [0, 1.24, 1.5, 2.7, 4.2]) {
+      const playerS = Math.floor((y + 0.1) / STOREY)
+      for (const pitch of [0.62, 0.75, 0.87, 1.1, 1.35]) {
+        for (const piece of ['wall', 'floor', 'stairs', 'roof'] as const) {
+          const result = resolveTargetSlot(
+            { position: [1.5, y, 1.5], yaw: -Math.PI / 2, pitch, piece, rotState: 0 },
+            OPEN,
+          )
+          expect(parseSlotId(result.slotId)!.s).toBe(playerS + 1)
+        }
+      }
+    }
   })
 })
 
