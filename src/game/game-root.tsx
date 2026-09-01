@@ -58,7 +58,13 @@ import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
 import { settleTasksPending } from './structure'
 import { PipelineWarmup } from './warmup'
-import { enableMicIfAlreadyPermitted, startVoice, stopVoice, voiceDebug } from './voice'
+import {
+  enableMicIfAlreadyPermitted,
+  setVoiceMode,
+  startVoice,
+  stopVoice,
+  voiceDebug,
+} from './voice'
 import { VoiceControls } from './voice-controls'
 import { dormantPrimeQueueSize, VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
@@ -842,6 +848,13 @@ function ActiveGame() {
       // and whether a track has actually arrived — plus `notSent`/`given_up`,
       // the two counters that turn "voice is flaky" into a number.
       voice: () => voiceDebug(),
+      // The mode, settable — the sidebar picker is in the editor and a QA run is
+      // inside the game, so without this seam the proximity mix is the one half
+      // of voice no harness can reach.
+      voiceMode: (mode: 'squad' | 'proximity') => {
+        setVoiceMode(mode)
+        return voiceDebug().mode
+      },
       // Host post-tuning census (host-post.ts, perf fix 5): is the shadow
       // throttle + outline guard live, how many lights are frozen, how
       // often the outline guard had to re-clear. Plain data.

@@ -12,7 +12,9 @@ Two layers, and the split matters:
   registered `kind` and owns the late-join handshake.
 - **kind owners.** `presence.ts` owns `'pose'` (this document's second half).
   `shared-world.ts` owns `'boots/world'` and `'boots/world-snap'` (Part 3).
-  Neither knows anything about the other.
+  `voice.ts` owns `'boots/voice'` (Part 5) — and is the one kind whose payload
+  is not the thing being replicated: the bus carries the *handshake*, the audio
+  goes peer-to-peer. None of the three knows anything about the others.
 
 Every function in both layers is feature-detected: with no bus (solo app,
 older hosts, `:3002`, or the host's `NEXT_PUBLIC_PLUGIN_COLLAB` off),
@@ -29,7 +31,10 @@ byte on the wire.
 | `src/game/remote-players.tsx` | R3F rendering: `<RemotePlayers/>` → `<RemoteAvatar>` rigs, articulation, weapon silhouettes, distance-faded name tags, HUD chip drive. |
 | `src/game/game-root.tsx` | Lifecycle wiring (start/stop keyed on the session serial), local pose sampler, `__boots.presence()` QA handle, toast wiring. |
 | `src/game/session.ts` | `exitGame` goodbye frame; scene-write sentinel with the remote-op discriminator. |
-| `src/game/hud.ts` | "N builders here" chip + muted join/leave toasts. |
+| `src/game/hud.ts` | "N builders here" chip + muted join/leave toasts, voice chip. |
+| `src/game/voice-policy.ts` | PURE voice rules: the wire type + its validator, the SDP budget trim, who offers (total order), the round-robin signalling target, the room cap, the proximity curve, the talk gate. No WebRTC, no bus, no DOM. |
+| `src/game/voice.ts` | THE CALL — one kind (`'boots/voice'`) for signalling, an `RTCPeerConnection` mesh for audio: peer lifecycle, non-trickle offer/answer with epochs + acks, the microphone, the tick that mixes levels, the give-up list, QA counters. |
+| `src/game/voice-controls.tsx` | In-game wiring: takes `KeyM` off the one-shot action queue, drives the HUD's voice chip. |
 
 # Part 1 — the frame bus (`net.ts`)
 
@@ -761,3 +766,297 @@ This bit once already: `net-world.ts` importing a never-deployed
 a hard 500 the moment `game-root.tsx` wired it up. If `localhost:3002` starts
 answering 500 with "Can't resolve './shared-…'", the repo is fine and the copies
 are stale.
+
+# Part 5 — the call (`voice.ts`, `voice-policy.ts`)
+
+The owner's ask was "talk to each other like if we were on a call or teammates in
+fortnite". Parts 1–4 replicate *what people do*; this part replicates *what they
+say*, and it is the only layer in the plugin whose payload does not travel on the
+host bus at all.
+
+**The bus carries the handshake. The audio goes peer-to-peer.** Every frame in
+Parts 1–4 IS the thing being replicated — a pose, a delta, a snapshot. A voice
+frame is a *description of how to open a connection somewhere else*: two browsers
+exchange SDP over the collab bus, and from then on the sound travels directly
+between them over WebRTC. Nothing in this part ever puts audio on the bus.
+
+That is not a preference. The host coalesces to the latest payload per
+`(pluginId, event)` inside its window and caps a frame at 8000 serialized bytes,
+so a channel that keeps only the newest thing it was handed cannot carry a
+*stream*, where every packet matters and none supersedes another. What such a
+channel is very good at is carrying **one small, current, idempotent fact** —
+which is exactly what an offer, an answer and an ack can be made into, and the
+whole design of this part follows from making them that.
+
+| | |
+|---|---|
+| `voice-policy.ts` | Pure rules, no WebRTC / bus / DOM: `readVoiceFrame` (wire validation), `sdpIsAudioOnly`, `trimSdpToBudget`, `voiceOffererIsUs`, `nextSignalTarget`, `voiceRoom` / `voicePeersFor`, `proximityGain` / `mixGain`, `talkGate`, and every constant below. Unit-testable to the last branch, which is why the negotiation rules live here rather than beside the connection they drive. |
+| `voice.ts` | The mesh: `startVoice` / `stopVoice`, `makeLink` / `closeLink` / `restart`, `makeOffer` / `makeAnswer` / `publishSignal` / `ingest`, `enableMic` / `toggleMic` / `setMicMuted`, `voiceTick`, `setVoiceMode` (persisted), `isPeerTalking`, `voiceDebug`. Owns all state; the only module here that touches `RTCPeerConnection`. |
+| `voice-controls.tsx` | `<VoiceControls/>`: takes `'KeyM'` off `session.input.state.actions` at priority −1 and drives the HUD chip. No state of its own. |
+| `game-root.tsx` | Starts/stops with the session, feeds `getLocalPosition`, exposes `__boots.voice()` and `__boots.voiceMode()`. |
+| `session.ts` | `exitGame` → `stopVoice()`, so leaving the game releases the microphone. |
+| `remote-players.tsx` | The speaking dot over a talking peer's name tag. |
+| `panel.tsx`, `touch.ts` | The sidebar mode picker (Squad / Nearby) and the phone's MIC button. |
+
+## The frame
+
+```jsonc
+{
+  "v": 1,                     // VOICE_PROTOCOL
+  "mode": "squad",            // informational: what MY mixer is doing
+  "talking": true,            // the talk gate, for the dot and the HUD count
+  "to": "session_b",          // whose description this frame carries (optional)
+  "sdp": {                    // at most ONE peer's description per frame
+    "type": "offer",          // 'offer' | 'answer'
+    "epoch": 3,               // monotonic per link; an answer echoes the offer's
+    "sdp": "v=0\r\no=- …"     // trimmed to MAX_SDP_CHARS, audio-only
+  },
+  "ack": { "session_b": 3 }   // newest epoch I have APPLIED from each peer
+}
+```
+
+Everything except `sdp`/`to` is **cumulative state**, not an event: a frame is a
+complete statement of where this peer is in every negotiation it has, so the
+newest frame always supersedes the older one *correctly*. That is what makes the
+host's latest-value coalescing harmless here instead of fatal.
+
+## Non-trickle ICE, on purpose
+
+Ordinary WebRTC trickles candidates: a description first, then a stream of small
+candidate messages, all of which must arrive. On a channel that keeps only the
+latest payload per event, most of that stream is dropped and the call never
+connects — with no error anywhere, because nothing failed; a message simply
+stopped existing.
+
+So Boots gathers first and sends once. `makeOffer` / `makeAnswer` create the
+description, `await gathered(pc)` waits for ICE gathering to finish (end-of-
+candidates event, gathering-state change, or `ICE_GATHER_MS`, whichever comes
+first — engines disagree about which of the first two they emit), and the
+description that goes out already contains the candidates. One frame per
+description, no ordering requirement, nothing to lose.
+
+**And it is re-sent until acknowledged.** `link.outbound` holds the description
+we owe a peer; `publishSignal` runs every `SIGNAL_EVERY_TICKS` ticks and puts one
+owed description on the wire, round-robin across the peers that are owed one
+(`nextSignalTarget`, which is why one slow peer cannot starve the rest). It stops
+when their `ack[me]` names our epoch — or, for an offer, when their answer
+arrives, because *applying* the answer is itself proof they had the offer.
+
+**A description is only counted as sent when the host says `'sent'`.**
+`'deferred'` and `'suppressed'` mean the frame is gone, and counting those as
+sent would turn `offersSent` into a lie and hide the exact condition this whole
+scheme exists to survive. They increment `notSent` instead — **expected to be
+non-zero, and not a failure.**
+
+## Who offers, and what happens when both do
+
+`voiceOffererIsUs(me, peer)` is a total order on session ids: the lower id
+offers, the higher one waits and builds its link when the offer lands. No round
+trip, no leader election, and both sides reach the same answer from data they
+already have.
+
+Glare — both ends holding a local offer — is still reachable (a link rebuilt
+while their offer was in flight, or a peer on a different build). It is resolved
+by **the same total order**, so again both sides agree with no negotiation: the
+side the order says owns the pair keeps its offer and drops theirs (`dropped++`);
+the other rolls its own offer back (`setLocalDescription({type:'rollback'})`) and
+answers. Deciding it any other way — newest wins, first wins — leaves two
+half-open connections and silence.
+
+A peer that offers when the order says it should not is **answered anyway**. The
+order exists to avoid glare, not to police it, and refusing would turn a
+version-mismatched peer into permanent silence.
+
+## Epochs
+
+`epoch` is per-link and monotonic, and an **answer carries the offer's epoch**.
+That single choice is what makes late signalling harmless rather than confusing:
+an answer to a superseded offer, or an offer we have already answered, is
+*recognisable* and counted (`dropped`) instead of being applied against the wrong
+negotiation and failing the pair for the rest of the session.
+
+## Bounds
+
+| Constant | Value | Why |
+| --- | --- | --- |
+| `MAX_VOICE_PEERS` | 6 | Mesh cost grows with the square of the room; six is where a phone still copes. |
+| `MAX_SDP_CHARS` | 6200 | Under the host's 8000-byte frame budget with the envelope and the ack map beside it. |
+| `MAX_ICE_CANDIDATES` | 24 | A validation bound on what a peer may hand us, not a target. |
+| `MAX_ACK_ENTRIES` | `MAX_VOICE_PEERS + 2` | The ack map is bounded by the room, plus slack for a peer mid-swap. |
+| `MAX_SESSION_ID_CHARS` | 128 | A `to`/`ack` key is an id, not a place to put a paragraph. |
+
+`trimSdpToBudget` drops **candidate lines** — keeping at least one of each type
+it can — rather than truncating the string, because half an SDP is not an SDP;
+if it cannot fit, the description is abandoned and `tooLarge` counted. Every
+inbound frame goes through `readVoiceFrame`, and `sdpIsAudioOnly` refuses any
+description carrying a video or data m-line: a peer cannot negotiate a camera or
+a side channel into a voice call.
+
+**The cap is on the ROOM, not per peer.** `voiceRoom(roster)` picks the same
+deterministic subset for everybody, and `voicePeersFor` derives one member's list
+from it. A per-peer cap would let A be in a call with B while B's own list is
+full — one-way audio, and a bug report nobody can reproduce.
+
+## The mesh, tick by tick
+
+`voiceTick(now)` runs every `VOICE_TICK_MS` and is the only thing that moves:
+
+1. **Roster.** Peers are the presence remotes whose phase is `'game'` (an
+   editor-only viewer is not in the call), minus the give-up list, capped by the
+   room. Links to peers who left are closed; links to peers who arrived are
+   opened, and the lower id offers. An `'idle'` link on our side of the order
+   with nothing owed re-offers — that is the repair path for an offer whose
+   publish was coalesced away before it was ever counted.
+2. **Our own talk state**, from the local mic analyser through `talkGate`.
+3. **Levels**, `mixGain(mode, distance)` per peer, written only on change — so a
+   squad call touches nothing at all, and a refused autoplay heals here because
+   by now the player has clicked something.
+4. **One signalling frame**, every fourth tick, carrying at most one description.
+
+Recovery is bounded: a negotiation still unconnected after
+`NEGOTIATION_TIMEOUT_MS` is restarted, and after `MAX_NEGOTIATION_ATTEMPTS`
+restarts the peer goes on the `unreachable` set and `given_up` is incremented —
+**given up on deliberately and countably**, because with STUN only some pairs
+genuinely cannot reach each other, and retrying forever would burn a connection
+attempt every fifteen seconds for the rest of the session and still be silent.
+
+`ICE servers` are public STUN, with `setVoiceIceServers` as the seam for a relay
+when there is one. There is no TURN today; the honest consequence is in the "not
+handled" list below.
+
+## The microphone
+
+One `sendrecv` audio transceiver is created **before any description exists**, so
+enabling the mic later is `sender.replaceTrack(track)` with **no renegotiation** —
+the alternative is a second handshake in the middle of a firefight. Two things
+follow: you can hear the room with your mic off, and the handshake is expected to
+complete while every mic in the session is off.
+
+`MicState` is `off | live | muted | denied | unavailable`. `M` (or the phone's
+MIC button) acquires on first press and mutes/unmutes after that; muting disables
+the track and keeps the device, so the call survives. `getUserMedia` asks for
+`echoCancellation`, `noiseSuppression` and `autoGainControl` — the three that
+decide whether a game call is usable at all, since without cancellation everyone
+hears themselves through everyone else. `enableMicIfAlreadyPermitted` turns the
+mic on at session start **only** when permission was already granted, because a
+permission dialog appearing mid-firefight is worse than no voice at all. And
+`stopVoice` stops the tracks: leaving the game must turn the browser's recording
+indicator off, or the next thing the player does is check whether we are still
+listening.
+
+## The talk gate, and who is talking
+
+The gate is RMS with hysteresis and hang time: it opens at `VAD_OPEN_RMS`, holds
+while the level stays above `VAD_CLOSE_RMS`, and closes `VAD_HANG_MS` after the
+level was last loud enough to open — so a breath between words does not flicker
+the dot. The analyser is WebAudio on the **local** mic only.
+
+The resulting boolean rides on our own frames, and each peer's copy is stamped
+with the tick clock when it arrives. `isPeerTalking` treats a flag older than
+`TALKING_STALE_MS` as quiet, so a peer whose frames stop arriving goes silent on
+the HUD instead of talking forever. `remote-players.tsx` reads it per avatar
+(with wall time passed in explicitly, since the module's clock only advances
+while the tick runs) and shows a dot over the name tag. **Which mouth a voice
+belongs to is the one thing a call in a game needs and a call on a phone does
+not.**
+
+## Output goes through an audio element, never WebAudio
+
+Each peer's stream is attached to a floating `HTMLAudioElement` — created with
+`new Audio()` and deliberately never in the DOM, so the host page cannot style,
+click or scroll it away — and its level is set with `element.volume`.
+
+**A remote `MediaStream` routed through a `MediaStreamAudioSourceNode` is silent
+on iOS Safari.** That is the whole reason the mixer is an element property and
+not a gain node, and it is a trade with a visible cost: iOS makes `volume`
+read-only, so **proximity is flat on iPhone** — you hear everyone at full level.
+Squad, which is what most people want, is unaffected. The sidebar says so in
+words ("Flat on iPhone") rather than leaving a phone user to wonder why walking
+away changes nothing.
+
+## Two mixes
+
+| Mode | Behaviour |
+| --- | --- |
+| `squad` (default) | Everyone at full level, wherever they are. A party call. |
+| `proximity` | Full within `VOICE_NEAR_M`, fading to nothing at `VOICE_FAR_M` on a `VOICE_ROLLOFF` curve. Walk over to talk. |
+
+Distance is measured against the peer's latest presence snapshot — the voice
+layer reads the avatar layer's ring and never samples the wire itself. Changing
+mode sets every `link.gain` to `-1`, which forces the next tick to rewrite every
+level. The choice is persisted per browser under `boots.voice.mode.1` (a
+*preference*, not session state: somebody who picked proximity because they are
+building at opposite ends of a house did not pick it for one page load), and an
+unrecognised stored value falls back to the default rather than being trusted
+into the state.
+
+## QA surface
+
+`__boots.voice()` dumps, per peer, the real `RTCPeerConnection` state
+(`state / connection / ice`), what description is still owed (`owed`), the mixed
+`gain`, whether a remote track has actually arrived (`hasTrack`), `attempts` and
+their `talking` flag — plus `mode`, `mic`, `unreachable` and the counters:
+
+`offersSent`, `answersSent`, `offersApplied`, `answersApplied`, `dropped`,
+`tooLarge`, `restarts`, `given_up`, `notSent`.
+
+Every one of those is a **silent** failure otherwise. `__boots.voiceMode(mode)`
+exists because the picker is in the editor sidebar and a QA run is inside the
+game, so without that seam the proximity mix is the one half of voice no harness
+can reach.
+
+### Two-browser voice checklist (`docs/qa/qa-boots-voice.mjs`)
+
+Two tabs, two live sessions, the host-faithful lossy bus shim
+(`qa-collab-bus.mjs`) for signalling, and Chromium's fake capture device standing
+in for a microphone. What it asserts is the pair of facts that make a call a
+call:
+
+1. each side's connection to the other reaches `'connected'` — **with both mics
+   still off**, which is also the proof that the up-front transceiver works;
+2. each side actually **holds** the other's audio (`hasTrack`); a `'connected'`
+   link with no track is the failure mode that looks perfect in every other
+   readout.
+
+Then: a real `keyboard.press('m')` on both (so `input.ts` → `takeAction` →
+`VoiceControls` is exercised, not just the module's entry point), a mode switch
+to `proximity` and back, and the counters. The verdict is
+`meshOk && audioOk && signalled && gaveUp === 0`; `notSent` is printed as an
+expected non-zero. The talk gate is **reported, not asserted** — the fake device
+is a periodic beep, so whether it opens inside any given window is luck, and the
+gate itself is pinned by unit tests that feed it known levels.
+
+**Run it from the QA directory** (`docs/qa`); `qa-playwright.mjs` finds the
+browser automation package in the sibling host checkout, because plugin-boots
+does not depend on one and no working directory can change that — bare-specifier
+resolution walks up from the importing file, never from cwd.
+
+**And hot-deploy BOTH host copies first.** `:3002` is served by
+`editor/apps/editor`, so a run against a plugin copied only into
+`apps/community/node_modules` tests a build with no voice module in it at all —
+which reads, in every single readout, exactly like voice being broken. This bit
+once: `__boots.voice()` came back `undefined` on both tabs while the repo was
+perfectly fine. Sync both, restart the dev server (node_modules is not watched),
+then run.
+
+## What is not handled, stated rather than hidden
+
+- **No TURN.** Two symmetric NATs will not reach each other with STUN alone.
+  Those pairs are *counted* (`given_up`) rather than retried forever, and the
+  seam to point at a relay is one function call — but until there is one, a
+  minority of pairs will be unable to hear each other while everyone else in the
+  same room can.
+- **Proximity is flat on iPhone**, for the reason above. Squad is not.
+- **Nothing measures whether a remote peer is actually audible.** The output is
+  an element, so there is no analyser on it; "is he talking" is his own flag,
+  relayed. A peer whose mic is captured but muted at the OS level looks talkative
+  and is silent.
+- **A mesh, not a mixer.** Every peer sends its audio to every other peer, which
+  is why the room is capped at six. A server-side mix would lift that ceiling and
+  is a different piece of infrastructure entirely.
+- **No build identity on the wire** (the same gap as Part 3): `v` versions the
+  protocol, nothing versions the codec. Two clients on different revisions can
+  disagree about a field and neither will know.
+- **Signalling is only as live as the tick.** A frame lost to coalescing costs up
+  to four ticks before the next attempt; the resend loop is what makes that a
+  delay instead of a failure, and `notSent` is what makes it visible.

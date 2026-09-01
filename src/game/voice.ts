@@ -127,6 +127,22 @@ type PeerLink = {
   talkingAt: number
   /** Last gain we wrote, so the tick does not touch the element needlessly. */
   gain: number
+  /**
+   * HOW FAR THE HANDSHAKE GOT, as a label — the one field that turns "voice
+   * doesn't work" into a place to look.
+   *
+   * Every step of a negotiation is an `await` on a browser API, and the two ways
+   * one of them ends badly are indistinguishable from outside: an await that
+   * never settles and an await that settled into a silent `return` both leave a
+   * link sitting in `'negotiating'` with nothing owed. `state` cannot tell them
+   * apart because it is the same value for both, and neither logs anything.
+   *
+   * So each stage stamps this on the way past. A stuck link reads as the stage it
+   * is stuck IN; a link that gave up reads as the reason it gave up.
+   */
+  step: string
+  /** Whatever a caught negotiation error said, for the same reason. */
+  error: string | null
 }
 
 type VoiceState = {
@@ -189,6 +205,15 @@ type VoiceState = {
      * takes several seconds to connect, so it is counted rather than ignored.
      */
     notSent: number
+    /**
+     * A description the browser agreed to make and then did not hand back — the
+     * `localDescription` was empty after `setLocalDescription` resolved. Nothing
+     * threw, so this is invisible without a counter, and the peer waits for a
+     * frame that will never be built until the negotiation times out.
+     */
+    abandoned: number
+    /** Negotiations that ended in a caught exception (see `link.error`). */
+    threw: number
   }
 }
 
@@ -239,6 +264,8 @@ const state: VoiceState = {
     restarts: 0,
     given_up: 0,
     notSent: 0,
+    abandoned: 0,
+    threw: 0,
   },
 }
 
@@ -325,6 +352,8 @@ function makeLink(sessionId: string): PeerLink | null {
     talking: false,
     talkingAt: 0,
     gain: -1,
+    step: 'new',
+    error: null,
   }
   // ONE sendrecv audio transceiver, created before any description exists.
   // Negotiating the send direction up front is what lets the mic be enabled
@@ -375,7 +404,7 @@ function closeLink(link: PeerLink): void {
 
 /** Tear a link down and start over, unless this peer has used up its attempts. */
 function restart(link: PeerLink, _why: string): void {
-  const { sessionId, attempts } = link
+  const { sessionId, attempts, epoch } = link
   closeLink(link)
   if (attempts + 1 >= MAX_NEGOTIATION_ATTEMPTS) {
     // Given up ON PURPOSE and countably. With STUN only, some pairs genuinely
@@ -387,29 +416,75 @@ function restart(link: PeerLink, _why: string): void {
   }
   state.counters.restarts++
   const fresh = makeLink(sessionId)
-  if (fresh) fresh.attempts = attempts + 1
+  if (!fresh) return
+  fresh.attempts = attempts + 1
+  /**
+   * THE EPOCH SURVIVES THE CONNECTION. It numbers descriptions for this PAIR,
+   * not for this `RTCPeerConnection`, and starting a rebuilt link back at 0 was
+   * a deadlock with no error anywhere:
+   *
+   * our first offer is epoch 1, they answer it and record `applied = 1`. We
+   * restart — a timeout, a failed ICE — and offer again as epoch 1. Now BOTH
+   * checks that exist to protect this protocol fire on the wrong side of the
+   * truth: they see `epoch <= applied` and drop our new offer as one they have
+   * already answered, so they never answer again; and their old answer, still
+   * being re-sent, matches our new offer's epoch exactly, so we hand a
+   * description built for a dead connection to a live one, `setRemoteDescription`
+   * rejects it, and we restart — which produces epoch 1 again. Four rounds of
+   * that and the pair is written off as unreachable, having been perfectly
+   * reachable the whole time.
+   *
+   * Carrying the number forward makes every one of those checks correct again:
+   * a newer offer is always a larger epoch, and a stale answer never matches.
+   */
+  fresh.epoch = epoch
 }
 
 // ── Signalling ───────────────────────────────────────────────────────────────
 
+/**
+ * An error as a short string. Name AND message, because the name alone
+ * (`InvalidStateError`) does not say which state, and the message alone is not
+ * always there. Bounded, since this is read in a debug dump, not thrown again.
+ */
+function describeError(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 160)
+  return String(error).slice(0, 160)
+}
+
 async function makeOffer(link: PeerLink): Promise<void> {
   link.state = 'negotiating'
   link.startedAt = state.clock
+  link.error = null
   try {
+    link.step = 'offer:create'
     const offer = await link.pc.createOffer()
+    link.step = 'offer:local'
     await link.pc.setLocalDescription(offer)
+    link.step = 'offer:gather'
     await gathered(link.pc)
     const sdp = link.pc.localDescription?.sdp
-    if (!sdp) return
+    if (!sdp) {
+      // Agreed to make a description, then handed back nothing. Nothing threw,
+      // so without the counter this peer just waits out the timeout in silence.
+      link.step = 'offer:no-sdp'
+      state.counters.abandoned++
+      return
+    }
     const trimmed = trimSdpToBudget(sdp, MAX_SDP_CHARS)
     if (trimmed === null) {
+      link.step = 'offer:too-large'
       state.counters.tooLarge++
       return
     }
     link.epoch += 1
     link.outbound = { type: 'offer', epoch: link.epoch, sdp: trimmed }
-  } catch {
+    link.step = 'offer:owed'
+  } catch (error) {
     link.state = 'failed'
+    link.step = 'offer:threw'
+    link.error = describeError(error)
+    state.counters.threw++
   }
 }
 
@@ -427,15 +502,24 @@ async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void
     }
     // Ours is superseded either way: they are the offerer for this negotiation.
     link.outbound = null
+    link.step = 'answer:remote'
     await link.pc.setRemoteDescription({ sdp: offer.sdp, type: 'offer' })
     state.counters.offersApplied++
+    link.step = 'answer:create'
     const answer = await link.pc.createAnswer()
+    link.step = 'answer:local'
     await link.pc.setLocalDescription(answer)
+    link.step = 'answer:gather'
     await gathered(link.pc)
     const sdp = link.pc.localDescription?.sdp
-    if (!sdp) return
+    if (!sdp) {
+      link.step = 'answer:no-sdp'
+      state.counters.abandoned++
+      return
+    }
     const trimmed = trimSdpToBudget(sdp, MAX_SDP_CHARS)
     if (trimmed === null) {
+      link.step = 'answer:too-large'
       state.counters.tooLarge++
       return
     }
@@ -444,8 +528,12 @@ async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void
     // that has already been superseded is detectable instead of confusing.
     link.outbound = { type: 'answer', epoch: offer.epoch, sdp: trimmed }
     link.ackedByThem = false
-  } catch {
+    link.step = 'answer:owed'
+  } catch (error) {
     link.state = 'failed'
+    link.step = 'answer:threw'
+    link.error = describeError(error)
+    state.counters.threw++
   }
 }
 
@@ -455,6 +543,14 @@ function ackMap(): Record<string, number> {
     if (link.applied > 0) ack[link.sessionId] = link.applied
   }
   return ack
+}
+
+/** Is any peer still waiting on a description from us? */
+function anythingOwed(): boolean {
+  for (const link of state.peers.values()) {
+    if (link.outbound !== null && !link.ackedByThem) return true
+  }
+  return false
 }
 
 /** Publish one frame: at most one peer's description, plus our own flags. */
@@ -751,12 +847,35 @@ export function voiceTick(now: number): void {
       continue
     }
     // A negotiation that never completed: start it over, boundedly.
+    //
+    // PATIENCE DEPENDS ON WHETHER ANYTHING IS HAPPENING. A link whose ICE is
+    // checking or already up has a live path to the other machine and is waiting
+    // on one more description; tearing that down at the same deadline as a link
+    // that never heard anything throws away the expensive half of the handshake
+    // — and, in a two-peer call, does it at exactly the moment the answer is in
+    // flight, because both sides started their clocks together. The doubled
+    // deadline still fires: a path that is up but never finishes DTLS is dead,
+    // it just gets the benefit of the doubt first.
+    const iceMoving =
+      link.pc.iceConnectionState === 'checking' ||
+      link.pc.iceConnectionState === 'connected' ||
+      link.pc.iceConnectionState === 'completed'
+    const patience = iceMoving ? NEGOTIATION_TIMEOUT_MS * 2 : NEGOTIATION_TIMEOUT_MS
     if (
       link.state === 'negotiating' &&
-      now - link.startedAt > NEGOTIATION_TIMEOUT_MS &&
+      now - link.startedAt > patience &&
       link.pc.connectionState !== 'connected'
     ) {
       restart(link, 'timeout')
+      continue
+    }
+    // A negotiation that ENDED badly. Every `catch` in the signalling path lands
+    // here, and until this branch existed such a link was never touched again:
+    // the timeout above only looks at `'negotiating'`, so one rejected
+    // createAnswer meant that pair was silent for the rest of the session with a
+    // full attempt budget unspent. `restart` is bounded, so this cannot spin.
+    if (link.state === 'failed') {
+      restart(link, 'failed')
       continue
     }
     // An idle link on our side of the ordering never got its offer out (the
@@ -794,8 +913,19 @@ export function voiceTick(now: number): void {
     }
   }
 
-  // 4. One signalling frame every SIGNAL_EVERY_TICKS, at most one description.
-  if (state.ticks % SIGNAL_EVERY_TICKS === 0 && netAvailable()) publishSignal()
+  // 4. One signalling frame: every tick while a description is owed, otherwise
+  //    every SIGNAL_EVERY_TICKS as a heartbeat. At most one description either
+  //    way.
+  //
+  //    The heartbeat rate is right for what a heartbeat carries — a talk flag and
+  //    an ack map — and wrong for a handshake, where it is pure added latency on
+  //    every hop, twice per round trip, on top of ICE gathering. A pair that
+  //    cannot finish inside the negotiation deadline gets restarted, and a
+  //    restart is far more expensive than the frames saved by waiting. So while
+  //    anything is owed, this runs at the tick.
+  if (netAvailable() && (state.ticks % SIGNAL_EVERY_TICKS === 0 || anythingOwed())) {
+    publishSignal()
+  }
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -896,9 +1026,18 @@ export function voiceDebug(): {
     talking: boolean
     attempts: number
     hasTrack: boolean
+    step: string
+    error: string | null
   }>
   unreachable: string[]
   counters: VoiceState['counters']
+  /**
+   * How many times the tick has run. Two readings a known wall-time apart say
+   * whether the tick is running at all — a browser that has throttled a hidden
+   * tab's timers starves every deadline in this module at once, and without this
+   * number that reads as "the peer never answered".
+   */
+  ticks: number
 } {
   const peers = [...state.peers.values()].map((link) => ({
     applied: link.applied,
@@ -910,8 +1049,10 @@ export function voiceDebug(): {
     ice: link.pc.iceConnectionState,
     name: participantName(getRemotes().get(link.sessionId)?.userId ?? ''),
     owed: link.outbound ? `${link.outbound.type}@${link.outbound.epoch}` : null,
+    error: link.error,
     sessionId: link.sessionId,
     state: link.state,
+    step: link.step,
     talking: link.talking,
   }))
   return {
@@ -922,6 +1063,7 @@ export function voiceDebug(): {
     peers,
     supported: voiceSupported(),
     talking: state.talking,
+    ticks: state.ticks,
     unreachable: [...state.unreachable],
   }
 }
@@ -933,6 +1075,7 @@ export function resetVoice(): void {
   state.mode = 'squad'
   state.lastTarget = null
   state.counters = {
+    abandoned: 0,
     answersApplied: 0,
     answersSent: 0,
     dropped: 0,
@@ -941,6 +1084,7 @@ export function resetVoice(): void {
     offersApplied: 0,
     offersSent: 0,
     restarts: 0,
+    threw: 0,
     tooLarge: 0,
   }
 }

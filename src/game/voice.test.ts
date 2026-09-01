@@ -129,6 +129,8 @@ type FakeSender = {
 class FakePeerConnection {
   static made: FakePeerConnection[] = []
   static rejectSetRemote = false
+  /** Accept setLocalDescription and hand back nothing — the silent abandon. */
+  static swallowLocalDescription = false
 
   connectionState = 'new'
   iceConnectionState = 'new'
@@ -188,8 +190,9 @@ class FakePeerConnection {
       this.localDescription = null
       return
     }
-    this.localDescription = { sdp: description.sdp ?? SDP(description.type), type: description.type }
     this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable'
+    if (FakePeerConnection.swallowLocalDescription) return
+    this.localDescription = { sdp: description.sdp ?? SDP(description.type), type: description.type }
   }
 
   async setRemoteDescription(description: { sdp: string; type: string }) {
@@ -266,6 +269,7 @@ const mic: MicScript = { grant: true, permission: 'prompt', track: null }
 function installWebRtc(): void {
   FakePeerConnection.made = []
   FakePeerConnection.rejectSetRemote = false
+  FakePeerConnection.swallowLocalDescription = false
   FakeAudio.made = []
   g.RTCPeerConnection = FakePeerConnection
   g.MediaStream = FakeMediaStream
@@ -557,6 +561,171 @@ describe('exactly one side offers', () => {
   })
 })
 
+describe('a rebuilt link is a CONTINUATION, not a fresh start', () => {
+  /**
+   * These four tests are the whole reason two real browsers could not hear each
+   * other. Each one on its own reads like an edge case; together they are the
+   * deadlock: our first offer is epoch 1, they answer and record it, we restart
+   * for any reason at all, and every check that exists to protect this protocol
+   * then fires on the wrong side of the truth.
+   */
+  test('the epoch KEEPS COUNTING across a restart', async () => {
+    const bus = boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    expect(peer('session-z')?.owed).toBe('offer@1')
+
+    // Any restart at all. A rejected answer is the cheapest one to script.
+    FakePeerConnection.rejectSetRemote = true
+    hearVoice('session-z', {
+      v: VOICE_PROTOCOL,
+      to: 'session-me',
+      sdp: { type: 'answer', epoch: 1, sdp: SDP('sendrecv') },
+    })
+    await settle()
+    expect(voiceDebug().counters.restarts).toBe(1)
+
+    // The rebuilt link re-offers — as epoch 2. Starting again at 1 is what made
+    // the far side drop it as "an offer we already answered".
+    FakePeerConnection.rejectSetRemote = false
+    voiceTick(1100)
+    await settle()
+    voiceTick(1200)
+    expect(peer('session-z')?.owed).toBe('offer@2')
+    expect(lastDescriptionTo(bus, 'session-z')?.sdp?.epoch).toBe(2)
+  })
+
+  test('their answer to the DEAD offer no longer matches the live one', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+
+    FakePeerConnection.rejectSetRemote = true
+    hearVoice('session-z', {
+      v: VOICE_PROTOCOL,
+      to: 'session-me',
+      sdp: { type: 'answer', epoch: 1, sdp: SDP('sendrecv') },
+    })
+    await settle()
+    FakePeerConnection.rejectSetRemote = false
+    voiceTick(1100)
+    await settle()
+
+    // Their resend of the OLD answer arrives at the NEW connection. With the
+    // epoch carried forward this is recognisably stale; without it, the numbers
+    // matched, the wrong description went into a live connection, it rejected,
+    // and that produced another restart — the loop.
+    hearVoice('session-z', {
+      v: VOICE_PROTOCOL,
+      to: 'session-me',
+      sdp: { type: 'answer', epoch: 1, sdp: SDP('sendrecv') },
+    })
+    await settle()
+    expect(voiceDebug().counters.answersApplied).toBe(0)
+    expect(voiceDebug().counters.restarts).toBe(1)
+    expect(peer('session-z')?.owed).toBe('offer@2')
+  })
+
+  test('a link that ended in an EXCEPTION is picked back up by the tick', async () => {
+    boot()
+    seePeer('session-a') // below us: they offer, we answer
+    voiceTick(1000)
+    FakePeerConnection.rejectSetRemote = true
+    hearVoice('session-a', {
+      v: VOICE_PROTOCOL,
+      to: 'session-me',
+      sdp: { type: 'offer', epoch: 1, sdp: SDP('sendrecv') },
+    })
+    await settle()
+    expect(peer('session-a')?.state).toBe('failed')
+    expect(peer('session-a')?.step).toBe('answer:threw')
+    expect(peer('session-a')?.error).toContain('SDP rejected')
+    expect(voiceDebug().counters.threw).toBe(1)
+
+    // The timeout branch only ever looked at 'negotiating', so before this
+    // existed a single caught exception meant silence for the rest of the
+    // session with the whole attempt budget unspent.
+    FakePeerConnection.rejectSetRemote = false
+    voiceTick(1100)
+    expect(voiceDebug().counters.restarts).toBe(1)
+    expect(peer('session-a')?.state).toBe('idle')
+  })
+
+  test('a description the browser never hands back is COUNTED, not silent', async () => {
+    boot()
+    seePeer('session-z')
+    FakePeerConnection.swallowLocalDescription = true
+    voiceTick(1000)
+    await settle()
+    expect(voiceDebug().counters.abandoned).toBe(1)
+    expect(peer('session-z')?.step).toBe('offer:no-sdp')
+    expect(peer('session-z')?.owed).toBeNull()
+  })
+})
+
+describe('patience, and where it runs out', () => {
+  test('a handshake with ICE in flight is given twice as long', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    // A live path to the other machine, waiting on one more description. Killing
+    // this at the base deadline throws away the expensive half of the handshake
+    // — and in a two-peer call does it exactly when the answer is in flight,
+    // because both sides started their clocks together.
+    pc.iceConnectionState = 'checking'
+    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS + 1)
+    expect(voiceDebug().counters.restarts).toBe(0)
+    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS * 2 + 1)
+    expect(voiceDebug().counters.restarts).toBe(1)
+  })
+
+  test('a handshake that heard NOTHING is restarted on the base deadline', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS + 1)
+    expect(voiceDebug().counters.restarts).toBe(1)
+  })
+})
+
+describe('a pending description does not wait for the heartbeat', () => {
+  test('an owed offer goes out on the very next tick', async () => {
+    const bus = boot()
+    seePeer('session-z')
+    voiceTick(1000) // builds the link and starts the offer
+    await settle() // the offer becomes owed
+    voiceTick(1100) // ONE tick later, not four
+    const frame = lastDescriptionTo(bus, 'session-z')
+    expect(frame?.sdp?.epoch).toBe(1)
+    expect(voiceDebug().counters.offersSent).toBe(1)
+  })
+
+  test('with nothing owed it stays on the heartbeat', async () => {
+    const bus = boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-z', {
+      v: VOICE_PROTOCOL,
+      to: 'session-me',
+      sdp: { type: 'answer', epoch: 1, sdp: SDP('sendrecv') },
+    })
+    await settle()
+    expect(peer('session-z')?.owed).toBeNull()
+    const before = sent(bus).length
+    voiceTick(1100)
+    voiceTick(1200)
+    expect(sent(bus).length).toBe(before)
+    voiceTick(1300) // ticks % SIGNAL_EVERY_TICKS === 0
+    expect(sent(bus).length).toBe(before + 1)
+  })
+})
+
 describe('glare — both ends offered', () => {
   test('the pair’s OWNER keeps its offer and ignores theirs', async () => {
     boot()
@@ -614,14 +783,16 @@ describe('a coalesced frame is not a sent frame', () => {
     // The host kept somebody else's payload for this event inside its window.
     expect(voiceDebug().counters.notSent).toBeGreaterThan(0)
     expect(voiceDebug().counters.offersSent).toBe(0)
-    // The offer is STILL owed, so the next heartbeat carries it again. This is
-    // the whole reason signalling is non-trickle and idempotent.
+    // The offer is STILL owed, so the next tick carries it again. This is the
+    // whole reason signalling is non-trickle and idempotent.
     expect(peer('session-z')?.owed).toBe('offer@1')
 
     bus.publishResult = 'sent'
-    for (let t = 0; t < 4; t++) voiceTick(2000 + t * 100)
+    voiceTick(2000)
+    // Epoch 1 either way: what goes back on the wire is the SAME description,
+    // not a renegotiation, which is what makes a swallowed frame survivable.
     expect(lastDescriptionTo(bus, 'session-z')?.sdp?.epoch).toBe(1)
-    expect(voiceDebug().counters.offersSent).toBe(1)
+    expect(voiceDebug().counters.offersSent).toBeGreaterThan(0)
   })
 
   test('an acknowledged description stops being re-sent', async () => {
@@ -635,13 +806,18 @@ describe('a coalesced frame is not a sent frame', () => {
     })
     await settle()
     for (let t = 0; t < 4; t++) voiceTick(1100 + t * 100)
-    expect(voiceDebug().counters.answersSent).toBe(1)
+    // An owed description repeats on every tick until it is acked, so the count
+    // here is a number of ATTEMPTS, not of distinct answers — the assertion that
+    // matters is the one below, that the ack ends them.
+    const attempts = voiceDebug().counters.answersSent
+    expect(attempts).toBeGreaterThan(0)
+    const onWire = sent(bus).filter((f) => f.sdp).length
 
     // Their ack of OUR answer epoch: they have it, stop.
     hearVoice('session-a', { v: VOICE_PROTOCOL, ack: { 'session-me': 2 } })
     for (let t = 0; t < 8; t++) voiceTick(2000 + t * 100)
-    expect(voiceDebug().counters.answersSent).toBe(1)
-    expect(sent(bus).filter((f) => f.sdp).length).toBe(1)
+    expect(voiceDebug().counters.answersSent).toBe(attempts)
+    expect(sent(bus).filter((f) => f.sdp).length).toBe(onWire)
   })
 
   test('we advertise what we have applied, so they can stop re-sending too', async () => {
