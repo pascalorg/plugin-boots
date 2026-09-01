@@ -13,9 +13,11 @@ import {
 import { type LocalPose, startPresence, stopPresence } from './presence'
 import type { PresenceFrame } from './presence-interp'
 import {
+  DISCONNECT_GRACE_MS,
   MAX_NEGOTIATION_ATTEMPTS,
   micState,
   NEGOTIATION_TIMEOUT_MS,
+  PEER_ABSENT_MS,
   resetVoice,
   selfTalking,
   setVoiceMode,
@@ -431,9 +433,11 @@ describe('the mesh is the people in the GAME', () => {
     const element = FakeAudio.made[0]!
     expect(element.srcObject).not.toBeNull()
 
-    // 'editor' is presence's explicit exit — the peer pressed Esc.
+    // 'editor' is presence's explicit exit — the peer pressed Esc. The teardown
+    // waits out PEER_ABSENT_MS, because at this level leaving and a lost
+    // presence frame look the same and only one of them should cost a handshake.
     seePeer('session-z', { ph: 'editor' }, 1100)
-    voiceTick(1200)
+    voiceTick(1200 + PEER_ABSENT_MS)
     expect(voiceDebug().peers).toEqual([])
     expect(FakePeerConnection.made[0]!.closed).toBe(true)
     // Left playing, a departed peer's stream is a voice in an empty room.
@@ -558,6 +562,167 @@ describe('exactly one side offers', () => {
     await settle()
     expect(voiceDebug().counters.restarts).toBe(1)
     expect(FakePeerConnection.made[0]!.closed).toBe(true)
+  })
+})
+
+describe('a peer missing from the roster has not necessarily left', () => {
+  /**
+   * The failure this pins was the whole reason two browsers in one room could not
+   * hear each other, and it never once looked like itself: presence dropped the
+   * remote for a beat, the tick closed the link, the next tick built a new one
+   * from zero, and the readouts showed a pair that kept starting a handshake and
+   * never finishing — which is exactly what an unreachable peer looks like.
+   */
+  test('a roster flicker does NOT destroy the connection', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    expect(peer('session-z')?.owed).toBe('offer@1')
+    expect(FakePeerConnection.made.length).toBe(1)
+
+    // Gone from the roster, then back a tick later.
+    seePeer('session-z', { ph: 'editor' })
+    voiceTick(1100)
+    expect(voiceDebug().peers.length).toBe(1)
+    expect(voiceDebug().counters.reaped).toBe(0)
+    expect(peer('session-z')?.absentMs).toBeGreaterThan(0)
+
+    seePeer('session-z')
+    voiceTick(1200)
+    // The SAME connection, with the epoch and the owed description intact — one
+    // RTCPeerConnection for the whole episode is the assertion that matters,
+    // because a second one means the candidates were thrown away.
+    expect(FakePeerConnection.made.length).toBe(1)
+    expect(peer('session-z')?.owed).toBe('offer@1')
+    expect(peer('session-z')?.absentMs).toBe(0)
+  })
+
+  test('a peer who really left is reaped once the grace period runs out', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+
+    seePeer('session-z', { ph: 'editor' })
+    voiceTick(1000 + PEER_ABSENT_MS)
+    expect(voiceDebug().peers.length).toBe(1) // still inside the grace period
+    voiceTick(1000 + PEER_ABSENT_MS + 1)
+    expect(voiceDebug().peers.length).toBe(0)
+    expect(voiceDebug().counters.reaped).toBe(1)
+  })
+
+  test('an owed description still goes out to a peer inside its grace period', async () => {
+    const bus = boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    seePeer('session-z', { ph: 'editor' })
+    voiceTick(1100)
+    // Their absence may be the very loss that swallowed our offer, so the resend
+    // has to keep going — stopping it turns a hiccup into a dead pair.
+    expect(lastDescriptionTo(bus, 'session-z')?.sdp?.epoch).toBe(1)
+  })
+})
+
+describe('a call outlives the presence roster', () => {
+  /**
+   * Presence rides the render loop; voice rides an interval. A window that is
+   * behind another one therefore stops publishing poses entirely while its voice
+   * frames keep arriving — measured at ~5 s of pose silence in a two-tab QA run,
+   * well past the 3 s staleness sweep. Liveness for a CALL has to come from the
+   * call, or alt-tabbing hangs up on somebody who is still talking.
+   */
+  test('a voice frame from them keeps the link alive with no presence at all', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    // An established call, which is the case that matters: somebody clicks
+    // another window twenty seconds into a conversation.
+    FakePeerConnection.made[0]!.goLive()
+    seePeer('session-z', { ph: 'editor' }) // out of the roster entirely
+
+    // Well past PEER_ABSENT_MS, but they are still on the wire.
+    for (let at = 1100; at <= 20_000; at += 500) {
+      hearVoice('session-z', { v: VOICE_PROTOCOL, talking: false })
+      voiceTick(at)
+    }
+    expect(voiceDebug().peers.length).toBe(1)
+    expect(voiceDebug().counters.reaped).toBe(0)
+    expect(FakePeerConnection.made.length).toBe(1)
+  })
+
+  test('silence on BOTH channels is what actually ends the link', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    seePeer('session-z', { ph: 'editor' })
+    voiceTick(1000 + PEER_ABSENT_MS + 1)
+    expect(voiceDebug().peers.length).toBe(0)
+    expect(voiceDebug().counters.reaped).toBe(1)
+  })
+})
+
+describe('a connection that WAS up and fell over', () => {
+  test("'disconnected' is given a grace period, then the pair is rebuilt", async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.goLive()
+    expect(peer('session-z')?.state).toBe('connected')
+
+    pc.connectionState = 'disconnected'
+    pc.emit('connectionstatechange')
+    voiceTick(2000)
+    // ICE often recovers on its own, so this window is deliberate.
+    expect(voiceDebug().counters.restarts).toBe(0)
+    voiceTick(2000 + DISCONNECT_GRACE_MS + 1)
+    expect(voiceDebug().counters.restarts).toBe(1)
+    expect(FakePeerConnection.made.length).toBe(2)
+  })
+
+  test('a connection that heals inside the window is left alone', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.goLive()
+    pc.connectionState = 'disconnected'
+    pc.emit('connectionstatechange')
+    voiceTick(2000)
+    pc.connectionState = 'connected'
+    pc.emit('connectionstatechange')
+    voiceTick(2000 + DISCONNECT_GRACE_MS + 1)
+    expect(voiceDebug().counters.restarts).toBe(0)
+    expect(FakePeerConnection.made.length).toBe(1)
+  })
+
+  test('reconnecting REFUNDS the attempt budget', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.goLive()
+
+    // Drop it, let the tick rebuild it, and connect again — as a long session on
+    // a flaky network does. The budget exists for "we cannot reach this peer at
+    // all"; spending it on recoveries wrote off pairs that kept proving they
+    // worked, and the give-up list is permanent for the session.
+    pc.connectionState = 'disconnected'
+    pc.emit('connectionstatechange')
+    voiceTick(2000 + DISCONNECT_GRACE_MS + 1)
+    await settle()
+    expect(peer('session-z')?.attempts).toBe(1)
+    const rebuilt = FakePeerConnection.made[1]!
+    rebuilt.goLive()
+    expect(peer('session-z')?.attempts).toBe(0)
+    expect(voiceDebug().unreachable).toEqual([])
   })
 })
 

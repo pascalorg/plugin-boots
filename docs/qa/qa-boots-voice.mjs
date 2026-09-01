@@ -128,6 +128,30 @@ for (const client of clients) {
   log(`[${client.label}] active ${v?.active} supported ${v?.supported} mode ${v?.mode} mic ${v?.mic}`)
 }
 
+// ── 0b. does the roster hold still? ─────────────────────────────────────────
+// A voice link is built from the presence roster, so a remote that flickers out
+// of it takes the whole handshake with it — connection, gathered candidates,
+// epoch, applied watermark — and both ends begin again. That failure is
+// invisible in every voice readout: it looks precisely like a peer who cannot be
+// reached, and it is the opposite problem. So sample the roster faster than the
+// negotiation deadline and count the disappearances directly.
+log('\n=== 0b. presence roster stability (a flicker here breaks the call) ===')
+const watchRoster = async (client) =>
+  client.page.evaluate(() => {
+    globalThis.__rosterWatch = { drops: 0, samples: 0, maxAgeMs: 0, seen: 0 }
+    const w = globalThis.__rosterWatch
+    let had = 0
+    globalThis.__rosterTimer = setInterval(() => {
+      const remotes = globalThis.__boots?.presence?.()?.remotes ?? []
+      w.samples++
+      w.seen = Math.max(w.seen, remotes.length)
+      for (const r of remotes) w.maxAgeMs = Math.max(w.maxAgeMs, r.ageMs ?? 0)
+      if (remotes.length < had) w.drops++
+      had = remotes.length
+    }, 200)
+  })
+for (const client of clients) await watchRoster(client)
+
 // ── 1. the mesh forms before anybody speaks ─────────────────────────────────
 // A link is opened for every peer in the session whether or not either side has
 // a microphone: you must be able to HEAR people while your own mic is off, and
@@ -144,6 +168,9 @@ const meshLine = async () => {
           // both an await that never settled and an await that returned in
           // silence, and only the stage label tells them apart.
           `${p.sessionId} ${p.state}@${p.step}/${p.connection}/${p.ice} owed=${p.owed} track=${p.hasTrack}` +
+          // A link inside its absence grace period is not negotiating and looks
+          // identical to an idle one; only this says why.
+          (p.absentMs ? ` absent=${p.absentMs}ms` : '') +
           (p.error ? ` ERR(${p.error})` : ''),
       )
       .join('  |  ')
@@ -250,6 +277,8 @@ for (const client of clients) {
   log(`[${client.label}] busStats ${JSON.stringify(await busStats(client))}`)
   const p = await presence(client)
   log(`[${client.label}] presence remotes ${p?.remotes?.length ?? 0}`)
+  const w = await client.page.evaluate(() => globalThis.__rosterWatch ?? null)
+  log(`[${client.label}] roster ${JSON.stringify(w)}`)
 }
 
 const counters = []
@@ -260,6 +289,9 @@ const signalled =
   counters.reduce((sum, c) => sum + (c.offersSent ?? 0), 0) >= 1 &&
   counters.reduce((sum, c) => sum + (c.answersSent ?? 0), 0) >= 1
 const gaveUp = counters.reduce((sum, c) => sum + (c.given_up ?? 0), 0)
+// Nobody leaves during this run, so every reaped link is presence churn that
+// threw away a handshake in progress.
+const reaped = counters.reduce((sum, c) => sum + (c.reaped ?? 0), 0)
 
 log('\n=== VERDICT ===')
 log(`  mesh connected both ways : ${meshOk}`)
@@ -267,7 +299,8 @@ log(`  audio flowing both ways  : ${audioOk}`)
 log(`  offer + answer exchanged : ${signalled}`)
 log(`  peers given up on        : ${gaveUp} (must be 0)`)
 log(`  frames the bus swallowed : ${counters.map((c) => c.notSent ?? 0).join(' / ')} (expected, resent)`)
-log(`  VOICE WORKS: ${meshOk && audioOk && signalled && gaveUp === 0}`)
+log(`  links reaped mid-call    : ${reaped} (must be 0 — nobody left)`)
+log(`  VOICE WORKS: ${meshOk && audioOk && signalled && gaveUp === 0 && reaped === 0}`)
 
 for (const client of clients) {
   await client.page.screenshot({ path: `${SHOT}-${client.label}.png` }).catch(() => {})

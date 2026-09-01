@@ -875,6 +875,17 @@ an answer to a superseded offer, or an offer we have already answered, is
 *recognisable* and counted (`dropped`) instead of being applied against the wrong
 negotiation and failing the pair for the rest of the session.
 
+**The epoch belongs to the PAIR, not to the `RTCPeerConnection`.** A restart
+rebuilds the connection and carries the number forward; resetting it to 0 was a
+deadlock with no error anywhere in it. Walk it: we offered epoch 1, they answered
+and recorded `applied = 1`, we restarted for any reason and offered epoch 1
+again. They see `epoch <= applied` and drop it as one they have already answered.
+Meanwhile their old answer — still being re-sent, because we never acked it —
+matches our new offer's epoch *exactly*, so a description built for a dead
+connection goes into a live one, `setRemoteDescription` rejects it, and we
+restart. Which produces epoch 1 again. Four rounds of that and the pair is on the
+`unreachable` list, having been reachable the whole time.
+
 ## Bounds
 
 | Constant | Value | Why |
@@ -903,18 +914,51 @@ full — one-way audio, and a bug report nobody can reproduce.
 
 1. **Roster.** Peers are the presence remotes whose phase is `'game'` (an
    editor-only viewer is not in the call), minus the give-up list, capped by the
-   room. Links to peers who left are closed; links to peers who arrived are
-   opened, and the lower id offers. An `'idle'` link on our side of the order
-   with nothing owed re-offers — that is the repair path for an offer whose
-   publish was coalesced away before it was ever counted.
+   room. Links to peers who arrived are opened, and the lower id offers. An
+   `'idle'` link on our side of the order with nothing owed re-offers — that is
+   the repair path for an offer whose publish was coalesced away before it was
+   ever counted.
 2. **Our own talk state**, from the local mic analyser through `talkGate`.
 3. **Levels**, `mixGain(mode, distance)` per peer, written only on change — so a
    squad call touches nothing at all, and a refused autoplay heals here because
    by now the player has clicked something.
-4. **One signalling frame**, every fourth tick, carrying at most one description.
+4. **One signalling frame**: every tick while any description is owed, otherwise
+   every `SIGNAL_EVERY_TICKS` as a heartbeat, carrying at most one description.
+   The heartbeat rate is right for what a heartbeat carries — a talk flag and an
+   ack map — and wrong for a handshake, where it is pure added latency on every
+   hop, twice per round trip, on top of ICE gathering.
+
+### A peer missing from the roster has not left
+
+**A link is only torn down once its peer has been absent for `PEER_ABSENT_MS`
+(4 s), and `counters.reaped` counts it.** Presence is a lossy stream over a
+coalescing bus, so a remote can drop out of the roster for a few ticks because a
+publish lost its window or a tab was throttled mid-stride. Reaping on the first
+tick that fails to mention them destroys the `RTCPeerConnection`, the gathered
+candidates, the epoch and the applied watermark — so the pair restarts from zero
+on **both** sides and never gets the few seconds a handshake needs.
+
+This is worth stating plainly because of how it presented: two browsers on one
+machine, each reporting a healthy session, each seeing the other in presence,
+neither hearing anything, offers and answers flowing steadily on the wire. Every
+voice readout said "unreachable peer"; the actual fault was one layer down and
+the opposite kind of problem. `reaped` climbing during a call where nobody left
+is now the tell, and `voiceDebug().peers[].absentMs` says which link is inside
+its grace period rather than idle.
+
+A description owed to an absent peer **keeps being re-sent** — their absence may
+be the very loss that ate it.
 
 Recovery is bounded: a negotiation still unconnected after
-`NEGOTIATION_TIMEOUT_MS` is restarted, and after `MAX_NEGOTIATION_ATTEMPTS`
+`NEGOTIATION_TIMEOUT_MS` is restarted — **doubled while ICE is `checking`,
+`connected` or `completed`**, because a link with a live path to the other
+machine is waiting on one more description and tearing it down at the same
+deadline as one that never heard anything throws away the expensive half of the
+handshake, at precisely the moment the answer is in flight (both sides started
+their clocks together). A link that ended in a caught exception (`state` is
+`'failed'`, `step` ends in `:threw`) is restarted too; until that branch existed
+one rejected `createAnswer` meant that pair was silent for the rest of the
+session with a full attempt budget unspent. After `MAX_NEGOTIATION_ATTEMPTS`
 restarts the peer goes on the `unreachable` set and `given_up` is incremented —
 **given up on deliberately and countably**, because with STUN only some pairs
 genuinely cannot reach each other, and retrying forever would burn a connection

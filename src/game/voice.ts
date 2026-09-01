@@ -86,6 +86,26 @@ export const NEGOTIATION_TIMEOUT_MS = 15_000
 export const MAX_NEGOTIATION_ATTEMPTS = 4
 /** Remote `talking` older than this reads as quiet (their frames stopped). */
 export const TALKING_STALE_MS = 1200
+/**
+ * How long a peer may be MISSING FROM PRESENCE before their link is torn down.
+ *
+ * Presence is a best-effort stream over a coalescing bus: a remote can vanish
+ * from the roster for a few frames because their publish lost a window, because
+ * their tab was throttled mid-stride, or because interpolation ran out of
+ * snapshots — none of which means they left the game. Reaping on the first tick
+ * that fails to mention them is what turned this into churn instead of a call:
+ * a closed link takes the RTCPeerConnection, the gathered candidates, the epoch
+ * and the applied watermark with it, so the pair starts from zero on BOTH sides
+ * and never gets the ~4 s it needs to finish. It looks exactly like a handshake
+ * that keeps failing, which is the most expensive kind of thing to read wrong.
+ *
+ * Longer than any plausible gap, far shorter than a session. The cost of being
+ * wrong the other way is a silent audio element for a moment after somebody
+ * really has left.
+ */
+export const PEER_ABSENT_MS = 4000
+/** An established connection sitting 'disconnected' this long is rebuilt (ms). */
+export const DISCONNECT_GRACE_MS = 5000
 
 let iceServers: RTCIceServer[] = [
   // Public STUN. Enough to discover a reflexive candidate, which is what makes
@@ -123,6 +143,10 @@ type PeerLink = {
   state: PeerLinkState
   attempts: number
   startedAt: number
+  /** Last tick this peer was in the roster — the grace period is measured off it. */
+  seenAt: number
+  /** When an established connection went 'disconnected' (0 = it has not). */
+  droppedAt: number
   talking: boolean
   talkingAt: number
   /** Last gain we wrote, so the tick does not touch the element needlessly. */
@@ -214,6 +238,14 @@ type VoiceState = {
     abandoned: number
     /** Negotiations that ended in a caught exception (see `link.error`). */
     threw: number
+    /**
+     * Links torn down because the peer stayed out of the roster past
+     * PEER_ABSENT_MS. One per person who left is the healthy reading; a number
+     * that climbs during a call is presence churn eating the handshake, and
+     * without it that failure is indistinguishable from a peer who cannot be
+     * reached — same silence, same empty connection state, opposite fix.
+     */
+    reaped: number
   }
 }
 
@@ -266,6 +298,7 @@ const state: VoiceState = {
     notSent: 0,
     abandoned: 0,
     threw: 0,
+    reaped: 0,
   },
 }
 
@@ -349,6 +382,8 @@ function makeLink(sessionId: string): PeerLink | null {
     state: 'idle',
     attempts: 0,
     startedAt: state.clock,
+    seenAt: state.clock,
+    droppedAt: 0,
     talking: false,
     talkingAt: 0,
     gain: -1,
@@ -380,9 +415,27 @@ function makeLink(sessionId: string): PeerLink | null {
   pc.addEventListener('connectionstatechange', () => {
     if (pc.connectionState === 'connected') {
       link.state = 'connected'
+      link.droppedAt = 0
+      // THE ATTEMPT BUDGET IS FOR "CANNOT CONNECT", NOT FOR "HAS BEEN CONNECTED".
+      // Without this, a pair that reconnects after every network hiccup spends
+      // one attempt each time and is eventually written off as unreachable —
+      // having demonstrably been reachable, repeatedly.
+      link.attempts = 0
       return
     }
-    if (pc.connectionState === 'failed') restart(link, 'ice-failed')
+    if (pc.connectionState === 'failed') {
+      restart(link, 'ice-failed')
+      return
+    }
+    // 'disconnected' is not a verdict: ICE says the selected pair stopped
+    // responding, and it often recovers on its own within a second or two. But
+    // nothing here used to look at it again, so a call that dropped once stayed
+    // dropped for the rest of the session — state 'connected', connectionState
+    // 'disconnected', silence, and no counter moving. The tick gives it
+    // DISCONNECT_GRACE_MS to heal and then rebuilds.
+    if (pc.connectionState === 'disconnected' && link.droppedAt === 0) {
+      link.droppedAt = state.clock
+    }
   })
   state.peers.set(sessionId, link)
   return link
@@ -593,6 +646,16 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
   const from = msg.sessionId
   const frame = msg.data
   const link = state.peers.get(from)
+
+  // A FRAME FROM THEM IS THE PROOF OF LIFE, not the presence roster.
+  //
+  // Presence rides the render loop, so a peer whose window is behind another one
+  // stops publishing poses entirely and drops out of the roster after a few
+  // seconds — while their voice frames, which ride an interval, keep arriving the
+  // whole time. Reaping the link on the roster alone therefore hangs up on
+  // somebody who is still plainly there and still talking to us over this very
+  // channel. This one line is why alt-tabbing no longer ends the call.
+  if (link) link.seenAt = state.clock
 
   // Their flags are useful even before a connection exists — that is what the
   // HUD's "who is talking" reads, and it costs nothing.
@@ -832,18 +895,46 @@ export function voiceTick(now: number): void {
   if (me === null) return
 
   // 1. The roster: reap peers who left, open links to peers who arrived.
+  //
+  // A PEER MISSING FROM THE ROSTER HAS NOT NECESSARILY LEFT. Presence is a
+  // lossy stream, so it is normal for a remote to be absent from a tick or two;
+  // closing the link on the first of them destroyed the connection, the gathered
+  // candidates, the epoch and the applied watermark, and both sides then began
+  // again from zero — over and over, never getting the few seconds a handshake
+  // needs. Two browsers in the same room read as two unreachable machines.
   const wanted = new Set(meshNow())
   for (const link of [...state.peers.values()]) {
-    if (!wanted.has(link.sessionId)) closeLink(link)
+    if (wanted.has(link.sessionId)) {
+      link.seenAt = now
+      continue
+    }
+    if (now - link.seenAt <= PEER_ABSENT_MS) continue
+    state.counters.reaped++
+    closeLink(link)
   }
   for (const sessionId of wanted) {
-    let link = state.peers.get(sessionId)
-    if (!link) {
-      link = makeLink(sessionId) ?? undefined
-      if (!link) continue
-      // Only the lower session id offers. The other side builds its link when
-      // the offer lands, which is why this is not a deadlock.
-      if (voiceOffererIsUs(me, sessionId)) void makeOffer(link)
+    if (state.peers.has(sessionId)) continue
+    const link = makeLink(sessionId)
+    if (!link) continue
+    // Only the lower session id offers. The other side builds its link when
+    // the offer lands, which is why this is not a deadlock.
+    if (voiceOffererIsUs(me, sessionId)) void makeOffer(link)
+  }
+
+  // 1b. Repair, over EVERY link rather than only the ones the roster currently
+  //     mentions — a link inside its absence grace period is exactly the one most
+  //     likely to need help, and skipping it leaves the pair frozen in whatever
+  //     half-state the dropout caught it in until presence comes back.
+  for (const link of [...state.peers.values()]) {
+    const sessionId = link.sessionId
+    // A connection that WAS up and fell over. ICE 'disconnected' often heals by
+    // itself, so it gets a grace period; past that the pair is rebuilt. Until
+    // this branch existed a single blip meant that pair was silent for the rest
+    // of the session with `state` still cheerfully reading 'connected'.
+    if (link.droppedAt !== 0 && link.pc.connectionState === 'connected') {
+      link.droppedAt = 0
+    } else if (link.droppedAt !== 0 && now - link.droppedAt > DISCONNECT_GRACE_MS) {
+      restart(link, 'dropped')
       continue
     }
     // A negotiation that never completed: start it over, boundedly.
@@ -1028,6 +1119,12 @@ export function voiceDebug(): {
     hasTrack: boolean
     step: string
     error: string | null
+    /**
+     * How long this peer has been missing from the presence roster (ms, 0 while
+     * present). A link inside its grace period looks idle in every other field,
+     * so without this the reason it is not negotiating is invisible.
+     */
+    absentMs: number
   }>
   unreachable: string[]
   counters: VoiceState['counters']
@@ -1040,6 +1137,7 @@ export function voiceDebug(): {
   ticks: number
 } {
   const peers = [...state.peers.values()].map((link) => ({
+    absentMs: Math.max(0, state.clock - link.seenAt),
     applied: link.applied,
     attempts: link.attempts,
     connection: link.pc.connectionState,
@@ -1083,6 +1181,7 @@ export function resetVoice(): void {
     notSent: 0,
     offersApplied: 0,
     offersSent: 0,
+    reaped: 0,
     restarts: 0,
     threw: 0,
     tooLarge: 0,
