@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import {
@@ -684,6 +684,13 @@ describe('planEditExitTransform: occupancy guard + piece gating', () => {
 })
 
 describe('transformPlaced: in-place piece rebuild (store action)', () => {
+  // `placed` is a module singleton and this block indexes into it positionally
+  // (`before[1]` is the STAIR_UP_MASK wall): a leftover piece from another file
+  // shifts every index. Start from an empty store.
+  beforeEach(() => {
+    useBoots.getState().resolvePlaced()
+  })
+
   test('swaps piece type + yaw, resets mask to FULL, preserves id/position/order', () => {
     const store = useBoots.getState()
     store.addPlaced({ piece: 'wall', position: [0, 0, 0], yaw: 0 })
@@ -791,6 +798,12 @@ function worldWithPlacedWall(): GameWorld {
 
 afterEach(() => {
   resetDestruction()
+  // The rig is a module singleton and this file moves it: hand it back at the
+  // origin. A leftover position is not inert — toggleOperable derives a door's
+  // SWING DIRECTION from where the player stands, so a stale rig mirrors every
+  // leaf the next test file opens (that is what broke door-stale-pose and
+  // door-repose under `bun test --randomize`).
+  playerRig.position.set(0, 0, 0)
 })
 
 describe('placed pieces are destructible', () => {
@@ -847,11 +860,19 @@ function worldWithBoxCollider(nodeId: string): GameWorld {
 }
 
 describe('destruction ↔ slot registry (the third door pieces leave through)', () => {
-  afterEach(() => {
+  /** The placed-piece store, the slot registry and the destruction ledger are
+   * module singletons, and the tests below assert on the WHOLE store (`placed`
+   * empty once everything cascaded), so a stranger's leftover piece reads as a
+   * cascade that failed to fire. Cleaning up after ourselves is not enough —
+   * clear going IN too. (`--randomize --seed=7777777` arrived here with one
+   * piece already standing.) */
+  const isolate = () => {
     resetDestruction()
     resetPieceSlots()
     useBoots.setState({ placed: [] })
-  })
+  }
+  beforeEach(isolate)
+  afterEach(isolate)
 
   test('a piece carved to zero voxels runs the undo cleanup and cascades', () => {
     const store = useBoots.getState()
@@ -974,12 +995,15 @@ const hostWall = (nodeId: string, nodeType = 'wall') =>
   hostEntry(nodeId, nodeType, [3, 2.8, 0.2], 1.5, 1.4, 0)
 
 describe('scene-support probe: AABB overlap alone never grants (PIN)', () => {
-  afterEach(() => {
+  // Same reason as the block above: these tests read the whole `placed` store.
+  const isolate = () => {
     resetPieceSlots()
     resetDestruction()
     resetGridAnchor()
     useBoots.setState({ placed: [] })
-  })
+  }
+  beforeEach(isolate)
+  afterEach(isolate)
 
   test('a host-roof AABB over empty airspace refuses placement AND cascades a 3-stack', () => {
     // The over-grant model: a small far-away roof mesh whose worldBox is

@@ -154,6 +154,12 @@ function prevoxelize(world: GameWorld): void {
 // ── setup ────────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
+  // The destruction ledger and the pending-demolition list are singletons, and
+  // the Save assertions here count rows across the WHOLE of both ("only wall-1
+  // is offered"). A leftover leveled node from another file is offered too:
+  // seed 88888 saw 2 where the test names 1.
+  discardDemolition()
+  resetDestruction()
   setShellFlag('wall', false)
   setShellFlag('roof', false)
   setShellFlag('slab', false)

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Color, Matrix4, Mesh, Object3D, PlaneGeometry, Vector3 } from 'three'
 import { collideCapsule, PLAYER_CAPSULE } from './collision'
 import {
@@ -220,7 +220,12 @@ function makeBot(kind: BotKind, x: number, y: number, z: number): Bot {
   }
 }
 
-afterEach(() => {
+/** All of these are module singletons — the terrain authority, the crater ring,
+ * the debris pool, the destruction ledger, the bot roster. Run the teardown
+ * BOTH ways: the debris block below reads `debrisDump()[0]`, which is only
+ * "the chunk I just spawned" if the pool arrives empty (seed 65536 read a
+ * stranger's chunk and the excavation shelf assertion failed on it). */
+const isolate = () => {
   resetGround()
   resetCraters()
   clearDebris()
@@ -229,7 +234,9 @@ afterEach(() => {
   resetBotProbeBudget()
   resetStoreyLadder()
   resetGridTerrainY()
-})
+}
+beforeEach(isolate)
+afterEach(isolate)
 
 // ---------------------------------------------------------------------------
 

@@ -1,8 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
-import { clearDebris } from './debris'
+import { resetSnapVoiceGate } from './audio'
 import { resetCraters } from './craters'
+import { clearDebris } from './debris'
+import { clearDust } from './dust'
+import { clearGlassShards } from './glass'
+import { clearShellDebris } from './shell-debris'
+import { resetSettleDrain, resetStructure } from './structure'
 import {
   collapseWholeTarget,
   damageExplosion,
@@ -118,31 +123,37 @@ function seedRandom(seed: number): void {
 }
 
 /**
- * SATURATE THE PARTICLE RINGS FIRST.
+ * EMPTY THE PARTICLE RINGS FIRST.
  *
- * Dust and debris live in fixed-size pools that only recycle on an update tick,
- * and nothing here ticks them. A COLD pool hands out every slot it is asked
- * for; a full one refuses some — and refusing a particle means skipping the
- * Math.random calls that would have jittered it. So a first demolition draws
- * ~1240 numbers from the stream where the fourth draws ~1070, and every later
- * carve lands on a different part of the seeded sequence: a real difference in
- * the rubble that has nothing to do with anything under test.
+ * Dust, debris and shell fragments live in fixed-size pools that only recycle
+ * on an update tick, and nothing here ticks them. A COLD pool hands out every
+ * slot it is asked for; a full one refuses some — and refusing a particle means
+ * skipping the Math.random calls that would have jittered it. So two runs whose
+ * pools start at different occupancies draw a different COUNT from the stream,
+ * every later carve lands on a different part of the seeded sequence, and the
+ * rubble differs for a reason that has nothing to do with anything under test.
  *
- * Warming up until two consecutive runs draw the same count puts every measured
- * run at the same fixed point. (Found the hard way: solo-vs-solo disagreed.)
+ * This used to warm the pools UP instead, looping until two consecutive
+ * demolitions drew the same count, on the theory that "full" is a fixed point.
+ * It is not a state — it is a coincidence of two counts matching, and the loop
+ * accepted the first coincidence it saw. With `bun test --randomize` the pools
+ * arrive carrying whatever an earlier test file left in them, the fixed point is
+ * reached at a different occupancy, and solo-vs-solo diverged inside a single
+ * test (seed 2175878450: alive 432 vs 325, sheet 0 at 25 hits vs 144 and torn).
+ *
+ * EMPTY is a state. Every pool has a clear, so every measured run starts from
+ * the same one and the counts follow.
  */
-function warmUp(): void {
-  let prev = -1
-  for (let i = 0; i < 12; i++) {
-    resetDestruction()
-    resetCraters()
-    seedRandom(0xbeef)
-    demolish(makeWorld())
-    if (randomCalls === prev) break
-    prev = randomCalls
-  }
+function coldPools(): void {
   resetDestruction()
+  resetStructure()
+  resetSettleDrain()
   resetCraters()
+  clearDebris()
+  clearDust()
+  clearShellDebris()
+  clearGlassShards()
+  resetSnapVoiceGate()
 }
 
 // ── the fingerprint ──────────────────────────────────────────────────────────
@@ -219,7 +230,7 @@ function demolish(world: GameWorld): void {
 }
 
 function runSolo(seed: number): string {
-  warmUp()
+  coldPools()
   seedRandom(seed)
   const world = makeWorld()
   demolish(world)
@@ -227,7 +238,7 @@ function runSolo(seed: number): string {
 }
 
 function runSynced(seed: number, sink: SharedDelta[]): string {
-  warmUp()
+  coldPools()
   seedRandom(seed)
   const shared = createSharedWorld('me')
   setDamageSync({ world: shared, publish: (delta) => sink.push(delta) })
@@ -270,8 +281,16 @@ describe('single player is byte-identical with sync off', () => {
     // If this fails, nothing below means anything: the comparison would be
     // measuring the random stream, not the publish calls.
     const a = runSolo(0x5eed)
+    const drawsA = randomCalls
     const b = runSolo(0x5eed)
     expect(b).toBe(a)
+    // The DRAW COUNT too, asserted separately: a divergence here says the two
+    // runs consumed different amounts of the stream (a pool refusing a particle,
+    // a leftover settle timer), which is a different diagnosis from the same
+    // stream producing different rubble. The bitmap diff alone cannot tell them
+    // apart, and it was the pool-occupancy kind that made this suite flaky under
+    // --randomize.
+    expect(randomCalls).toBe(drawsA)
     expect(a.length).toBeGreaterThan(2000)
   })
 
@@ -314,7 +333,7 @@ describe('single player is byte-identical with sync off', () => {
 
 describe('with sync off the bridge is inert', () => {
   test('no sync installed after a full demolition: nothing pending, nothing active', () => {
-    warmUp()
+    coldPools()
     seedRandom(0x5eed)
     demolish(makeWorld())
     expect(damageSyncActive()).toBe(false)

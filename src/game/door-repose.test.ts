@@ -23,6 +23,7 @@ import {
   type VoxelTarget,
 } from './destruction'
 import { advanceOperables, mountInteract, type OperableState, toggleOperable, unmountInteract } from './interact'
+import { playerRig } from './player'
 import { gridContainsPoint, reposeVoxelGrid, type VoxelGridData } from './voxel'
 import { primeSkin, syncPassageHoles } from './voxel-walls'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -79,6 +80,7 @@ const isolate = () => {
   mounted = null
   resetDestruction()
   clearPassages()
+  playerRig.position.set(0, 0, 0)
 }
 
 beforeEach(() => {
@@ -86,6 +88,16 @@ beforeEach(() => {
   setShellFlag('wall', false)
   setShellFlag('roof', false)
   setShellFlag('slab', false)
+  // The rig is one of those singletons, and this file leans on it hardest:
+  // toggleOperable reads playerRig.position to decide WHICH WAY the leaf
+  // swings (away from the side you push it from), so the +Z stance below is
+  // what makes "the leaf sweeps into the room along −Z" true and the aim line
+  // at z = −0.5 a line that crosses the open leaf. Left to the default origin
+  // it works by coincidence — z = 0 lands on the >= 0 side of the test — and
+  // any earlier test file that parks the rig at negative z mirrors the swing:
+  // `--randomize --seed=42` (enemies-drone before this file) turned the
+  // four-lane agreement test into a raycast that found nothing.
+  playerRig.position.set(0, 1.6, 2)
 })
 afterAll(() => {
   setShellFlag('wall', true)

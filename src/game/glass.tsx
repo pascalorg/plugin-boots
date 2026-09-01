@@ -210,6 +210,11 @@ let liveShards = 0
 export function clearGlassShards(): void {
   for (const slot of shardSlots) slot.alive = false
   liveShards = 0
+  // The cursor as well — same reason as debris.tsx's clearDebris: a pool that
+  // clears its slots but keeps its write position hands the next pane a
+  // rotated (and possibly wrapped) slot range, so "empty" stops being a single
+  // reproducible state.
+  shardCursor = 0
 }
 
 /** Frames the shard loop has stepped since module load — QA reads deltas to

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { sceneRegistry, useScene } from '@pascal-app/core'
+import { useViewer } from '@pascal-app/viewer'
 import { BoxGeometry, Group, Mesh } from 'three'
 import { collectWorld } from './world'
 
@@ -32,12 +33,21 @@ function register(id: string, kind: string, root: Group | Mesh): void {
   registered.push({ id, kind })
 }
 
+/** Pin the viewer's selected level — the field collectWorld mirrors into
+ * `world.levelId`. Typed loosely because the preload stub's selection carries
+ * only the one field these tests read. */
+const setSelectedLevel = (levelId: string | null) =>
+  useViewer.setState({
+    selection: { ...(useViewer.getState() as { selection?: object }).selection, levelId },
+  } as never)
+
 afterEach(() => {
   for (const { id, kind } of registered.splice(0)) {
     sceneRegistry.nodes.delete(id)
     sceneRegistry.byType[kind]!.delete(id)
   }
   useScene.getState().setScene({}, [])
+  setSelectedLevel('level-test') // back to the stub's default for everyone else
 })
 
 /** A 4×2.8×0.2 wall mesh whose base sits on its level's floor. */
@@ -152,7 +162,16 @@ describe('collectWorld across stacked levels', () => {
 
   test('levelId mirrors the viewer selection (dead useScene.selectedLevelId read is gone)', () => {
     buildTwoStoreys(0, 2.8)
-    const world = collectWorld()
-    expect(world.levelId).toBe('level-test')
+    // SET the selection here rather than leaning on the preload stub's default.
+    // The viewer store is a process-wide singleton and several files re-pin its
+    // selection per test without handing it back (keep/item-keep park it on
+    // 'level_test' or null), so asserting the stub constant made this test a
+    // reader of whatever ran before it — `--randomize --seed=11111` got
+    // 'level_test'. Pinning it also makes the assertion say what it means:
+    // collectWorld MIRRORS the selection, whatever it is.
+    setSelectedLevel('level_b')
+    expect(collectWorld().levelId).toBe('level_b')
+    setSelectedLevel(null)
+    expect(collectWorld().levelId).toBeNull()
   })
 })

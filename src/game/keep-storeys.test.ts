@@ -95,6 +95,9 @@ afterEach(() => {
     sceneRegistry.nodes.delete(id)
     sceneRegistry.byType.level!.delete(id)
   }
+  // The viewer store is process-wide and this file re-pins its selected level
+  // per test; hand it back the way the preload stub set it.
+  useViewer.setState({ selection: { levelId: 'level-test' } } as never)
 })
 
 describe('level parenting: pieces land on the level their storey maps to', () => {

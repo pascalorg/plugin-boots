@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { useScene } from '@pascal-app/core'
 import { Mesh, PlaneGeometry, Vector3 } from 'three'
 import { useBoots } from '../store'
@@ -218,7 +218,18 @@ function installAppliers(): void {
   })
 }
 
-afterEach(() => {
+/**
+ * EVERY STORE THIS FILE READS IS A MODULE SINGLETON — clear them going IN too.
+ *
+ * The assertions here are about WHOLE stores (`placed` has length 1,
+ * `liveRecords` has length 0), and reconcileSharedPieces walks the entire
+ * placed store, so one leftover piece from an earlier test file publishes a
+ * record this file never asked for. `--randomize --seed=31337` arrived with
+ * exactly one, and "a slotless legacy piece publishes nothing" failed on a
+ * stranger's wall. Cleaning up after ourselves cannot fix that; cleaning up
+ * before can.
+ */
+const isolate = () => {
   resetSharedBuild()
   useBoots.getState().resolvePlaced()
   useBoots.getState().setPhase('editor')
@@ -232,7 +243,10 @@ afterEach(() => {
   resetStoreyLadder()
   scene.getState().setReadOnly?.(false)
   scene.getState().setScene({}, [])
-})
+}
+
+beforeEach(isolate)
+afterEach(isolate)
 
 // ── Sync off: single-player is not touched ──────────────────────────────────
 

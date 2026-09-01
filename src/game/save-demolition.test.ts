@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { resetDestruction, useDestruction, type VoxelTarget } from './destruction'
 import {
   captureDemolition,
@@ -39,10 +39,16 @@ describe('captureDemolition (member ids fold onto scene nodes)', () => {
       .targets.set(nodeId, { nodeId, kind, ...target(aliveCount, broken) } as unknown as VoxelTarget)
   }
 
-  afterEach(() => {
+  // captureDemolition counts the WHOLE destruction ledger and the pending list
+  // is a singleton, so a stranger's leveled node is indistinguishable from one
+  // of ours: seed 99 made "a second session keeps the first session leveled wall
+  // pending" report 2 rows for one wall. Clear both ways.
+  const isolate = () => {
     discardDemolition()
     resetDestruction()
-  })
+  }
+  beforeEach(isolate)
+  afterEach(isolate)
 
   test('roof plane/residual members are never captured raw; the GROUP node is, once every member is leveled', () => {
     // Roof shells enroll per plane under `<nodeId>#p<n>` + `#residual`

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, Color, Quaternion, Vector3 } from 'three'
 import { sfx } from './audio'
 import { clearDebris, debrisCensus, spawnFlatDebris } from './debris'
@@ -76,10 +76,17 @@ function gableMembers() {
   return buildRafters(null, [{ roofType: 'gable' }], [frontPlane(), backPlane()])
 }
 
-afterEach(() => {
+/** The debris ring is a fixed-size pool that only recycles on an update tick,
+ * and nothing here ticks it: arriving FULL, it refuses every new particle and
+ * `debrisCensus().live` stops rising — which is exactly what the rafter chip
+ * asserts (seed 246810 read 768 before and 768 after). Empty is a state; take
+ * it going in, not just coming out. */
+const isolate = () => {
   resetDestruction()
   clearDebris()
-})
+}
+beforeEach(isolate)
+afterEach(isolate)
 
 describe('roofPlaneFrame', () => {
   test('across/normal/upSlope form the documented right-handed roof frame', () => {

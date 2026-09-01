@@ -11,6 +11,7 @@ import {
   useDestruction,
 } from './destruction'
 import { advanceOperables, mountInteract, type OperableState, toggleOperable, unmountInteract } from './interact'
+import { playerRig } from './player'
 import type { VoxelGridData } from './voxel'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -62,6 +63,21 @@ beforeEach(() => {
   setShellFlag('wall', false)
   setShellFlag('roof', false)
   setShellFlag('slab', false)
+  // WHERE THE PLAYER STANDS IS PART OF THIS FIXTURE.
+  //
+  // toggleOperable derives the hinge sign from playerRig.position — a door
+  // swings AWAY from the side you push it from — so the entire geometry of this
+  // file (hinge at x = −0.4, leaf sweeping into the room along −Z, AIM_FROM
+  // firing back across the doorway from z = −0.5) holds only for a player
+  // standing on the +Z side. The default rig sits at the ORIGIN, which lands on
+  // the z >= 0 boundary and happens to give the right sign; that is a
+  // coincidence, and a leftover position from another test file is enough to
+  // flip it. `bun test --randomize --seed=42` did exactly that: enemies-drone
+  // leaves the rig at (0, 1.6, −0.5), the leaf then swung the other way, and
+  // three raycasts here reported no hit at all — a mirrored grid, same cell
+  // count, byte-identical everywhere else. So state the stance instead of
+  // inheriting it.
+  playerRig.position.set(0, 1.6, 2)
 })
 afterAll(() => {
   setShellFlag('wall', true)
@@ -75,6 +91,7 @@ afterEach(() => {
   mounted = null
   resetDestruction()
   clearPassages()
+  playerRig.position.set(0, 0, 0)
 })
 
 type Built = { root: Group; collider: ColliderEntry }

@@ -148,6 +148,11 @@ describe('Save and Discard close the preview', () => {
   beforeEach(() => {
     useBoots.getState().resolvePlaced()
     useScene.getState().setScene({}, [])
+    // The gate reads the PHASE as well as the lanes, and phase is a singleton:
+    // a file that left the store mid-session makes `shouldPreview` refuse for
+    // the right reason and the wrong test (seeds 314159 / 100000 arrived in
+    // 'game'). The preview is an EDITOR surface — say so.
+    useBoots.getState().setPhase('editor')
   })
 
   /** The pieces lane as the gate sees it. */

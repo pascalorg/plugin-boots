@@ -172,6 +172,12 @@ function flyDrone(
 
 afterEach(() => {
   resetDestruction()
+  // The rig is a module singleton and this file moves it: hand it back at the
+  // origin. A leftover position is not inert — toggleOperable derives a door's
+  // SWING DIRECTION from where the player stands, so a stale rig mirrors every
+  // leaf the next test file opens (that is what broke door-stale-pose and
+  // door-repose under `bun test --randomize`).
+  playerRig.position.set(0, 0, 0)
 })
 
 describe('drone steering probes: pure path/descent decisions', () => {

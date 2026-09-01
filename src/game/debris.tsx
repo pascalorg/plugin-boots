@@ -392,6 +392,14 @@ export function clearDebris(): void {
   for (const slot of slots) slot.alive = false
   liveCount = 0
   spawnSeq = 0
+  // The RING CURSOR too, or "empty" is not one state: the next burst would
+  // start wherever the last one stopped, and every slot-ordered reader (the
+  // debrisDump probe, the instance matrices) would see the same pieces in a
+  // rotated order — including a wrap that splits a burst across the ends. It
+  // made "identical spawn sequences shed identical shapes" fail about one run
+  // in eight, in a fixed test order, because how far the cursor had travelled
+  // depended on how many rim nibbles earlier carves happened to roll.
+  cursor = 0
 }
 
 /** Headless test probe — live piece count, flat-plate count, and the mean

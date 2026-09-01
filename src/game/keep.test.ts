@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import {
   type AnyNodeDefinition,
   nodeRegistry,
@@ -57,6 +57,14 @@ beforeEach(() => {
   useBoots.getState().resolvePlaced()
   useScene.getState().setScene({}, [])
   setLevel('level_test')
+})
+
+/** Hand the viewer stub's selection back the way the preload set it. The store
+ * is process-wide and the block above re-pins it per test (including to null),
+ * so a file that reads `selection.levelId` after this one — world-levels does —
+ * would otherwise read OUR level id. */
+afterEach(() => {
+  useViewer.setState({ selection: { levelId: 'level-test' } } as never)
 })
 
 describe('keepPlaced with an EMPTY registry (host never registered kinds)', () => {

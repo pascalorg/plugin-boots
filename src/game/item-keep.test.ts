@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import {
   type AnyNodeDefinition,
   DoorNode,
@@ -58,9 +58,58 @@ beforeEach(() => {
   setLevel('level_test')
 })
 
-// Order matters: this block runs BEFORE the real ItemNode registration
-// below — the registry singleton has no unregister.
+/** Hand the viewer stub's selection back the way the preload set it. The store
+ * is process-wide and the block above re-pins it per test (including to null),
+ * so a file that reads `selection.levelId` after this one — world-levels does —
+ * would otherwise read OUR level id. */
+afterEach(() => {
+  useViewer.setState({ selection: { levelId: 'level-test' } } as never)
+})
+
+/**
+ * EVERY BLOCK DECLARES THE REGISTRY IT NEEDS.
+ *
+ * The registry is a process-wide singleton, so which kinds are installed used to
+ * be decided by file order: the "no item kind" block only passed because it ran
+ * before the block that registers ItemNode, and the "no door/window kinds" block
+ * only passed because it ran before the one that registers those. `bun test
+ * --randomize` reorders describes and both assertions flipped — a false failure
+ * that says nothing about item-keep.
+ *
+ * `nodeRegistry._reset()` exists (the old comment here claimed there was no
+ * unregister), so each block can state its own precondition instead of
+ * inheriting one. `defaults()` THROWS on purpose in every registration: the live
+ * host's registry has form (keep.ts "HOST DEFAULTS ARE UNTRUSTED"), so every
+ * kept node also proves safeDefaults degrades to the zod schema's own field
+ * defaults instead of losing the save.
+ */
+const brokenDefaults = () => {
+  throw new Error('host defaults broke')
+}
+const registerKind = (kind: string, schema: unknown, schemaVersion: number) =>
+  nodeRegistry._register({
+    kind,
+    schemaVersion,
+    schema,
+    defaults: brokenDefaults,
+  } as unknown as AnyNodeDefinition)
+/** Only `item` installed — furniture keeps, apertures have nowhere to go. */
+const registryWithItemOnly = () => {
+  nodeRegistry._reset()
+  registerKind('item', ItemNode, 2)
+}
+/** The full set the openings tab needs. */
+const registryWithApertures = () => {
+  registryWithItemOnly()
+  registerKind('door', DoorNode, 1)
+  registerKind('window', WindowNode, 1)
+}
+
 describe('applyItems without an item registry kind', () => {
+  beforeAll(() => {
+    nodeRegistry._reset()
+  })
+
   test('every placement skips, the store still resolves', () => {
     expect(nodeRegistry.has('item')).toBe(false)
     seed([1, 0, 2])
@@ -73,22 +122,7 @@ describe('applyItems without an item registry kind', () => {
 })
 
 describe('applyItems against the real ItemNode schema', () => {
-  beforeAll(() => {
-    if (!nodeRegistry.has('item')) {
-      // defaults() THROWS on purpose — the live host's registry has form
-      // (keep.ts "HOST DEFAULTS ARE UNTRUSTED"): every kept node in this
-      // block therefore also proves safeDefaults degrades it to the zod
-      // schema's own field defaults instead of losing the save.
-      nodeRegistry._register({
-        kind: 'item',
-        schemaVersion: 2,
-        schema: ItemNode,
-        defaults: () => {
-          throw new Error('host defaults broke')
-        },
-      } as unknown as AnyNodeDefinition)
-    }
-  })
+  beforeAll(registryWithItemOnly)
 
   test('placements become level-parented item nodes, asset verbatim', () => {
     seed([1.5, 0, -2], Math.PI / 2)
@@ -203,9 +237,11 @@ const seedWall = (id = 'wall_host') => {
 const seedAperture = (defId: string, wallId: string, u: number, v: number) =>
   useItems.getState().addAperture(openingDef(defId), wallId, u, v)
 
-// Order matters again: proves the missing-kind skip BEFORE door/window
-// registration (bun runs describes in file order).
 describe('applyItems apertures without door/window registry kinds', () => {
+  // `item` IS installed here: the point of the block is that a pass carrying
+  // both keeps the furniture while the apertures skip.
+  beforeAll(registryWithItemOnly)
+
   test('apertures skip, furniture in the same pass still keeps', () => {
     expect(nodeRegistry.has('door')).toBe(false)
     const wallId = seedWall()
@@ -220,29 +256,7 @@ describe('applyItems apertures without door/window registry kinds', () => {
 })
 
 describe('applyItems apertures against the real Door/Window schemas', () => {
-  beforeAll(() => {
-    // Broken defaults() again — the aperture lane must also survive the
-    // "HOST DEFAULTS ARE UNTRUSTED" rule.
-    const broken = () => {
-      throw new Error('host defaults broke')
-    }
-    if (!nodeRegistry.has('door')) {
-      nodeRegistry._register({
-        kind: 'door',
-        schemaVersion: 1,
-        schema: DoorNode,
-        defaults: broken,
-      } as unknown as AnyNodeDefinition)
-    }
-    if (!nodeRegistry.has('window')) {
-      nodeRegistry._register({
-        kind: 'window',
-        schemaVersion: 1,
-        schema: WindowNode,
-        defaults: broken,
-      } as unknown as AnyNodeDefinition)
-    }
-  })
+  beforeAll(registryWithApertures)
 
   test('a pending hinged door becomes a wall-hosted door node', () => {
     const wallId = seedWall()
