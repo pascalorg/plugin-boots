@@ -1781,3 +1781,77 @@ observable as post/reply/post/reply instead of post/post/reply/reply, and
 covers the borrowed `runTask` end to end into the bargain. That borrow is
 the module's one coupling to a package it does not control, and until now
 nothing exercised it outside a browser.
+
+---
+
+## WHO ACTUALLY BUILDS THE BVHs — MEASURED, AND ONE HYPOTHESIS KILLED
+
+The worker fix landed and the main-thread build count did not move: 118
+cache-miss builds per session before, 118 after. The hypothesis was that
+the queue was still failing somewhere. It was not. A timestamped stack
+probe over `bvhFor`'s miss branch named every caller instead:
+
+    pickAimedOperable (interact.tsx)   x76      -> 0 after the cull
+    ensureVoxelTarget (destruction.ts) x30      -> x105 after
+    stepBvhDrain (warmup.tsx)          x10
+    useFixtureColliders (guntable.tsx) x10      -> 0 after
+    spawn probe                        x1
+
+Three lanes were asking for a BVH before the worker could hand one over,
+and `ColliderEntry.bvh` is a lazy getter that BUILDS on read — so
+"asking" and "building" are the same act. The aim probe alone accounted
+for 76 of them, every frame, over every operable, because it had no
+broadphase; the bullet lane has had one since the minigun first-fire
+freeze. Glass had none either, and panes are not colliders, so nothing
+else ever builds them. The gun depot built all its fixtures eagerly at
+mount whether a ray came near them or not.
+
+All three are fixed (ba74ffe), each with a test that fails when the fix is
+reverted.
+
+AND THE TOTAL STILL DID NOT DROP. It went the other way: the prevoxelizer
+absorbed the work, x30 -> x105. Those BVHs are not waste — `ensureVoxelTarget`
+genuinely needs the geometry it voxelizes, and it was simply finding the
+cache already warm before, because the three eager lanes had paid for it
+first. So "yield to the worker and the count falls" was WRONG, and is
+recorded here as wrong. What changed is WHO pays and WHEN: a per-frame
+probe over every operable no longer does, and `perf()` reports 0 spikes
+over 7255 frames, which says the remaining builds are budgeted rather than
+user-visible. That is the argument for NOT re-architecting destruction.ts
+tonight.
+
+### THE AIM PICK WAS ACCUSED AND CLEARED
+
+`qa-boots-aimpick` read 12/22 door sides picked before the cull and 8/22
+after — an apparent interaction regression, on a commit already pushed.
+Two measurements settled it:
+
+1. The cull's exactness, directly. A probe recorded the AABB verdict beside
+   the raycast result for every collider, with the cull DISABLED, over 266
+   poses: every operable, both sides, point blank / standoff / 3.5 m,
+   off-axis and pitched. 79,800 collider checks, 257 raycast hits, and ZERO
+   colliders where the box said miss and the BVH said hit. Exact, as the
+   geometry requires — culling on a MISS only is what preserves the
+   point-blank case, since a ray whose origin is inside the box gets its
+   exit point back.
+
+2. The probe's own repeatability. Byte-identical game code, run twice:
+   6/22, then 8/22. The spread was the instrument. Straight after entry a
+   door's collider group AABB can still come back in a half-applied frame
+   with its thin axis reading as the wide one — door_5ehohrtqaxcer6up
+   measured span [1.01, 2.10, 0.13] on one run and [0.13, 2.10, 1.01] on
+   the next — so the derived standoff stood BESIDE the leaf and the miss
+   said nothing about the crosshair. Every door was otherwise identical in
+   the census: closed, settled, host visible, no disabled collider, no
+   voxel target.
+
+Waiting until two consecutive censuses agree on every live box, then
+re-reading each box at use time, gives 22/22 and 20/22 WITH the cull.
+(The one residual, door_klmiwhsd0uup6hvy, is the 30-collider double leaf —
+probe geometry, not the pick.)
+
+The lesson worth keeping: the aim lane had no headless reading at all, so
+every question about it had to be asked through a walk, a teleport and a
+keypress. `__boots.doors.aimed()` (afd6ef6) runs the frame loop's own
+two-step on demand and reports which lane answered. A change to a pick
+needs a measurement OF the pick.
