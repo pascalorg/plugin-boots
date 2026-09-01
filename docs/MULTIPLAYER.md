@@ -548,6 +548,29 @@ installed yet cannot make the notice accuse anyone of standing on a different
 lot. And still: *do not surface a grid-mismatch notice while `world.gridStamp` is
 0*, because 0 means unknown, not different.
 
+**A FINGERPRINT MUST BE COARSER THAN THE NOISE IN ITS INPUTS.** With the publish
+race fixed, both peers stamped a non-zero number — and a peer who joined *later*
+still refused every piece, `blindGrid 0` and `refusedGrid` climbing, which is the
+gate saying *we genuinely disagree*. `gridAudit()` (`world.ts`, exposed as
+`__boots.gridAudit()`) prints the stamp's whole preimage — anchor x/z/yaw, storey
+ladder, level ys, longest walls — and named the culprit in one run: everything
+identical, the **yaw** differing in the fifth decimal, and *jittering between two
+calls in the same session*. `deriveGridAnchor` reads the anchor yaw off a wall
+root's `matrixWorld`, and that matrix is live: the host LevelSystem lerps level
+groups every frame and leaves ~1e-4 rad of residue (measured +6.4e-6, −6.6e-5,
++2.2e-5 rad). `gridStamp` hashed the yaw on a 65536-step turn — 0.0055° a step,
+*finer than the jitter* — so a +ε and a −ε around zero, the same angle, hashed as
+step 0 versus step 65535. One lot, two fingerprints, every slot-addressed piece
+refused in both directions, forever. Quantizing does not remove disagreement, it
+moves it to the step boundary; the fix is to make the step much larger than the
+noise. `ANCHOR_YAW_SNAP` snaps the derived yaw to 0.05° at the source (9× the
+residue, and 0.025° of worst-case skew is 7 mm over a 16 m wall — nothing against
+a 1 m cell), and `YAW_STAMP_STEPS = 360` buckets the hash to a whole degree as a
+second line for an angle that lands exactly on a snap step. Regression tests in
+`world-anchor.test.ts` feed the three measured residues and assert one anchor and
+one stamp; the anchor point is quantized to the millimetre for the same reason,
+which is why those tests assert positions to 3 decimals and no further.
+
 **Our own name is not a constant, so it is checked every tick.** `world.self` is
 the prefix on every record id we mint, and a *peer* gates each inbound record
 with `isAuthoredBy(rec.id, msg.sessionId)` — the sender read live off the

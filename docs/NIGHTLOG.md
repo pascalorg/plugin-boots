@@ -2370,6 +2370,48 @@ must happen once per session and can be published late belongs in a held fact
 with a republish on attach, not in an effect that gives up when its peer is not
 ready.
 
+### A fingerprint must be coarser than the noise in its inputs
+
+**Third road to the same complaint, and the one that survived TWO fixes.** With
+the publish race fixed and the relay gate split, two clients that joined at the
+same moment agreed perfectly — builds and destruction both ways, `refusedGrid 0`.
+A client that joined *later* saw nothing, `blindGrid 0` and `refusedGrid`
+climbing, which is the gate saying not *"I don't know my lot"* but *"we genuinely
+disagree about it"*. That distinction is the whole reason the two counters are
+separate, and it is what stopped the investigation from going down the same road
+a third time.
+
+`gridAudit()` exists because a hash tells you THAT two peers differ and never
+WHICH input differs. It prints the stamp's entire preimage — anchor x/z/yaw, the
+storey ladder, the level ys, the longest walls. First run: the anchors and ladders
+were identical and only the yaw differed, at the fifth decimal. Second run, same
+session: the yaw had *moved again*. That is not a disagreement between peers, it
+is noise in one peer — the anchor yaw is read off a wall root's `matrixWorld`, and
+the host LevelSystem lerps level groups every frame, leaving a residue that never
+settles (+6.4e-6, −6.6e-5, +2.2e-5 rad across three audits).
+
+The mistake was in the hash. `gridStamp` quantized the yaw on a 65536-step turn —
+0.0055° per step, an order of magnitude *finer than the jitter*. **Quantization
+does not remove disagreement, it moves it to the step boundary**, and the finer
+the step, the likelier the straddle: a +ε and a −ε around zero are the same angle
+and landed on step 0 versus step 65535, opposite ends of the turn. So two peers on
+one lot fingerprinted differently and refused every slot-addressed piece the other
+placed, in both directions, all session, while unaddressed damage kept landing —
+the owner's sentence again, reached by a third road. Ironically the yaw was put in
+the stamp to close a real hole (two peers agreeing on the anchor POINT while
+disagreeing on its rotation build inside each other), and the precision it was
+written with is what broke it.
+
+The fix has two lines and only the first is load-bearing. `ANCHOR_YAW_SNAP` snaps
+the *derived* yaw to 0.05° — 9× the observed residue, so both peers round to the
+same multiple, and the lattice pays at most 0.025° of skew against the wall it
+aligns to, 7 mm over a 16 m building, well under the 1 m cell it addresses. Then
+`YAW_STAMP_STEPS = 360` buckets the hash to a whole degree, so a document angle
+sitting exactly *on* one of those 0.05° steps still lands in one bucket. The
+anchor point is quantized to the millimetre for the same reason, which is why the
+anchor tests now assert positions to 3 decimals: **the anchor is a fingerprint,
+not a measurement, and it may not be more precise than it is reproducible.**
+
 ### A fort has to outlive its builder
 
 Second road to the same complaint, and the one that survived the first fix: the

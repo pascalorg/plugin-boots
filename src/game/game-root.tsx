@@ -52,6 +52,7 @@ import {
 } from './presence'
 import { RemotePlayers } from './remote-players'
 import { getSession, hideForGame, getSessionSerial } from './session'
+import { sharedBuildDebug } from './shared-build'
 import { ShellLayer, shellCensus } from './shell-layer'
 import { aimDirection, fire } from './shooting'
 import { pendingToneCount, toneAuditReport } from './skin-tone'
@@ -79,6 +80,7 @@ import {
   collectWorld,
   countCoplanarSuspects,
   type GameWorld,
+  gridAudit,
   installGroundProbes,
   isOverlayName,
 } from './world'
@@ -846,6 +848,18 @@ function ActiveGame() {
       presence: () => presenceDebug(),
       // `unsent` + `overflow` together are the whole "are we desynced" question.
       worldSync: () => worldSyncDebug(),
+      // The build lane's own view (shared-build.ts). `gridStampPublishes` and
+      // `gridFrameHeld` are here because their failure is INVISIBLE from
+      // everywhere else: a 0 stamp refuses every slot-addressed frame in both
+      // directions while damage keeps landing, which is what production did all
+      // through August ("others couldn't see my constructions / only some
+      // destructions"). A counter is the only way QA can tell that apart from a
+      // quiet wire.
+      buildSync: () => sharedBuildDebug(),
+      // …and WHY two peers' stamps differ, read live from the registry: the
+      // anchor, the ladder, the levels behind it and the longest walls the
+      // anchor votes on (world.gridAudit).
+      gridAudit: () => gridAudit(),
       // Voice QA dump (voice.ts): one line per peer with its real
       // RTCPeerConnection state, what description it still owes, its mixed gain
       // and whether a track has actually arrived — plus `notSent`/`given_up`,

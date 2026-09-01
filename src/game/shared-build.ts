@@ -982,6 +982,14 @@ export function sharedBuildDebug(): {
   gridFrameHeld: boolean
   /** Times a stamp actually reached a world. 0 with a live lane is the bug. */
   gridStampPublishes: number
+  /**
+   * THE STAMP'S OWN INPUTS, as a plain copy. A mismatched stamp is a hash
+   * collision-free "you two are not on the same lot", which tells QA that the
+   * pieces lane is refused and NOTHING about why. These four fields are the
+   * whole preimage — anchor x/z/yaw and the storey ladder with the terrain rung
+   * first — so a disagreement can be read off two dumps instead of guessed at.
+   */
+  gridFrame: { x: number; z: number; yaw: number; ys: number[] } | null
 } {
   return {
     on: sync !== null,
@@ -995,6 +1003,7 @@ export function sharedBuildDebug(): {
     gridStamp: sync?.world.gridStamp ?? 0,
     gridFrameHeld: gridFrame !== null,
     gridStampPublishes,
+    gridFrame: gridFrame ? { x: gridFrame.x, z: gridFrame.z, yaw: gridFrame.yaw, ys: [...gridFrame.ys] } : null,
   }
 }
 

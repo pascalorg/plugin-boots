@@ -37,12 +37,20 @@
 import {
   quantPos,
   quantYaw,
-  YAW_STEPS,
   type CellKey,
   type NodeId,
   type PieceRec,
   type StrokeRec,
 } from './shared-world'
+
+/**
+ * Steps the LOT FINGERPRINT buckets the anchor yaw into — one per degree.
+ * Deliberately far coarser than the wire's own `YAW_STEPS` (65536): see the
+ * gridStamp doc comment for the production bug that taught us why a fingerprint
+ * must be coarser than the noise in its inputs, not as fine as the format
+ * allows.
+ */
+export const YAW_STAMP_STEPS = 360
 
 // ── Stable hashing and seeded randomness ────────────────────────────────────
 
@@ -131,9 +139,24 @@ export function mulberry32(seed: number): () => number {
  * waves that frame through, which is the one failure the gate exists to stop.
  *
  * Anchor and storey values are quantized to the millimetre before hashing, and
- * the yaw to grid.ts's own turn (wrapped, so 0 and 2π are one grid) so that
- * floating-point noise in two clients' identical arithmetic cannot make them
- * disagree. Returns a non-zero u32 (0 is reserved for "unknown").
+ * the yaw to a whole degree, so that floating-point noise in two clients'
+ * identical arithmetic cannot make them disagree. Returns a non-zero u32 (0 is
+ * reserved for "unknown").
+ *
+ * WHY A WHOLE DEGREE AND NOT THE WIRE'S OWN 65536-STEP TURN — the bug this cost
+ * (2026-09-01). Quantization does not remove disagreement, it MOVES it to the
+ * step boundary, and the finer the step the likelier the straddle. The anchor
+ * yaw is derived through a live `matrixWorld` whose lerp residue is ~1e-4 rad,
+ * which is bigger than a 0.0055° step: a +ε and a −ε around zero are the same
+ * angle and hashed as step 0 versus step 65535, so two peers on ONE lot
+ * fingerprinted differently and refused every slot-addressed piece the other
+ * placed — invisible walls both ways, all session, while unaddressed damage kept
+ * landing. `deriveGridAnchor` now snaps its yaw to 0.05° at the source, which is
+ * the real fix; this coarse bucket is the second line, so a document angle that
+ * happens to sit ON one of those 0.05° steps still lands in one bucket here.
+ * A degree is far finer than the lattice cares about — over a 20 m building it
+ * is 35 cm of skew, and the identity/cardinal snap in `deriveGridAnchor` handles
+ * the aligned case exactly — while being 175× the noise it has to absorb.
  */
 export function gridStamp(
   anchorX: number,
@@ -147,7 +170,7 @@ export function gridStamp(
     // Prefixed because it is the one part that is not a millimetre: a stamp
     // whose inputs are all bare integers invites the assumption that they
     // share a unit.
-    `y${Math.round((quantYaw(anchorYaw) / (Math.PI * 2)) * YAW_STEPS) % YAW_STEPS}`,
+    `y${Math.round((quantYaw(anchorYaw) / (Math.PI * 2)) * YAW_STAMP_STEPS) % YAW_STAMP_STEPS}`,
   ]
   for (const y of storeyYs) parts.push((quantPos(y) * 1000).toFixed(0))
   const h = hashString(parts.join('|'))

@@ -38,6 +38,7 @@ import {
 import { CELL, type GridAnchor, STOREY } from './grid'
 import { WALKABLE_NORMAL_Y } from './movement'
 import { perfEvent } from './perf-monitor'
+import { quantPos } from './shared-world'
 
 /**
  * One-shot world snapshot taken when the game starts: which host meshes are
@@ -1750,6 +1751,31 @@ const ANCHOR_OFFSET_EPS = 0.02
 /** Walls shorter than this are stubs — no vote, never the anchor point
  * (same degeneracy floor the stud/anatomy builders use). */
 const ANCHOR_MIN_WALL = 0.3
+/**
+ * THE ANCHOR IS A FINGERPRINT, SO IT MUST NOT CARRY RENDER NOISE. 0.05° per
+ * step, ~0.9 mrad.
+ *
+ * The yaw is read through the wall root's `matrixWorld`, and that matrix is
+ * LIVE: the host LevelSystem lerps level groups every frame and its quaternion
+ * leaves a residue of ~1e-4 rad that never settles. Measured on 2026-09-01, the
+ * same session audited three times in a row: +6.4e-6, −6.6e-5, +2.2e-5 rad.
+ *
+ * That is small enough to be invisible in geometry and large enough to destroy
+ * multiplayer, because `gridStamp` hashes the yaw on a 65536-step turn
+ * (0.0055°/step): a +ε and a −ε around zero are the SAME ANGLE and land on
+ * OPPOSITE ENDS of the turn — step 0 versus step 65535 — so two peers on one lot
+ * fingerprinted differently and refused every slot-addressed piece the other
+ * placed. Walls invisible both ways, damage still landing: the owner's
+ * "others couldn't see my constructions / only some destructions", third road.
+ *
+ * A step of 0.05° is ~9× the observed jitter, so both peers round to the same
+ * multiple; axis-aligned buildings (the common case) land on exact 0. The lattice
+ * pays at most 0.025° of skew against the wall it aligns to — 7 mm over a 16 m
+ * building, well under the 1 m cell it addresses. `gridStamp` also buckets the
+ * yaw coarsely as a second line of defence for angles that sit exactly on one of
+ * these steps; see YAW_STAMP_STEPS there.
+ */
+const ANCHOR_YAW_SNAP = (0.05 * Math.PI) / 180
 
 const HALF_PI = Math.PI / 2
 
@@ -1850,7 +1876,14 @@ export function deriveGridAnchor(
     const offZ = Math.abs(anchorZ - Math.round(anchorZ / CELL) * CELL)
     if (offX <= ANCHOR_OFFSET_EPS && offZ <= ANCHOR_OFFSET_EPS) return { x: 0, z: 0, yaw: 0 }
   }
-  return { x: anchorX, z: anchorZ, yaw }
+  // SNAPPED, because two peers must derive the SAME anchor from one document
+  // and the inputs above are live matrices — see ANCHOR_YAW_SNAP. Position to
+  // the millimetre the rest of the wire already speaks; yaw to 0.05°.
+  return {
+    x: quantPos(anchorX),
+    z: quantPos(anchorZ),
+    yaw: Math.round(yaw / ANCHOR_YAW_SNAP) * ANCHOR_YAW_SNAP,
+  }
 }
 
 /**
@@ -2183,6 +2216,53 @@ export function deriveStoreyLadder(
   ys.push(ys[ys.length - 1]! + levelTopSpan(topId, nodes))
   for (let rung = 0; rung < LADDER_SKY_RUNGS; rung++) ys.push(ys[ys.length - 1]! + STOREY)
   return ys
+}
+
+/**
+ * WHY THE TWO PEERS DISAGREED ABOUT THE LOT — the preimage, readable live.
+ *
+ * A slot id ("Wx:3,6,0") is an address in the lattice, and the lattice is the
+ * anchor plus the storey ladder. Peers whose stamps differ refuse each other's
+ * slot-addressed pieces entirely, which is invisible from the game: walls simply
+ * never appear. `sharedBuildDebug().gridFrame` says the two numbers differ; this
+ * says WHICH INPUT differs, which is the only question worth asking next.
+ *
+ * Read live from the registry, so calling it in a session tells you what that
+ * session would publish RIGHT NOW — not what it published at mount. That
+ * difference is itself a finding (2026-09-01: a late joiner's ladder was two
+ * rungs short of the ladder the first player published).
+ */
+export function gridAudit(): {
+  anchor: GridAnchor
+  ladder: number[] | null
+  levels: Array<{ id: string; y: number }>
+  walls: Array<{ id: string; length: number }>
+} {
+  const nodes = useScene.getState().nodes as Record<string, Record<string, unknown>>
+  const levels = collectStackedLevels()
+  const walls: Array<{ id: string; length: number }> = []
+  const ids = sceneRegistry.byType.wall ?? []
+  for (const id of ids) {
+    const node = nodes[id] as Partial<WallNodeLike> | undefined
+    if (!node?.start || !node?.end) continue
+    walls.push({
+      id,
+      length: Math.hypot(node.end[0] - node.start[0], node.end[1] - node.start[1]),
+    })
+  }
+  walls.sort((a, b) => b.length - a.length)
+  const collected: Array<{ node: WallNodeLike; root: Object3D }> = []
+  for (const id of ids) {
+    const root = sceneRegistry.nodes.get(id)
+    const node = nodes[id] as WallNodeLike | undefined
+    if (root && node?.start && node?.end) collected.push({ node, root })
+  }
+  return {
+    anchor: deriveGridAnchor(collected),
+    ladder: deriveStoreyLadder(levels, nodes),
+    levels: levels.map((l) => ({ id: l.id, y: l.y })),
+    walls: walls.slice(0, 6),
+  }
 }
 
 export function collectWorld(): GameWorld {

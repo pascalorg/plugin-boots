@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { sceneRegistry, useScene } from '@pascal-app/core'
 import { BoxGeometry, Group, Mesh, Vector3 } from 'three'
+import { gridStamp } from './shared-derive'
 import type { WallNodeLike } from './world'
 import { collectWorld, deriveGridAnchor } from './world'
 
@@ -83,10 +84,13 @@ describe('deriveGridAnchor — rotated-building composition', () => {
     const anchor = deriveGridAnchor([wall])
     expect(anchor.yaw).toBeCloseTo(Math.PI / 6, 8)
     // The anchor point is the level-local start pushed through the SAME
-    // matrixWorld the meshes render with.
+    // matrixWorld the meshes render with — to the MILLIMETRE, which is as far
+    // as the anchor is allowed to be precise: it is a fingerprint two peers must
+    // derive identically off a live matrix, so it is quantized at the source
+    // (see ANCHOR_YAW_SNAP / quantPos in world.ts).
     const start = new Vector3(2, 0, 1).applyMatrix4(root.matrixWorld)
-    expect(anchor.x).toBeCloseTo(start.x, 8)
-    expect(anchor.z).toBeCloseTo(start.z, 8)
+    expect(anchor.x).toBeCloseTo(start.x, 3)
+    expect(anchor.z).toBeCloseTo(start.z, 3)
   })
 
   test('longest wall wins the anchor point across mixed roots', () => {
@@ -101,9 +105,67 @@ describe('deriveGridAnchor — rotated-building composition', () => {
     ]
     const anchor = deriveGridAnchor(walls)
     const start = new Vector3(4, 0, -2).applyMatrix4(rotated.matrixWorld)
-    expect(anchor.x).toBeCloseTo(start.x, 8)
-    expect(anchor.z).toBeCloseTo(start.z, 8)
+    expect(anchor.x).toBeCloseTo(start.x, 3) // millimetre: the anchor is quantized
+    expect(anchor.z).toBeCloseTo(start.z, 3)
     expect(anchor.yaw).toBeCloseTo(Math.PI / 6, 8)
+  })
+})
+
+describe('deriveGridAnchor — the anchor is a fingerprint, not a measurement', () => {
+  /**
+   * THE BUG THIS BLOCK EXISTS FOR (2026-09-01, prod). The anchor yaw is read
+   * through a LIVE matrixWorld — the host LevelSystem lerps level groups every
+   * frame and leaves ~1e-4 rad of residue that never settles. Two peers on the
+   * same lot therefore derive yaws that differ in the fifth decimal, and
+   * `gridStamp` used to hash the yaw on a 65536-step turn (0.0055°/step), so a
+   * +ε and a −ε around zero — the same angle — landed on step 0 versus step
+   * 65535. Different fingerprint ⇒ every slot-addressed piece the other peer
+   * placed was REFUSED, in both directions, for the whole session. The contract
+   * these tests pin: jitter smaller than the snap must produce the SAME anchor
+   * and the SAME stamp, and a real rotation must still survive.
+   */
+  const jittered = (residue: number, base = 0) => {
+    const root = new Group()
+    root.rotation.y = base + residue
+    // Start off the 3 m lattice, so the identity snap does not fire and the
+    // derivation actually has to hash a live yaw — the production shape.
+    return deriveGridAnchor([wallEntry([1, 0.5], [7, 0.5], root)])
+  }
+  const stampOf = (a: { x: number; z: number; yaw: number }) => gridStamp(a.x, a.z, a.yaw, [0])
+
+  test('render residue around zero yields one anchor and one stamp', () => {
+    // The three residues measured in one real session, audited three times.
+    const anchors = [6.4e-6, -6.6e-5, 2.2e-5].map((r) => jittered(r))
+    for (const anchor of anchors) {
+      expect(Math.abs(anchor.yaw - anchors[0]!.yaw)).toBe(0)
+      expect(anchor.x).toBe(anchors[0]!.x)
+      expect(anchor.z).toBe(anchors[0]!.z)
+      expect(stampOf(anchor)).toBe(stampOf(anchors[0]!))
+    }
+  })
+
+  test('residue straddling zero does not wrap to the far end of the turn', () => {
+    // The exact pair that broke production: same angle, opposite signs.
+    expect(stampOf(jittered(1e-5))).toBe(stampOf(jittered(-1e-5)))
+  })
+
+  test('residue around a genuinely rotated building agrees too', () => {
+    const base = Math.PI / 6
+    const plus = jittered(1e-4, base)
+    const minus = jittered(-1e-4, base)
+    expect(Math.abs(plus.yaw - minus.yaw)).toBe(0)
+    expect(stampOf(plus)).toBe(stampOf(minus))
+    expect(plus.yaw).toBeCloseTo(base, 4)
+  })
+
+  test('a real rotation survives the snap — this is not a cardinal clamp', () => {
+    const odd = (12.37 * Math.PI) / 180
+    const anchor = jittered(0, odd)
+    expect(anchor.yaw).not.toBe(0)
+    // Worst case is half a step: 0.025°, i.e. 7 mm of skew over a 16 m wall.
+    expect(Math.abs(anchor.yaw - odd)).toBeLessThanOrEqual((0.025 * Math.PI) / 180 + 1e-12)
+    // …and a different real angle is a different lot, as the gate needs.
+    expect(stampOf(anchor)).not.toBe(stampOf(jittered(0, (24.74 * Math.PI) / 180)))
   })
 })
 
@@ -193,7 +255,7 @@ describe('collectWorld stashes the grid anchor', () => {
     expect(world.gridAnchor).toBeDefined()
     expect(world.gridAnchor!.yaw).toBeCloseTo(Math.PI / 6, 6)
     const start = new Vector3(-2, 0, 0).applyMatrix4(wallRoot.matrixWorld)
-    expect(world.gridAnchor!.x).toBeCloseTo(start.x, 6)
-    expect(world.gridAnchor!.z).toBeCloseTo(start.z, 6)
+    expect(world.gridAnchor!.x).toBeCloseTo(start.x, 3) // millimetre, as derived
+    expect(world.gridAnchor!.z).toBeCloseTo(start.z, 3)
   })
 })

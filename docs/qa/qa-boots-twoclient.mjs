@@ -16,6 +16,17 @@
  * same voxels die. Both directions, because a one-way wire looks identical to a
  * working one from whichever end happens to be driving.
  *
+ * Three more sections were added after the owner played it with a friend
+ * (2026-09-01), each pinned to one of his sentences:
+ *   5. the GRID STAMP counters — the failure that was invisible in development
+ *      and total in production ("others couldn't see my constructions / only
+ *      some destructions");
+ *   6. B builds, B LEAVES, and a peer who was never in the room while B was
+ *      there still gets B's wall ("we should always all see the state of the map
+ *      as it is currently");
+ *   7. a remote avatar photographed at 6 m and 20 m, either side of the detail
+ *      LOD ("our avatars should look like pascalines").
+ *
  *   SCENE=… node qa-boots-twoclient.mjs
  */
 import { chromium } from './qa-playwright.mjs'
@@ -95,6 +106,7 @@ const presence = (client) => client.page.evaluate(() => globalThis.__boots?.pres
 const pieces = (client) => client.page.evaluate(() => globalThis.__boots?.pieces?.() ?? [])
 const targets = (client) => client.page.evaluate(() => globalThis.__boots?.targets?.() ?? [])
 const worldSync = (client) => client.page.evaluate(() => globalThis.__boots?.worldSync?.() ?? null)
+const buildSync = (client) => client.page.evaluate(() => globalThis.__boots?.buildSync?.() ?? null)
 const busStats = (client) => client.page.evaluate(() => globalThis.__busStats?.() ?? null)
 
 for (const client of clients) log(`[${client.label}] phase ${await phase(client)}`)
@@ -234,12 +246,136 @@ log('\n=== 4. the wire ===')
 for (const client of clients) {
   log(`[${client.label}] busStats ${JSON.stringify(await busStats(client))}`)
   log(`[${client.label}] worldSync ${JSON.stringify(await worldSync(client))}`)
+  log(`[${client.label}] buildSync ${JSON.stringify(await buildSync(client))}`)
 }
 
+/**
+ * THE GRID STAMP, ASSERTED — the counter that would have caught a whole month.
+ *
+ * `publishGridStamp` used to no-op when the build lane was not attached yet, and
+ * React runs a child's effect before its parent's, so the publish ALWAYS lost
+ * the race with `startWorldSync()`. StrictMode's double-invoke hid it in
+ * development; in a production build `world.gridStamp` stayed 0 all session, and
+ * the gate reads `delta.gridStamp !== 0 && delta.gridStamp === world.gridStamp`
+ * — so every slot-addressed frame was refused in BOTH directions while grid-free
+ * damage kept landing. Sections 2 and 3 above cannot separate those two lanes;
+ * these three numbers can, and they are cheap:
+ *   gridStampPublishes > 0   the frame reached a world at all
+ *   gridFrameHeld === true   it is retained, so a late attach still speaks it
+ *   blindGrid === 0          no frame was ever refused while OUR stamp was 0
+ */
+log('\n=== 5. the grid stamp (the production-only failure) ===')
+let stampOk = true
 for (const client of clients) {
+  const bs = await buildSync(client)
+  const ws = await worldSync(client)
+  const ok =
+    (bs?.gridStampPublishes ?? 0) > 0 &&
+    bs?.gridFrameHeld === true &&
+    (bs?.gridStamp ?? 0) !== 0 &&
+    (ws?.blindGrid ?? 0) === 0
+  log(
+    `[${client.label}] publishes ${bs?.gridStampPublishes} held ${bs?.gridFrameHeld} ` +
+      `stamp ${bs?.gridStamp} · blindGrid ${ws?.blindGrid} refusedGrid ${ws?.refusedGrid} → ${ok}`,
+  )
+  if (!ok) stampOk = false
+}
+log(`  GRID STAMP HEALTHY: ${stampOk}`)
+
+/**
+ * THE FORT OUTLIVES ITS BUILDER — the relay gate, end to end.
+ *
+ * Under a per-frame authorship gate a record's only courier is its author, so
+ * when a builder leaves the room their walls stop being re-published and the
+ * next visitor finds a lot that has forgotten what was built on it (the owner's
+ * "we should always all see the state of the map as it is currently"). The gate
+ * is now split: deltas stay strictly authored, snapshots are accepted whoever
+ * wrote the records inside them. The only honest test is the sequence itself —
+ * B builds, B LEAVES, and a peer who was never in the room while B was there
+ * must still be handed B's wall, by A.
+ */
+log('\n=== 6. a fort outlives its builder (relay) ===')
+const bKeys = keysOf(await pieces(b))
+const aKeysBefore = keysOf(await pieces(a))
+// Only the pieces A holds that B authored can prove a relay: anything A built
+// itself would arrive from its own author and prove nothing.
+log(`  A holds ${aKeysBefore.size} pieces, B holds ${bKeys.size}`)
+await b.page.close()
+log('  B has left the room')
+await a.page.bringToFront()
+await a.page.waitForTimeout(4000)
+
+const cPage = await browser.newPage()
+const cErrors = []
+cPage.on('pageerror', (e) => cErrors.push(String(e).slice(0, 200)))
+await cPage.addInitScript(installBus, {
+  clientId: 'client_C',
+  name: 'Latecomer',
+  projectId: `project_${SCENE}`,
+  sessionId: 'session_C',
+  userId: 'user_C',
+})
+const c = { errors: cErrors, label: 'C', page: cPage }
+await cPage.goto(URL, { timeout: 240000, waitUntil: 'domcontentloaded' }).catch((e) => log('C goto:', e.message))
+await cPage.waitForTimeout(15000)
+await jumpIn(c)
+// The joiner asks for state and merges what comes back; a snapshot may take a
+// few ticks to drain, so poll rather than sleeping on a guess.
+let cKeys = new Set()
+for (let round = 0; round < 12; round++) {
+  await cPage.waitForTimeout(2500)
+  await cPage.bringToFront()
+  cKeys = keysOf(await pieces(c))
+  if (cKeys.size >= aKeysBefore.size) break
+}
+const cSync = await worldSync(c)
+const relayedIn = [...aKeysBefore].filter((key) => cKeys.has(key))
+log(`[C] phase ${await phase(c)} pieces ${cKeys.size}   of A's ${aKeysBefore.size}: ${relayedIn.length}`)
+log(`[C] worldSync ${JSON.stringify(cSync)}`)
+const relayOk = cKeys.size >= aKeysBefore.size && (cSync?.relayed ?? 0) > 0
+log(`  LATECOMER GOT THE WHOLE MAP: ${relayOk}  (relayed ${cSync?.relayed})`)
+
+/**
+ * THE AVATARS — "our avatars should look like pascalines, only slightly
+ * customized (each new player has a different color?)".
+ *
+ * Unit tests pin the palette (assignPalette: stable, distinct, agreed on every
+ * screen without coordination) and the articulation, but only pixels can answer
+ * whether the thing standing over there READS as the mascot. So C stands off in
+ * front of A's avatar and looks at it, at two distances that straddle
+ * DETAIL_MAX_DIST (14 m) — the near shot is the full rig, the far one is the
+ * simplified one plus the name tag, and the LOD crossing is exactly where a
+ * remote avatar has blinked out before. The shots are for a human to read; what
+ * is asserted here is only that there WAS someone to photograph.
+ */
+log('\n=== 7. the avatar in frame ===')
+const aPose = (await presence(c))?.remotes?.[0] ?? null
+log(`[C] sees remote ${JSON.stringify(aPose)}`)
+if (aPose) {
+  const [ax, , az] = aPose.p
+  for (const dist of [6, 20]) {
+    // Stand due +Z of them and look back along −Z: yaw 0 is (−sin 0, −cos 0).
+    await cPage.evaluate(
+      ([x, z]) => globalThis.__bootsPlayer?.teleport?.(x, z, 0, -0.05),
+      [ax, az + dist],
+    )
+    await cPage.waitForTimeout(2500)
+    await cPage.screenshot({ path: `${SHOT}-avatar-${dist}m.png` }).catch(() => {})
+    const still = (await presence(c))?.remotes?.[0] ?? null
+    log(`  ${dist} m: remote age ${still?.ageMs} ms  → ${SHOT}-avatar-${dist}m.png`)
+  }
+}
+
+for (const client of [...clients.filter((x) => x !== b), c]) {
   await client.page.screenshot({ path: `${SHOT}-${client.label}.png` }).catch(() => {})
   log(`[${client.label}] page errors: ${client.errors.length}`)
   for (const e of client.errors.slice(0, 5)) log(`   ${e}`)
 }
+log(`[B] page errors: ${b.errors.length}`)
+
+log('\n=== verdict ===')
+log(`  builds A→B ${buildAtoB}  B→A ${buildBtoA}`)
+log(`  destruction B→A ${damageBtoA}  A→B ${damageAtoB}`)
+log(`  grid stamp healthy ${stampOk}   latecomer got the map ${relayOk}`)
 
 await browser.close()
