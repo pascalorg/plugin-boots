@@ -4,6 +4,7 @@ import {
   currentDropInUrl,
   dropInUrlFrom,
   getShareBridge,
+  playTogetherIntro,
   type ProjectShareBridge,
   publishProject,
   shareMessage,
@@ -243,6 +244,34 @@ describe('public is not the same as joinable', () => {
       'muted',
     )
     expect(shareMessageTone({ kind: 'idle' })).toBe('muted')
+  })
+
+  test('the standing blurb obeys reach too — both sentences or neither', () => {
+    // The blurb sits directly above the button. Teaching the click message to
+    // stop promising a drop-in while the paragraph above it kept promising one
+    // would fix nothing: whichever he reads first is the one he acts on.
+    expect(playTogetherIntro('drops-in')).toMatch(/drop straight into the game/i)
+
+    const viewOnly = playTogetherIntro('view-only')
+    expect(viewOnly).not.toMatch(/drop straight into the game/i)
+    expect(viewOnly).toMatch(/not an open lobby/i)
+    expect(viewOnly).toMatch(/read-only/i)
+
+    const unknown = playTogetherIntro('unknown')
+    expect(unknown).not.toMatch(/drop straight into the game/i)
+    // Unknown must still invite him to share — it is the state every v1 host
+    // reports, and refusing to describe the link at all would be worse copy
+    // than naming the missing condition.
+    expect(unknown).toMatch(/send this link/i)
+    expect(unknown).toMatch(/lobby/i)
+  })
+
+  test('the blurb never mentions visibility — that is the click message\'s job', () => {
+    // Said in both places it reads as two different problems, and the private
+    // warning with its one-click fix is already right there.
+    for (const reach of ['drops-in', 'view-only', 'unknown'] as const) {
+      expect(playTogetherIntro(reach)).not.toMatch(/private/i)
+    }
   })
 })
 

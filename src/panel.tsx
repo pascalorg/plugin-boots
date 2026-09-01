@@ -31,12 +31,22 @@ import { enterGame } from './game/session'
 import { setVoiceMode, voiceMode } from './game/voice'
 import type { VoiceMode } from './game/voice-policy'
 import {
+  onRosterChange,
+  roster,
+  type RosterEntry,
+  ROSTER_POLL_MS,
+  rosterMessage,
+  rosterSignature,
+} from './game/roster'
+import {
   copyText,
   currentDropInUrl,
   getShareBridge,
+  playTogetherIntro,
   publishProject,
   shareMessage,
   shareMessageTone,
+  type ShareReach,
   shareReach,
   type ShareState,
   shareVisibility,
@@ -630,6 +640,109 @@ export function VoiceSettings() {
   )
 }
 
+// ── Who's here ──────────────────────────────────────────────────────────────
+//
+// The bug report was "so nothing really like joining a game together": two
+// people, one link, and neither screen said whether the other had arrived. That
+// one silence hides several different failures, and this line separates them —
+// "Just you in here right now" means the LINK failed, a name means it worked and
+// whatever is wrong is downstream. See roster.ts for why it reads the host bus
+// directly instead of net.ts's game-lifetime copy.
+
+/** Live read of the room, resilient to a bus installed after we mounted. */
+function useRoster(): RosterEntry[] | null {
+  const [entries, setEntries] = useState<RosterEntry[] | null>(() => roster())
+
+  useEffect(() => {
+    // Compared by signature, not by identity: `roster()` builds a fresh array
+    // every call, so setting state unconditionally would re-render the sidebar
+    // every ROSTER_POLL_MS for the life of the session.
+    let signature = rosterSignature(entries)
+    const read = () => {
+      const next = roster()
+      const nextSignature = rosterSignature(next)
+      if (nextSignature === signature) return
+      signature = nextSignature
+      setEntries(next)
+    }
+    read()
+    const stopListening = onRosterChange(read)
+    const timer = setInterval(read, ROSTER_POLL_MS)
+    return () => {
+      stopListening()
+      clearInterval(timer)
+    }
+    // Mount-only on purpose (hence no `entries` dep): it is read once to seed
+    // the signature, and re-running this on every roster change would tear down
+    // the subscription it just installed.
+  }, [])
+
+  return entries
+}
+
+export function WhosHere() {
+  const entries = useRoster()
+  const somebody = entries !== null && entries.length > 0
+
+  return (
+    <p
+      className={
+        somebody
+          ? 'flex items-center gap-1.5 font-semibold text-[11px] text-sidebar-foreground/80 leading-relaxed'
+          : 'flex items-center gap-1.5 text-[11px] text-sidebar-foreground/50 leading-relaxed'
+      }
+      data-boots-roster={entries === null ? 'no-bus' : String(entries.length)}
+    >
+      <span
+        aria-hidden="true"
+        className={
+          somebody
+            ? 'size-1.5 shrink-0 rounded-full bg-emerald-400'
+            : 'size-1.5 shrink-0 rounded-full bg-sidebar-foreground/25'
+        }
+      />
+      {rosterMessage(entries)}
+    </p>
+  )
+}
+
+/**
+ * Play together — the link, who is on the other end of it, and the voice call.
+ *
+ * Grouped because they are one question ("can we play this together right
+ * now?") with three answers that have to agree. The intro is reach-aware for
+ * the same reason the click message is: two sentences about the same link, one
+ * of them promising a drop-in the host will not perform, is how the owner ends
+ * up sharing a link he believes works.
+ */
+export function PlayTogether() {
+  // Snapshotted at render and refreshed by the bridge's own subscription — the
+  // owner can flip visibility from the host navbar while this panel is open,
+  // and reach can change under us when the host swaps the bridge.
+  const [reach, setReach] = useState<ShareReach>(() => shareReach(getShareBridge()))
+
+  useEffect(() => {
+    const bridge = getShareBridge()
+    if (!bridge) return
+    setReach(shareReach(getShareBridge()))
+    return bridge.subscribe(() => setReach(shareReach(getShareBridge())))
+  }, [])
+
+  return (
+    <section className="flex flex-col gap-2">
+      <p className="font-semibold text-[10px] text-sidebar-foreground/70 uppercase tracking-wider">
+        Play together
+      </p>
+      <WhosHere />
+      <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
+        {playTogetherIntro(reach)}
+      </p>
+      <ShareLink />
+      <VoiceSettings />
+    </section>
+  )
+}
+
 /**
  * The Boots left-rail panel. One big verb: Jump in — the whole editor
  * becomes a game. After a session where you built pieces, the panel offers
@@ -765,17 +878,7 @@ export default function BootsPanel() {
         <p>You can't die — you get staggered. The machines back off; shake it off and keep going.</p>
       </section>
 
-      <section className="flex flex-col gap-2">
-        <p className="font-semibold text-[10px] text-sidebar-foreground/70 uppercase tracking-wider">
-          Play together
-        </p>
-        <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
-          Send this link to a friend: they land in this project and can jump straight into the game
-          with you. Builds and destruction are shared live.
-        </p>
-        <ShareLink />
-        <VoiceSettings />
-      </section>
+      <PlayTogether />
     </div>
   )
 }

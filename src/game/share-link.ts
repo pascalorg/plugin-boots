@@ -243,6 +243,32 @@ export function shareMessage(state: ShareState): string {
 }
 
 /**
+ * The standing blurb above the "Play together" share button — the one the owner
+ * reads BEFORE clicking anything.
+ *
+ * It has to obey the same rule as the after-click message, and for a while it
+ * did not: it promised "they land in this project and can jump straight into
+ * the game with you" unconditionally, sitting directly above a button that had
+ * just been taught to say the opposite when true. Fixing the sentence that
+ * appears after the click and leaving the one above it lying is not a fix —
+ * whichever of the two he reads first is the one he acts on.
+ *
+ * Unlike the click messages this one never mentions visibility: private is the
+ * click's business (the warning and its one-click fix are right there), and
+ * saying it twice in one section reads like two different problems.
+ */
+export function playTogetherIntro(reach: ShareReach): string {
+  switch (reach) {
+    case 'drops-in':
+      return 'Send this link to a friend: they sign in and drop straight into the game with you. Builds and destruction are shared live.'
+    case 'view-only':
+      return 'This project is not an open lobby, so the link opens your building read-only — nobody can jump in with you here yet. Ask us to open it as a lobby.'
+    case 'unknown':
+      return 'Send this link to a friend: they land in this project, and can jump into the game with you if it is open as a lobby. Builds and destruction are shared live.'
+  }
+}
+
+/**
  * The one sentence that used to be a lie. A public project only drops a
  * stranger into the game if the host also opened it as a lobby, so the promise
  * is made only where we can see that it holds.
