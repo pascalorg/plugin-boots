@@ -6,8 +6,10 @@ import {
   getShareBridge,
   type ProjectShareBridge,
   publishProject,
-  type ShareState,
   shareMessage,
+  shareMessageTone,
+  shareReach,
+  type ShareState,
   shareVisibility,
   showsPrivateWarning,
 } from './share-link'
@@ -49,6 +51,16 @@ const bridgeOf = (
   setPublic,
   subscribe: () => () => {},
   version: 1,
+})
+
+/**
+ * A v2 bridge — one that can tell us whether the link drops anyone in.
+ * `isPrivate` defaults to public because reach only matters once it is.
+ */
+const lobbyBridge = (isOpenLobby: boolean, isPrivate = false): ProjectShareBridge => ({
+  ...bridgeOf(isPrivate),
+  isOpenLobby,
+  version: 2,
 })
 
 afterEach(() => {
@@ -122,21 +134,115 @@ describe('the link is the route that works for them', () => {
 })
 
 describe('the host bridge is feature-detected', () => {
-  test('absent, and any version but 1, read as no bridge', () => {
-    // Same contract as the collab bus (net.ts): a protocol we only half
-    // understand is worse than none, because the half we get wrong is
-    // someone's project visibility.
-    expect(getShareBridge()).toBeNull()
-    globals.__pascalProjectShare = { ...bridgeOf(true), version: 2 }
+  test('absent reads as no bridge; v1 and every version above it are taken', () => {
+    // Deliberately NOT the collab bus's exact-version rule. Every field read
+    // here is v1's and v2 only adds an optional one, so refusing a v2 host
+    // would trade a host that can tell us MORE for no bridge at all — losing
+    // the private warning and its one-click fix to a version bump.
     expect(getShareBridge()).toBeNull()
     globals.__pascalProjectShare = bridgeOf(true)
     expect(getShareBridge()?.projectId).toBe('project_AHyVrpVr3g1jUXpr')
+    globals.__pascalProjectShare = { ...bridgeOf(true), version: 2 }
+    expect(getShareBridge()?.version).toBe(2)
+    globals.__pascalProjectShare = { ...bridgeOf(true), version: 7 }
+    expect(getShareBridge()?.version).toBe(7)
+  })
+
+  test('a version below the protocol is still refused', () => {
+    globals.__pascalProjectShare = { ...bridgeOf(true), version: 0 }
+    expect(getShareBridge()).toBeNull()
   })
 
   test('visibility is unknown without a bridge — never guessed', () => {
     expect(shareVisibility(null)).toBe('unknown')
     expect(shareVisibility(bridgeOf(true))).toBe('private')
     expect(shareVisibility(bridgeOf(false))).toBe('public')
+  })
+})
+
+describe('public is not the same as joinable', () => {
+  /**
+   * The bug this describes: a project can be public — anyone may OPEN it — and
+   * still not be an open lobby, in which case the link renders the building
+   * read-only and nobody drops into the game. The sidebar used to promise
+   * "anyone with the link signs in and drops straight into your game" for any
+   * public project, which is exactly the "nothing really like joining a game
+   * together" report.
+   */
+  const url = 'https://editor.pascal.app/play/p_1?boots=drop'
+
+  test('reach is unknown on a v1 host, and unknown is not false', () => {
+    // The dangerous default: `isOpenLobby ?? false` would tell every v1 host's
+    // owner their friend lands on a read-only view, including the hosts where
+    // they in fact drop straight in.
+    expect(shareReach(null)).toBe('unknown')
+    expect(shareReach(bridgeOf(false))).toBe('unknown')
+    expect(shareReach({ ...bridgeOf(false), version: 2 })).toBe('unknown')
+  })
+
+  test('reach follows the flag once the host sets it', () => {
+    expect(shareReach(lobbyBridge(true))).toBe('drops-in')
+    expect(shareReach(lobbyBridge(false))).toBe('view-only')
+  })
+
+  test('only a real lobby gets the promise', () => {
+    const dropsIn = shareMessage({ kind: 'copied', reach: 'drops-in', url, visibility: 'public' })
+    expect(dropsIn).toContain('drops straight into your game')
+
+    const viewOnly = shareMessage({ kind: 'copied', reach: 'view-only', url, visibility: 'public' })
+    expect(viewOnly).not.toContain('drops straight into your game')
+    expect(viewOnly).toContain('read-only')
+  })
+
+  test('an unknown reach names the condition instead of promising or denying', () => {
+    const message = shareMessage({ kind: 'copied', reach: 'unknown', url, visibility: 'public' })
+    expect(message).not.toContain('drops straight into your game')
+    expect(message).not.toContain('read-only')
+    expect(message).toContain('lobby')
+  })
+
+  test('publishing a non-lobby says so — going public did not make it joinable', () => {
+    // The trap in the one-click fix: the owner presses "Make it public",
+    // succeeds, and the old copy congratulated them with a promise that
+    // publishing has no power to make true.
+    const message = shareMessage({ kind: 'published', reach: 'view-only', url })
+    expect(message).not.toContain('drops straight into your game')
+    expect(message).toContain('not an open lobby')
+  })
+
+  test('publishProject reports the reach it read from the host', async () => {
+    expect(await publishProject(lobbyBridge(false), url)).toEqual({
+      kind: 'published',
+      reach: 'view-only',
+      url,
+    })
+    expect(await publishProject(lobbyBridge(true), url)).toEqual({
+      kind: 'published',
+      reach: 'drops-in',
+      url,
+    })
+  })
+
+  test('a caveat is amber; an outcome is grey', () => {
+    // "Copied" with a link that cannot deliver anyone looks like success, so it
+    // may not be styled as one.
+    expect(shareMessageTone({ kind: 'copied', reach: 'view-only', url, visibility: 'public' })).toBe(
+      'warn',
+    )
+    expect(shareMessageTone({ kind: 'published', reach: 'view-only', url })).toBe('warn')
+    expect(shareMessageTone({ error: 'nope', kind: 'publish-failed', url })).toBe('warn')
+
+    expect(shareMessageTone({ kind: 'copied', reach: 'drops-in', url, visibility: 'public' })).toBe(
+      'muted',
+    )
+    expect(shareMessageTone({ kind: 'copied', reach: 'unknown', url, visibility: 'public' })).toBe(
+      'muted',
+    )
+    // Private is the warning box's job, not this line's.
+    expect(shareMessageTone({ kind: 'copied', reach: 'view-only', url, visibility: 'private' })).toBe(
+      'muted',
+    )
+    expect(shareMessageTone({ kind: 'idle' })).toBe('muted')
   })
 })
 
@@ -175,12 +281,16 @@ describe('what the button says', () => {
     const states: ShareState[] = [
       { kind: 'idle' },
       { kind: 'no-link' },
-      { kind: 'copied', url, visibility: 'public' },
-      { kind: 'copied', url, visibility: 'private' },
-      { kind: 'copied', url, visibility: 'unknown' },
-      { kind: 'manual', url, visibility: 'public' },
+      { kind: 'copied', reach: 'drops-in', url, visibility: 'public' },
+      { kind: 'copied', reach: 'view-only', url, visibility: 'public' },
+      { kind: 'copied', reach: 'unknown', url, visibility: 'public' },
+      { kind: 'copied', reach: 'unknown', url, visibility: 'private' },
+      { kind: 'copied', reach: 'unknown', url, visibility: 'unknown' },
+      { kind: 'manual', reach: 'drops-in', url, visibility: 'public' },
       { kind: 'publishing', url },
-      { kind: 'published', url },
+      { kind: 'published', reach: 'drops-in', url },
+      { kind: 'published', reach: 'view-only', url },
+      { kind: 'published', reach: 'unknown', url },
       { error: 'not allowed', kind: 'publish-failed', url },
     ]
     for (const state of states) {
@@ -191,25 +301,39 @@ describe('what the button says', () => {
   test('a private copy never claims the friend can join', () => {
     // The regression that matters: "Link copied — anyone with it can join" on
     // a private project sends someone straight into a permission wall.
-    const message = shareMessage({ kind: 'copied', url, visibility: 'private' })
-    expect(message).not.toContain('anyone')
-    expect(showsPrivateWarning({ kind: 'copied', url, visibility: 'private' })).toBe(true)
-    expect(showsPrivateWarning({ kind: 'manual', url, visibility: 'private' })).toBe(true)
+    // Private wins over reach: even a project that IS an open lobby refuses a
+    // stranger while it is private, so the promise stays off.
+    for (const reach of ['drops-in', 'view-only', 'unknown'] as const) {
+      const message = shareMessage({ kind: 'copied', reach, url, visibility: 'private' })
+      expect(message, reach).not.toContain('anyone')
+    }
+    expect(showsPrivateWarning({ kind: 'copied', reach: 'drops-in', url, visibility: 'private' })).toBe(
+      true,
+    )
+    expect(showsPrivateWarning({ kind: 'manual', reach: 'unknown', url, visibility: 'private' })).toBe(
+      true,
+    )
   })
 
   test('an unknown visibility says the condition out loud', () => {
     // No bridge: we cannot read the row, so the honest line names what has to
     // be true rather than promising either way.
-    const message = shareMessage({ kind: 'copied', url, visibility: 'unknown' })
+    const message = shareMessage({ kind: 'copied', reach: 'unknown', url, visibility: 'unknown' })
     expect(message).toContain('public')
-    expect(showsPrivateWarning({ kind: 'copied', url, visibility: 'unknown' })).toBe(false)
+    expect(showsPrivateWarning({ kind: 'copied', reach: 'unknown', url, visibility: 'unknown' })).toBe(
+      false,
+    )
   })
 
   test('the warning is gone the moment the project is public', () => {
-    expect(showsPrivateWarning({ kind: 'copied', url, visibility: 'public' })).toBe(false)
-    expect(showsPrivateWarning({ kind: 'published', url })).toBe(false)
+    expect(showsPrivateWarning({ kind: 'copied', reach: 'drops-in', url, visibility: 'public' })).toBe(
+      false,
+    )
+    expect(showsPrivateWarning({ kind: 'published', reach: 'drops-in', url })).toBe(false)
     expect(showsPrivateWarning({ kind: 'publishing', url })).toBe(false)
-    expect(shareMessage({ kind: 'copied', url, visibility: 'public' })).toContain('anyone')
+    expect(
+      shareMessage({ kind: 'copied', reach: 'drops-in', url, visibility: 'public' }),
+    ).toContain('anyone')
   })
 
   test('a refusal is quoted, not swallowed', () => {
@@ -223,7 +347,12 @@ describe('the one-click publish', () => {
   const url = 'https://editor.pascal.app/editor/p_1?boots=drop'
 
   test('success becomes published', async () => {
-    expect(await publishProject(bridgeOf(true), url)).toEqual({ kind: 'published', url })
+    // A v1 host cannot say whether the link drops anyone in, so it does not.
+    expect(await publishProject(bridgeOf(true), url)).toEqual({
+      kind: 'published',
+      reach: 'unknown',
+      url,
+    })
   })
 
   test("the host's own refusal is surfaced verbatim", async () => {

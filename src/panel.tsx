@@ -35,8 +35,10 @@ import {
   currentDropInUrl,
   getShareBridge,
   publishProject,
-  type ShareState,
   shareMessage,
+  shareMessageTone,
+  shareReach,
+  type ShareState,
   shareVisibility,
   showsPrivateWarning,
 } from './game/share-link'
@@ -478,8 +480,11 @@ export function ShareLink() {
     return bridge.subscribe(() => {
       setState((prev) => {
         if (prev.kind !== 'copied' && prev.kind !== 'manual') return prev
-        const visibility = shareVisibility(getShareBridge())
-        return visibility === prev.visibility ? prev : { ...prev, visibility }
+        const live = getShareBridge()
+        const visibility = shareVisibility(live)
+        const reach = shareReach(live)
+        if (visibility === prev.visibility && reach === prev.reach) return prev
+        return { ...prev, reach, visibility }
       })
     })
   }, [])
@@ -493,9 +498,11 @@ export function ShareLink() {
     // Snapshot the visibility BEFORE the await: the warning has to describe
     // the project the link points at, not whatever the host reports a tick
     // later.
-    const visibility = shareVisibility(getShareBridge())
+    const bridge = getShareBridge()
+    const visibility = shareVisibility(bridge)
+    const reach = shareReach(bridge)
     const copied = await copyText(url)
-    setState({ kind: copied ? 'copied' : 'manual', url, visibility })
+    setState({ kind: copied ? 'copied' : 'manual', reach, url, visibility })
   }
 
   const publish = async (url: string) => {
@@ -541,7 +548,7 @@ export function ShareLink() {
       {message && (
         <p
           className={
-            state.kind === 'publish-failed'
+            shareMessageTone(state) === 'warn'
               ? 'text-[11px] text-amber-300/80 leading-relaxed'
               : 'text-[11px] text-sidebar-foreground/50 leading-relaxed'
           }
