@@ -2039,3 +2039,70 @@ reading before that was an artefact.
 One real observation survives it: at ~1.5 fps on a 485 k-triangle scene the
 keep-alive cannot outrun the 3 s staleness window, and a remote avatar can
 blink out and back. Not a wire fault — a note for the frame budget.
+
+## TWO PEOPLE, ONE CALL — three bugs between a connected pair and a conversation
+
+The ask was "talk to each other like if we were on a call or teammates in
+fortnite". Every unit test passed and the mesh was reported as connecting, so the
+two-browser harness (`docs/qa/qa-boots-voice.mjs`) was written to answer the one
+question none of them can: do two real Chromium sessions on the real bus end up
+holding each other's audio? Its verdict was **false** on every run until tonight,
+for three different reasons in sequence. All three are the same *kind* of bug —
+nothing threw, no counter moved, and both ends reported a healthy call.
+
+**1. Presence churn was destroying handshakes.** A link was reaped the first tick
+its peer failed to appear in the presence roster, taking the connection, the
+gathered candidates, the epoch and the applied watermark with it — so the pair
+restarted from zero on both sides and never got the few seconds a handshake needs.
+The roster sampler added for this printed the evidence directly:
+`roster {"drops":1,"maxAgeMs":5668}` with `reaped: 1` on both sides of a call
+nobody had left. Presence rides the render loop and voice rides an interval, so a
+backgrounded tab stops publishing poses entirely while its voice frames keep
+arriving the whole time — which makes the roster the wrong place to ask whether
+somebody is still in a call. Liveness now comes from their voice frames, and
+absence needs `PEER_ABSENT_MS` before anything is torn down.
+
+**2. A frozen tab reaped the whole room on its first tick back.** Every deadline
+in the module is a difference against a clock the interval is assumed to be
+advancing. `stalls: 35` per run says how untrue that is: gaps over a second, in a
+tab that was merely behind another one. Read literally, the tick that lands on
+resume says every peer went silent and every handshake timed out, simultaneously.
+A gap over `TICK_STALL_MS` is now credited back to every deadline each link owns.
+Time the page was awake for still counts — the credit forgives the freeze, not the
+peer.
+
+**3. The answerer never negotiated its own audio.** With the mesh finally staying
+up, the harness reported `A holds B's audio: false` / `B holds A's audio: true` —
+a connected pair, a live sender on both ends, and one person inaudible.
+`voiceInternals()` was written for exactly this, because `voice()` cannot see it:
+
+```
+A  transceiver mid=0     direction=sendrecv  current=sendonly
+B  transceiver mid=null  direction=sendrecv  current=null
+B  transceiver mid=0     direction=recvonly  current=recvonly
+```
+
+WebRTC recycles an existing transceiver for an incoming m-line only when it came
+from `addTrack`; one created with `addTransceiver` is a request for an m-line of
+our own. So the answerer held two — its own, which could never acquire an m-line
+because an answer cannot add them, and the one the offer implicitly created, which
+the spec defines as **recvonly**. Its answer said "I only receive". Accurate, and
+fatal. The answerer now adopts the associated transceiver before `createAnswer`,
+forces it to `sendrecv`, and moves its sender there so the mic reaches the m-line
+rather than an orphan.
+
+Found on the way, both from the same root — **signalling here is a resend loop and
+every stage of a handshake is an `await`**: the answerer started a whole new
+negotiation for every duplicate of an offer it was already answering (4 applied and
+7 answers sent for one offer at epoch 1), and a duplicate *answer* hit
+`setRemoteDescription` twice, whose rejection path **restarts the pair** — hanging
+up on a working call as the reward for the peer's patience. `link.busy` claims the
+epoch synchronously, before the first await.
+
+**Verdict now, twice in a row:** mesh connected both ways, audio flowing both ways,
+0 given up, 0 reaped, 0 restarts, and the talk gate observed end to end — A's mic
+opened and B's HUD counted A as talking. 2303 tests, tsc clean.
+
+The harness had been muting both microphones, incidentally: the session comes up
+`live` when permission was already granted, and M is a toggle. A call where nobody
+can speak was never the thing under test.

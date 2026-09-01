@@ -968,6 +968,39 @@ attempt every fifteen seconds for the rest of the session and still be silent.
 when there is one. There is no TURN today; the honest consequence is in the "not
 handled" list below.
 
+### The answerer has to send, not only receive
+
+**Before `createAnswer`, the answerer adopts the transceiver the offer created and
+points it at `sendrecv`.** Without that step a call connects and exactly one
+person can be heard.
+
+WebRTC recycles an existing transceiver for an incoming m-line only when that
+transceiver came from `addTrack`; one created with `addTransceiver` is understood
+as a request for an m-line **of our own**. So the answerer ended up holding two:
+the one it made up front, associated with no m-line and unable to ever acquire one
+because an answer cannot add m-lines, and the one the offer implicitly created —
+which the spec defines as **`recvonly`**. Its answer said "I only receive", which
+was accurate. `voiceInternals()` on the two tabs, side by side:
+
+```
+A  transceiver mid=0     direction=sendrecv  current=sendonly
+B  transceiver mid=null  direction=sendrecv  current=null
+B  transceiver mid=0     direction=recvonly  current=recvonly
+```
+
+The offerer settled at `sendonly` and its receiver track stayed muted for the rest
+of the session — with a live sender, a connected pair and a green readout on both
+ends. Nothing threw and no counter moved, which is why this needed a per-direction
+dump to find at all.
+
+`adoptAssociatedTransceiver` also moves `link.sender` onto the associated
+transceiver, because a mic swapped into the orphan's sender is a track attached to
+no m-line: nobody is sent it, and every readout still says the mic is live. The
+orphan is stopped so it cannot demand an m-line in a later negotiation. The
+offerer's own transceiver is untouched — that side was never broken, and the fake
+`RTCPeerConnection` in the tests models the implicit `recvonly` transceiver so
+none of this can regress quietly.
+
 ### One negotiation at a time, per pair
 
 **`link.busy` claims an epoch synchronously, before the first `await`, and is
