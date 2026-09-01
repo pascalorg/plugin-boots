@@ -2203,3 +2203,50 @@ paragraph directly above the share button promised "they land in this project an
 jump straight into the game with you" unconditionally — sitting on top of a button
 that had just been taught to say the opposite when true. Whichever of the two he reads
 first is the one he acts on, so the blurb follows reach too now.
+
+## THE WHITE CIRCLE — what the pixels say, and what they still cannot say
+
+The report was precise: "quand je spray paint, ca clignote en blanc au niveau de la ou
+le spray touche le mur (cercle) au moment ou je click. apres la couleur reste tout
+bien." Three lanes draw a circle at the impact point, and two of them deliberately
+prime an InstancedMesh's colours WHITE before the first draw — the sprite pool and
+dust both carry the same comment about a WebGPU pipeline compiled without
+instanceColor ignoring every later setColorAt. So reading the code produced three
+plausible culprits and no way to choose between them.
+
+`docs/qa/qa-paint-flash.mjs` samples the pixels under the crosshair on every animation
+frame across a spray pulse and prints the trace. **On the decal lane there is no
+flash.** 240 frames at 60 fps, twice over, plus another two dozen traced pulses at
+distances from 1.3 m to 4.9 m: the pixel goes straight from the wall to the coat and
+stays there. Decals grew on every single pulse, so the spray really was landing.
+
+Three earlier attempts had to be thrown away, and how they failed is the useful part:
+
+**A steady pixel is not evidence.** The first two runs traced a beautifully constant
+colour and would have reported "no flash" — while `census()` sat at all zeros. Nothing
+had been sprayed at all. The editor's wireframe LineSegments sit in front of every
+surface, so `identifyAim()[0]` is never the wall, and paint only lands on nodes whose
+type is PAINTABLE. The fix is to stop aiming by geometry and aim by outcome: spray each
+candidate pose and keep the first one where the census actually GROWS. Any paint QA that
+does not assert a census delta is asserting nothing.
+
+**Palette index 0 is WHITE (#f4f4ef), and it is the default coat.** A trace taken on a
+fresh session cannot tell a white bug from white paint — the first run's one bright
+frame was simply white paint, correctly rendered. Cycle off index 0 first.
+
+**Standing 0.3 m from the wall invalidates the run**: the whole sampled patch starts
+inside the coat, so there is no before-colour to flash away from. That is how the third
+attempt "cleared" a lane it never traced.
+
+What is still open: the splat-SPRITE pool only draws on Boots-owned voxels — a wall
+that has already taken damage — and it cannot be reached from a script, because guns
+have no QA fire hook (paintDebug and builderDebug expose `holdFire`; the gun path does
+not). Every wall in the test building is pristine, so `sprites` never moved. The
+sprite lane is the one lane the report could still be about, and it is also the lane
+carrying the white priming and the header that calls its stamps "circles near AND far".
+
+So the localizing question is now a single yes/no, and it is the owner's to answer:
+does the flash happen on a wall he has ALREADY SHOT, or on an untouched one? Untouched
+means the decal lane, which is on the record as clean and would send us to the mist
+puff or the HUD instead. Already-shot means the sprite pool, and the trace tooling is
+sitting there ready to run.
