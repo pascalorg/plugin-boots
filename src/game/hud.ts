@@ -141,7 +141,9 @@ export const KEYBAR_DEFAULT = 'Esc exit · G grenade · R rotate/shape · F edit
  * PIECE_KEYS + the Q cycle (duplicated as display data — hud must not import
  * the React builder: builder → session → hud would cycle). */
 const BUILDER_KEY_CODES: ReadonlyArray<readonly [string, string]> = [
-  ['KeyZ', 'wall'],
+  // Z is the wall FAMILY key — press it again to step solid → door → window
+  // (builder.nextWallVariant). Q cycles the whole menu.
+  ['KeyZ', 'wall·door·window'],
   ['KeyX', 'floor'],
   ['KeyC', 'stairs'],
   ['KeyV', 'roof'],
@@ -173,6 +175,14 @@ export function builderKeybarText(
     ' · ',
   )
   return `${pieces} · R rotate/shape · F edit · U undo · Esc exit`
+}
+
+/** What the weapon line prints while the builder is held: the SELECTION, not
+ * just the piece — a wall with an aperture is a DOOR or a WINDOW to the
+ * player (the piece is a wall only to the grid). Pure; the store subscription
+ * renders it. */
+export function buildSelectionLabel(piece: string, opening: string | null): string {
+  return (opening ?? piece).toUpperCase()
 }
 
 /** Hitmarker flavors — see hitmarker() in the header. */
@@ -820,7 +830,10 @@ export class Hud {
       const s = useBoots.getState()
       if (this.weaponEl) {
         const label = WEAPON_LABEL[s.weapon] ?? s.weapon.toUpperCase()
-        this.weaponEl.textContent = s.weapon === 'builder' ? `${label} · ${s.buildPiece.toUpperCase()} (Q)` : label
+        this.weaponEl.textContent =
+          s.weapon === 'builder'
+            ? `${label} · ${buildSelectionLabel(s.buildPiece, s.buildOpening)} (Q)`
+            : label
       }
       // Keybind bar tracks the held weapon: the builder shows its piece
       // hotkeys (Z/X/C/V/Q — discoverability), everything else the default.

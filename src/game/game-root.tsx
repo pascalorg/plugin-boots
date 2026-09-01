@@ -28,11 +28,13 @@ import { Doors, doorsDebug } from './doors'
 import { clearDust, dustDebug, DustSystem, setDustFloorProbe } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
+import { PlacedFittings } from './fittings'
 import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
 import { groundSurfaceY, resetGround } from './ground'
 import { GunTable } from './guntable'
 import { HostPostTuning, hostPostDebug } from './host-post'
+import { resetGameOperables } from './interact'
 import { GameItems } from './item-place'
 import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
@@ -874,6 +876,9 @@ function ActiveGame() {
       // it with the session so a next Jump-in on a flat scene, or a test,
       // never inherits the last lot's terrain.
       resetGround()
+      // Built doors/windows are retained facts on the E lane (they outlive an
+      // interact remount on purpose) — the SESSION is what ends them.
+      resetGameOperables()
       resetDestruction()
       resetGlass()
       clearDebris()
@@ -901,6 +906,9 @@ function ActiveGame() {
       <GunTable world={world} />
       <Doors world={world} />
       <PlacedPieces world={world} />
+      {/* The leaves that hang in the pieces above — a built wall's pocketed
+       * middle column becomes a door or a window you open with E. */}
+      <PlacedFittings world={world} />
       <GameItems world={world} />
       <Builder />
       <Enemies world={world} />

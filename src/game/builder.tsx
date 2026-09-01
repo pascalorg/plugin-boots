@@ -13,7 +13,13 @@ import {
   type Mesh,
 } from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
-import { type BuildPiece, FULL_MASK, type PlacedPiece, useBoots } from '../store'
+import {
+  type BuildOpening,
+  type BuildPiece,
+  FULL_MASK,
+  type PlacedPiece,
+  useBoots,
+} from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
 import { spawnDebris } from './debris'
@@ -69,6 +75,7 @@ import {
 import { getSession } from './session'
 import {
   buildSyncOn,
+  forgetGridStamp,
   forgetSharedPieces,
   isForeignPiece,
   publishGridStamp,
@@ -155,6 +162,26 @@ import { bvhFor, type ColliderEntry, type GameWorld } from './world'
  * editing; Q piece-cycling is gated off via builderDebug.isEditing
  * (viewmodel.tsx feature-detects the flag).
  * NOTE: needs 'KeyF' in input.ts GAME_KEYS to receive the key.
+ *
+ * ── THE WALL FAMILY: DOORS AND WINDOWS (owner ask 2026-09-01) ──────────────
+ * "In the build menu make sure I could place windows and doors as well. In a
+ * way that makes sense. And that I could use them by pressing E afterward."
+ * A door and a window are NOT new pieces: they are a WALL whose middle
+ * column is pocketed (DOOR_MASK / WINDOW_MASK — the exact patterns
+ * planWallMask already classifies). That choice is the whole design:
+ *   - the aperture is a real hole in the rendered mesh, the collider and the
+ *     voxel replica from the first frame, because the mask already drives all
+ *     three (geometryForMask);
+ *   - multiplayer replication is free — the piece record already carries
+ *     `mask`, so a peer's door arrives as a door with NO wire-format change;
+ *   - Keep already turns those exact masks into real host door/window nodes
+ *     pocketed into the wall (keep.ts's MASK → NODE MAPPING);
+ *   - support, occupancy and slot addressing are untouched: it is a wall.
+ * The swinging leaf/sash that E operates is derived from the same mask by
+ * fittings.tsx — nothing about it is stored.
+ * SELECTION: Z is the wall FAMILY key — press it again to step solid → door
+ * → window (nextWallVariant); Q cycles the whole menu (BUILD_CYCLE). The
+ * ghost previews the pocketed mask, so you see the hole before you place.
  *
  * ── API (exported for tests / other systems) ──────────────────────────────
  *   PIECE_DIMS / pieceDims / piecePose    piece geometry + pose from base
@@ -671,6 +698,60 @@ export function trimmedWallSpan(
 export const HALF_WALL_MASK = 0b000000111 // 7
 /** Bottom two rows alive — 2/3 wall (Keep trims to 1.87 m). */
 export const TWO_THIRD_WALL_MASK = 0b000111111 // 63
+// --- The wall family: door / window presets --------------------------------
+
+/** The column every built aperture is pocketed into: the MIDDLE one. A 3 m
+ * wall with a centered opening is the answer that always reads right, and it
+ * keeps R free for the wall's far-edge parity flip (a door that wandered
+ * columns on every R press would fight the aim). */
+export const OPENING_COL = 1
+
+/** DOOR: the middle column's bottom TWO cells dead — a cell-wide doorway
+ * 2·span/3 tall (1.87 m on a classic 2.8 storey). planWallMask reads it as
+ * `pocket: 'door'` at that column and Keep pockets a real door node there. */
+export const DOOR_MASK =
+  FULL_MASK & ~((1 << maskBit(OPENING_COL, 0)) | (1 << maskBit(OPENING_COL, 1))) // 493
+
+/** WINDOW: the middle column's MIDDLE cell dead — a cell-wide, span/3-tall
+ * opening at chest height. planWallMask reads it as `pocket: 'window'`. */
+export const WINDOW_MASK = FULL_MASK & ~(1 << maskBit(OPENING_COL, 1)) // 495
+
+/** The 3×3 mask the build menu's current selection places. Only walls can
+ * carry an aperture; everything else is intact. */
+export function wallOpeningMask(piece: BuildPiece, opening: BuildOpening): number {
+  if (piece !== 'wall' || opening === null) return FULL_MASK
+  return opening === 'door' ? DOOR_MASK : WINDOW_MASK
+}
+
+/** One entry of the build menu — a piece plus, for walls, its variant. */
+export type BuildSelection = { piece: BuildPiece; opening: BuildOpening }
+
+/** The build menu in Q-cycle order: the WALL FAMILY first (solid, door,
+ * window — one slot, one mask apart), then floor, stairs, roof. Mirrored as
+ * display data by hud.ts (which must not import this module). */
+export const BUILD_CYCLE: ReadonlyArray<BuildSelection> = [
+  { piece: 'wall', opening: null },
+  { piece: 'wall', opening: 'door' },
+  { piece: 'wall', opening: 'window' },
+  { piece: 'floor', opening: null },
+  { piece: 'stairs', opening: null },
+  { piece: 'roof', opening: null },
+]
+
+/** Q: the next entry of BUILD_CYCLE after this selection (wrapping). An
+ * unknown selection — e.g. an opening left on a non-wall by a future caller
+ * — restarts the cycle at the solid wall. Pure; viewmodel.tsx's Q handler. */
+export function nextBuildSelection(piece: BuildPiece, opening: BuildOpening): BuildSelection {
+  const at = BUILD_CYCLE.findIndex((s) => s.piece === piece && s.opening === opening)
+  return BUILD_CYCLE[(at + 1) % BUILD_CYCLE.length]!
+}
+
+/** Z pressed while already on the wall family: solid → door → window → solid.
+ * Pure. */
+export function nextWallVariant(opening: BuildOpening): BuildOpening {
+  return opening === null ? 'door' : opening === 'door' ? 'window' : null
+}
+
 /** Staircase silhouette, column heights 1·2·3 ascending toward local +X
  * (bits 0,1,2 + 4,5 + 8). */
 export const STAIR_UP_MASK = 0b100110111 // 311
@@ -726,6 +807,10 @@ type GhostState = {
   z: number
   yaw: number
   piece: BuildPiece
+  /** The 3×3 cell mask the click will place — FULL_MASK for everything but
+   * the wall family's door/window variants, whose pocket the ghost previews
+   * (wallOpeningMask). */
+  mask: number
   /** The resolved slot's storey span — the piece the click will place
    * conforms to it (wall height, stairs rise, roof corner rise). */
   span: number
@@ -746,6 +831,7 @@ const _debugGhost: GhostState = {
   z: 0,
   yaw: 0,
   piece: 'wall',
+  mask: FULL_MASK,
   span: WALL_H,
   corners: null,
   valid: false,
@@ -773,6 +859,7 @@ export const builderDebug: {
   ghost: () => GhostState
   anchor: () => GridAnchor
   ladder: () => number[] | null
+  terrainY: () => number
   worldToGrid: (x: number, z: number, yaw?: number) => { x: number; z: number; yaw: number }
 } = {
   holdFire: false,
@@ -783,6 +870,10 @@ export const builderDebug: {
     const ladder = getStoreyLadder()
     return ladder ? [...ladder] : null
   },
+  // The dirt the storeys are measured from — a sunk lattice (ground pieces
+  // half buried, ceilings at chest height) is this number disagreeing with
+  // the ground the player is actually standing on.
+  terrainY: () => gridTerrainY(),
   worldToGrid: (x, z, yaw = 0) => worldToGrid(x, z, yaw),
 }
 
@@ -1216,9 +1307,13 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     setStoreyLadder(world.storeyLadder ?? null)
     // SLOT IDS ARE ADDRESSES IN THIS FRAME, so a peer only means the same
     // thing by "Wx:1,0,0" if it installed the same one. Publish the
-    // fingerprint the moment the frame exists and never again — a peer whose
-    // stamp differs has its slot-addressed pieces refused rather than landed
-    // in the wrong place (shared-build surfaces that refusal to the player).
+    // fingerprint the moment the frame exists — a peer whose stamp differs has
+    // its slot-addressed pieces refused rather than landed in the wrong place
+    // (shared-build surfaces that refusal to the player). The call is a
+    // RETAINED FACT, not an event: this effect is a child's and runs BEFORE the
+    // parent effect that attaches the transport, so shared-build holds the
+    // frame and republishes it on attach. It used to no-op in that window,
+    // which cost the whole pieces lane in production — see publishGridStamp.
     // The terrain rung goes in first: with no ladder the storeys are measured
     // from it, so two lots at different elevations are genuinely different
     // grids even when the anchor and the ladder match. The anchor's YAW counts
@@ -1254,6 +1349,7 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
       resetGridAnchor() // the lattice frame dies with the session — back to identity
       resetStoreyLadder() // …and the storeys fall back to uniform 2.8
       resetGridTerrainY() // …measured from the lot plane again
+      forgetGridStamp() // …and the retained fingerprint dies with the frame it names
       resetCladQueue() // pending clads die too (their meshes just unmounted)
       // Span-keyed geometry caches die with the ladder that minted their
       // spans (they'd otherwise grow per building across an editor run).
@@ -1468,6 +1564,7 @@ export function Builder() {
 
   const weapon = useBoots((s) => s.weapon)
   const buildPiece = useBoots((s) => s.buildPiece)
+  const buildOpening = useBoots((s) => s.buildOpening)
   const active = weapon === 'builder'
 
   useEffect(() => {
@@ -1538,11 +1635,18 @@ export function Builder() {
     // Direct piece hotkeys (Z/X/C/V — PIECE_KEYS): fresh edges only, inert
     // while an F edit is open (same gate as Q cycling), trackers kept warm
     // so holding a key across an edit never edge-switches on exit.
+    // Z is the WALL FAMILY key: pressed while already on a wall it steps the
+    // variant (solid → door → window), so the apertures are one key away
+    // without stealing a second letter from the loadout.
     for (const [code, pieceForKey] of PIECE_KEYS) {
       const down = session.input.state.keys.has(code)
       if (down && !prevPieceKeys.current[code] && !edit) {
-        if (useBoots.getState().buildPiece !== pieceForKey) {
-          useBoots.getState().setBuildPiece(pieceForKey)
+        const store = useBoots.getState()
+        if (pieceForKey === 'wall' && store.buildPiece === 'wall') {
+          store.setBuildOpening(nextWallVariant(store.buildOpening))
+          sfx.weaponSwitch()
+        } else if (store.buildPiece !== pieceForKey) {
+          store.setBuildPiece(pieceForKey)
           sfx.weaponSwitch()
         }
       }
@@ -1736,11 +1840,16 @@ export function Builder() {
     // compare — placement below still spreads its own copy.
     const ghostCorners =
       buildPiece === 'roof' ? ROOF_PRESETS[((rotateTurns.current % 4) + 4) % 4]! : null
+    // The wall family's aperture, previewed: the ghost shows the POCKETED
+    // mask, so the hole is visible before the click (owner ask — "before
+    // placing … there should be a preview transparent").
+    const ghostMask = wallOpeningMask(buildPiece, buildOpening)
 
     if (
       !ghost ||
       ghost.slotId !== target.slotId ||
       ghost.piece !== buildPiece ||
+      ghost.mask !== ghostMask ||
       ghost.yaw !== pose.yaw ||
       ghost.span !== span ||
       ghost.valid !== target.valid ||
@@ -1754,6 +1863,7 @@ export function Builder() {
         z: pose.position[2],
         yaw: pose.yaw,
         piece: buildPiece,
+        mask: ghostMask,
         span,
         corners: ghostCorners,
         valid: target.valid,
@@ -1767,6 +1877,7 @@ export function Builder() {
     _debugGhost.z = pose.position[2]
     _debugGhost.yaw = pose.yaw
     _debugGhost.piece = buildPiece
+    _debugGhost.mask = ghostMask
     _debugGhost.span = span
     _debugGhost.corners = ghostCorners
     _debugGhost.valid = target.valid
@@ -1805,6 +1916,10 @@ export function Builder() {
           position: [pose.position[0], pose.position[1], pose.position[2]],
           yaw: pose.yaw,
           slotId: target.slotId,
+          // The wall family lands AS its aperture: a door/window is this mask
+          // and nothing else (see THE WALL FAMILY above). fittings.tsx reads
+          // it back to hang the leaf E operates.
+          mask: ghostMask,
           // The piece conforms to its slot's LOCAL storey span for its
           // whole life (render, collide, edit, Keep).
           height: span,
@@ -1909,13 +2024,21 @@ export function Builder() {
   // already-placed piece would otherwise sit exactly coplanar with its
   // faces and z-fight (transparent + no depthWrite still depth-TESTS).
   const ghostDims = pieceDims(ghost.piece, ghost.span)
+  // The wall family's door/window previews its POCKET: the same merged-cell
+  // geometry the placement will render, so the hole is part of the preview
+  // (inflation moves to the transform — the geometry is a shared cache row).
+  const maskedGeometry =
+    ghost.mask === FULL_MASK ? null : geometryForMask(ghost.piece, ghost.mask, ghost.span)
   return (
     <group ref={ghostRef} userData={{ __boots: true }}>
       <mesh
         position={[ghost.x, pose.y, ghost.z]}
         rotation={[pose.tilt, ghost.yaw, 0, 'YXZ']}
+        {...(maskedGeometry ? { geometry: maskedGeometry, scale: 1.03 } : {})}
       >
-        <boxGeometry args={[ghostDims[0] * 1.03, ghostDims[1] * 1.03, ghostDims[2] * 1.03]} />
+        {!maskedGeometry && (
+          <boxGeometry args={[ghostDims[0] * 1.03, ghostDims[1] * 1.03, ghostDims[2] * 1.03]} />
+        )}
         <meshBasicMaterial
           color={ghost.valid ? '#59a7ff' : '#ff5a4d'}
           depthWrite={false}
@@ -1928,9 +2051,10 @@ export function Builder() {
        * fill only reads face-on (walls, roofs). The edges read from any
        * angle (owner report: "no preview when I place floor"). */}
       <lineSegments
-        geometry={ghostEdges(ghost.piece, ghost.span)}
+        geometry={ghostEdges(ghost.piece, ghost.span, ghost.mask)}
         position={[ghost.x, pose.y, ghost.z]}
         rotation={[pose.tilt, ghost.yaw, 0, 'YXZ']}
+        {...(maskedGeometry ? { scale: 1.03 } : {})}
       >
         <lineBasicMaterial
           color={ghost.valid ? '#8ec4ff' : '#ff7a6e'}
@@ -1943,18 +2067,27 @@ export function Builder() {
   )
 }
 
-/** Edge-outline geometry per (piece, span) — module cache: a handful of
- * entries per session (pieces × storey spans), never disposed until the
- * plugin unloads, matching pieceDims' cache lifetime. */
+/** Edge-outline geometry per (piece, span, mask) — module cache: a handful of
+ * entries per session (pieces × storey spans × the two aperture masks), never
+ * disposed until the plugin unloads, matching pieceDims' cache lifetime. An
+ * intact mask outlines the inflated box; a pocketed one outlines the
+ * merged-cell shape, so the door/window reads as a hole from any angle (the
+ * cell seams come along, which is exactly the 3×3 grammar the player edits
+ * in). */
 const ghostEdgeCache = new Map<string, EdgesGeometry>()
-function ghostEdges(piece: BuildPiece, span: number): EdgesGeometry {
-  const key = `${piece}:${span}`
+function ghostEdges(piece: BuildPiece, span: number, mask = FULL_MASK): EdgesGeometry {
+  const key = `${piece}:${span}:${mask}`
   let edges = ghostEdgeCache.get(key)
   if (!edges) {
-    const d = pieceDims(piece, span)
-    const box = new BoxGeometry(d[0] * 1.03, d[1] * 1.03, d[2] * 1.03)
-    edges = new EdgesGeometry(box)
-    box.dispose()
+    const masked = mask === FULL_MASK ? null : geometryForMask(piece, mask, span)
+    if (masked) {
+      edges = new EdgesGeometry(masked)
+    } else {
+      const d = pieceDims(piece, span)
+      const box = new BoxGeometry(d[0] * 1.03, d[1] * 1.03, d[2] * 1.03)
+      edges = new EdgesGeometry(box)
+      box.dispose()
+    }
     ghostEdgeCache.set(key, edges)
   }
   return edges

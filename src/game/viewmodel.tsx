@@ -6,7 +6,7 @@ import type { Group, Mesh, Object3D } from 'three'
 import type { WeaponId } from '../store'
 import { useBoots } from '../store'
 import { sfx } from './audio'
-import { builderDebug } from './builder'
+import { builderDebug, nextBuildSelection } from './builder'
 import { throwGrenade } from './grenade'
 import { isItemMenuOpen } from './inventory'
 import { itemGhostActive, useItems } from './item-place'
@@ -275,8 +275,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         const editFlag = (builderDebug as { isEditing?: boolean | (() => boolean) }).isEditing
         const editing = typeof editFlag === 'function' ? editFlag() : editFlag === true
         if (!editing) {
-          const order = ['wall', 'floor', 'stairs', 'roof'] as const
-          state.setBuildPiece(order[(order.indexOf(state.buildPiece) + 1) % order.length]!)
+          // The whole build menu, wall variants included: solid wall → door →
+          // window → floor → stairs → roof (builder.BUILD_CYCLE).
+          const next = nextBuildSelection(state.buildPiece, state.buildOpening)
+          if (next.opening === null) state.setBuildPiece(next.piece)
+          else state.setBuildOpening(next.opening)
         }
       }
     }

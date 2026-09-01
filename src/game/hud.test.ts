@@ -22,7 +22,9 @@ import {
 describe('builder keybind bar', () => {
   test('advertises every piece hotkey, the cycle, and the standing keys', () => {
     const bar = builderKeybarText()
-    expect(bar).toContain('Z wall')
+    // Z is the wall FAMILY key — a player who never presses Q must still be
+    // told doors and windows exist (owner ask 2026-09-01).
+    expect(bar).toContain('Z wall·door·window')
     expect(bar).toContain('X floor')
     expect(bar).toContain('C stairs')
     expect(bar).toContain('V roof')

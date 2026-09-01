@@ -7,6 +7,15 @@ export type WeaponId = 'knife' | 'pistol' | 'rifle' | 'minigun' | 'hammer' | 'bu
  * holds one or the other, never both. */
 export type BuildPiece = 'wall' | 'floor' | 'stairs' | 'roof'
 
+/** A wall's built-in APERTURE — the build menu's door/window presets.
+ * The piece stays a plain 'wall': the opening is nothing but its 3×3 cell
+ * mask with the middle column pocketed (builder.wallOpeningMask), so
+ * multiplayer replication, the support graph, slot occupancy and Keep's
+ * mask → node mapping all keep working with no new concepts. The swinging
+ * leaf/sash that E operates is derived from the same mask by fittings.tsx.
+ * null = a solid wall. */
+export type BuildOpening = 'door' | 'window' | null
+
 /** All nine cells of a piece's 3×3 grid alive (see PlacedPiece.mask). */
 export const FULL_MASK = 0b111111111
 
@@ -60,6 +69,9 @@ type BootsState = {
    * blocked. Set/cleared by player.tsx's stagger loop. */
   staggered: boolean
   buildPiece: BuildPiece
+  /** The wall variant the build menu is on — see BuildOpening. Meaningful
+   * only while buildPiece is 'wall'; every other piece clears it. */
+  buildOpening: BuildOpening
   /** Pieces placed in build mode this session (or awaiting Keep/Discard). */
   placed: PlacedPiece[]
 
@@ -70,7 +82,13 @@ type BootsState = {
   setReloading: (reloading: boolean) => void
   setHealth: (health: number) => void
   setStaggered: (staggered: boolean) => void
+  /** Select a piece. ALWAYS clears buildOpening: picking floor/stairs/roof
+   * leaves the wall family, and picking 'wall' means the SOLID wall (the
+   * door/window variants are reached through setBuildOpening). */
   setBuildPiece: (piece: BuildPiece) => void
+  /** Select a wall variant — forces buildPiece to 'wall', since an aperture
+   * is a wall mask and nothing else can carry one. */
+  setBuildOpening: (opening: BuildOpening) => void
   /** Append a placement (mask defaults to FULL_MASK, slotId optional —
    * pass the grid slot so the support graph can track the piece).
    * Returns the stored piece so callers can wire id ↔ slotId maps. */
@@ -117,6 +135,7 @@ export const useBoots = create<BootsState>((set, get) => ({
   health: 100,
   staggered: false,
   buildPiece: 'wall',
+  buildOpening: null,
   placed: [],
 
   setPhase: (phase) => set({ phase }),
@@ -127,7 +146,8 @@ export const useBoots = create<BootsState>((set, get) => ({
   setReloading: (reloading) => set({ reloading }),
   setHealth: (health) => set({ health }),
   setStaggered: (staggered) => set({ staggered }),
-  setBuildPiece: (buildPiece) => set({ buildPiece }),
+  setBuildPiece: (buildPiece) => set({ buildPiece, buildOpening: null }),
+  setBuildOpening: (buildOpening) => set({ buildPiece: 'wall', buildOpening }),
   addPlaced: (piece) => {
     const stored: PlacedPiece = { mask: FULL_MASK, ...piece, id: placedId++ }
     set((s) => ({ placed: [...s.placed, stored] }))
@@ -169,6 +189,7 @@ export const useBoots = create<BootsState>((set, get) => ({
       health: 100,
       staggered: false,
       buildPiece: 'wall',
+      buildOpening: null,
       // `placed` deliberately survives re-entry — an undecided Keep/Discard
       // resumes. It also survives a RELOAD now (pending-store.ts), so the
       // decision is offered for as long as it is open, not just on the Esc

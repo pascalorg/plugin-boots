@@ -52,6 +52,10 @@ import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world
  * - Windows (sliding/casement/awning/hopper/single-hung/double-hung/
  *   louvered): poseWindowMovingParts from @pascal-app/viewer. Fixed/bay/bow
  *   panes don't operate.
+ * - GAME-BUILT doors/windows (the builder's wall pockets — fittings.tsx):
+ *   registered at runtime through registerGameOperable instead of collected
+ *   from the scene. No host node, so they are plain hinged leaves; a window
+ *   sash swings the same way and only its prompt noun differs.
  * - Cabinets (cabinet/cabinet-module): every subtree object carrying
  *   userData.cabinetPose {type:'rotate'|'translate', axis, angle|distance}
  *   lerped by openScale (a local 10-line re-implementation of the host's
@@ -98,6 +102,18 @@ import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world
 
 export const AIM_RANGE = 2.5
 export const DOOR_FALLBACK_RANGE = 1.2
+/** Vertical slack on the point-blank fallback (m): how far the player's EYE
+ * may sit outside the leaf's own vertical extent and still count as standing
+ * at that door. The fallback used to measure a 3-D distance to the leaf's
+ * CENTRE, which quietly made it height-dependent — the eye rides 1.58 m up
+ * while a doorway the player BUILT on a 2.5 m storey is only 1.67 m tall, so
+ * its centre sits ~0.7 m BELOW the eye and half the 1.2 m budget went
+ * straight UP: E stopped answering at arm's length in front of an open
+ * doorway (owner QA 2026-09-01), and host doors lost the last 20 cm of their
+ * range for the same reason. "Shoulders against the leaf" is a HORIZONTAL
+ * notion; this band is only here to keep the door one storey up — or one
+ * storey down — from answering. */
+export const DOOR_FALLBACK_RISE = 0.6
 const TABLE_RANGE = 2.4
 const OPEN_ANGLE = (100 * Math.PI) / 180
 
@@ -237,9 +253,15 @@ export type OperableState = {
   nodeId: string
   root: Object3D
   node: Record<string, unknown> | null
+  /** Prompt noun override — a GAME-BUILT casement sash swings exactly like a
+   * door leaf (kind 'door-hinged'), but the player must read "window". Absent
+   * on host nodes, where the kind already carries the noun. */
+  noun?: 'door' | 'window'
   colliders: ColliderEntry[]
-  /** World-space bounds center at snapshot time — proximity anchor. */
-  center: Vector3
+  /** World-space collider bounds at snapshot time — THE DOORWAY, which stays
+   * where the frame is however far the leaf has swung out of it. The
+   * point-blank fallback stands the player against this. */
+  mountBox: Box3
   /** Colliders drop while open (doors, out-swing windows). */
   passable: boolean
   /** Doorway prism for passage relief (passable kinds only): collider-group
@@ -577,7 +599,7 @@ export function advanceOperables(states: Iterable<OperableState>, dt: number): v
 function collidersOf(
   world: GameWorld,
   colliderIndices: readonly number[],
-): { colliders: ColliderEntry[]; center: Vector3 } | null {
+): { colliders: ColliderEntry[]; bounds: Box3 } | null {
   const colliders: ColliderEntry[] = []
   const worldBounds = new Box3()
   for (const index of colliderIndices) {
@@ -587,7 +609,7 @@ function collidersOf(
     worldBounds.union(collider.worldBox)
   }
   if (colliders.length === 0 || worldBounds.isEmpty()) return null
-  return { colliders, center: worldBounds.getCenter(new Vector3()) }
+  return { colliders, bounds: worldBounds }
 }
 
 function buildHingedRig(root: Object3D, colliders: ColliderEntry[]): HingedRig {
@@ -650,7 +672,7 @@ function buildState(
     root: entry.root,
     node,
     colliders: picked.colliders,
-    center: picked.center,
+    mountBox: picked.bounds,
     passable,
     passage: passable ? buildPassageBox(picked.colliders) : null,
     ballistic: false,
@@ -706,8 +728,106 @@ export function mountInteract(world: GameWorld): Map<string, OperableState> {
       restoreValue: state.restoreValue,
     })
   }
+  // GAME-BUILT doors/windows are a RETAINED FACT, not an event (the
+  // publishGridStamp pattern): a piece can be placed — or arrive from a peer —
+  // before this component mounts, and it must still answer E. They keep their
+  // live state across a remount; no restore ledger, since their meshes are the
+  // plugin's own and die with the session.
+  for (const [nodeId, state] of gameOperables) states.set(nodeId, state)
   activeStates = states
   return states
+}
+
+// ---------------------------------------------------------------------------
+// GAME-BUILT operables (the builder's door/window wall pockets)
+// ---------------------------------------------------------------------------
+
+/**
+ * One door/window the PLAYER built. fittings.tsx owns the leaf mesh and its
+ * collider; this lane owns the swing, the prompt and E.
+ *
+ * There is no host node behind it, which is exactly what `classifyOperable`
+ * calls a plain hinged door — and a casement sash swings the same way, so a
+ * built window is a hinged operable too, wearing `noun: 'window'` for the
+ * prompt. The rig hinges on the root's local −X edge (buildHingedRig), so the
+ * caller puts the root AT the hinge with the leaf reaching +X.
+ */
+export type GameOperableSpec = {
+  /** Unique, '__boots'-prefixed (the prevoxelize guard keys off it). */
+  nodeId: string
+  /** Hinge frame: the leaf's parent group, at the hinge, yawed with the wall. */
+  root: Object3D
+  /** The leaf's own collider entries (already pushed on world.colliders). */
+  colliders: ColliderEntry[]
+  noun: 'door' | 'window'
+  /** Register a doorway passage prism while open. Doors yes — the player walks
+   * through. Windows NO: nothing crosses a chest-high sash, and a prism there
+   * would relieve real wall contacts for no gain. */
+  passage: boolean
+  /** Raise the prism's ceiling to this world Y — the wall's TOP. A built
+   * doorway is two cells tall (2·span/3 ≈ 1.87 m on a classic storey, but
+   * only 1.67 m on a 2.5 m one) and the capsule is 1.78 m: without this the
+   * LINTEL cell above the leaf pinches the head and the player stands in an
+   * open doorway unable to cross. The prism only relieves NON-GROUND contacts
+   * inside the opening, so this buys the crossing nothing else. */
+  passageTop?: number
+}
+
+/** Live game-built operables, by nodeId — the retained facts mountInteract
+ * drains. Survives an interact remount; each fitting unregisters its own. */
+const gameOperables = new Map<string, OperableState>()
+
+/** Hang a built door/window on the E lane. Re-registering the same nodeId
+ * replaces it (a mask edit re-mints the leaf). Returns the live state, or null
+ * when there is nothing to hang (no colliders / empty bounds). */
+export function registerGameOperable(spec: GameOperableSpec): OperableState | null {
+  unregisterGameOperable(spec.nodeId)
+  if (spec.colliders.length === 0) return null
+  const bounds = new Box3()
+  for (const collider of spec.colliders) bounds.union(collider.worldBox)
+  if (bounds.isEmpty()) return null
+  const passage = spec.passage ? buildPassageBox(spec.colliders) : null
+  if (passage && spec.passageTop !== undefined && spec.passageTop > passage.max.y) {
+    passage.max.y = spec.passageTop
+  }
+  const state: OperableState = {
+    kind: 'door-hinged',
+    nodeId: spec.nodeId,
+    root: spec.root,
+    node: null,
+    noun: spec.noun,
+    colliders: spec.colliders,
+    mountBox: bounds,
+    passable: true,
+    passage,
+    ballistic: false,
+    value: 0,
+    open: false,
+    from: 0,
+    to: 0,
+    animT: DURATIONS['door-hinged'],
+    duration: DURATIONS['door-hinged'],
+    restoreValue: 0,
+    hinged: buildHingedRig(spec.root, spec.colliders),
+  }
+  gameOperables.set(spec.nodeId, state)
+  activeStates?.set(spec.nodeId, state)
+  return state
+}
+
+/** Drop a built door/window (the piece was undone, collapsed, re-masked, or
+ * the session ended). The caller still owns its collider entries. */
+export function unregisterGameOperable(nodeId: string): void {
+  const state = gameOperables.get(nodeId)
+  if (!state) return
+  gameOperables.delete(nodeId)
+  if (activeStates?.get(nodeId) === state) activeStates.delete(nodeId)
+  if (state.passage) unregisterPassage(state.passage)
+}
+
+/** Test isolation / hard session reset — every built operable forgotten. */
+export function resetGameOperables(): void {
+  for (const nodeId of [...gameOperables.keys()]) unregisterGameOperable(nodeId)
 }
 
 /**
@@ -793,10 +913,21 @@ export function pickAimedOperable(
   return best
 }
 
-/** Point-blank fallback: the nearest DOOR within range of the player —
- * shoulders-against-the-leaf territory where the crosshair may look past
- * the jamb. Windows/cabinets stay aim-only (you don't lean on a cabinet
- * expecting it to open). Pure — exported for tests. */
+/**
+ * Point-blank fallback: the nearest DOOR the player is standing at —
+ * shoulders-against-the-leaf territory where the crosshair may look past the
+ * jamb, or straight through an open doorway that has nothing left to hit.
+ *
+ * `position` is the EYE (playerRig.position), so the measurement is
+ * HORIZONTAL distance to the doorway's footprint plus a vertical band around
+ * its own extent (DOOR_FALLBACK_RISE). Distance to the leaf's centre would be
+ * a different range at every door height — see DOOR_FALLBACK_RISE for the
+ * doorway that made E stop answering. The footprint is the MOUNT-pose box: the
+ * doorway you are standing in, not wherever the leaf swung to.
+ *
+ * Windows/cabinets stay aim-only (you don't lean on a cabinet expecting it to
+ * open). Pure — exported for tests.
+ */
 export function nearestDoorFallback(
   states: Iterable<OperableState>,
   position: Vector3,
@@ -806,8 +937,19 @@ export function nearestDoorFallback(
   let bestSq = range * range
   for (const state of states) {
     if (state.kind !== 'door-hinged' && state.kind !== 'door-operation') continue
+    // A built window sash is a hinged operable (see GameOperableSpec) — but it
+    // is still a window: aim-only, or standing beside one would steal the
+    // point-blank prompt from the door you are actually leaning on.
+    if (state.noun === 'window') continue
     if (standsDown(state)) continue
-    const dSq = state.center.distanceToSquared(position)
+    const box = state.mountBox
+    // The band first: it is what separates the door under your hand from the
+    // one on the storey above, and it costs two compares.
+    if (position.y < box.min.y - DOOR_FALLBACK_RISE) continue
+    if (position.y > box.max.y + DOOR_FALLBACK_RISE) continue
+    const dx = Math.max(box.min.x - position.x, 0, position.x - box.max.x)
+    const dz = Math.max(box.min.z - position.z, 0, position.z - box.max.z)
+    const dSq = dx * dx + dz * dz
     if (dSq < bestSq) {
       bestSq = dSq
       best = state
@@ -893,7 +1035,7 @@ export function Interact({ world }: { world: GameWorld }) {
     }
 
     const prompt = target
-      ? `E — ${target.open ? 'Close' : 'Open'} ${operableNoun(target.kind)}`
+      ? `E — ${target.open ? 'Close' : 'Open'} ${target.noun ?? operableNoun(target.kind)}`
       : null
     if (prompt !== lastPrompt.current) {
       lastPrompt.current = prompt

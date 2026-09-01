@@ -94,6 +94,38 @@ describe('slotId survives every piece-mutating action', () => {
   })
 })
 
+/**
+ * The build MENU is one selection, not two independent flags: an aperture is a
+ * wall's mask (builder.wallOpeningMask), so 'floor + door' has no meaning and
+ * must be unreachable through the actions — a ghost would preview a hole the
+ * placed floor could never have.
+ */
+describe('build selection: piece and aperture cannot disagree', () => {
+  test('picking any piece clears the aperture', () => {
+    useBoots.getState().setBuildOpening('door')
+    expect(useBoots.getState().buildPiece).toBe('wall')
+    useBoots.getState().setBuildPiece('floor')
+    expect(useBoots.getState().buildOpening).toBeNull()
+    // Even re-picking the wall: Z's family cycle sets the variant explicitly.
+    useBoots.getState().setBuildOpening('window')
+    useBoots.getState().setBuildPiece('wall')
+    expect(useBoots.getState().buildOpening).toBeNull()
+  })
+
+  test('picking an aperture forces the wall', () => {
+    useBoots.getState().setBuildPiece('roof')
+    useBoots.getState().setBuildOpening('window')
+    expect(useBoots.getState().buildPiece).toBe('wall')
+    expect(useBoots.getState().buildOpening).toBe('window')
+  })
+
+  test('a new session starts on the plain wall', () => {
+    useBoots.getState().setBuildOpening('door')
+    useBoots.getState().resetSession()
+    expect(useBoots.getState().buildOpening).toBeNull()
+  })
+})
+
 describe('resetSession: re-entry resumes an undecided session', () => {
   test('keeps placed, and resets only the loadout', () => {
     // Two things at once, and they pull opposite ways:
