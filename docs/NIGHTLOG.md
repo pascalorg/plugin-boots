@@ -2106,3 +2106,50 @@ opened and B's HUD counted A as talking. 2303 tests, tsc clean.
 The harness had been muting both microphones, incidentally: the session comes up
 `live` when permission was already granted, and M is a toggle. A call where nobody
 can speak was never the thing under test.
+
+## PUBLIC IS NOT THE SAME AS JOINABLE — the sentence that told him it worked
+
+The link half of "1 link join" had a second failure, and it was not in the routing:
+it was in the sentence under the button. **Share link** said, for every *public*
+project,
+
+> Link copied — anyone with it signs in and drops straight into your game.
+
+Dropping in needs two independent things. Public is one. The other is the project
+being an **open lobby**, a separate host decision that visibility deliberately does
+not imply — a public project is published for *viewing*, and every public project
+silently becoming world-playable is the accident that marker exists to prevent. On a
+public non-lobby the link renders the building read-only and nobody joins anything.
+
+Which is exactly the report: *"nothing really like joining a game together"*. The
+copy was part of why it took a live share to find out — it told the owner the link
+worked, so there was nothing to check.
+
+The plugin could not have known better: bridge v1 exposed visibility and nothing
+else. So v2 adds `isOpenLobby` (the marker only — the plugin already knows whether
+the project is private and combines the two itself, and folding them together would
+leave it unable to say *which* condition is missing), and `shareReach` turns it into
+the only three answers there are: `drops-in`, `view-only`, `unknown`.
+
+**`unknown` is not `false`.** An `isOpenLobby ?? false` default would print "they
+land on a read-only view" on every host that has not shipped the field, including
+the ones that do drop them in. Absent means we do not know, and the line says the
+condition out loud instead of promising either way.
+
+Two smaller things fell out of it. The plugin's version gate went from `== 1` to
+`>= 1`: a v2 host — one that can tell us *more* — must not read as *no bridge at
+all*, which would have traded the private warning and its one-click fix for a
+version bump. And a `view-only` line is styled amber, like a failed publish: it
+looks like success and isn't, so it may not sit greyed out under a copied link.
+
+`qa-boots-share.mjs` drives the real panel in a real browser against a real bridge
+and reads the sentence off the DOM, because none of this is visible to a unit test:
+whether the panel reads the bridge at all, whether it reads it at *click* time, and
+whether the amber lands on the caveat. Four combinations, all four correct, 0 page
+errors — including the trap in the one-click fix, where "Make it public" succeeds and
+the old copy congratulated the owner with a promise publishing has no power to make
+true.
+
+Getting the harness to the panel took two tries. On a bare `/scene` the plugin is not
+loaded at all, and the rail entry for a plugin is an icon with no text and no
+`aria-label` — the only thing in the DOM that names Boots is the image source.
