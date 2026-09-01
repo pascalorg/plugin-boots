@@ -4,8 +4,11 @@ import {
   AIR_ARM_SWING,
   AIR_LEG_SPLIT,
   articulate,
+  assignPalette,
   AVATAR_PALETTE,
   createArticulation,
+  DETAIL_MAX_DIST,
+  detailVisible,
   hashUserId,
   LEG_SWING_MAX,
   materialsFor,
@@ -49,9 +52,73 @@ describe('avatar palette — stable per userId, bounded to 8', () => {
     const a = materialsFor(2)
     expect(materialsFor(2)).toBe(a) // cache hit — shared across avatars
     expect(materialsFor(3)).not.toBe(a)
-    expect(`#${a.body.color.getHexString()}`).toBe(AVATAR_PALETTE[2])
-    // Trim is a darker cut of the same tint.
-    expect(a.trim.color.r).toBeLessThan(a.body.color.r + 1e-6)
+    expect(`#${a.vest.color.getHexString()}`).toBe(AVATAR_PALETTE[2])
+    // The hat band is a darker cut of the same tint (the hat stays white).
+    expect(a.band.color.r).toBeLessThan(a.vest.color.r + 1e-6)
+  })
+})
+
+/**
+ * Distinct colors are the whole point of the customization: "each new player
+ * has a different color". The hash alone cannot promise that, so the deal is
+ * roster-wide — and it has to come out the same on every screen from nothing
+ * but the id set, because there is no message that carries it.
+ */
+describe('palette assignment — one tint each, agreed without coordination', () => {
+  test('a lot of players up to the palette size all get different tints', () => {
+    for (let n = 1; n <= AVATAR_PALETTE.length; n++) {
+      const ids = Array.from({ length: n }, (_, i) => `user-${i}`)
+      const deal = assignPalette(ids)
+      expect(deal.size).toBe(n)
+      expect(new Set(deal.values()).size).toBe(n) // no two share
+      for (const slot of deal.values()) {
+        expect(slot).toBeGreaterThanOrEqual(0)
+        expect(slot).toBeLessThan(AVATAR_PALETTE.length)
+      }
+    }
+  })
+
+  test('every client computes the same deal, whatever order it learned them in', () => {
+    const ids = ['zoe', 'ada', 'grace', 'linus', 'hopper']
+    const mine = assignPalette(ids)
+    const theirs = assignPalette([...ids].reverse())
+    const late = assignPalette([ids[2]!, ids[0]!, ids[4]!, ids[1]!, ids[3]!])
+    for (const id of ids) {
+      expect(theirs.get(id)).toBe(mine.get(id))
+      expect(late.get(id)).toBe(mine.get(id))
+    }
+  })
+
+  test('an uncontested id keeps the tint its hash asked for', () => {
+    const deal = assignPalette(['solo-user'])
+    expect(deal.get('solo-user')).toBe(paletteIndexFor('solo-user'))
+  })
+
+  test('one person on two devices is one entry, not two tints', () => {
+    const deal = assignPalette(['ada', 'ada', 'grace'])
+    expect(deal.size).toBe(2)
+    expect(deal.get('ada')).toBe(paletteIndexFor('ada'))
+  })
+
+  test('past the palette size it degrades to the hash instead of failing', () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `user-${i}`)
+    const deal = assignPalette(ids)
+    expect(deal.size).toBe(20)
+    // The first 8 dealt (sorted order) still hold 8 distinct slots.
+    expect(new Set(deal.values()).size).toBe(AVATAR_PALETTE.length)
+    for (const slot of deal.values()) expect(slot).toBeLessThan(AVATAR_PALETTE.length)
+  })
+})
+
+describe('detail LOD — the small parts fall away with distance', () => {
+  test('near is detailed, far is silhouette, and the boundary is inclusive', () => {
+    expect(detailVisible(0)).toBe(true)
+    expect(detailVisible((DETAIL_MAX_DIST - 1) ** 2)).toBe(true)
+    expect(detailVisible(DETAIL_MAX_DIST ** 2)).toBe(true)
+    expect(detailVisible((DETAIL_MAX_DIST + 0.5) ** 2)).toBe(false)
+    // Detail drops well before the name tag does — the tag is the last thing
+    // to go, because it is the one part that is still legible out there.
+    expect(DETAIL_MAX_DIST).toBeLessThan(TAG_MAX_DIST)
   })
 })
 

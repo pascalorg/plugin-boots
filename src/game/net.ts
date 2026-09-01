@@ -600,6 +600,12 @@ export function localSessionId(): string | null {
   return state.bus?.sessionId ?? null
 }
 
+/** Our own user id, or null with no bus. Two windows of one account share it
+ * — which is why the avatar palette keys on the USER, not the session. */
+export function localUserId(): string | null {
+  return state.bus?.userId ?? null
+}
+
 /** Display name for a userId off the live roster (null when unknown). */
 export function participantName(userId: string): string | null {
   for (const participant of getParticipants()) {
