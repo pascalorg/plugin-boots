@@ -205,10 +205,17 @@ log(`  MESH CONNECTED BOTH WAYS: ${meshOk}`)
 // way in — it exercises input.ts, takeAction and VoiceControls, not just the
 // module's exported entry point.
 log('\n=== 2. press M on both ===')
+// The session may already have come up 'live' — `enableMicIfAlreadyPermitted`
+// turns the mic on when permission was granted before, and the fake UI grants it.
+// M is a TOGGLE, so pressing it once in that case leaves both mics muted, and a
+// call where nobody can speak is not the thing under test. Press until live.
 for (const client of clients) {
   await client.page.bringToFront()
-  await client.page.keyboard.press('m')
-  await client.page.waitForTimeout(2500)
+  for (let press = 0; press < 3; press++) {
+    if ((await voice(client))?.mic === 'live') break
+    await client.page.keyboard.press('m')
+    await client.page.waitForTimeout(2500)
+  }
   const v = await voice(client)
   log(`[${client.label}] mic ${v?.mic}`)
 }

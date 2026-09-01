@@ -968,6 +968,29 @@ attempt every fifteen seconds for the rest of the session and still be silent.
 when there is one. There is no TURN today; the honest consequence is in the "not
 handled" list below.
 
+### One negotiation at a time, per pair
+
+**`link.busy` claims an epoch synchronously, before the first `await`, and is
+released in a `finally`.** Signalling here is a resend loop and every stage of a
+handshake is an `await`: the offerer republishes the same description every tick
+until it is acknowledged, and it cannot be acknowledged until the answerer has
+finished `createAnswer`, `setLocalDescription` and the whole ICE gather — up to
+`ICE_GATHER_MS` later. `applied` is written at the **end** of that sequence, so it
+could not stop the answerer starting a fresh negotiation for every copy that
+arrived in the meantime. A two-browser run showed **4 offers applied and 7 answers
+sent for one offer at epoch 1**.
+
+Nothing about that looked broken, which is why it survived: both ends reported a
+connected pair, and the local answer that happened to survive the interleaving
+belonged to no offer the other side was still holding. **Media in one direction
+only, with every readout green.**
+
+The same hazard runs the other way. `outbound` is cleared when the answer
+*finishes* applying, so a duplicate answer arriving first called
+`setRemoteDescription` twice; the second rejects, and the rejection path
+**restarts the pair** — the reward for the peer's patience was being hung up on.
+Both directions are pinned by tests that fail without the guard.
+
 ### Liveness for a call comes from the call
 
 **A voice frame from a peer is proof they are there**, and `ingest` refreshes

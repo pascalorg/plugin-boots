@@ -129,6 +129,29 @@ type FakeSender = {
   replaceTrack: (track: unknown) => Promise<void>
 }
 
+type FakeTransceiver = {
+  direction: string
+  kind: string
+  /** null until an m-line is associated with it — the crux of the answerer bug. */
+  mid: string | null
+  currentDirection: string | null
+  sender: FakeSender
+  stopped: boolean
+  stop: () => void
+}
+
+function makeSender(): FakeSender {
+  const sender: FakeSender = {
+    track: null,
+    replaced: [],
+    replaceTrack: async (track: unknown) => {
+      sender.track = track
+      sender.replaced.push(track)
+    },
+  }
+  return sender
+}
+
 class FakePeerConnection {
   static made: FakePeerConnection[] = []
   static rejectSetRemote = false
@@ -152,7 +175,7 @@ class FakePeerConnection {
   remoteDescriptions: Array<{ sdp: string; type: string }> = []
   closed = false
   rollbacks = 0
-  transceivers: Array<{ direction: string; sender: FakeSender }> = []
+  transceivers: FakeTransceiver[] = []
   private listeners = new Map<string, Set<(event: unknown) => void>>()
 
   constructor(public config: { iceServers?: unknown[] }) {
@@ -160,17 +183,26 @@ class FakePeerConnection {
   }
 
   addTransceiver(kind: string, init: { direction: string }) {
-    const sender: FakeSender = {
-      track: null,
-      replaced: [],
-      replaceTrack: async (track: unknown) => {
-        sender.track = track
-        sender.replaced.push(track)
+    const transceiver: FakeTransceiver = {
+      currentDirection: null,
+      direction: init.direction,
+      kind,
+      // NOT ASSOCIATED WITH AN M-LINE, and it will not be. A transceiver we asked
+      // for is a request for an m-line of our own; only ones created by addTrack
+      // are recycled for an incoming offer's m-line.
+      mid: null,
+      sender: makeSender(),
+      stop() {
+        this.stopped = true
       },
+      stopped: false,
     }
-    const transceiver = { direction: init.direction, kind, sender }
     this.transceivers.push(transceiver)
     return transceiver
+  }
+
+  getTransceivers() {
+    return this.transceivers
   }
 
   addEventListener(type: string, handler: (event: unknown) => void) {
@@ -212,6 +244,21 @@ class FakePeerConnection {
     if (FakePeerConnection.rejectSetRemote) throw new Error('SDP rejected')
     this.remoteDescriptions.push(description)
     this.signalingState = description.type === 'offer' ? 'have-remote-offer' : 'stable'
+    if (description.type !== 'offer') return
+    // The spec's implicit transceiver, faithfully including the part that broke
+    // the call: an m-line the application did not ask for arrives RECVONLY.
+    if (this.transceivers.some((transceiver) => transceiver.mid === '0')) return
+    this.transceivers.push({
+      currentDirection: 'recvonly',
+      direction: 'recvonly',
+      kind: 'audio',
+      mid: '0',
+      sender: makeSender(),
+      stop() {
+        this.stopped = true
+      },
+      stopped: false,
+    })
   }
 
   /** Pretend the ICE agent connected and a track arrived. */
@@ -993,6 +1040,98 @@ describe('a pending description does not wait for the heartbeat', () => {
     expect(sent(bus).length).toBe(before)
     voiceTick(1300) // ticks % SIGNAL_EVERY_TICKS === 0
     expect(sent(bus).length).toBe(before + 1)
+  })
+})
+
+describe('the answerer has to SEND, not only receive', () => {
+  /**
+   * THE BUG THAT MADE HALF A CALL. Two real browsers connected, both reported a
+   * healthy pair with a live sender, and only one of them could be heard.
+   *
+   * WebRTC recycles an existing transceiver for an incoming m-line only when that
+   * transceiver came from `addTrack`; one created with `addTransceiver` is a
+   * request for an m-line of our own. So the answerer held two — its own, which
+   * had no m-line and could never get one because an answer cannot add m-lines,
+   * and the one the offer implicitly created, which the spec defines as
+   * **recvonly**. Its answer said "I only receive". That was accurate, and it was
+   * the whole problem: the offerer's transceiver settled at `sendonly` and its
+   * receiver track stayed muted for the rest of the session.
+   *
+   * Nothing threw. No counter moved. The fake models the recvonly implicit
+   * transceiver precisely so this can never come back silently.
+   */
+  const anOffer = { epoch: 1, sdp: SDP('sendrecv'), type: 'offer' as const }
+
+  test('the transceiver the offer created is turned into sendrecv', async () => {
+    boot()
+    seePeer('session-a') // below us, so they offer and we answer
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anOffer, to: 'session-me' })
+    await settle()
+
+    const pc = FakePeerConnection.made[0]!
+    const associated = pc.transceivers.find((transceiver) => transceiver.mid !== null)
+    expect(associated?.direction).toBe('sendrecv')
+    expect(peer('session-a')?.owed).toBe('answer@1')
+  })
+
+  test('the mic goes into the sender that has the m-line', async () => {
+    boot()
+    const { enableMic } = await import('./voice')
+    await enableMic()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anOffer, to: 'session-me' })
+    await settle()
+
+    const pc = FakePeerConnection.made[0]!
+    const associated = pc.transceivers.find((transceiver) => transceiver.mid !== null)
+    // A track on the orphan is a track on nothing: it is attached to no m-line,
+    // so nobody is sent it, and the readouts all look correct anyway.
+    expect(associated?.sender.track).toBe(mic.track)
+  })
+
+  test('a mic enabled LATER lands on the adopted sender', async () => {
+    boot()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anOffer, to: 'session-me' })
+    await settle()
+    const { enableMic } = await import('./voice')
+    expect(await enableMic()).toBe('live')
+
+    const pc = FakePeerConnection.made[0]!
+    const associated = pc.transceivers.find((transceiver) => transceiver.mid !== null)
+    expect(associated?.sender.track).toBe(mic.track)
+  })
+
+  test('the orphan is stopped, so it cannot demand an m-line later', async () => {
+    boot()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anOffer, to: 'session-me' })
+    await settle()
+
+    const pc = FakePeerConnection.made[0]!
+    const orphans = pc.transceivers.filter((transceiver) => transceiver.mid === null)
+    expect(orphans.length).toBe(1)
+    expect(orphans[0]!.stopped).toBe(true)
+  })
+
+  test('the OFFERER keeps the transceiver it made — nothing to adopt', async () => {
+    boot()
+    seePeer('session-z') // above us, so we offer
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    // Our own m-line, our own sender: this side was never the broken one.
+    expect(pc.transceivers.length).toBe(1)
+    expect(pc.transceivers[0]!.direction).toBe('sendrecv')
+    expect(pc.transceivers[0]!.stopped).toBe(false)
   })
 })
 

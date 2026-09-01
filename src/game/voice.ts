@@ -580,6 +580,51 @@ async function makeOffer(link: PeerLink): Promise<void> {
   }
 }
 
+/**
+ * ADOPT THE TRANSCEIVER THE OFFER CREATED, AND MAKE IT SEND.
+ *
+ * This is the whole reason two real browsers connected and only one of them could
+ * hear anything. WebRTC only recycles an existing transceiver for an incoming
+ * m-line when that transceiver was created by `addTrack`; one we created with
+ * `addTransceiver` is understood as a request for an m-line of OUR OWN. So the
+ * answerer ended up holding two: the one it made up front, unassociated with any
+ * m-line and unable to acquire one (an answer cannot add m-lines), and the one
+ * the offer implicitly created — which the spec defines as **recvonly**.
+ *
+ * The answer therefore said "I only receive", and it was true. Both ends reported
+ * a connected pair with a live sender; the offerer's transceiver settled at
+ * `sendonly` and its receiver track stayed muted forever. Nothing threw, nothing
+ * retried, and one person in the call could not be heard at all.
+ *
+ * So before answering, point the associated transceiver at 'sendrecv', move our
+ * sender to it — the one `replaceTrack` will be called on when the mic comes up —
+ * and stop the orphan so it cannot demand an m-line in some later negotiation.
+ */
+function adoptAssociatedTransceiver(link: PeerLink): void {
+  const transceivers = link.pc.getTransceivers?.() ?? []
+  // Audio-only module, so the first m-line is ours; `mid` is what says a
+  // transceiver has one at all.
+  const associated = transceivers.find((transceiver) => transceiver.mid !== null)
+  if (!associated) return
+  try {
+    associated.direction = 'sendrecv'
+  } catch {
+    // A stack that refuses the assignment leaves the pair receive-only rather
+    // than failing it — half a call beats none.
+  }
+  link.sender = associated.sender
+  if (state.micTrack) void associated.sender.replaceTrack(state.micTrack).catch(() => {})
+  for (const transceiver of transceivers) {
+    if (transceiver === associated || transceiver.mid !== null) continue
+    try {
+      transceiver.stop?.()
+    } catch {
+      // Old stacks without stop(): an unassociated transceiver is inert here
+      // anyway, because we never offer again on a connection we answered on.
+    }
+  }
+}
+
 async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void> {
   link.state = 'negotiating'
   link.startedAt = state.clock
@@ -600,6 +645,9 @@ async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void
     link.step = 'answer:remote'
     await link.pc.setRemoteDescription({ sdp: offer.sdp, type: 'offer' })
     state.counters.offersApplied++
+    // BEFORE createAnswer: the direction the answer advertises is read off the
+    // transceiver, and the one the offer just created only receives.
+    adoptAssociatedTransceiver(link)
     link.step = 'answer:create'
     const answer = await link.pc.createAnswer()
     link.step = 'answer:local'
