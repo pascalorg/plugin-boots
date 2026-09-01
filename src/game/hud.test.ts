@@ -258,7 +258,7 @@ describe('paint color carousel (R-cycle readout)', () => {
 })
 
 /**
- * Voice chip (owner ask: "talk to each other like teammates in fortnite"): the
+ * Voice chip (owner ask: talk to each other like teammates in a squad game): the
  * one line that tells a player whether the call exists, whether their own mic is
  * live, and whether anybody is speaking. Its whole job is to be readable in a
  * firefight, so the rules it has to keep are: never advertise voice to somebody

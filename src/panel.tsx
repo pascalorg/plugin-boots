@@ -14,6 +14,7 @@ const runAsOneHistoryStep = <T,>(run: () => T): T => {
   return step ? step(useScene, run) : run()
 }
 import { useEffect, useState } from 'react'
+import { BOOTS_ICON } from './art'
 import { type BuildPiece, type PlacedPiece, useBoots } from './store'
 import { isForeignPlacedPiece } from './game/builder'
 import { applyItems, discardItems } from './game/item-keep'
@@ -790,13 +791,24 @@ export default function BootsPanel() {
     <div className="flex flex-col gap-4 p-4 text-sidebar-foreground">
       <header className="flex flex-col gap-1">
         <div className="flex items-center gap-2">
+          {/* The badge, same asset the rail entry uses (art.ts) — Pascaline in
+              her hard hat. Square and self-framed, so it needs no border here;
+              rounded to the sidebar's radius and fixed at 24px so a long
+              sidebar never reflows around it. */}
+          <img
+            alt=""
+            className="size-6 shrink-0 rounded-[5px] object-cover"
+            draggable={false}
+            src={BOOTS_ICON}
+          />
           <h2 className="font-semibold text-base">Boots</h2>
           <span className="rounded-full border border-sidebar-border/60 bg-sidebar-accent px-1.5 py-px font-semibold text-[9px] text-sidebar-foreground/70 uppercase tracking-widest">
             Alpha
           </span>
         </div>
         <p className="text-sidebar-foreground/50 text-xs leading-relaxed">
-          Just like Bones, it's alpha. Make sure your building can resist robot zombie attacks.
+          Just like Bones, it's alpha. Pascaline laced up her work boots — make sure your building
+          can resist robot zombie attacks.
         </p>
       </header>
 

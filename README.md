@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src/assets/boots-icon.webp" width="240" alt="Boots — bring your construction boots" />
+  <img src="src/assets/boots-loader.webp" width="560" alt="Boots — Pascaline in her hard hat, on the loading plate" />
 </p>
 
 # Boots

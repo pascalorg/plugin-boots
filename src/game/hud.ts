@@ -1,3 +1,4 @@
+import { BOOTS_LOADER } from '../art'
 import { useBoots } from '../store'
 import { heartbeatBpm, setHeartbeatPulseListener } from './audio'
 import type { TargetResult } from './grid'
@@ -499,6 +500,26 @@ export class Hud {
       `width:min(560px,72vw);box-sizing:border-box;padding:40px 44px;background:#14171b;border:2px solid #2e343b;border-radius:10px;transition:transform ${VEIL_FADE_MS / 1000}s ease`,
     )
     this.veilCardEl = card
+    // THE HERO, above the bar (owner ask). An animated WebP of Pascaline — the
+    // editor's own mascot — cycling three official poses over a turning
+    // sunburst, with the depot hazard rail scrolling along its bottom edge.
+    // A plain <img>, so the browser owns the animation: no rAF, no timer, no
+    // work on the frame loop this card exists to wait for. Same asset, same
+    // look, in drop-gate.tsx — the two loading surfaces are one brand.
+    //
+    // `height:auto` and NOT a fixed height with object-fit: the plate's own
+    // hazard rail runs along its bottom edge, and a `cover` crop ate it in the
+    // first pass. The 1px frame makes the plate's straight top and bottom read
+    // as a deliberate inset panel inside the card's 2px frame.
+    const hero = document.createElement('img')
+    hero.src = BOOTS_LOADER
+    hero.alt = ''
+    hero.draggable = false
+    hero.dataset.bootsHero = '1'
+    hero.style.cssText =
+      'display:block;width:100%;height:auto;border-radius:6px;margin-bottom:24px;' +
+      'border:1px solid rgba(255,255,255,0.10);box-sizing:border-box;background:#0d0f11'
+    card.appendChild(hero)
     // Wordmark row — big stencil BOOTS + the sidebar panel's ALPHA chip.
     const mark = veilChild(card, 'display:flex;align-items:center;justify-content:center;gap:4px')
     veilChild(

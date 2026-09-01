@@ -1,8 +1,8 @@
 /**
  * QA — CAN THE TWO PEOPLE IN ONE BUILDING HEAR EACH OTHER?
  *
- * The owner's ask was "talk to each other like if we were on a call or teammates
- * in fortnite". Nothing in the plugin's test suite can answer whether that is
+ * The owner's ask was to talk to each other the way people on a call do, or
+ * teammates in a squad game. Nothing in the plugin's test suite can answer whether that is
  * true, because voice.test.ts drives one copy of the module against a scripted
  * WebRTC stack: it proves the state machine, never that two real browsers ever
  * complete an ICE handshake over the real bus and end up with each other's audio.

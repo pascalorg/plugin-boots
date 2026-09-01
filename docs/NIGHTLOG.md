@@ -2042,8 +2042,8 @@ blink out and back. Not a wire fault — a note for the frame budget.
 
 ## TWO PEOPLE, ONE CALL — three bugs between a connected pair and a conversation
 
-The ask was "talk to each other like if we were on a call or teammates in
-fortnite". Every unit test passed and the mesh was reported as connecting, so the
+The ask was to talk to each other the way people on a call do, or teammates in a
+squad game. Every unit test passed and the mesh was reported as connecting, so the
 two-browser harness (`docs/qa/qa-boots-voice.mjs`) was written to answer the one
 question none of them can: do two real Chromium sessions on the real bus end up
 holding each other's audio? Its verdict was **false** on every run until tonight,
@@ -2250,3 +2250,75 @@ does the flash happen on a wall he has ALREADY SHOT, or on an untouched one? Unt
 means the decal lane, which is on the record as clean and would send us to the mist
 puff or the HUD instead. Already-shot means the sprite pool, and the trace tooling is
 sitting there ready to run.
+
+## The rebrand — Pascaline gets the plugin (2026-09-01)
+
+The ask: keep the name, replace every logo and image, put an animated loader
+above the loading bar, all of it on the mascot.
+
+What was there: a rail icon of a frightened man in a helmet between two boards —
+generated, off-brand, and the only picture the plugin owned. The loading screens
+were type and nothing else.
+
+What landed, and the one decision behind all of it: **nothing is generated.**
+Every pixel of Pascaline comes out of the official render pack
+(`pascalorg/pascaline`, 2048×2084 PNGs); `docs/brand/build-brand-assets.py` only
+frames her, lights her and animates the plate around her. A model asked for "the
+mascot" drifts off-model every time, and the mascot belongs to the product, not
+to this plugin. Full rationale in [`docs/brand/README.md`](brand/README.md).
+
+- `src/assets/boots-icon.webp` — 512², the badge. Rail entry, Plugins list,
+  panel header. **Filename deliberately unchanged**: `qa-boots-roster.mjs` finds
+  the rail entry with `img[src*="boots-icon"]`, because the host renders it as an
+  icon with no text and no `aria-label`.
+- `src/assets/boots-loader.webp` — 700×300, **24 frames, 1.92 s**, above the bar
+  in *both* loading surfaces (`game/hud.ts`'s in-game card and
+  `game/drop-gate.tsx`'s share-link veil), so the two screens a visitor sees back
+  to back are one brand.
+- `src/art.ts` — the two URLs, one place. `panel.tsx` header badge,
+  `index.ts` panel icon + copy, README hero.
+
+Three things cost a pass each, and all three are the kind that only a browser
+tells you:
+
+**The crop is sized against 20 px, because that is what the rail renders**
+(`h-5 w-5` in the host's `use-plugin-panels.tsx` — measured in host source, not
+guessed). The first badge took in the collar and jacket; rendered at exactly 20 px
+and upscaled NEAREST, the bottom half is one dark smear. Hat-to-smile is what
+survives.
+
+**Centre on the hard hat, never the alpha bbox.** The bbox moves with whichever
+arm is outstretched, so a pose cycle anchored on it swings her sideways every
+eight frames. `head_anchor()` finds the hat instead — the only large bright,
+unsaturated, fully opaque region in the top third — which is also why the cycle
+is `thumbs-up` / `wave` / `hands-palm` and not the other four: those three
+register on the hat to the pixel. `celebrate` and `point-left` would jump.
+
+**`object-fit: cover` at a fixed height ate the plate's own hazard rail** in both
+surfaces (520×196 displayed against a 2.33:1 source). Both are `height:auto` now,
+with a 1 px frame so the straight edges read as a deliberate inset panel.
+
+Animated **WebP**, not GIF: a quarter of the bytes, 24-bit instead of a 256-entry
+palette that visibly bands a soft-shaded render, and `src/assets.d.ts` already
+declares `*.webp` so it rides the existing static-import pipeline. It is a plain
+`<img>` in both surfaces — the *browser* owns the animation, so there is no rAF
+and no timer competing with the frame loop the loading card exists to wait for.
+
+`docs/qa/qa-boots-brand.mjs` is the guard, and it checks the two claims a unit
+test cannot see. **That the loader is really animated** — counted as `ANMF`
+chunks in the fetched bytes, because a still and an animation are the same MIME
+type, the same `<img>` and the same `complete === true`; this is the check that
+catches the real regression, which is someone routing the asset through
+`next/image`, whose optimizer flattens animation (verified today: it is served
+raw from `/_next/static/media/`). And **that the hero is above the bar** — as
+geometry, `hero.bottom ≤ bar.top`, in each surface separately, since that is the
+literal ask and a hero rendered below or off-screen passes everything else.
+
+Green on the record: brand QA 16/16 with 0 page errors (veil hero 520×224 at
+2.32:1 against a 2.33:1 source, 24 ANMF frames, card hero above the card bar,
+rail entry 512² decoded at 20×20, badge on the panel header too), roster QA
+still 0 failures, `check-types` clean, `bun test` 2331 pass / 0 fail.
+
+Left alone on purpose: `definition.ts`'s `boots:job` keeps
+`icon: { kind: 'iconify', name: 'lucide:traffic-cone' }`. The node is
+`hidden: true` and that icon never reaches a screen.

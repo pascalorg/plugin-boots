@@ -769,8 +769,8 @@ are stale.
 
 # Part 5 — the call (`voice.ts`, `voice-policy.ts`)
 
-The owner's ask was "talk to each other like if we were on a call or teammates in
-fortnite". Parts 1–4 replicate *what people do*; this part replicates *what they
+The owner's ask was to talk to each other the way people on a call do, or
+teammates in a squad game. Parts 1–4 replicate *what people do*; this part replicates *what they
 say*, and it is the only layer in the plugin whose payload does not travel on the
 host bus at all.
 

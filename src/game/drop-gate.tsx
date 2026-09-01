@@ -2,6 +2,7 @@
 
 import { sceneRegistry } from '@pascal-app/core'
 import { useEffect } from 'react'
+import { BOOTS_LOADER } from '../art'
 import { useBoots } from '../store'
 import { enterGame } from './session'
 
@@ -106,14 +107,30 @@ export function DropGate() {
     // the editor chrome. Body-level (NOT the canvas parent): enterGame
     // fullscreens the canvas container and the veil must not ride into it.
     const veil = document.createElement('div')
+    veil.dataset.bootsDropVeil = '1' // QA hook: distinct from the game's own [data-boots-veil]
     veil.style.cssText =
       `position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;` +
       `justify-content:center;gap:26px;background:#0c0e10`
+    // THE HERO, above the bar — the same animated Pascaline plate the in-game
+    // card shows (art.ts), so the two loading surfaces a visitor sees back to
+    // back are one brand. A plain <img>: the browser animates it, and nothing
+    // here competes with the scene hydrating underneath.
+    const hero = document.createElement('img')
+    hero.src = BOOTS_LOADER
+    hero.alt = ''
+    hero.draggable = false
+    hero.dataset.bootsHero = '1'
+    // height:auto keeps the plate's own hazard rail — a fixed height with
+    // object-fit:cover cropped it off in the first pass.
+    hero.style.cssText =
+      'display:block;width:min(520px,74vw);height:auto;border-radius:8px;' +
+      'border:1px solid rgba(255,255,255,0.10);box-sizing:border-box;background:#0d0f11'
     const word = document.createElement('div')
     word.textContent = 'BOOTS'
     word.style.cssText = `font:800 44px/1 ${FONT};letter-spacing:0.35em;color:rgba(255,255,255,0.92);padding-left:0.35em`
     // Loading bar (visible until ready) — same look as the in-game card.
     const track = document.createElement('div')
+    track.dataset.bootsDropBar = '1' // QA hook: the bar the hero must sit above
     track.style.cssText =
       'width:min(420px,60vw);height:10px;border-radius:5px;background:rgba(255,255,255,0.08);overflow:hidden'
     const fill = document.createElement('div')
@@ -126,7 +143,7 @@ export function DropGate() {
     button.style.cssText =
       `display:none;font:700 20px/1 ${FONT};letter-spacing:0.12em;color:#0f1113;background:#e8c229;` +
       'border:none;border-radius:8px;padding:16px 44px;cursor:pointer'
-    veil.append(word, track, button)
+    veil.append(hero, word, track, button)
     document.body.appendChild(veil)
 
     const t0 = performance.now()
