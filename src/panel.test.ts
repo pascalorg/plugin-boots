@@ -6,6 +6,7 @@ import { type CatalogEntry, type OpeningEntry } from './game/inventory'
 import { type Placement, useItems } from './game/item-place'
 import { type PaintedNode, usePaintKeep } from './game/paint-keep'
 import { type DestroyedNode, useDemolition } from './game/save-demolition'
+import { setVoiceMode, voiceMode } from './game/voice'
 import BootsPanel, {
   discardSessionChanges,
   nodeLabel,
@@ -14,6 +15,8 @@ import BootsPanel, {
   pendingChangeGroups,
   type SaveBridges,
   saveSessionChanges,
+  VOICE_MODES,
+  VoiceSettings,
 } from './panel'
 import { type BuildPiece, type PlacedPiece, useBoots } from './store'
 
@@ -585,5 +588,64 @@ describe('the live Save and Discard paths', () => {
     )
 
     expect(useScene.getState().nodes).toBe(before)
+  })
+})
+
+/**
+ * Voice chat, in the rail.
+ *
+ * The sidebar is the ONLY place the mic key can be written down — there is no
+ * settings screen inside a first-person game, and a control nobody knows about
+ * is a control nobody uses. What these pin is the promise the copy makes and the
+ * one setting that has to round-trip through voice.ts.
+ */
+describe('voice chat in the sidebar', () => {
+  test('both mixes are offered, once each, and each says what it does', () => {
+    expect(VOICE_MODES.length).toBe(2)
+    expect(VOICE_MODES.map((m) => m.mode).sort()).toEqual(['proximity', 'squad'])
+    expect(new Set(VOICE_MODES.map((m) => m.label)).size).toBe(2)
+    for (const option of VOICE_MODES) {
+      expect(option.label.length).toBeGreaterThan(0)
+      expect(option.detail.length).toBeGreaterThan(0)
+    }
+    // The iPhone caveat is not optional copy: on iOS `volume` is read-only, so
+    // proximity mixes flat there. Saying it here is cheaper than the bug report.
+    const nearby = VOICE_MODES.find((m) => m.mode === 'proximity')
+    expect(nearby?.detail).toContain('iPhone')
+  })
+
+  test('the section names the key, the phone button, and the free listening', () => {
+    const html = renderToString(createElement(VoiceSettings))
+    expect(html).toContain('Voice chat')
+    expect(html).toContain('M')
+    expect(html).toContain('MIC')
+    // "you hear everyone whether or not you press it" is the sentence that stops
+    // a denied permission from reading as a broken feature.
+    expect(html).toMatch(/hear everyone/i)
+  })
+
+  test('the pressed button is whatever voice.ts actually has set', () => {
+    const before = voiceMode()
+    try {
+      setVoiceMode('proximity')
+      const nearby = renderToString(createElement(VoiceSettings))
+      // aria-pressed is the state a screen reader and a test can both read; the
+      // visual difference is a class, which proves nothing about the mode.
+      expect(nearby).toContain('aria-pressed="true"')
+      const pressedLabel = /aria-pressed="true"[^>]*>([^<]+)</.exec(nearby)?.[1]
+      expect(pressedLabel).toBe('Nearby')
+
+      setVoiceMode('squad')
+      const squad = renderToString(createElement(VoiceSettings))
+      expect(/aria-pressed="true"[^>]*>([^<]+)</.exec(squad)?.[1]).toBe('Squad')
+    } finally {
+      setVoiceMode(before)
+    }
+  })
+
+  test('the panel offers it next to the share link, in Play together', () => {
+    const html = renderToString(createElement(BootsPanel))
+    expect(html).toContain('Play together')
+    expect(html).toContain('Voice chat')
   })
 })

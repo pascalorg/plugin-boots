@@ -7,9 +7,11 @@ import {
   publishFrame,
   registerFrameKind,
 } from './net'
+import { browserPendingStorage } from './pending-store'
 import { getRemotes, participantName } from './presence'
 import { latestSnapshot } from './presence-interp'
 import {
+  isVoiceMode,
   MAX_SDP_CHARS,
   mixGain,
   nextSignalTarget,
@@ -190,9 +192,27 @@ type VoiceState = {
   }
 }
 
+/**
+ * Where the mode lives between visits. It is a PREFERENCE, not session state:
+ * somebody who picked proximity because they are building on opposite ends of a
+ * house did not pick it for one page load, and re-picking it every reload is the
+ * kind of small friction that ends with the feature unused.
+ *
+ * One key for the whole browser rather than one per project, because the choice
+ * is about how the person likes to be heard, not about the building.
+ */
+const MODE_KEY = 'boots.voice.mode.1'
+
+function loadMode(): VoiceMode {
+  const stored = browserPendingStorage()?.getItem(MODE_KEY)
+  // Anything unrecognised — a hand-edited value, a mode a newer build wrote —
+  // falls back to the default rather than being trusted into the state.
+  return isVoiceMode(stored) ? stored : 'squad'
+}
+
 const state: VoiceState = {
   active: false,
-  mode: 'squad',
+  mode: loadMode(),
   timer: null,
   offFrame: null,
   getLocalPosition: null,
@@ -669,6 +689,12 @@ export function setVoiceMode(mode: VoiceMode): void {
   state.mode = mode
   // Force the next tick to rewrite every level.
   for (const link of state.peers.values()) link.gain = -1
+  try {
+    browserPendingStorage()?.setItem(MODE_KEY, mode)
+  } catch {
+    // A full or refusing quota must not cost the mode change itself — the
+    // running call already switched above.
+  }
 }
 
 export function voiceMode(): VoiceMode {

@@ -28,6 +28,8 @@ import {
   useDemolition,
 } from './game/save-demolition'
 import { enterGame } from './game/session'
+import { setVoiceMode, voiceMode } from './game/voice'
+import type { VoiceMode } from './game/voice-policy'
 import {
   copyText,
   currentDropInUrl,
@@ -551,6 +553,76 @@ export function ShareLink() {
   )
 }
 
+// ── Voice ───────────────────────────────────────────────────────────────────
+//
+// The sidebar's whole job here is to say that voice EXISTS. Everything about the
+// call is automatic once two people are in the same session — the one thing a
+// player has to know is that M turns their microphone on, and there is nowhere
+// in a first-person game to write that down.
+//
+// The mode picker is the only real setting, and it is a preference that outlives
+// the page (voice.ts persists it), so it belongs out here in the editor rather
+// than behind a key nobody would find mid-firefight.
+
+/** What each mode promises, in the words a player would use. */
+export const VOICE_MODES: ReadonlyArray<{ mode: VoiceMode; label: string; detail: string }> = [
+  {
+    detail: 'Everyone hears everyone, wherever they are in the building.',
+    label: 'Squad',
+    mode: 'squad',
+  },
+  {
+    detail: 'Voices fade with distance — walk over to talk. Flat on iPhone.',
+    label: 'Nearby',
+    mode: 'proximity',
+  },
+]
+
+export function VoiceSettings() {
+  // Module state, not a store: voice.ts owns the mode (it also has to survive a
+  // reload, which the game stores deliberately do not). Mirrored into React on
+  // mount so the buttons show what is actually set.
+  const [mode, setMode] = useState<VoiceMode>(() => voiceMode())
+
+  const pick = (next: VoiceMode) => {
+    setVoiceMode(next)
+    setMode(next)
+  }
+
+  return (
+    <section className="flex flex-col gap-2">
+      <p className="font-semibold text-[10px] text-sidebar-foreground/70 uppercase tracking-wider">
+        Voice chat
+      </p>
+      <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
+        Press <span className="font-semibold text-sidebar-foreground/80">M</span> in the game to turn
+        your microphone on — the MIC button on a phone. You hear everyone else whether or not you
+        ever press it, and leaving the game switches the mic off.
+      </p>
+      <div className="flex gap-1.5">
+        {VOICE_MODES.map((option) => (
+          <button
+            aria-pressed={mode === option.mode}
+            className={
+              mode === option.mode
+                ? 'flex-1 rounded-md bg-sidebar-accent px-2 py-1.5 font-semibold text-xs'
+                : 'flex-1 rounded-md border border-sidebar-border/60 px-2 py-1.5 text-xs hover:bg-sidebar-accent/60'
+            }
+            key={option.mode}
+            onClick={() => pick(option.mode)}
+            type="button"
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
+        {VOICE_MODES.find((option) => option.mode === mode)?.detail}
+      </p>
+    </section>
+  )
+}
+
 /**
  * The Boots left-rail panel. One big verb: Jump in — the whole editor
  * becomes a game. After a session where you built pieces, the panel offers
@@ -695,6 +767,7 @@ export default function BootsPanel() {
           with you. Builds and destruction are shared live.
         </p>
         <ShareLink />
+        <VoiceSettings />
       </section>
     </div>
   )

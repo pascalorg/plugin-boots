@@ -25,6 +25,7 @@ import {
   TALKING_STALE_MS,
   voiceActive,
   voiceDebug,
+  voiceMode,
   voiceTick,
 } from './voice'
 import { VOICE_FAR_M, VOICE_PROTOCOL, type VoiceFrame } from './voice-policy'
@@ -919,5 +920,76 @@ describe('stopVoice', () => {
     voiceTick(1200)
     await settle()
     expect(voiceDebug().peers.length).toBe(1)
+  })
+})
+
+/**
+ * The mode is a PREFERENCE and has to outlive the page.
+ *
+ * Somebody picks proximity because they are working at opposite ends of a house;
+ * if that resets on every reload they will pick it twice and then stop bothering.
+ * The write also must not be able to break the mode change itself — a browser in
+ * private mode throws on the storage, and a call that switched correctly must not
+ * be undone by the bookkeeping that records it.
+ */
+describe('voice mode persistence', () => {
+  const globals = globalThis as { localStorage?: unknown }
+  const KEY = 'boots.voice.mode.1'
+
+  function fakeStorage(over: Partial<Storage> = {}): Storage {
+    const map = new Map<string, string>()
+    return {
+      clear: () => map.clear(),
+      getItem: (key: string) => map.get(key) ?? null,
+      key: (index: number) => [...map.keys()][index] ?? null,
+      get length() {
+        return map.size
+      },
+      removeItem: (key: string) => map.delete(key),
+      setItem: (key: string, value: string) => void map.set(key, value),
+      ...over,
+    } as Storage
+  }
+
+  function withStorage(storage: unknown, run: () => void): void {
+    const real = Object.getOwnPropertyDescriptor(globals, 'localStorage')
+    Object.defineProperty(globals, 'localStorage', { configurable: true, value: storage })
+    try {
+      run()
+    } finally {
+      if (real) Object.defineProperty(globals, 'localStorage', real)
+      else Object.defineProperty(globals, 'localStorage', { configurable: true, value: undefined })
+    }
+  }
+
+  test('choosing a mode writes it down', () => {
+    const storage = fakeStorage()
+    withStorage(storage, () => {
+      setVoiceMode('proximity')
+      expect(storage.getItem(KEY)).toBe('proximity')
+      expect(voiceMode()).toBe('proximity')
+      setVoiceMode('squad')
+      expect(storage.getItem(KEY)).toBe('squad')
+    })
+  })
+
+  test('a storage that refuses to be written does not lose the mode change', () => {
+    // Safari in private mode, an embedded webview with storage off, a full quota.
+    const hostile = fakeStorage({
+      setItem: () => {
+        throw new Error('QuotaExceededError')
+      },
+    })
+    withStorage(hostile, () => {
+      expect(() => setVoiceMode('proximity')).not.toThrow()
+      expect(voiceMode()).toBe('proximity')
+    })
+  })
+
+  test('no storage at all is not an error either', () => {
+    withStorage(undefined, () => {
+      expect(() => setVoiceMode('squad')).not.toThrow()
+      expect(voiceMode()).toBe('squad')
+    })
   })
 })
