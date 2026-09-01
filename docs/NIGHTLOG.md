@@ -2153,3 +2153,53 @@ true.
 Getting the harness to the panel took two tries. On a bare `/scene` the plugin is not
 loaded at all, and the rail entry for a plugin is an icon with no text and no
 `aria-label` — the only thing in the DOM that names Boots is the image source.
+
+## THE SILENCE — nobody could tell whether the other person had arrived
+
+The report was never "it crashed". It was *"so nothing really like joining a game
+together"*, and after a night of chasing why the link didn't work I noticed the
+sentence describes something else: two people, one link, and **neither screen said
+whether the other one was there**.
+
+That single silence covers at least four unrelated failures — the link never opened,
+it opened read-only, the bus was off, or both of them arrived and never found each
+other inside a big building. All four look identical from the sidebar, so the only
+report available to the person holding the link is that multiplayer doesn't work.
+
+One line under Play together splits it in two, which is the only split that matters
+when you are trying to fix it:
+
+```
+Just you in here right now.       -> nobody arrived. The LINK is the bug.
+Anna is in here with you.         -> the link worked. Look downstream, in the game.
+```
+
+Two ways to get this wrong, both of which I had to write down before I trusted it.
+
+**It has to read the HOST bus, not the game's.** `net.ts` captures the bus in
+`startNet()` and is only alive for the duration of a game session, so its roster is
+empty in the editor — which is exactly where the sidebar is, before Jump in and right
+after Esc. Empty renders as "just you": the wrong answer at the worst possible moment,
+and the moment a real user is most likely to read it. `getCollabBus()` is the host's
+object, alive as long as the editor's awareness session, so the line is readable in
+every phase. The browser QA proves that specific case — it reads the line *after Esc*.
+
+**It has to count sessions, not users.** The likeliest first test of a share link is
+one person, two devices, the same Google account — which the host reports as ONE
+participant with TWO sessions. Counting distinct users would have told that person
+they were alone while they stared at their own phone sitting in the lobby.
+
+It says "in here", never "in the game", because the host roster knows who has the
+project *open* and cannot tell an editor tab from someone already running around
+inside. Claiming the stronger thing is the same class of mistake the share sentence
+had just been fixed for, and it would send someone hunting the wrong bug.
+
+And no-bus is `null`, not an empty list, printed as its own sentence: a page with no
+shared session is not an empty room, and "nobody can join here" is the useful thing to
+say. Same rule as the share bridge's reach — `unknown` is not `false`.
+
+While wiring it I found the other half of last night's lie still standing. The
+paragraph directly above the share button promised "they land in this project and can
+jump straight into the game with you" unconditionally — sitting on top of a button
+that had just been taught to say the opposite when true. Whichever of the two he reads
+first is the one he acts on, so the blurb follows reach too now.
