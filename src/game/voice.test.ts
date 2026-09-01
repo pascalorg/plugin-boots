@@ -25,6 +25,7 @@ import {
   stopVoice,
   talkingPeers,
   TALKING_STALE_MS,
+  TICK_STALL_MS,
   voiceActive,
   voiceDebug,
   voiceMode,
@@ -355,6 +356,20 @@ function hearVoice(sessionId: string, frame: VoiceFrame): void {
   })
 }
 
+/**
+ * Advance the clock to `to` in steps a RUNNING page would take.
+ *
+ * A single `voiceTick` fifteen seconds after the last one is not a fast-forward
+ * as far as the module is concerned — it is the signature of a page that was
+ * frozen, and the module deliberately credits that time back rather than reaping
+ * every peer for silence it was not listening for. So a test about a deadline has
+ * to let time pass the way time passes.
+ */
+function runUntil(to: number, from: number, step = 900): void {
+  for (let at = from + step; at < to; at += step) voiceTick(at)
+  voiceTick(to)
+}
+
 /** Let the queued microtasks (createOffer/createAnswer chains) finish. */
 const settle = async (rounds = 6) => {
   for (let i = 0; i < rounds; i++) await Promise.resolve()
@@ -437,7 +452,7 @@ describe('the mesh is the people in the GAME', () => {
     // waits out PEER_ABSENT_MS, because at this level leaving and a lost
     // presence frame look the same and only one of them should cost a handshake.
     seePeer('session-z', { ph: 'editor' }, 1100)
-    voiceTick(1200 + PEER_ABSENT_MS)
+    runUntil(1200 + PEER_ABSENT_MS, 1000)
     expect(voiceDebug().peers).toEqual([])
     expect(FakePeerConnection.made[0]!.closed).toBe(true)
     // Left playing, a departed peer's stream is a voice in an empty room.
@@ -605,7 +620,7 @@ describe('a peer missing from the roster has not necessarily left', () => {
     await settle()
 
     seePeer('session-z', { ph: 'editor' })
-    voiceTick(1000 + PEER_ABSENT_MS)
+    runUntil(1000 + PEER_ABSENT_MS, 1000)
     expect(voiceDebug().peers.length).toBe(1) // still inside the grace period
     voiceTick(1000 + PEER_ABSENT_MS + 1)
     expect(voiceDebug().peers.length).toBe(0)
@@ -659,9 +674,88 @@ describe('a call outlives the presence roster', () => {
     voiceTick(1000)
     await settle()
     seePeer('session-z', { ph: 'editor' })
-    voiceTick(1000 + PEER_ABSENT_MS + 1)
+    runUntil(1000 + PEER_ABSENT_MS + 1, 1000)
     expect(voiceDebug().peers.length).toBe(0)
     expect(voiceDebug().counters.reaped).toBe(1)
+  })
+})
+
+describe('a page that was frozen does not blame its peers', () => {
+  /**
+   * Every deadline in this module is `now - thenSomething > limit`, and all of
+   * them assume the interval that measures them has been running. A backgrounded
+   * tab breaks that assumption completely: Chromium can suspend the whole page,
+   * so the tick that arrives on resume carries thirty seconds of clock the module
+   * never watched. Read literally, that one tick says every peer went silent,
+   * every handshake timed out and everybody stopped talking — all at once, all
+   * wrong, because nothing was listening.
+   *
+   * So an over-long gap is credited back to every deadline the link owns: the
+   * page missed the time, the peers did not spend it. What still counts is time
+   * the page was actually awake for, which is why each of these ends by proving
+   * the deadline fires normally afterwards. The credit forgives the freeze, not
+   * the peer.
+   */
+  test('the first tick back reaps nobody', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    seePeer('session-z', { ph: 'editor' }) // out of the roster
+
+    // Thirty seconds in ONE tick — the signature of a suspended page, not of a
+    // room that emptied.
+    voiceTick(31_000)
+    expect(voiceDebug().counters.stalls).toBe(1)
+    expect(voiceDebug().counters.reaped).toBe(0)
+    expect(voiceDebug().peers.length).toBe(1)
+
+    // …and somebody who really did leave is still reaped, on the time the page
+    // was awake for.
+    runUntil(31_000 + PEER_ABSENT_MS + 1, 31_000)
+    expect(voiceDebug().counters.reaped).toBe(1)
+  })
+
+  test('a stall is not the peer ignoring our offer', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    // Nobody answered, but the negotiation deadline elapsed while the page was
+    // asleep. Restarting here would throw away a handshake that never got its
+    // chance — and, since the peer's answer is on the way, would deadlock the
+    // pair on the epoch it was answering.
+    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS * 2 + 500)
+    expect(voiceDebug().counters.stalls).toBe(1)
+    expect(voiceDebug().counters.restarts).toBe(0)
+    expect(FakePeerConnection.made.length).toBe(1)
+  })
+
+  test('a peer who was talking is not silenced by the clock', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    hearVoice('session-z', { v: VOICE_PROTOCOL, talking: true })
+    expect(talkingPeers()).toEqual(['session-z'])
+
+    voiceTick(20_000)
+    expect(talkingPeers()).toEqual(['session-z'])
+
+    // The dot above their head still goes out on time once we are watching.
+    runUntil(20_000 + TALKING_STALE_MS + 200, 20_000)
+    expect(talkingPeers()).toEqual([])
+  })
+
+  test('an ordinary tick is not a stall', () => {
+    boot()
+    seePeer('session-z')
+    // A gap under the threshold is the normal jitter of a busy frame; only a
+    // gap an interval could not have produced counts.
+    runUntil(4000, 1000, TICK_STALL_MS - 200)
+    expect(voiceDebug().counters.stalls).toBe(0)
   })
 })
 
@@ -680,7 +774,7 @@ describe('a connection that WAS up and fell over', () => {
     voiceTick(2000)
     // ICE often recovers on its own, so this window is deliberate.
     expect(voiceDebug().counters.restarts).toBe(0)
-    voiceTick(2000 + DISCONNECT_GRACE_MS + 1)
+    runUntil(2000 + DISCONNECT_GRACE_MS + 1, 2000)
     expect(voiceDebug().counters.restarts).toBe(1)
     expect(FakePeerConnection.made.length).toBe(2)
   })
@@ -697,7 +791,7 @@ describe('a connection that WAS up and fell over', () => {
     voiceTick(2000)
     pc.connectionState = 'connected'
     pc.emit('connectionstatechange')
-    voiceTick(2000 + DISCONNECT_GRACE_MS + 1)
+    runUntil(2000 + DISCONNECT_GRACE_MS + 1, 2000)
     expect(voiceDebug().counters.restarts).toBe(0)
     expect(FakePeerConnection.made.length).toBe(1)
   })
@@ -716,7 +810,7 @@ describe('a connection that WAS up and fell over', () => {
     // worked, and the give-up list is permanent for the session.
     pc.connectionState = 'disconnected'
     pc.emit('connectionstatechange')
-    voiceTick(2000 + DISCONNECT_GRACE_MS + 1)
+    runUntil(2000 + DISCONNECT_GRACE_MS + 1, 1000)
     await settle()
     expect(peer('session-z')?.attempts).toBe(1)
     const rebuilt = FakePeerConnection.made[1]!
@@ -842,9 +936,9 @@ describe('patience, and where it runs out', () => {
     // — and in a two-peer call does it exactly when the answer is in flight,
     // because both sides started their clocks together.
     pc.iceConnectionState = 'checking'
-    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS + 1)
+    runUntil(1000 + NEGOTIATION_TIMEOUT_MS + 1, 1000)
     expect(voiceDebug().counters.restarts).toBe(0)
-    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS * 2 + 1)
+    runUntil(1000 + NEGOTIATION_TIMEOUT_MS * 2 + 1, 1000 + NEGOTIATION_TIMEOUT_MS + 1)
     expect(voiceDebug().counters.restarts).toBe(1)
   })
 
@@ -853,7 +947,7 @@ describe('patience, and where it runs out', () => {
     seePeer('session-z')
     voiceTick(1000)
     await settle()
-    voiceTick(1000 + NEGOTIATION_TIMEOUT_MS + 1)
+    runUntil(1000 + NEGOTIATION_TIMEOUT_MS + 1, 1000)
     expect(voiceDebug().counters.restarts).toBe(1)
   })
 })
@@ -1010,8 +1104,9 @@ describe('a pair that cannot connect is given up on, countably', () => {
     // Two ticks per attempt: one notices the timeout and rebuilds the link, the
     // next offers on the fresh one. Bounded well above what it should need.
     for (let attempt = 0; attempt < (MAX_NEGOTIATION_ATTEMPTS + 2) * 2; attempt++) {
-      now += NEGOTIATION_TIMEOUT_MS + 200
-      voiceTick(now)
+      const next = now + NEGOTIATION_TIMEOUT_MS + 200
+      runUntil(next, now)
+      now = next
       await settle()
     }
     const debug = voiceDebug()

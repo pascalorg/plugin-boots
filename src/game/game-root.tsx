@@ -64,6 +64,7 @@ import {
   startVoice,
   stopVoice,
   voiceDebug,
+  voiceInternals,
 } from './voice'
 import { VoiceControls } from './voice-controls'
 import { dormantPrimeQueueSize, VoxelWalls } from './voxel-walls'
@@ -855,6 +856,10 @@ function ActiveGame() {
         setVoiceMode(mode)
         return voiceDebug().mode
       },
+      // The raw per-direction WebRTC state. `voice()` says the handshake
+      // finished; this is the only thing that can say why a finished handshake
+      // still has somebody hearing nothing.
+      voiceInternals: () => voiceInternals(),
       // Host post-tuning census (host-post.ts, perf fix 5): is the shadow
       // throttle + outline guard live, how many lights are frozen, how
       // often the outline guard had to re-clear. Plain data.

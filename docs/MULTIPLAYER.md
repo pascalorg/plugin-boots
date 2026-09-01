@@ -968,6 +968,50 @@ attempt every fifteen seconds for the rest of the session and still be silent.
 when there is one. There is no TURN today; the honest consequence is in the "not
 handled" list below.
 
+### Liveness for a call comes from the call
+
+**A voice frame from a peer is proof they are there**, and `ingest` refreshes
+their absence clock on the strength of it alone. The two layers are driven by
+different things: presence rides the render loop, voice rides an interval. So a
+window sitting behind another one stops publishing poses entirely — a two-tab QA
+run measured ~5.7 s of pose silence, well past the 3 s staleness sweep — while
+its voice frames keep arriving the whole time. Building liveness for the call out
+of the roster meant alt-tabbing hung up on somebody who was still talking. Both
+channels have to go quiet before a link is torn down.
+
+### A tick that arrives late is our own fault
+
+Every deadline here reads `now - somethingAt > limit`, and each one assumes the
+interval measuring it has been running. A backgrounded tab breaks that outright:
+Chromium can suspend the page, so the tick that lands on resume carries thirty
+seconds of clock nobody watched. Taken literally that single tick says every peer
+went silent, every handshake timed out and everybody stopped talking — all at
+once, all false.
+
+So a gap longer than `TICK_STALL_MS` (1 s — longer than any interval could
+produce) is **credited back** to every deadline each link owns: `seenAt`,
+`startedAt`, `talkingAt`, `droppedAt`, and the local over-open clock. Time the
+page was awake for still counts, which is the point — the credit forgives the
+freeze, not the peer. `counters.stalls` says how often it happened, and a room
+that empties itself the instant you come back to the tab is what it looks like
+when this is missing.
+
+### A dropped connection is not a dead one
+
+`'disconnected'` is a **grace period**, not a verdict: ICE frequently recovers on
+its own, so a link that reports it is left alone for `DISCONNECT_GRACE_MS` (5 s)
+and only then rebuilt, with `droppedAt` cleared the moment it comes back. Without
+that branch a link that fell over once read `state: 'connected'` beside a
+`connectionState` of `'disconnected'` forever, with no counter moving anywhere.
+And reaching `'connected'` **refunds the attempt budget** (`attempts = 0`): the
+budget exists for "this pair cannot reach each other at all", and spending it on
+recoveries wrote off pairs that kept proving they worked — permanently, since the
+give-up list lasts the session.
+
+The repair pass runs over **every** link, not only the ones the roster currently
+mentions, because the links that most need repairing are exactly the ones whose
+peer has flickered out of it.
+
 ## The microphone
 
 One `sendrecv` audio transceiver is created **before any description exists**, so
@@ -1042,12 +1086,22 @@ into the state.
 their `talking` flag — plus `mode`, `mic`, `unreachable` and the counters:
 
 `offersSent`, `answersSent`, `offersApplied`, `answersApplied`, `dropped`,
-`tooLarge`, `restarts`, `given_up`, `notSent`.
+`tooLarge`, `restarts`, `given_up`, `notSent`, `reaped`, `stalls`.
 
 Every one of those is a **silent** failure otherwise. `__boots.voiceMode(mode)`
 exists because the picker is in the editor sidebar and a QA run is inside the
 game, so without that seam the proximity mix is the one half of voice no harness
 can reach.
+
+`__boots.voiceInternals()` goes one level below all of it: per link, the
+`signaling`/`connection`/`ice` states, every transceiver's `direction` vs
+`currentDirection`, each receiver's track (`muted`, `readyState`), each sender's
+(`hasTrack`, `enabled`), and whether the audio element actually holds a stream and
+is playing. `voice()` answers "did the handshake finish"; this answers the
+question that comes next and cannot be seen from there, because **media is
+negotiated per direction**: a completed handshake where one side hears nothing is
+a `currentDirection` of `recvonly` on one end, or a sender that never got the
+track, and both of those look perfect in every other readout.
 
 ### Two-browser voice checklist (`docs/qa/qa-boots-voice.mjs`)
 

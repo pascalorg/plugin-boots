@@ -106,6 +106,19 @@ export const TALKING_STALE_MS = 1200
 export const PEER_ABSENT_MS = 4000
 /** An established connection sitting 'disconnected' this long is rebuilt (ms). */
 export const DISCONNECT_GRACE_MS = 5000
+/**
+ * A gap between ticks longer than this means THIS PAGE stopped running, not that
+ * anything happened to anybody else (ms).
+ *
+ * A hidden tab, a laptop lid, a long garbage collection: the interval simply does
+ * not fire, and when it fires again the clock has jumped. Every deadline in this
+ * module is a difference against that clock, so a jump makes all of them expire
+ * at once — the peers get reaped for silence during a window in which we were not
+ * listening, and their frames, queued behind this very callback, arrive a
+ * millisecond too late to save them. Nothing about that is the peers' fault, and
+ * the fix is to credit the lost time back rather than to spend it accusing them.
+ */
+export const TICK_STALL_MS = 1000
 
 let iceServers: RTCIceServer[] = [
   // Public STUN. Enough to discover a reflexive candidate, which is what makes
@@ -212,6 +225,8 @@ type VoiceState = {
    */
   clock: number
   lastTarget: string | null
+  /** Clock reading of the previous tick, to notice that this page was frozen. */
+  lastTickAt: number
   /** Observability — every one of these is a silent failure otherwise. */
   counters: {
     offersSent: number
@@ -246,6 +261,13 @@ type VoiceState = {
      * reached — same silence, same empty connection state, opposite fix.
      */
     reaped: number
+    /**
+     * Ticks that arrived after a gap long enough to mean this page was not
+     * running. Expected to be non-zero in any real session — somebody switches
+     * windows — and worth seeing, because the alternative reading of the same
+     * event is "every peer went silent at once".
+     */
+    stalls: number
   }
 }
 
@@ -286,6 +308,7 @@ const state: VoiceState = {
   ticks: 0,
   clock: 0,
   lastTarget: null,
+  lastTickAt: 0,
   counters: {
     offersSent: 0,
     answersSent: 0,
@@ -299,6 +322,7 @@ const state: VoiceState = {
     abandoned: 0,
     threw: 0,
     reaped: 0,
+    stalls: 0,
   },
 }
 
@@ -890,7 +914,26 @@ function meshNow(): string[] {
 export function voiceTick(now: number): void {
   if (!state.active) return
   state.ticks++
+  const previous = state.lastTickAt
+  state.lastTickAt = now
   state.clock = now
+  // A FROZEN PAGE DOES NOT GET TO BLAME ITS PEERS. If the gap since the last tick
+  // is far longer than the tick interval, this page was not running, so none of
+  // the elapsed time is evidence about anybody else — give it back to every
+  // deadline that would otherwise expire the instant we wake up. Without this, a
+  // hidden tab hangs up on the whole room on its first tick back, having spent
+  // the outage not listening.
+  if (previous !== 0 && now - previous > TICK_STALL_MS) {
+    const stall = now - previous - VOICE_TICK_MS
+    state.counters.stalls++
+    state.lastOverOpenAt += stall
+    for (const link of state.peers.values()) {
+      link.seenAt += stall
+      link.startedAt += stall
+      link.talkingAt += stall
+      if (link.droppedAt !== 0) link.droppedAt += stall
+    }
+  }
   const me = localSessionId()
   if (me === null) return
 
@@ -1166,6 +1209,65 @@ export function voiceDebug(): {
   }
 }
 
+/**
+ * THE RAW WEBRTC STATE, per peer — for one-way audio and nothing else.
+ *
+ * `voiceDebug` answers "did the handshake finish"; this answers the question that
+ * comes next and cannot be seen from there: media is negotiated per DIRECTION, so
+ * a pair can be perfectly connected while one side's m-line came back `recvonly`,
+ * or while a receiver exists whose track is muted and will never produce a sample.
+ * Both look exactly like a working call from the outside and exactly like a broken
+ * one to the person wearing headphones.
+ *
+ * Deliberately raw and unshaped: it is read by a human chasing a specific class of
+ * bug, not by the HUD.
+ */
+export function voiceInternals(): Array<{
+  sessionId: string
+  signaling: string
+  connection: string
+  ice: string
+  transceivers: Array<{ mid: string | null; direction: string; currentDirection: string | null }>
+  receivers: Array<{ kind: string; muted: boolean; readyState: string }>
+  senders: Array<{ hasTrack: boolean; kind: string | null; enabled: boolean | null }>
+  elementHasStream: boolean
+  elementTracks: number
+  elementPaused: boolean | null
+}> {
+  const out: ReturnType<typeof voiceInternals> = []
+  for (const link of state.peers.values()) {
+    const stream = link.element?.srcObject
+    out.push({
+      sessionId: link.sessionId,
+      signaling: link.pc.signalingState,
+      connection: link.pc.connectionState,
+      ice: link.pc.iceConnectionState,
+      transceivers: (link.pc.getTransceivers?.() ?? []).map((transceiver) => ({
+        mid: transceiver.mid,
+        direction: transceiver.direction,
+        currentDirection: transceiver.currentDirection,
+      })),
+      receivers: (link.pc.getReceivers?.() ?? [])
+        .filter((receiver) => receiver.track)
+        .map((receiver) => ({
+          kind: receiver.track.kind,
+          muted: receiver.track.muted,
+          readyState: receiver.track.readyState,
+        })),
+      senders: (link.pc.getSenders?.() ?? []).map((sender) => ({
+        hasTrack: Boolean(sender.track),
+        kind: sender.track?.kind ?? null,
+        enabled: sender.track ? sender.track.enabled : null,
+      })),
+      elementHasStream: Boolean(stream),
+      elementTracks:
+        stream instanceof MediaStream ? stream.getTracks().filter((t) => t.kind === 'audio').length : 0,
+      elementPaused: link.element ? link.element.paused : null,
+    })
+  }
+  return out
+}
+
 /** Test-only: forget everything, including the give-up list. */
 export function resetVoice(): void {
   stopVoice()
@@ -1183,6 +1285,7 @@ export function resetVoice(): void {
     offersSent: 0,
     reaped: 0,
     restarts: 0,
+    stalls: 0,
     threw: 0,
     tooLarge: 0,
   }
