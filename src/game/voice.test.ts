@@ -134,6 +134,15 @@ class FakePeerConnection {
   static rejectSetRemote = false
   /** Accept setLocalDescription and hand back nothing — the silent abandon. */
   static swallowLocalDescription = false
+  /**
+   * Hold every negotiation at createAnswer until this resolves.
+   *
+   * The real thing spends seconds here (createAnswer, setLocalDescription, then
+   * the whole ICE gather), and that window is where the resend loop lands. The
+   * fake resolves in a microtask, so without a gate no test can put two copies of
+   * one offer inside the same negotiation — the exact shape of the bug.
+   */
+  static holdAnswer: Promise<void> | null = null
 
   connectionState = 'new'
   iceConnectionState = 'new'
@@ -183,6 +192,7 @@ class FakePeerConnection {
   }
 
   async createAnswer() {
+    if (FakePeerConnection.holdAnswer) await FakePeerConnection.holdAnswer
     return { sdp: SDP('sendrecv'), type: 'answer' }
   }
 
@@ -271,6 +281,7 @@ const mic: MicScript = { grant: true, permission: 'prompt', track: null }
 
 function installWebRtc(): void {
   FakePeerConnection.made = []
+  FakePeerConnection.holdAnswer = null
   FakePeerConnection.rejectSetRemote = false
   FakePeerConnection.swallowLocalDescription = false
   FakeAudio.made = []
@@ -982,6 +993,93 @@ describe('a pending description does not wait for the heartbeat', () => {
     expect(sent(bus).length).toBe(before)
     voiceTick(1300) // ticks % SIGNAL_EVERY_TICKS === 0
     expect(sent(bus).length).toBe(before + 1)
+  })
+})
+
+describe('one negotiation at a time, per pair', () => {
+  /**
+   * SIGNALLING HERE IS A RESEND LOOP, and every stage of a handshake is an await.
+   * The offerer publishes the same description every tick until it is
+   * acknowledged — which cannot happen until the answerer has finished
+   * createAnswer, setLocalDescription and the full ICE gather, seconds later. So
+   * the answerer sees ten or thirty copies of an offer it is already in the
+   * middle of answering, and `applied` — written at the very END of that
+   * sequence — cannot stop it starting a fresh negotiation for every one.
+   *
+   * What that produced was not a failure anybody could see: both ends reported a
+   * connected pair, and the local answer that happened to survive the
+   * interleaving belonged to no offer the other side still held. Media in one
+   * direction only, with every readout green.
+   */
+  test('the same offer arriving many times is answered once', async () => {
+    boot()
+    seePeer('session-a') // below us, so they are the offerer and we answer
+    voiceTick(1000)
+    await settle()
+
+    let release = () => {}
+    FakePeerConnection.holdAnswer = new Promise<void>((resolve) => {
+      release = () => resolve()
+    })
+    const offer = { epoch: 1, sdp: SDP('sendrecv'), type: 'offer' as const }
+    for (let tick = 0; tick < 10; tick++) {
+      hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: offer, to: 'session-me' })
+      await settle(2)
+    }
+    release()
+    FakePeerConnection.holdAnswer = null
+    await settle()
+
+    expect(voiceDebug().counters.offersApplied).toBe(1)
+    expect(voiceDebug().counters.dropped).toBe(9)
+    // One connection, one remote offer on it. Nine `setRemoteDescription` calls
+    // on a connection mid-negotiation is what a one-way call is made of.
+    expect(FakePeerConnection.made.length).toBe(1)
+    expect(FakePeerConnection.made[0]!.remoteDescriptions.length).toBe(1)
+    expect(peer('session-a')?.owed).toBe('answer@1')
+  })
+
+  test('a NEW offer is still answered once the first one has settled', async () => {
+    boot()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', {
+      v: VOICE_PROTOCOL,
+      sdp: { epoch: 1, sdp: SDP('sendrecv'), type: 'offer' },
+      to: 'session-me',
+    })
+    await settle()
+    // Their link was rebuilt and they are offering again — the guard is about
+    // duplicates of one description, never about refusing the next one.
+    hearVoice('session-a', {
+      v: VOICE_PROTOCOL,
+      sdp: { epoch: 2, sdp: SDP('sendrecv'), type: 'offer' },
+      to: 'session-me',
+    })
+    await settle()
+    expect(voiceDebug().counters.offersApplied).toBe(2)
+    expect(peer('session-a')?.owed).toBe('answer@2')
+  })
+
+  test('a duplicate ANSWER does not tear down the call it belongs to', async () => {
+    boot()
+    seePeer('session-z') // above us, so we offer
+    voiceTick(1000)
+    await settle()
+    const answer = { epoch: 1, sdp: SDP('sendrecv'), type: 'answer' as const }
+    // Two copies inside one microtask turn: their resend loop runs until we ack,
+    // and we only stop owing the offer when the first application resolves. The
+    // second setRemoteDescription rejects on a real stack, and the rejection path
+    // restarts the pair — so the punishment for their patience was our hanging up.
+    hearVoice('session-z', { v: VOICE_PROTOCOL, sdp: answer, to: 'session-me' })
+    hearVoice('session-z', { v: VOICE_PROTOCOL, sdp: answer, to: 'session-me' })
+    await settle()
+    expect(voiceDebug().counters.answersApplied).toBe(1)
+    expect(voiceDebug().counters.restarts).toBe(0)
+    expect(FakePeerConnection.made.length).toBe(1)
+    // The offer is acknowledged by having been answered, so it stops being sent.
+    expect(peer('session-z')?.owed).toBe(null)
   })
 })
 

@@ -151,6 +151,20 @@ type PeerLink = {
   outbound: VoiceDescription | null
   /** Newest epoch we have applied FROM them (what we put in `ack`). */
   applied: number
+  /**
+   * ONE NEGOTIATION AT A TIME, PER PAIR — the epoch currently being answered or
+   * applied, marked BEFORE the first `await` and cleared when it settles.
+   *
+   * `applied` cannot do this job: it is written at the END of the handshake,
+   * after ICE gathering, seconds later. In between, the offerer re-sends the same
+   * description every tick until it is acknowledged, so the answerer used to see
+   * ten or thirty copies of an offer it had not finished answering and start a
+   * whole new negotiation for each — every one of them a `setRemoteDescription`
+   * on a connection already mid-flight. The last local answer to survive that
+   * interleaving then belonged to no offer the other side was still holding,
+   * which is a connected pair with media in one direction.
+   */
+  busy: number
   /** Their epoch we have acknowledged and they have seen — stops the resend. */
   ackedByThem: boolean
   state: PeerLinkState
@@ -402,6 +416,7 @@ function makeLink(sessionId: string): PeerLink | null {
     epoch: 0,
     outbound: null,
     applied: 0,
+    busy: 0,
     ackedByThem: false,
     state: 'idle',
     attempts: 0,
@@ -568,6 +583,9 @@ async function makeOffer(link: PeerLink): Promise<void> {
 async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void> {
   link.state = 'negotiating'
   link.startedAt = state.clock
+  // Claimed synchronously: every line below is an await, and the offerer is
+  // re-sending this same description every tick until we acknowledge it.
+  link.busy = offer.epoch
   try {
     if (link.pc.signalingState === 'have-local-offer') {
       // We are answering a peer we had also offered to. Handing an offer to a
@@ -611,6 +629,11 @@ async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void
     link.step = 'answer:threw'
     link.error = describeError(error)
     state.counters.threw++
+  } finally {
+    // Released whatever happened: an answer that fell over must not lock the pair
+    // out of answering the next copy of the offer, and `applied` — which is only
+    // written on success — is what stops a duplicate being answered twice.
+    if (link.busy === offer.epoch) link.busy = 0
   }
 }
 
@@ -705,8 +728,10 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
       target = makeLink(from) ?? undefined
       if (!target) return
     }
-    if (description.epoch <= target.applied) {
-      state.counters.dropped++ // an offer we already answered
+    if (description.epoch <= target.applied || description.epoch === target.busy) {
+      // Already answered, or being answered right now — the resend loop means we
+      // see the same offer many times before our answer is ever acknowledged.
+      state.counters.dropped++
       return
     }
     // GLARE. Both ends offered — a build mismatch, or a link rebuilt at the
@@ -732,6 +757,15 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
     state.counters.dropped++ // an answer to a superseded offer
     return
   }
+  if (link.busy === description.epoch) {
+    // The same hazard from the other end: the answerer re-sends until we ack, and
+    // `outbound` is only cleared once this promise resolves. A second
+    // `setRemoteDescription` for an answer already being applied rejects, and the
+    // rejection path RESTARTS the pair — tearing down a call that was working.
+    state.counters.dropped++
+    return
+  }
+  link.busy = description.epoch
   link.pc
     .setRemoteDescription({ sdp: description.sdp, type: 'answer' })
     .then(() => {
@@ -742,6 +776,9 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
     })
     .catch(() => {
       restart(link, 'answer-rejected')
+    })
+    .finally(() => {
+      if (link.busy === description.epoch) link.busy = 0
     })
 }
 
@@ -1168,6 +1205,13 @@ export function voiceDebug(): {
      * so without this the reason it is not negotiating is invisible.
      */
     absentMs: number
+    /**
+     * Has the peer acknowledged what `owed` names? An answerer keeps its answer in
+     * `outbound` for the whole session, so `owed` alone reads as a description
+     * still going out every tick long after it landed — which is what made a
+     * healthy call look like a stuck one in the two-browser dump.
+     */
+    acked: boolean
   }>
   unreachable: string[]
   counters: VoiceState['counters']
@@ -1181,6 +1225,7 @@ export function voiceDebug(): {
 } {
   const peers = [...state.peers.values()].map((link) => ({
     absentMs: Math.max(0, state.clock - link.seenAt),
+    acked: link.ackedByThem,
     applied: link.applied,
     attempts: link.attempts,
     connection: link.pc.connectionState,

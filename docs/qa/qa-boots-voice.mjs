@@ -167,7 +167,7 @@ const meshLine = async () => {
           // `step` is the whole point of the line: state says 'negotiating' for
           // both an await that never settled and an await that returned in
           // silence, and only the stage label tells them apart.
-          `${p.sessionId} ${p.state}@${p.step}/${p.connection}/${p.ice} owed=${p.owed} track=${p.hasTrack}` +
+          `${p.sessionId} ${p.state}@${p.step}/${p.connection}/${p.ice} owed=${p.owed}${p.owed && p.acked ? '(acked)' : ''} track=${p.hasTrack}` +
           // A link inside its absence grace period is not negotiating and looks
           // identical to an idle one; only this says why.
           (p.absentMs ? ` absent=${p.absentMs}ms` : '') +
@@ -236,6 +236,34 @@ for (const client of clients) {
 }
 const audioOk = audio.every((r) => r.ok)
 log(`  AUDIO FLOWING BOTH WAYS: ${audioOk}`)
+
+// ── 3b. why not? ────────────────────────────────────────────────────────────
+// Media is negotiated per DIRECTION, so "connected with no track" is not one
+// bug: it is a transceiver stuck at recvonly, a sender that never got the mic, a
+// receiver whose track arrived muted, or an element that has the stream and is
+// paused. Nothing above can tell those apart, and each has a different fix.
+if (!audioOk) {
+  log('\n=== 3b. per-direction WebRTC state (one-way audio) ===')
+  for (const client of clients) {
+    const raw = await client.page.evaluate(() => globalThis.__boots?.voiceInternals?.() ?? null)
+    if (!Array.isArray(raw)) {
+      log(`[${client.label}] voiceInternals unavailable — stale bundle?`)
+      continue
+    }
+    for (const p of raw) {
+      log(`[${client.label}] ${p.sessionId} sig=${p.signaling} conn=${p.connection} ice=${p.ice}`)
+      for (const t of p.transceivers ?? [])
+        log(`   transceiver mid=${t.mid} direction=${t.direction} current=${t.currentDirection}`)
+      for (const r of p.receivers ?? [])
+        log(`   receiver ${r.kind} muted=${r.muted} readyState=${r.readyState}`)
+      for (const s of p.senders ?? [])
+        log(`   sender ${s.kind} hasTrack=${s.hasTrack} enabled=${s.enabled}`)
+      log(
+        `   element stream=${p.elementHasStream} tracks=${p.elementTracks} paused=${p.elementPaused}`,
+      )
+    }
+  }
+}
 
 // ── 4. the talk gate, reported not asserted ─────────────────────────────────
 // The fake device is a periodic beep, so the gate opening inside any particular
