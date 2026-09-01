@@ -27,7 +27,7 @@
  *
  *   SCENE=… ENGINE=chromium|webkit node qa-boots-phone.mjs
  */
-import { chromium, devices, webkit } from 'playwright'
+import { chromium, devices, webkit } from './qa-playwright.mjs'
 
 const SCENE = process.env.SCENE ?? '65fbacdc1faf'
 const URL = `http://localhost:3002/scene/${SCENE}?boots=drop`
