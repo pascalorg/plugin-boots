@@ -830,6 +830,17 @@ export function selfTalking(): boolean {
   return state.talking
 }
 
+/**
+ * Is this one peer talking right now? A map lookup, for the per-avatar frame
+ * check — `talkingPeers()` allocates an array, and twelve avatars each calling
+ * it every frame is 720 throwaway arrays a second for one boolean apiece.
+ */
+export function isPeerTalking(sessionId: string, now = state.clock): boolean {
+  const link = state.peers.get(sessionId)
+  if (!link || !link.talking) return false
+  return now - link.talkingAt <= TALKING_STALE_MS
+}
+
 /** Session ids whose last frame said they were talking, recently enough. */
 export function talkingPeers(now = state.clock): string[] {
   const out: string[] = []

@@ -23,6 +23,7 @@ import {
   useDestruction,
 } from './destruction'
 import { armoryStationPosition } from './guntable'
+import { takeAction } from './input'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
 import { getSession } from './session'
@@ -901,30 +902,15 @@ export function Interact({ world }: { world: GameWorld }) {
       session.hud.prompt(prompt, 'doors')
     }
 
-    // E — take the one-shot 'KeyE' action from the input queue so a tap
-    // whose keydown+keyup both land inside one frame still registers
-    // (per-frame keys sampling misses it). This callback runs at priority
-    // -1, before the viewmodel's consumeActions() drain; we strip only our
-    // KeyE entries, in place, and only while an operable has the press. The
-    // gun tables keep their priority: while either is busy `target` is null,
-    // the queue is left alone, and they read the keys set — never the queue.
-    if (target) {
-      const actions = session.input.state.actions
-      let tapped = false
-      let write = 0
-      for (let read = 0; read < actions.length; read++) {
-        const action = actions[read]!
-        if (action === 'KeyE') {
-          tapped = true
-        } else {
-          if (write !== read) actions[write] = action
-          write++
-        }
-      }
-      if (tapped) {
-        actions.length = write
-        toggleOperable(target)
-      }
+    // E — take the one-shot 'KeyE' action from the input queue so a tap whose
+    // keydown+keyup both land inside one frame still registers (per-frame keys
+    // sampling misses it — see input.takeAction). This callback runs at priority
+    // -1, before the viewmodel's consumeActions() drain, and claims the press
+    // ONLY while an operable is aimed at. The gun tables keep their priority:
+    // while either is busy `target` is null, so the short-circuit leaves the
+    // queue untouched, and they read the keys set — never the queue.
+    if (target && takeAction(session.input.state.actions, 'KeyE')) {
+      toggleOperable(target)
     }
   }, -1)
 

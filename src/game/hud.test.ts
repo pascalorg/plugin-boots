@@ -9,6 +9,7 @@ import {
   LOADING_TIPS,
   PAINT_CAROUSEL_HOLD_MS,
   presenceChipText,
+  voiceChipText,
 } from './hud'
 
 /**
@@ -252,6 +253,69 @@ describe('paint color carousel (R-cycle readout)', () => {
     const hud = new Hud()
     expect(() => hud.paintCarousel(['#f4f4ef', '#26282c', '#8f959d'], 1)).not.toThrow()
     expect(() => hud.paintCarousel(['#f4f4ef', '#26282c', '#8f959d'], 2)).not.toThrow()
+    expect(() => hud.unmount()).not.toThrow()
+  })
+})
+
+/**
+ * Voice chip (owner ask: "talk to each other like teammates in fortnite"): the
+ * one line that tells a player whether the call exists, whether their own mic is
+ * live, and whether anybody is speaking. Its whole job is to be readable in a
+ * firefight, so the rules it has to keep are: never advertise voice to somebody
+ * standing alone with the mic off, ALWAYS offer the key once there is somebody to
+ * talk to, and never claim silence is a failure.
+ */
+
+describe('voice chip', () => {
+  const chip = (over: Partial<Parameters<typeof voiceChipText>[0]> = {}) =>
+    voiceChipText({ mic: 'off', talking: false, talkers: 0, peers: 0, ...over })
+
+  test('stays out of the way when there is nobody to talk to', () => {
+    expect(chip()).toBeNull()
+    expect(chip({ mic: 'denied' })).toBeNull()
+    expect(chip({ mic: 'unavailable' })).toBeNull()
+  })
+
+  test('a live mic is shown even alone — the recording indicator needs an owner', () => {
+    // The browser lights its red dot the moment the track exists. A chip that
+    // hides at that point leaves the player looking for what is recording them.
+    expect(chip({ mic: 'live' })).toBe('MIC ON')
+    expect(chip({ mic: 'muted' })).toBe('M — MIC MUTED')
+  })
+
+  test('offers the key as soon as a peer is in the game', () => {
+    expect(chip({ peers: 1 })).toBe('M — TALK')
+  })
+
+  test('own transmission is called out, and the mute state names its own key', () => {
+    expect(chip({ mic: 'live', peers: 1, talking: true })).toBe('● TALKING')
+    expect(chip({ mic: 'muted', peers: 1 })).toContain('M')
+  })
+
+  test('a blocked or missing mic still says you can HEAR them', () => {
+    // Denial is one-way. Telling somebody "blocked" and nothing else reads as
+    // "voice is broken", and they stop expecting to hear anyone.
+    expect(chip({ mic: 'denied', peers: 2 })).toBe('MIC BLOCKED — LISTENING')
+    expect(chip({ mic: 'unavailable', peers: 2 })).toBe('NO MIC — LISTENING')
+  })
+
+  test('speaker count rides on the end of whatever the state line says', () => {
+    expect(chip({ mic: 'off', peers: 2, talkers: 1 })).toBe('M — TALK  ·  1 SPEAKING')
+    expect(chip({ mic: 'live', peers: 3, talkers: 2 })).toBe('MIC ON  ·  2 SPEAKING')
+    expect(chip({ mic: 'denied', peers: 1, talkers: 1 })).toBe(
+      'MIC BLOCKED — LISTENING  ·  1 SPEAKING',
+    )
+    // Nobody speaking is the normal case, not a state worth printing a 0 for.
+    expect(chip({ mic: 'live', peers: 3, talkers: 0 })).toBe('MIC ON')
+  })
+
+  test('voiceChip is a safe no-op without a DOM', () => {
+    const hud = new Hud()
+    const args = { mic: 'live' as const, talking: false, talkers: 0, peers: 1 }
+    expect(() => hud.voiceChip(args)).not.toThrow()
+    expect(() => hud.voiceChip(args)).not.toThrow() // change-gated repeat
+    expect(() => hud.voiceChip({ ...args, talking: true })).not.toThrow()
+    expect(() => hud.voiceChip({ ...args, mic: 'off', peers: 0 })).not.toThrow()
     expect(() => hud.unmount()).not.toThrow()
   })
 })

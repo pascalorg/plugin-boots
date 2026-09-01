@@ -58,6 +58,8 @@ import { TreesDestruct, treesDebug } from './trees-destruct'
 import { Viewmodel } from './viewmodel'
 import { settleTasksPending } from './structure'
 import { PipelineWarmup } from './warmup'
+import { enableMicIfAlreadyPermitted, startVoice, stopVoice, voiceDebug } from './voice'
+import { VoiceControls } from './voice-controls'
 import { dormantPrimeQueueSize, VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
 import {
@@ -584,6 +586,18 @@ function ActiveGame() {
     // we could author records under. exitGame owns the stop, before
     // stopPresence closes the transport.
     startWorldSync()
+    // Voice rides the same transport for SIGNALLING only (the speech goes
+    // peer-to-peer). Feature-detected the same way, and it needs the eye
+    // position for the proximity mix — playerRig, not the pose sampler, because
+    // that one mutates a shared scratch object.
+    startVoice({
+      getLocalPosition: () => [playerRig.position.x, playerRig.position.y, playerRig.position.z],
+    })
+    // Turn the mic on ONLY if this browser already granted it. Prompting here
+    // would put a permission dialog in front of someone who just dropped into a
+    // firefight, and a dialog answered by reflex is denied for good; the HUD
+    // offers the key instead. Second session onward this is seamless.
+    void enableMicIfAlreadyPermitted()
     const offEvents = onPresenceEvent((event) => {
       const hud = getSession()?.hud as unknown as
         | { presenceToast?: (text: string) => void }
@@ -596,6 +610,7 @@ function ActiveGame() {
       // (session ended or a new one started) must not stop the new one.
       if (useBoots.getState().phase !== 'game' && getSessionSerial() === serial) {
         stopWorldSync() // before stopPresence: that call closes the transport
+        stopVoice() // releases the microphone — see below
         stopPresence()
       }
     }
@@ -822,6 +837,11 @@ function ActiveGame() {
       presence: () => presenceDebug(),
       // `unsent` + `overflow` together are the whole "are we desynced" question.
       worldSync: () => worldSyncDebug(),
+      // Voice QA dump (voice.ts): one line per peer with its real
+      // RTCPeerConnection state, what description it still owes, its mixed gain
+      // and whether a track has actually arrived — plus `notSent`/`given_up`,
+      // the two counters that turn "voice is flaky" into a number.
+      voice: () => voiceDebug(),
       // Host post-tuning census (host-post.ts, perf fix 5): is the shadow
       // throttle + outline guard live, how many lights are frozen, how
       // often the outline guard had to re-clear. Plain data.
@@ -847,6 +867,7 @@ function ActiveGame() {
     <>
       <Player world={world} />
       <RemotePlayers />
+      <VoiceControls />
       <Viewmodel world={world} />
       <PaintTool world={world} />
       <Prevoxelize world={world} />

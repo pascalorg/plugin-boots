@@ -180,6 +180,13 @@ export const BUTTONS: readonly ButtonSpec[] = [
   // Top strip — session controls.
   { code: EXIT, label: '✕', sub: 'EXIT', size: 42, place: `left:12px;${top(12)}`, mode: 'tap' },
   { code: 'KeyI', label: 'I', sub: 'GEAR', size: 42, place: `left:62px;${top(12)}`, mode: 'tap' },
+  // Mic toggle (voice.ts). A phone has no M key, and voice is the difference
+  // between two people in one building and two people in one call — so it gets a
+  // permanent button rather than a weapon-gated one. 'tap' pushes 'KeyM' onto the
+  // action queue exactly as a keydown would, and voice-controls.tsx takes it from
+  // there; the FIRST tap is also the permission prompt, which is why this has to
+  // be a real touch and not something the session does on entry.
+  { code: 'KeyM', label: 'M', sub: 'MIC', size: 42, place: `left:112px;${top(12)}`, mode: 'tap' },
 ]
 
 /** The weapon hotbar, tappable. Digit codes are what viewmodel.tsx consumes. */

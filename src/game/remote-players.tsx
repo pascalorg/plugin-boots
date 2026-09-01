@@ -5,9 +5,11 @@ import { type ReactElement, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BoxGeometry,
   CanvasTexture,
+  CircleGeometry,
   Color,
   type Group,
-  type MeshBasicMaterial,
+  type Mesh,
+  MeshBasicMaterial,
   MeshStandardMaterial,
   Quaternion,
 } from 'three'
@@ -26,6 +28,7 @@ import {
   type RemotePlayer,
 } from './presence'
 import { getSession } from './session'
+import { isPeerTalking } from './voice'
 import {
   HammerModel,
   KnifeModel,
@@ -225,6 +228,28 @@ const VISOR_MATERIAL = new MeshStandardMaterial({
   metalness: 0.4,
   roughness: 0.35,
 })
+
+/**
+ * The speaking dot — a small unlit disc over the name tag, shown while that peer
+ * is transmitting (voice.ts's talk gate, carried on their own frames).
+ *
+ * Which mouth a voice belongs to is the one thing a call in a game needs and a
+ * call on a phone does not: six people in one building, and without this the
+ * answer to "who said that" is to ask. It rides INSIDE the tag group so it
+ * billboards with the name and disappears at the same distance for free.
+ *
+ * Geometry AND material are shared across avatars, which is why the dot does not
+ * fade with the tag the way the name does — a shared material has one opacity, so
+ * fading it for the far avatar would fade it for the near one too. It blinks out
+ * with the group at the tag cutoff instead, which is the honest version of the
+ * same idea and costs one program for a whole lobby.
+ */
+const SPEAK_GEO = new CircleGeometry(0.045, 12)
+const SPEAK_MATERIAL = new MeshBasicMaterial({
+  color: '#7ee081',
+  depthWrite: false,
+  transparent: true,
+})
 const BOOT_MATERIAL = new MeshStandardMaterial({ color: '#332a22', roughness: 0.9 })
 
 const _tint = new Color()
@@ -313,6 +338,7 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
   const legRRef = useRef<Group>(null)
   const tagRef = useRef<Group>(null)
   const tagMatRef = useRef<MeshBasicMaterial>(null)
+  const speakRef = useRef<Mesh>(null)
   const gaitPhase = useRef(0)
   const lastScale = useRef(-1)
   const frame = useRef(0)
@@ -377,6 +403,17 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
         }
         root.getWorldQuaternion(_worldQuat).invert()
         tag.quaternion.copy(_worldQuat.multiply(camera.quaternion))
+        // Speaking dot: one map lookup (isPeerTalking, not talkingPeers() —
+        // that one allocates an array per call, and a dozen avatars asking it
+        // every frame is hundreds of throwaway arrays a second for one boolean
+        // each). `now` is passed explicitly so a peer whose last voice frame
+        // stopped arriving goes quiet on WALL time; the voice module's own clock
+        // only advances while its tick is running.
+        const speak = speakRef.current
+        if (speak) {
+          const talking = isPeerTalking(remote.sessionId, now)
+          if (speak.visible !== talking) speak.visible = talking
+        }
       }
     }
 
@@ -448,6 +485,16 @@ function RemoteAvatar({ remote }: { remote: RemotePlayer }) {
             <meshBasicMaterial ref={tagMatRef} map={tagTexture} transparent depthWrite={false} />
           </mesh>
         ) : null}
+        {/* Speaking dot — above the name, hidden until this peer transmits.
+            Mounted always (not conditionally rendered) so turning it on is a
+            boolean on an existing object rather than a mid-firefight remount. */}
+        <mesh
+          geometry={SPEAK_GEO}
+          material={SPEAK_MATERIAL}
+          position={[0, 0.16, 0]}
+          ref={speakRef}
+          visible={false}
+        />
       </group>
     </group>
   )

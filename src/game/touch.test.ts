@@ -215,6 +215,33 @@ describe('the button table agrees with the game', () => {
     }
   })
 
+  test('the phone can reach the microphone', () => {
+    // A phone has no M key. Without this button the whole voice layer is desktop
+    // only, and "join my game" from a phone means joining in silence.
+    const mic = BUTTONS.find((b) => b.code === 'KeyM')
+    expect(mic, 'no touch button for KeyM').toBeDefined()
+    expect(mic?.sub).toBe('MIC')
+    // NOT weapon-gated: talking is not a tool, and a mic that vanishes when you
+    // switch off the builder is a mic nobody trusts.
+    expect(mic?.weapons).toBeUndefined()
+    // 'tap' is what pushes the one-shot onto the action queue that
+    // voice-controls.tsx reads; 'hold' would toggle on press and never release.
+    expect(mic?.mode).toBe('tap')
+  })
+
+  test('the top-left session row does not stack its buttons on each other', () => {
+    // EXIT / GEAR / MIC share one row, hit-tested by rect with 6px of slop, and
+    // the first match in declaration order wins — overlapping rects would make
+    // one of them unpressable rather than looking wrong.
+    const row = BUTTONS.filter((b) => /top:/.test(b.place) && /left:/.test(b.place))
+      .map((b) => ({ left: Number(/left:\s*(\d+)px/.exec(b.place)?.[1] ?? Number.NaN), size: b.size }))
+      .sort((a, b) => a.left - b.left)
+    expect(row.length).toBeGreaterThanOrEqual(3)
+    for (let i = 1; i < row.length; i++) {
+      expect(row[i]!.left).toBeGreaterThanOrEqual(row[i - 1]!.left + row[i - 1]!.size)
+    }
+  })
+
   test('every button is placed, sized and reachable', () => {
     for (const spec of BUTTONS) {
       expect(spec.size).toBeGreaterThanOrEqual(42) // Apple's 44pt, near enough

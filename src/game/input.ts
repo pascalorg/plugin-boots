@@ -39,6 +39,10 @@ export const GAME_KEYS = new Set([
   'KeyV',
   'KeyU',
   'KeyI',
+  // Mic toggle (voice.ts). Claimed here even though voice may be unavailable:
+  // an unclaimed code reaches the host editor, and a keystroke that runs an
+  // editor tool mid-session is the one thing this plugin promises never happens.
+  'KeyM',
   'Digit1',
   'Digit2',
   'Digit3',
@@ -48,6 +52,39 @@ export const GAME_KEYS = new Set([
   'Digit7',
   'Tab',
 ])
+
+/**
+ * Take one code off the one-shot queue, in place, and report whether it was
+ * there. THE ONE way a per-frame callback claims a tap.
+ *
+ * Why a queue entry and not `keys.has(code)`: a tap whose keydown and keyup both
+ * land inside a single frame never appears in the held-keys set at all, so a fast
+ * press on a busy frame is simply lost. The queue keeps it.
+ *
+ * Why in place and not splice: everything else in the frame reads the SAME array
+ * — the viewmodel drains it a few priorities later — so the survivors have to
+ * stay in their original order, and only our entries may disappear. Splicing per
+ * hit would renumber the queue underneath whoever reads it next; the compaction
+ * below rewrites it once. All copies of a repeated code are consumed, because a
+ * key held down long enough to auto-repeat is still one intent.
+ *
+ * Callers run at priority -1 so this happens before the drain.
+ */
+export function takeAction(actions: string[], code: string): boolean {
+  let taken = false
+  let write = 0
+  for (let read = 0; read < actions.length; read++) {
+    const action = actions[read]!
+    if (action === code) {
+      taken = true
+    } else {
+      if (write !== read) actions[write] = action
+      write++
+    }
+  }
+  if (taken) actions.length = write
+  return taken
+}
 
 export class GameInput {
   state: GameInputState = {

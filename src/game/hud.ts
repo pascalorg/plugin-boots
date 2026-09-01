@@ -263,6 +263,42 @@ export function presenceChipText(count: number): string | null {
 const PRESENCE_TOAST_HOLD_MS = 2400
 const PRESENCE_TOAST_GAP_MS = 300
 
+/**
+ * Voice chip text — pure, so the whole decision table is pinnable headless.
+ * null = no chip at all.
+ *
+ * The chip's real job is DISCOVERABILITY. A voice feature nobody knows about is
+ * the same as no voice feature, so the moment somebody else is in the lot and
+ * our mic is off, the chip is the invitation ("M — TALK"). Alone in the lot it
+ * says nothing: there is no one to talk to and the rail is small.
+ *
+ * The other job is honesty about the two states that are indistinguishable from
+ * "broken": a mic the browser refused (we can still HEAR the room, and saying so
+ * is the difference between a bug report and a shrug) and a browser that cannot
+ * do voice at all.
+ */
+export function voiceChipText(args: {
+  mic: 'off' | 'live' | 'muted' | 'denied' | 'unavailable'
+  /** Is OUR mic over the talk gate right now. */
+  talking: boolean
+  /** How many peers are talking right now. */
+  talkers: number
+  /** Peers in the session — 0 means we are alone. */
+  peers: number
+}): string | null {
+  const { mic, talking, talkers, peers } = args
+  // Alone with the mic off: nothing to offer and nobody to offer it to.
+  if (peers <= 0 && mic !== 'live' && mic !== 'muted') return null
+  let base: string
+  if (mic === 'live') base = talking ? '● TALKING' : 'MIC ON'
+  else if (mic === 'muted') base = 'M — MIC MUTED'
+  else if (mic === 'denied') base = 'MIC BLOCKED — LISTENING'
+  else if (mic === 'unavailable') base = 'NO MIC — LISTENING'
+  else base = 'M — TALK'
+  if (talkers <= 0) return base
+  return `${base}  ·  ${talkers} SPEAKING`
+}
+
 /** How long a kill flare owns the marker against trailing hit writes. */
 const KILL_HOLD_MS = 160
 
@@ -414,6 +450,10 @@ export class Hud {
   private presenceToastActive = false
   private presenceToastTimer: ReturnType<typeof setTimeout> | null = null
   private presenceToastGapTimer: ReturnType<typeof setTimeout> | null = null
+  /** Voice chip — see voiceChip(). Gated on the rendered TEXT, not on the
+   * inputs, so a talk gate flickering at 10 Hz writes nothing. */
+  private voiceChipEl: HTMLDivElement | null = null
+  private voiceChipText = ''
 
   mount(container: HTMLElement): void {
     const root = document.createElement('div')
@@ -706,6 +746,12 @@ export class Hud {
     // a burst of joins reads one at a time.
     this.presenceToastEl = el(
       `position:absolute;left:28px;top:40px;color:rgba(255,255,255,0.45);font:${FONT};font-size:11px;letter-spacing:0.08em;text-shadow:0 1px 3px rgba(0,0,0,0.7);white-space:nowrap;opacity:0;transition:opacity 0.3s`,
+    )
+    // Voice chip — third line of the same muted top-left rail (chip 20px,
+    // toast 40px, this 60px). Same restraint: who is in the lot and whether
+    // anyone is speaking is ambient information, not combat chrome.
+    this.voiceChipEl = el(
+      `position:absolute;left:28px;top:60px;color:rgba(255,255,255,0.5);font:${FONT};font-size:11px;letter-spacing:0.1em;text-shadow:0 1px 3px rgba(0,0,0,0.7);white-space:nowrap;opacity:0;transition:opacity 0.25s`,
     )
     // WAVE CLEARED banner — center card, opacity-only (waveCleared()).
     this.waveClearEl = el(
@@ -1279,6 +1325,28 @@ export class Hud {
   }
 
   /**
+   * Voice chip: mic state plus how many peers are speaking (voice-controls.tsx
+   * drives it per frame; the change gate makes repeats free). Brighter while WE
+   * are talking — that is the one piece of feedback that answers "is it picking
+   * me up", which is otherwise unanswerable without a second person.
+   */
+  voiceChip(args: {
+    mic: 'off' | 'live' | 'muted' | 'denied' | 'unavailable'
+    talking: boolean
+    talkers: number
+    peers: number
+  }): void {
+    const text = voiceChipText(args) ?? ''
+    if (text === this.voiceChipText) return
+    this.voiceChipText = text
+    const el = this.voiceChipEl
+    if (!el) return
+    el.textContent = text
+    el.style.opacity = text ? '1' : '0'
+    el.style.color = args.talking ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.5)'
+  }
+
+  /**
    * Presence join/leave toast — one short muted line ("Alice joined").
    * Queued (a burst of joins reads one at a time), fade in 300ms, hold
    * ~2.4s, fade out, small gap, next. Unlike hint(), toasts have no
@@ -1375,6 +1443,8 @@ export class Hud {
     this.presenceToastActive = false
     this.presenceToastEl = null
     this.presenceChipEl = null
+    this.voiceChipEl = null
+    this.voiceChipText = ''
     this.presenceCount = -1
     // Veil teardown — Esc during loading exits cleanly: the veil rides the
     // root removal below; onReveal is deliberately NOT fired (the session

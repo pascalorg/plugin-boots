@@ -12,6 +12,7 @@ import { capturePaint } from './paint-keep'
 import { persistPendingChanges } from './pending-lanes'
 import { stopWorldSync } from './net-world'
 import { stopPresence } from './presence'
+import { stopVoice } from './voice'
 import { captureDemolition } from './save-demolition'
 import { TouchControls, touchPlayLikely } from './touch'
 
@@ -826,6 +827,13 @@ export function exitGame(): void {
   // send for the world: records are grow-only, so what we built stays built in
   // every peer that saw it. Leaving removes our avatar, not our fort.
   stopWorldSync()
+  // The call ends when the game does, AND THE MICROPHONE IS RELEASED. Leaving a
+  // game must turn the browser's recording indicator off: a tab that keeps a red
+  // dot lit after you pressed Esc is the kind of thing nobody asks about, they
+  // just never press Jump in again. The cost is re-acquiring the device on the
+  // next session, which is one permission-free call once the browser has been
+  // told yes.
+  stopVoice()
   stopPresence()
 
   useBoots.getState().setPhase('editor')
