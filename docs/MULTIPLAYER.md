@@ -1214,3 +1214,52 @@ then run.
 - **Signalling is only as live as the tick.** A frame lost to coalescing costs up
   to four ticks before the next attempt; the resend loop is what makes that a
   delay instead of a failure, and `notSent` is what makes it visible.
+
+## Part 5 — The link itself
+
+A link that joins two people has to clear three conditions, and every one of them
+lives outside this plugin. Worth writing down together, because for a full night
+the plugin was blameless and the link still did nothing.
+
+1. **The plugin code is on the host.** It ships as a git pin in the host's
+   `apps/community/package.json`. A commit on `main` here is not deployed.
+2. **The project carries the open-lobby marker.** A reviewed host-side entry
+   (`open-lobby-policy.ts`). Not something visibility implies, and not something
+   this plugin can grant.
+3. **The project is public.** The marker alone never exposes a private project;
+   the two conditions are independent and both required for a stranger.
+
+Miss 1 and the visitor gets a canvas with no game. Miss 2 or 3 and `/play/<id>`
+answers `notFound()` — deliberately the same answer for "no such project", "not a
+lobby" and "private", so a link cannot be used to probe which projects exist.
+
+### Telling from outside whether a link can work
+
+The refusal being indistinguishable is right, and it also means you cannot check
+your own lobby by fetching it: an anonymous `GET /play/<id>` returns the sign-in
+gate for **every** id, including ids that do not exist. `sign-in` is decided
+before the project is even loaded. A sign-in page is not evidence of a lobby.
+
+Condition 3 is readable from outside, though, and this is the probe to use —
+`/editor/<id>`, unauthenticated:
+
+- **public** → the page carries a `NEXT_REDIRECT` to `/viewer/<id>`
+- **private, or no such project** → the "you don't have access, ask the owner"
+  page, with no redirect
+
+Both are HTTP 200, so the status code tells you nothing; the body does. (This is
+also what the owner's friend hit when he was sent `/editor/<id>` instead of
+`/play/<id>` and reported "nothing happened" — for a public project that lands on
+the read-only viewer, which has no plugin rail and no game.)
+
+Condition 2 is not observable from outside by design. Read the allowlist.
+
+### The sentence under the button has to distinguish 2 from 3
+
+Because the owner cannot see any of this, the sidebar is the only thing that can
+tell him — and it used to promise "anyone with the link signs in and drops
+straight into your game" for any *public* project, which is condition 3 alone.
+Bridge v2 gives the plugin `isOpenLobby` so `shareReach` can say which of the two
+is missing, and `unknown` (a v1 host) promises nothing rather than guessing.
+`docs/qa/qa-boots-share.mjs` drives that panel in a real browser against a real
+bridge and reads the sentence back off the DOM.
