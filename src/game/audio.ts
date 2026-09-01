@@ -288,6 +288,20 @@ export type SprayHandle = {
   stop: () => void
 }
 
+/**
+ * The shared AudioContext, built on demand — for the ONE consumer that needs
+ * the context itself rather than a voice: voice.ts, whose mic analyser reads
+ * levels off a local getUserMedia stream to drive the talk gate.
+ *
+ * Deliberately NOT a route into the mix. Speech must not go through `master`:
+ * that chain is a compressor shared with gunfire (a minigun would duck whoever
+ * is talking) behind the concussion lowpass (a grenade would muffle them).
+ * Returns null wherever WebAudio does not exist, like everything else here.
+ */
+export function sharedAudioContext(): AudioContext | null {
+  return ensureContext()
+}
+
 export const sfx = {
   resume(): void {
     ensureContext()

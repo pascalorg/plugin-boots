@@ -120,6 +120,11 @@ export const FRAME_KINDS = [
   'boots/world-snap',
   'state-request',
   'state-snapshot',
+  // voice.ts → SIGNALLING ONLY. The audio itself never touches this bus: an
+  // 8 000-byte JSON frame under latest-value coalescing would drop the middle
+  // of every sentence. What travels here is one WebRTC description per peer
+  // per epoch, re-sent until acknowledged (see voice-policy.ts).
+  'boots/voice',
 ] as const
 export type BootsFrameKind = (typeof FRAME_KINDS)[number]
 

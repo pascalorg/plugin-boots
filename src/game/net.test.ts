@@ -283,6 +283,9 @@ describe('envelope codec — readEnvelope', () => {
       'boots/world-snap',
       'state-request',
       'state-snapshot',
+      // Voice SIGNALLING only — one WebRTC description per peer per epoch. The
+      // speech itself never enters this bus (see voice-policy.ts).
+      'boots/voice',
     ])
   })
 })
