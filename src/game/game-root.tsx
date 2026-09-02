@@ -49,6 +49,7 @@ import { PaintTool } from './paint'
 import { MOVE } from './movement'
 import { startWorldSync, stopWorldSync, worldSyncDebug } from './net-world'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
+import { mirrorDebug } from './depot-mirror'
 import { Player, playerDebug, playerRig } from './player'
 import {
   type LocalPose,
@@ -57,7 +58,7 @@ import {
   startPresence,
   stopPresence,
 } from './presence'
-import { RemotePlayers } from './remote-players'
+import { localPaletteIndex, RemotePlayers } from './remote-players'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { sharedBuildDebug } from './shared-build'
 import { ShellLayer, shellCensus } from './shell-layer'
@@ -778,6 +779,17 @@ function ActiveGame() {
         fov: (camera as { fov?: number }).fov ?? 0,
       }),
       state: () => useBoots.getState(),
+      // The depot mirror's pass (plain copies): how many reflections have been
+      // rendered, whether one runs right now, our own tint's slot — and the
+      // live reflection's pixels, for a QA that looks at the picture.
+      mirror: () => ({
+        backend: mirrorDebug.backend,
+        engaged: mirrorDebug.engaged,
+        paletteIndex: localPaletteIndex(),
+        passes: mirrorDebug.passes,
+        size: [...mirrorDebug.size] as [number, number],
+      }),
+      mirrorPixels: () => mirrorDebug.readPixels?.() ?? Promise.resolve(null),
       wallNodes: () => Array.from(world.walls.values()).map((w) => w.node),
       doors: doorsDebug,
       // Bot snapshots (plain copies, never live refs) + a freeze toggle the

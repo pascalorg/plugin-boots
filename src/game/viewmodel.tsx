@@ -29,6 +29,14 @@ import { WEAPONS } from './weapons'
 import type { GameWorld } from './world'
 
 /**
+ * The first-person rig's scene-graph name. It lives in the main scene and
+ * copies the camera every frame, so any pass that renders the scene from
+ * ANOTHER camera (the depot mirror's) has to find it and hide it, or a giant
+ * gun hangs across the picture from inside that camera.
+ */
+export const VIEWMODEL_NAME = 'boots-viewmodel'
+
+/**
  * First-person viewmodel: weapon meshes parented to a group that copies the
  * camera every frame (the host camera isn't guaranteed to be in the scene
  * graph, so children can't ride it directly). Also owns the trigger loop —
@@ -645,7 +653,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const showPaint = displayed === 'paint'
 
   return (
-    <group ref={rigRef} userData={{ __boots: true }}>
+    <group name={VIEWMODEL_NAME} ref={rigRef} userData={{ __boots: true }}>
       {/* Initial position matches the knife pose (spawn weapon); the frame loop owns it after. */}
       <group ref={poseRef} position={[0.3, -0.3, -0.42]}>
         <group visible={showKnife}>

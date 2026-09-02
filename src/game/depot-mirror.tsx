@@ -2,9 +2,24 @@
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
-import { CanvasTexture, type Group, Matrix4, type Mesh } from 'three'
+import {
+  CanvasTexture,
+  type Group,
+  Matrix4,
+  type Mesh,
+  MeshBasicMaterial,
+  MeshStandardMaterial,
+  type Object3D,
+  type PerspectiveCamera,
+  PlaneGeometry,
+  Vector3,
+  type WebGLRenderer,
+  WebGLRenderTarget,
+} from 'three'
 import { useBoots } from '../store'
+import { EYE_HEIGHT } from './collision'
 import { DEPOT_NODE_ID, DEPOT_NODE_TYPE, depotWorldYaw, worldToDepotLocal } from './guntable'
+import { aimMirrorCamera, flipPaneUv, MirrorCamera, type MirrorPane, paneInView } from './mirror-view'
 import { MOVE } from './movement'
 import { playerRig } from './player'
 import {
@@ -17,101 +32,84 @@ import {
   localPaletteIndex,
   subscribeLocalPalette,
 } from './remote-players'
+import { VIEWMODEL_NAME } from './viewmodel'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
- * THE DEPOT MIRROR (owner ask, 2026-08-31: "maybe somewhere in the depot with
- * the guns you can have a mirror so people check themselves").
+ * THE DEPOT MIRROR — a real one.
  *
- * A first-person game hides the one thing every player in a lobby wants to see:
- * themselves. Your teammates know you as the amber one; you have never seen it.
- * So the depot gets a wall cabinet with a glazed front, at the empty end of the
- * back wall past the gun rack, and standing in it is a Pascaline who copies you.
+ * Owner ask (2026-08-31): "maybe somewhere in the depot with the guns you can
+ * have a mirror so people check themselves". The first cut was a glazed
+ * cabinet with a 0.62-scale dummy inside and compressed parallax; the owner
+ * rejected it and chose this instead (2026-09-01): a full-size local Pascaline
+ * the main camera never sees, and the depot rendered from a mirrored camera
+ * into a render target mapped on the glass — a genuine planar reflection at
+ * 1:1, you, the room, the gun rack behind you, costing one small extra pass
+ * only while someone is in front of it.
  *
- * IT IS THE SAME RIG AS EVERY PEER, on purpose. The dummy is <AvatarRig/> — the
- * exact body remote-players.tsx mounts for the people around you — posed through
- * the exact same advanceGait/articulate rules, wearing the tint the lot's roster
- * deal reserved for our own id (localPaletteIndex) and holding whatever the store
- * says is in our hands. There is one definition of how a Pascaline looks and
- * moves, so the mirror cannot drift from the truth other players see: if it looks
- * right in here, that IS what they are looking at.
+ * So there is no scale factor, no plinth, no box and no clamp anywhere in this
+ * file. A flat full-length mirror hangs flush on the back wall past the rack,
+ * and what it shows is the scene, from the reflected eye, clipped at the glass.
+ * The optics live in mirror-view.ts (pure, tested — the camera, the off-axis
+ * frustum, the UV flip); this file is the wiring:
  *
- * IT IS A SHALLOW MIRROR, AND THE MATH SAYS SO. A real reflection stands as far
- * behind the glass as you stand in front of it — three metres back, through a
- * steel wall. This one is a 0.5 m cabinet, so `reflectStand` keeps the part of a
- * reflection that carries information (which way you face, that you lean and
- * stride and lower your gun) and COMPRESSES the parts that would only lose you:
- * depth is clamped to the cabinet, and lateral offset is geared down so backing
- * off or stepping aside never slides you out of your own frame. Heading is the
- * honest reflection — `reflectYaw` is the real plane mirror (bearing kept, depth
- * reversed), because a mirror that turned the wrong way would read as broken
- * instantly, and pitch passes through untouched for the same reason.
+ * YOU, AT 1:1. A first-person game never renders the local player, so the
+ * reflection needs a body to reflect: <AvatarRig/> — the exact body every peer
+ * gets, posed by the same advanceGait/articulate rules, wearing the tint the
+ * roster deal reserved for our own id, holding what the store says is in our
+ * hands — planted at our REAL eye position (feet = eye − EYE_HEIGHT, the way
+ * remote-players plants a peer from the wire), at our real yaw, in the depot's
+ * frame. It is `visible = false` at every instant except inside the pass, so
+ * the main camera (which sits inside its head) never sees it, nothing raycasts
+ * it (identifyAim's would-render filter drops invisible surfaces), and no layer
+ * bookkeeping is needed.
  *
- * ARMORED AND SEALED like the rest of the depot: the cabinet shell and the glass
- * register as '__boots-depot' / 'fixture' colliders, so nobody walks into the
- * alcove to be seen from behind, bullets spark on the pane, and grenades wash
- * over it. The dummy itself is pure decoration — never a collider, never a
- * target, and `visible` is false unless someone is close enough and in front,
- * so a lot nobody is preening in costs one boolean per frame.
+ * THE PASS runs in this component's frame callback, which is priority 0 and
+ * subscribed after Player's and Viewmodel's (GunTable mounts after them in
+ * ActiveGame), so it sees this frame's camera and runs before R3F's main render.
+ * Show the rig, hide the pane (or it samples its own last frame) and the
+ * first-person viewmodel (or a giant gun hangs across the reflection from inside
+ * the virtual camera), render the scene through the MirrorCamera into the
+ * target, restore everything. The main render then draws the pane with that
+ * texture as a plain `map` — no shader of ours anywhere, so it is the same on
+ * WebGPU and on the WebGL fallback the QA harness forces. The texture holds
+ * linear light (renderers tone-map only the output target), and the pane's
+ * material is tone-mapped like everything else on screen, so the reflection
+ * matches the room rather than blowing out.
  *
- * One always-mounted point light sits inside the cabinet at CONSTANT intensity
- * (the depot's WebGPU rule: never add or remove a light mid-session — the siren
- * animates intensity only). Without it the alcove is a black hole, and a mirror
- * you cannot see your vest color in is not a mirror.
+ * GATED. Nobody within MIRROR_RANGE in front of the glass, or the pane not on
+ * screen (paneInView): no pass, no cost, and the pane wears a dull steel-grey
+ * glass so a stale frozen "you" never hangs in it from across the lot.
+ *
+ * ARMORED like the rest of the depot: the pane registers as a '__boots-depot' /
+ * 'fixture' collider, so bullets spark on the glass and grenades wash over it;
+ * the wall behind it does the blocking. Named 'boots-mirror-pane' for QA, which
+ * reads its real matrixWorld out of world.colliders instead of re-deriving the
+ * depot's placement.
  */
 
-// ── Cabinet geometry, depot-local (pure, tested) ─────────────────────────────
+// ── Placement, depot-local (pure, tested) ────────────────────────────────────
 // The depot's frame: +x toward the breaker end wall, +z out the opening, y up
-// from the ground the container is seated on. Its interior deck plate tops out
-// at 0.12 and the back wall's inner face is at z = -1.15; the gun rack's rails
-// span x ∈ [-1.65, 1.65] and the far end wall's inner face is x = -2.9, which
-// leaves exactly one clear panel of back wall — and that is where the mirror
-// goes, at the build-bench end, in the ~1.2 m nobody else was using.
+// from the ground the container is seated on. Deck plate top y = 0.12; back
+// wall inner face z = −1.15; end walls x = ±2.9; the gun rack's rails span
+// x ∈ [−1.65, 1.65] — so the one clear panel of back wall is at x ≈ −2.3.
 
-/** Pane center, depot-local x. */
+/** Pane centre, depot-local x. */
 export const MIRROR_PANE_X = -2.3
-/** The pane plane, depot-local z: the front face of the cabinet. */
-export const MIRROR_PANE_Z = -0.65
-/** Pane opening [width, height] (m). */
-export const MIRROR_PANE_SIZE: readonly [number, number] = [0.92, 1.34]
-/** Bottom of the pane opening (depot-local y). The deck plate you stand on tops
- * out at 0.12 and your eyes are 1.58 above that (EYE_HEIGHT), so a sill near the
- * deck makes a mirror you have to look 30° DOWN into — QA's first screenshots
- * were of a cabinet under the horizon. Set high enough that the dummy's chest
- * lands on your eye line (see the ergonomics test) and the top still clears the
- * container roof. */
-export const MIRROR_SILL_Y = 0.5
-/** How far the cabinet recedes behind the pane (m). */
-export const MIRROR_DEPTH = 0.5
-/** The plinth's top — where the dummy's feet stand (depot-local y). Rides the
- * sill by a fixed 0.14, so raising the cabinet lifts the reflection with it. */
-export const MIRROR_PLINTH_TOP = MIRROR_SILL_Y + 0.14
-/** The rig's sole sits ~3.5 cm BELOW its own origin (a peer's root is planted
- * on the ground, not on their feet), which at dummy scale is ~2 cm of boot
- * buried in the plinth. Lift by exactly that, so she stands ON it. */
-export const MIRROR_FOOT_LIFT = 0.022
-/** Dummy scale: a 1.85 m Pascaline reads ~1.15 m tall, which is what a
- * reflection of someone a stride away subtends — and it fits the opening. */
-export const MIRROR_DUMMY_SCALE = 0.62
-/** Nothing animates unless the player is within this distance of the pane (m). */
+/** The glass plane, depot-local z: two centimetres proud of the back wall. */
+export const MIRROR_PANE_Z = -1.13
+/** Pane [width, height] (m) — full-length: boots to hat with room to spare. */
+export const MIRROR_PANE_SIZE: readonly [number, number] = [1.04, 1.95]
+/** Bottom edge of the glass (depot-local y), just above the 0.12 deck. */
+export const MIRROR_SILL_Y = 0.2
+/** Steel frame strip width (m), outside the glass. */
+export const MIRROR_FRAME = 0.04
+/** Nothing runs unless the player is within this distance of the pane (m). */
 export const MIRROR_RANGE = 4.5
-/** Closest the dummy's center comes to the glass (m) — its own body is ~0.2 m
- * deep at this scale, so 0 would push a nose through the pane. */
-export const MIRROR_MIN_STANDOFF = 0.1
-/** Deepest the dummy's center goes (m) — the cabinet's back panel, minus body. */
-export const MIRROR_MAX_STANDOFF = 0.36
-/** Lateral parallax: a fraction of how far off-center you actually stand, so
- * stepping aside slides the reflection A LITTLE (it has to move, or it reads as
- * a poster) but never out of the frame. */
-export const MIRROR_LATERAL_GAIN = 0.35
-/** Hard cap on that slide (m) — inside the pane's half-width. */
-export const MIRROR_LATERAL_MAX = 0.22
+/** Render target [width, height] — about half resolution at the pane's aspect. */
+export const MIRROR_TARGET_SIZE: readonly [number, number] = [512, 960]
 
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v
-}
-
-/** Wrap to (-π, π] so a mirrored heading stays canonical. */
+/** Wrap to (-π, π]. */
 export function wrapAngle(a: number): number {
   const twoPi = Math.PI * 2
   let out = a % twoPi
@@ -121,70 +119,66 @@ export function wrapAngle(a: number): number {
 }
 
 /**
- * The reflected heading, in the depot's own frame.
- *
- * The pane's normal is the depot's z axis, so this is the textbook plane
- * mirror: the facing direction's lateral component survives and its depth
- * component flips. With the rig's convention (a Pascaline at local yaw φ faces
- * (-sin φ, -cos φ)) that comes out as π - φ — turn to look at the glass and the
- * reflection turns to look back at you; step sideways along the wall and it
- * keeps the same bearing, exactly like the real thing.
- */
-export function reflectYaw(localYaw: number): number {
-  return wrapAngle(Math.PI - localYaw)
-}
-
-/**
- * Where the reflection stands, depot-local [x, z] — the compressed mirror (see
- * the header). Standing anywhere in the container gives a point inside the
- * cabinet: depth clamped into [MIN, MAX] standoff behind the glass, lateral
- * offset geared down and capped.
- */
-export function reflectStand(lx: number, lz: number): [number, number] {
-  const lateral = clamp(
-    (lx - MIRROR_PANE_X) * MIRROR_LATERAL_GAIN,
-    -MIRROR_LATERAL_MAX,
-    MIRROR_LATERAL_MAX,
-  )
-  const standoff = clamp(lz - MIRROR_PANE_Z, MIRROR_MIN_STANDOFF, MIRROR_MAX_STANDOFF)
-  return [MIRROR_PANE_X + lateral, MIRROR_PANE_Z - standoff]
-}
-
-/**
  * Is anyone actually looking? Within MIRROR_RANGE of the pane AND in front of
  * it (a player behind the back wall — outside the container — is looking at
- * corrugated steel, and there is nothing to animate for them).
+ * corrugated steel, and there is nothing to reflect for them).
  */
 export function mirrorEngaged(lx: number, lz: number): boolean {
   if (lz <= MIRROR_PANE_Z) return false
   return Math.hypot(lx - MIRROR_PANE_X, lz - MIRROR_PANE_Z) <= MIRROR_RANGE
 }
 
+/**
+ * QA handle (see `__boots.mirror()` / `__boots.mirrorPixels()` in game-root):
+ * how many passes have run, whether one is running now, and a way to read the
+ * live reflection back. Plain counters; the reader copies what it needs.
+ */
+export const mirrorDebug: {
+  passes: number
+  engaged: boolean
+  size: readonly [number, number]
+  /** Which backend the host renderer runs — 'webgpu', 'webgl', or '' before the first frame. */
+  backend: string
+  /** RGBA of the live target (rows bottom-up on WebGL, top-down on WebGPU); null before any pass. */
+  readPixels: (() => Promise<ArrayLike<number> | null>) | null
+} = { passes: 0, engaged: false, size: MIRROR_TARGET_SIZE, backend: '', readPixels: null }
+
 // ── Paint (matches the depot's palette) ──────────────────────────────────────
-const CABINET = '#464f57'
-const CABINET_DARK = '#333a41'
 const FRAME = '#6d7076'
+/** A mirror loses a little light; a touch of cool tint, otherwise the scene. */
+const GLASS_TINT = '#e9f0f2'
 
 /** Reused across frames — the mirror allocates nothing per frame. */
 const _artic: AvatarArticulation = createArticulation()
+const _eye = new Vector3()
+const _local = new Vector3()
+const _pane: MirrorPane = {
+  center: new Vector3(),
+  normal: new Vector3(),
+  width: MIRROR_PANE_SIZE[0],
+  height: MIRROR_PANE_SIZE[1],
+}
+
+/** How often (frames) to look for the viewmodel group while it is not found. */
+const VIEWMODEL_RESCAN = 30
 
 /**
- * The cabinet, the glass, and the dummy inside. Rendered as a CHILD of the
- * depot's root group, so every number above is in the depot's own frame and the
- * whole thing rides the container's placement and yaw for free.
+ * The glass, its frame, and the body it reflects. Rendered as a CHILD of the
+ * depot's root group, so every number above is in the depot's own frame and
+ * the whole thing rides the container's placement and yaw for free.
  */
 export function DepotMirror({ world }: { world: GameWorld }) {
-  const dummyRef = useRef<Group>(null)
-  const shellRefs = useRef<(Mesh | null)[]>([])
-  const solid = (i: number) => (mesh: Mesh | null) => {
-    shellRefs.current[i] = mesh
-  }
+  const paneRef = useRef<Mesh>(null)
+  const selfRef = useRef<Group>(null)
+  const colliderRefs = useRef<(Mesh | null)[]>([])
+  const glRef = useRef<WebGLRenderer | null>(null)
+  const viewmodel = useRef<Object3D | null>(null)
+  const viewmodelScan = useRef(0)
   // One stable handle object for the rig's pivots (createRigRefs, not eight
   // useRef calls — the rig's shape is the rig's business).
   const refs = useRef(createRigRefs()).current
   const gaitPhase = useRef(0)
-  const shown = useRef(false)
-  // The dummy holds what we hold. A store subscription, so a weapon swap
+  // The body holds what we hold. A store subscription, so a weapon swap
   // re-renders the rig exactly once, like a peer's does off the wire.
   const weapon = useBoots((s) => s.weapon)
   // And it wears what we wear. Our slot in the deal can MOVE when the roster
@@ -197,174 +191,197 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     localPaletteIndex,
   )
   // The depot's yaw is fixed once the lot loads: the player's heading has to
-  // come into this frame before it can be reflected in it.
+  // come into this frame before the rig can wear it.
   const yawOffset = useMemo(() => depotWorldYaw(world), [world])
 
-  useArmoredColliders(world, shellRefs)
-
-  useFrame((_, rawDt) => {
-    const dummy = dummyRef.current
-    if (!dummy) return
-    const [lx, lz] = worldToDepotLocal(world, playerRig.position.x, playerRig.position.z)
-    const engaged = mirrorEngaged(lx, lz)
-    if (engaged !== shown.current) {
-      shown.current = engaged
-      dummy.visible = engaged
+  // GPU-side gear, one set per mount: the target the pass renders into, the
+  // pane's geometry with its UVs turned for a render target seen in a mirror,
+  // the two faces of the glass (live reflection / idle steel-grey), and the
+  // virtual camera.
+  const gear = useMemo(() => {
+    const [w, h] = MIRROR_TARGET_SIZE
+    const target = new WebGLRenderTarget(w, h, { depthBuffer: true, stencilBuffer: false })
+    const glass = flipPaneUv(new PlaneGeometry(MIRROR_PANE_SIZE[0], MIRROR_PANE_SIZE[1]))
+    const live = new MeshBasicMaterial({ color: GLASS_TINT, map: target.texture })
+    const idle = new MeshStandardMaterial({ color: '#8b979e', metalness: 0.75, roughness: 0.18 })
+    return { camera: new MirrorCamera(), glass, idle, live, target }
+  }, [])
+  useEffect(
+    () => () => {
+      gear.target.dispose()
+      gear.glass.dispose()
+      gear.live.dispose()
+      gear.idle.dispose()
+    },
+    [gear],
+  )
+  useEffect(() => {
+    mirrorDebug.readPixels = async () => {
+      const gl = glRef.current as unknown as {
+        readRenderTargetPixelsAsync?: (
+          target: WebGLRenderTarget,
+          x: number,
+          y: number,
+          width: number,
+          height: number,
+        ) => Promise<ArrayLike<number>>
+      } | null
+      if (!gl?.readRenderTargetPixelsAsync || mirrorDebug.passes === 0) return null
+      const [w, h] = MIRROR_TARGET_SIZE
+      return gl.readRenderTargetPixelsAsync(gear.target, 0, 0, w, h)
     }
-    // Nobody near the glass: one hypot and out. An empty depot costs nothing.
+    return () => {
+      mirrorDebug.readPixels = null
+      mirrorDebug.engaged = false
+    }
+  }, [gear])
+
+  useArmoredColliders(world, colliderRefs)
+
+  useFrame((state, rawDt) => {
+    const pane = paneRef.current
+    const self = selfRef.current
+    const parent = self?.parent
+    if (!pane || !self || !parent) return
+    if (glRef.current !== state.gl) {
+      glRef.current = state.gl
+      const backend = (state.gl as unknown as { backend?: { isWebGPUBackend?: boolean } }).backend
+      mirrorDebug.backend = backend ? (backend.isWebGPUBackend ? 'webgpu' : 'webgl') : 'webgl'
+    }
+    const camera = state.camera
+    // Player set position/rotation this frame; bring the matrices with them
+    // (the renderer would only do it at render time, after us).
+    camera.updateMatrixWorld()
+
+    const [lx, lz] = worldToDepotLocal(world, playerRig.position.x, playerRig.position.z)
+    const engaged = mirrorEngaged(lx, lz) && paneInView(camera, pane)
+    const face = engaged ? gear.live : gear.idle
+    if (pane.material !== face) pane.material = face
+    mirrorDebug.engaged = engaged
+    // Nobody at the glass: one hypot, one frustum test, and out.
     if (!engaged) return
 
+    // ── the body: ours, posed like a peer's ────────────────────────────────
     const dt = Math.min(rawDt, 1 / 30)
     const s = Math.min(1, playerRig.speed / MOVE.runSpeed)
     const staggered = useBoots.getState().staggered
     gaitPhase.current = advanceGait(gaitPhase.current, playerRig.grounded ? s : 0, dt)
     articulate(_artic, gaitPhase.current, s, playerRig.pitch, playerRig.grounded, staggered)
-
-    const [dx, dz] = reflectStand(lx, lz)
-    // The bob is in rig units; the dummy is scaled, so its stride is too.
-    dummy.position.set(
-      dx,
-      MIRROR_PLINTH_TOP + MIRROR_FOOT_LIFT + _artic.bobY * MIRROR_DUMMY_SCALE,
-      dz,
-    )
-    dummy.rotation.y = reflectYaw(playerRig.yaw - yawOffset)
+    // playerRig.position is the EYE (feet + EYE_HEIGHT + bob) — exactly what
+    // goes out on the wire, so plant the feet exactly as remote-players does.
+    _local.copy(playerRig.position)
+    parent.worldToLocal(_local)
+    self.position.set(_local.x, _local.y - EYE_HEIGHT + _artic.bobY, _local.z)
+    self.rotation.y = playerRig.yaw - yawOffset
     if (refs.legL.current) refs.legL.current.rotation.x = _artic.legSwing
     if (refs.legR.current) refs.legR.current.rotation.x = -_artic.legSwing
     if (refs.armL.current) refs.armL.current.rotation.x = _artic.armSwing
     if (refs.armR.current) refs.armR.current.rotation.x = _artic.armAim
     if (refs.torso.current) refs.torso.current.rotation.x = _artic.torsoPitch
     if (refs.head.current) refs.head.current.rotation.x = _artic.headPitch
+
+    // ── the camera: the reflected eye, frustum fitted to the glass ─────────
+    camera.getWorldPosition(_eye)
+    pane.getWorldPosition(_pane.center)
+    // The pane's local +z, in world: the direction the glass faces.
+    _pane.normal.setFromMatrixColumn(pane.matrixWorld, 2).normalize()
+    if (!aimMirrorCamera(gear.camera, _eye, _pane, (camera as PerspectiveCamera).far ?? 1000)) {
+      return
+    }
+    gear.camera.layers.mask = camera.layers.mask
+
+    // The first-person weapon lives in the scene and copies the camera; find
+    // it once by name (rescanning only while it is missing or unmounted).
+    let gun = viewmodel.current
+    if (!gun || !gun.parent) {
+      gun = null
+      if (viewmodelScan.current-- <= 0) {
+        viewmodelScan.current = VIEWMODEL_RESCAN
+        gun = state.scene.getObjectByName(VIEWMODEL_NAME) ?? null
+        viewmodel.current = gun
+      }
+    }
+
+    // ── the pass ───────────────────────────────────────────────────────────
+    const gl = state.gl
+    const prevTarget = gl.getRenderTarget()
+    const prevAutoClear = gl.autoClear
+    const gunWasVisible = gun ? gun.visible : false
+    pane.visible = false
+    if (gun) gun.visible = false
+    self.visible = true
+    gl.autoClear = true
+    gl.setRenderTarget(gear.target)
+    gl.render(state.scene, gear.camera)
+    gl.setRenderTarget(prevTarget)
+    gl.autoClear = prevAutoClear
+    self.visible = false
+    if (gun) gun.visible = gunWasVisible
+    pane.visible = true
+    mirrorDebug.passes++
   })
 
   const [paneW, paneH] = MIRROR_PANE_SIZE
   const paneCenterY = MIRROR_SILL_Y + paneH / 2
-  const backZ = MIRROR_PANE_Z - MIRROR_DEPTH
-  const midZ = (MIRROR_PANE_Z + backZ) / 2
   const halfW = paneW / 2
-  const jamb = 0.06
+  // The frame sits OUTSIDE the glass, so it stays out of the pane's frustum
+  // (a strip inside the rectangle would render as a bar across the reflection)
+  // and a centimetre proud of the plane, out of the near-plane clip.
+  const frameZ = MIRROR_PANE_Z + 0.01
 
   // ONE FRAME, THE DEPOT'S. This group is deliberately untranslated, so every
-  // number below (and every constant above, and everything reflectStand
-  // returns) is a depot-local coordinate. An earlier cut offset the group to
-  // MIRROR_PANE_X and left the dummy's own x absolute, which put the reflection
-  // 2.3 m sideways — through the far end wall (QA caught it as `lateral 2.32`).
+  // number below is a depot-local coordinate, and `self.parent.worldToLocal`
+  // is exactly the depot root's inverse transform.
   return (
     <group>
-      {/* ── the cabinet shell: sealed except for the pane ──────────────── */}
-      {/* side jambs */}
-      {[-(halfW + jamb / 2), halfW + jamb / 2].map((dx, i) => (
-        <mesh
-          castShadow
-          key={dx}
-          position={[MIRROR_PANE_X + dx, paneCenterY, midZ]}
-          ref={solid(i)}
-        >
-          <boxGeometry args={[jamb, paneH + jamb * 2, MIRROR_DEPTH]} />
-          <meshStandardMaterial color={CABINET} metalness={0.3} roughness={0.65} />
-        </mesh>
-      ))}
-      {/* head and sill */}
+      {/* ── the glass ──────────────────────────────────────────────────── */}
+      {/* A COLLIDER (see useArmoredColliders) and the QA anchor: the harness
+          finds it in world.colliders and reads its real transform. Its
+          material is swapped per frame between the live reflection and idle
+          steel-grey glass; `visible` is off only for the instant of the pass. */}
       <mesh
-        castShadow
-        position={[MIRROR_PANE_X, MIRROR_SILL_Y + paneH + jamb / 2, midZ]}
-        ref={solid(2)}
-      >
-        <boxGeometry args={[paneW + jamb * 2, jamb, MIRROR_DEPTH]} />
-        <meshStandardMaterial color={CABINET_DARK} metalness={0.3} roughness={0.65} />
-      </mesh>
-      <mesh
-        castShadow
-        position={[MIRROR_PANE_X, MIRROR_SILL_Y - jamb / 2, midZ]}
-        ref={solid(3)}
-      >
-        <boxGeometry args={[paneW + jamb * 2, jamb, MIRROR_DEPTH]} />
-        <meshStandardMaterial color={CABINET_DARK} metalness={0.3} roughness={0.65} />
-      </mesh>
-      {/* the plinth the dummy stands on (also the cabinet's inner floor) */}
-      <mesh position={[MIRROR_PANE_X, (MIRROR_SILL_Y + MIRROR_PLINTH_TOP) / 2, midZ]}>
-        <boxGeometry
-          args={[paneW, MIRROR_PLINTH_TOP - MIRROR_SILL_Y, MIRROR_DEPTH - 0.02]}
-        />
-        <meshStandardMaterial color={CABINET_DARK} metalness={0.25} roughness={0.8} />
-      </mesh>
-      {/* back panel — a shade lighter than the shell so a dark vest still
-          reads as a silhouette against it */}
-      <mesh position={[MIRROR_PANE_X, paneCenterY, backZ + 0.015]}>
-        <boxGeometry args={[paneW, paneH, 0.03]} />
-        <meshStandardMaterial color="#5a656f" roughness={0.9} />
-      </mesh>
-
-      {/* ── the glazing ────────────────────────────────────────────────── */}
-      {/* The pane is a COLLIDER (see useArmoredColliders): it seals the alcove,
-          so the dummy can only ever be seen through the glass, from inside the
-          container — never from behind, and never by walking into the box. */}
-      {/* Named for QA: the harness finds the pane in world.colliders, reads its
-          real transform, and stands the player in front of it — so the live
-          check uses the SCENE's placement instead of re-deriving the depot's. */}
-      <mesh
+        geometry={gear.glass}
+        material={gear.idle}
         name="boots-mirror-pane"
         position={[MIRROR_PANE_X, paneCenterY, MIRROR_PANE_Z]}
-        ref={solid(4)}
-      >
-        <boxGeometry args={[paneW, paneH, 0.02]} />
-        <meshStandardMaterial
-          color="#cfe3ea"
-          metalness={0.6}
-          opacity={0.22}
-          roughness={0.05}
-          transparent
-        />
-      </mesh>
-      {/* steel frame over the glass edges */}
-      {[-(halfW - 0.02), halfW - 0.02].map((dx) => (
-        <mesh key={dx} position={[MIRROR_PANE_X + dx, paneCenterY, MIRROR_PANE_Z + 0.015]}>
-          <boxGeometry args={[0.04, paneH, 0.02]} />
+        ref={(mesh: Mesh | null) => {
+          paneRef.current = mesh
+          colliderRefs.current[0] = mesh
+        }}
+      />
+      {/* steel frame around the glass */}
+      {[-(halfW + MIRROR_FRAME / 2), halfW + MIRROR_FRAME / 2].map((dx) => (
+        <mesh key={dx} position={[MIRROR_PANE_X + dx, paneCenterY, frameZ]}>
+          <boxGeometry args={[MIRROR_FRAME, paneH + MIRROR_FRAME * 2, 0.02]} />
           <meshStandardMaterial color={FRAME} metalness={0.6} roughness={0.4} />
         </mesh>
       ))}
-      {[MIRROR_SILL_Y + 0.02, MIRROR_SILL_Y + paneH - 0.02].map((y) => (
-        <mesh key={y} position={[MIRROR_PANE_X, y, MIRROR_PANE_Z + 0.015]}>
-          <boxGeometry args={[paneW, 0.04, 0.02]} />
+      {[MIRROR_SILL_Y - MIRROR_FRAME / 2, MIRROR_SILL_Y + paneH + MIRROR_FRAME / 2].map((y) => (
+        <mesh key={y} position={[MIRROR_PANE_X, y, frameZ]}>
+          <boxGeometry args={[paneW, MIRROR_FRAME, 0.02]} />
           <meshStandardMaterial color={FRAME} metalness={0.6} roughness={0.4} />
         </mesh>
       ))}
-      {/* Stencil on the WALL above the cabinet (not floating off its head). */}
-      <MirrorPlaque position={[MIRROR_PANE_X, MIRROR_SILL_Y + paneH + 0.24, -1.13]} />
+      {/* Stencil on the wall above the frame. */}
+      <MirrorPlaque position={[MIRROR_PANE_X, MIRROR_SILL_Y + paneH + MIRROR_FRAME + 0.14, -1.13]} />
 
-      {/* ── the reflection ─────────────────────────────────────────────── */}
-      {/* Pure decoration: never a collider, never a target. Hidden until
-          someone stands in front of the glass. */}
-      <group
-        name="boots-mirror-dummy"
-        ref={dummyRef}
-        scale={MIRROR_DUMMY_SCALE}
-        userData={{ __boots: true }}
-        visible={false}
-      >
+      {/* ── the body in the glass: ours, full size ─────────────────────── */}
+      {/* Pure decoration: never a collider, never a target. Invisible at every
+          instant except inside the pass, so the main camera — which sits in
+          its head — never sees it. */}
+      <group name="boots-mirror-self" ref={selfRef} userData={{ __boots: true }} visible={false}>
         <AvatarRig paletteIndex={paletteIndex} refs={refs} weapon={weapon} />
       </group>
-      {/* Always mounted, CONSTANT intensity — the depot's WebGPU rule. Hung at
-          the top front of the cabinet so it rakes DOWN the body like display
-          lighting, and kept dim: the first cut sat it at chest height on 3.5 and
-          QA's screenshot came back with a blown-out white Pascaline, which
-          defeats the whole point of a mirror you check your own color in. */}
-      <pointLight
-        color="#ffe9c8"
-        distance={2.2}
-        intensity={1.1}
-        position={[MIRROR_PANE_X, MIRROR_SILL_Y + paneH - 0.08, MIRROR_PANE_Z - 0.1]}
-      />
     </group>
   )
 }
 
 /**
- * The cabinet's shell and glass, registered as the depot's own armored
- * colliders ('__boots-depot' / 'fixture' — the guntable contract: the RENDERED
- * meshes ARE the colliders, they block movement and bullets, they never
- * voxelize). The depot's own hook lives with the depot's meshes; this is the
- * same body over the mirror's refs, because the mirror is a child component and
- * cannot reach into the shell's ref array.
+ * The glass, registered as the depot's own armored collider ('__boots-depot' /
+ * 'fixture' — the guntable contract: the RENDERED meshes ARE the colliders,
+ * they block bullets and never voxelize). The depot's own hook lives with the
+ * depot's meshes; this is the same body over the mirror's refs, because the
+ * mirror is a child component and cannot reach into the shell's ref array.
  */
 function useArmoredColliders(world: GameWorld, refs: { current: (Mesh | null)[] }) {
   useEffect(() => {

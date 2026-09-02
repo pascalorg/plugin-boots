@@ -2704,3 +2704,71 @@ lot and awake at the pane, behind the glass and inside the box, facing you at
 1.000, a +0.5 rad turn mirrored to −0.500, wearing a lot tint, 0 page errors —
 and two screenshots that finally look like a mirror. `check-types` clean,
 `bun test` 2462 pass / 0 fail.
+
+## 2026-09-01 — The mirror, second cut: a real reflection
+
+The owner's verdict on the cabinet was short, and the replacement was chosen in
+one breath: *a full-size local Pascaline the main camera can't see, and the
+depot rendered from a mirrored camera into a render target mapped on the glass —
+a genuine planar reflection at 1:1, you, the room, the gun rack behind you,
+costing one small extra pass only while someone is in front of it.* So the
+0.62-scale dummy, the plinth, the 0.5 m box and every clamp in `reflectStand`
+are gone. What hangs on the back wall now is a flat full-length mirror, and what
+it shows is the scene.
+
+### The optics are one sentence, and a module
+
+A plane mirror shows at pane point Q exactly what a camera at the REFLECTED eye
+sees through Q. `mirror-view.ts` is that sentence made executable: reflect the
+eye across the pane, stand a camera there looking straight along the normal,
+and fit an off-axis frustum whose near rectangle IS the glass. Because the
+camera looks along the normal with world up, the pane is axis-aligned in camera
+space and the frustum bounds are plain offsets from its centre. And because the
+near plane sits *on* the glass, the container's own back wall two centimetres
+behind it is clipped before it can occlude the room — the handoff notes had
+left `near` unspecified, and without this the mirror is a picture of the inside
+of a steel wall.
+
+Two things the handoff had wrong, both caught before a line was written:
+`playerRig.position` is the EYE, not the feet (the wire carries eye positions;
+the body is planted at eye − EYE_HEIGHT exactly as remote-players plants a
+peer); and the renderer's own `_updateCamera` calls `updateProjectionMatrix()`
+the first time it meets a camera, which on a stock PerspectiveCamera rebuilds a
+symmetric frustum over the hand-built one. `MirrorCamera` owns that method and
+rebuilds the pane frustum in whatever depth convention the renderer just asked
+for — the same texels on WebGL and WebGPU, reversed depth included, with a test
+that flips the convention mid-flight and checks.
+
+### What the picture taught, again
+
+The first live run rendered a perfect reflection — and hung it upside down on
+the glass. three's node renderer reads a render target with v = 0 at the TOP of
+the picture on both backends (WebGPU natively; the GLSL builder flips
+render-target lookups to match, and three's own post-processing QuadMesh carries
+a top-down UV layout for this very reason). A plain PlaneGeometry has v = 1 at
+the top. So the pane's UVs are turned in both axes: u for the mirror (the
+virtual camera's right is the pane's −x), v for the renderer. The harness now
+reads the SCREEN back too — decodes its own screenshot, projects the pane's
+corners through the live camera pose, and checks the vest sits above the belt
+and boots inside that rectangle — because the target can be right while the
+glass is wrong.
+
+The tint check needed a median: the yard's red fence posts show in the glass
+as well, a few dozen texels that dragged a mean a hand's width off the vest.
+
+### Verified where it can be
+
+`mirror-view.test.ts` (17) projects real points through real three matrices at
+five pane yaws: the four pane corners land on the four image corners from any
+stand; a hair behind the glass is clipped and a hair in front is not; for
+random eyes and room points the texel found through the turned UVs is exactly
+where E'→R crosses the plane; your boots, chest and hat share your own x.
+`qa-boots-mirror.mjs` (14 checks) on the WebGL fallback: no pass across the
+lot, the pass every frame at the glass, none with your back turned, a picture
+not a color, our own tint centred at chest height, a step along the wall moving
+the picture the way a mirror moves it (both ways), the 1:1 body on your feet
+facing the glass, striding and freezing with you, the viewmodel findable by
+name — and upright on screen. Then the same on WebGPU, headless for the target
+(the picture is identical) and headed for the screen (headless Chromium does
+not composite a WebGPU canvas into a screenshot). `check-types` clean, `bun
+test` 2472 pass / 0 fail.
