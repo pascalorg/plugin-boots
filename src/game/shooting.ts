@@ -95,9 +95,9 @@ import type { GameWorld } from './world'
  * and glass keep their existing reads untouched.
  */
 
-export type FireOutcome = 'bot' | 'wall' | 'glass' | 'tree' | 'solid' | 'none'
+export type FireOutcome = 'bot' | 'player' | 'wall' | 'glass' | 'tree' | 'solid' | 'none'
 
-type HitClass = 'none' | 'solid' | 'voxel' | 'segment' | 'tree' | 'glass' | 'bot'
+type HitClass = 'none' | 'solid' | 'voxel' | 'segment' | 'tree' | 'glass' | 'bot' | 'player'
 
 /** Near-tie window: hits this close resolve by class priority, not range. */
 const TIE = 0.01
@@ -183,6 +183,23 @@ let treeRoutes: TreeCombatRoutes | null = null
  * casts on the caller side. */
 export function registerTreeRoutes<H extends TreeRayHit>(routes: TreeCombatRoutes<H> | null): void {
   treeRoutes = routes as TreeCombatRoutes | null
+}
+
+/** A ray hit on a remote player (PvP). `sessionId` addresses the victim. */
+export type PlayerRayHit = { sessionId: string; distance: number; point: Vector3 }
+
+/** PvP combat routes — wired by pvp-damage.ts (which owns the roster + the net
+ * lane) so this module stays decoupled from presence, exactly like the tree
+ * routes. Null in single-player / until the PvP lane starts. */
+export type PvpRoutes = {
+  raycast: (origin: Vector3, direction: Vector3, maxDist: number) => PlayerRayHit | null
+  onHit: (sessionId: string) => void
+}
+let pvpRoutes: PvpRoutes | null = null
+
+/** Wire (or clear, with null) PvP combat. */
+export function registerPvpRoutes(routes: PvpRoutes | null): void {
+  pvpRoutes = routes
 }
 
 // -------------------------------------------------------------------------
@@ -550,11 +567,22 @@ function fireShot(world: GameWorld, weapon: WeaponDef): FireOutcome {
   const botHit = raycastBots(_origin, _direction, bestDist + TIE)
   if (botHit) winner = 'bot'
 
+  // Remote players (PvP) — cast against the live roster, same wall-cull as the
+  // bots (bestDist already accounts for every world class). The nearer creature
+  // wins a bot-vs-player tie; walls nearer than either still block the shot.
+  const playerHit = pvpRoutes ? pvpRoutes.raycast(_origin, _direction, bestDist + TIE) : null
+  if (playerHit && (!botHit || playerHit.distance < botHit.distance)) winner = 'player'
+
   // SMASH weapons (warhammer): heavy area knockback around the impact —
   // whatever class the blow landed on (a whiff still shoves at max reach).
   // Runs BEFORE the class dispatch so a killed bot still flings its pack.
   if (weapon.smashRadius !== undefined) {
-    const impactDist = winner === 'bot' && botHit ? botHit.distance : bestDist
+    const impactDist =
+      winner === 'bot' && botHit
+        ? botHit.distance
+        : winner === 'player' && playerHit
+          ? playerHit.distance
+          : bestDist
     _smashCenter.copy(_origin).addScaledVector(_direction, impactDist)
     smashKnockback(_smashCenter, weapon.range * 1.5)
   }
@@ -571,6 +599,14 @@ function fireShot(world: GameWorld, weapon: WeaponDef): FireOutcome {
     else sfx.hitmarker()
     hitFeedback(killed ? 'kill' : 'hit')
     return 'bot'
+  }
+  if (winner === 'player' && playerHit) {
+    // The shooter only DECIDES the hit; pvp-damage broadcasts it and the
+    // victim applies its own hurt. No local damage, no death — ever.
+    pvpRoutes?.onHit(playerHit.sessionId)
+    sfx.hitmarker() // you tagged a person (never a kill confirm)
+    hitFeedback('hit')
+    return 'player'
   }
   if (winner === 'glass' && glassHit) {
     hitGlass(glassHit)

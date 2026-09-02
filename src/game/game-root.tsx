@@ -63,6 +63,7 @@ import {
   startPresence,
   stopPresence,
 } from './presence'
+import { startPvpSync, stopPvpSync } from './pvp-damage'
 import { localPaletteIndex, RemotePlayers } from './remote-players'
 import { getSession, hideForGame, getSessionSerial } from './session'
 import { sharedBuildDebug } from './shared-build'
@@ -738,6 +739,9 @@ function ActiveGame() {
     // we could author records under. exitGame owns the stop, before
     // stopPresence closes the transport.
     startWorldSync()
+    // PvP hit damage rides the same transport (a per-victim counter). Game
+    // phase only; inert without a bus or with an empty roster.
+    startPvpSync()
     // Voice rides the same transport for SIGNALLING only (the speech goes
     // peer-to-peer). Feature-detected the same way, and it needs the eye
     // position for the proximity mix — playerRig, not the pose sampler, because
@@ -761,6 +765,7 @@ function ActiveGame() {
       // Same-session remounts keep the adapter alive; a stale unmount
       // (session ended or a new one started) must not stop the new one.
       if (useBoots.getState().phase !== 'game' && getSessionSerial() === serial) {
+        stopPvpSync()
         stopWorldSync() // before stopPresence: that call closes the transport
         stopVoice() // releases the microphone — see below
         stopPresence()

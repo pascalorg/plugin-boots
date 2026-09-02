@@ -120,6 +120,10 @@ export const FRAME_KINDS = [
   'boots/world-snap',
   'state-request',
   'state-snapshot',
+  // PvP: a per-victim monotone hit counter (like the gunfire field on 'pose').
+  // A new peer on an old pin drops this unknown kind silently, so PvP simply
+  // doesn't occur across mismatched pins — nothing breaks.
+  'boots/pvp-hit',
   // voice.ts → SIGNALLING ONLY. The audio itself never touches this bus: an
   // 8 000-byte JSON frame under latest-value coalescing would drop the middle
   // of every sentence. What travels here is one WebRTC description per peer
