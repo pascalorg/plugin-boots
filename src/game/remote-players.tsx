@@ -1,7 +1,7 @@
 'use client'
 
-import { useFrame } from '@react-three/fiber'
-import { type ReactElement, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal, useFrame } from '@react-three/fiber'
+import { type ReactElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   BoxGeometry,
   CanvasTexture,
@@ -15,11 +15,19 @@ import {
   MeshStandardMaterial,
   Quaternion,
   SphereGeometry,
+  TorusGeometry,
 } from 'three'
 import { type RemoteShotKind, sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
+import {
+  HAND_BELOW_WRIST,
+  instantiatePascaline,
+  type PascalineDims,
+  type PascalineTemplate,
+  usePascalineTemplate,
+} from './pascaline-model'
 import {
   createSampledPose,
   INTERP_DELAY_MS,
@@ -580,19 +588,18 @@ export function createRigRefs(): AvatarRigRefs {
 }
 
 /**
- * PASCALINE, IN PRIMITIVES — the body, with no opinion about whose it is.
+ * PASCALINE, IN PRIMITIVES — the box body, kept as the FALLBACK: it is what a
+ * peer wears for the first frames before the real model has decoded, and
+ * forever if that decode fails (no Draco decoder, a hostile CSP). Same six
+ * pivots, same weapon frame, same tint materials as the model, so the
+ * animator never knows which body it is posing.
  *
  * Purely presentational: it mounts the hierarchy (hip pivots, torso, neck, two
  * arms, the held weapon, the two LOD groups) and hands the pivots back through
  * `refs`. Every frame-by-frame decision — where she stands, which way she
- * faces, how the gait swings, when detail drops — belongs to the caller, which
- * is what lets the SAME rig be a peer streamed off the wire and the reflection
- * in the depot mirror without either one knowing about the other.
- *
- * The root group is the caller's too: a peer's root carries the wire pose and
- * a name tag, the mirror's carries the reflected stand and the dummy scale.
+ * faces, how the gait swings, when detail drops — belongs to the caller.
  */
-export function AvatarRig({
+function PrimitiveRig({
   paletteIndex,
   refs,
   weapon,
@@ -602,8 +609,6 @@ export function AvatarRig({
   weapon: string
 }) {
   const { vest, band } = materialsFor(paletteIndex)
-  const Weapon = WEAPON_COMPONENT[weapon]
-  const muzzle = refs.fx ? remoteMuzzle(weapon) : null
 
   return (
     <>
@@ -669,40 +674,158 @@ export function AvatarRig({
             scale={[0.85, 0.7, 0.85]}
           />
           <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
-          {Weapon ? (
-            <group position={[0, -0.52, 0.02]} rotation={[-Math.PI / 2, 0, 0]}>
-              <Weapon />
-              {/* Muzzle fx, parented to the gun: the flash points wherever the
-                  peer aims for free, through the arm chain, with no per-frame
-                  math of ours. Mounted once and toggled, like the speaking dot,
-                  so firing is a boolean rather than a mid-firefight remount. */}
-              {muzzle ? (
-                <group position={muzzle} ref={refs.fx} visible={false}>
-                  <group ref={refs.flash}>
-                    <mesh geometry={FLASH_CORE_GEO} material={FLASH_MATERIAL} />
-                    <mesh
-                      geometry={FLASH_CONE_GEO}
-                      material={FLASH_MATERIAL}
-                      position={[0, 0, -0.13]}
-                      rotation={[-Math.PI / 2, 0, 0]}
-                    />
-                  </group>
-                  {/* Tracer stub — a streak leaving the barrel, deliberately
-                      NOT a beam to the target: the round's own impact already
-                      throws dust and debris on this client. */}
-                  <mesh
-                    geometry={TRACER_GEO}
-                    material={TRACER_MATERIAL}
-                    position={[0, 0, -(TRACER_LEN / 2) - 0.1]}
-                  />
-                </group>
-              ) : null}
-            </group>
-          ) : null}
+          <HeldWeapon refs={refs} weapon={weapon} />
         </group>
       </group>
     </>
   )
+}
+
+/**
+ * The held weapon, in THE ARM FRAME: hanging −y from the shoulder, barrel down
+ * the arm (weapon-models contract: grip at the origin, barrel down −Z), muzzle
+ * fx parented to the gun. One definition for both bodies — the box rig mounts
+ * it straight under its arm pivot, the model under its arm frame (see
+ * pascaline-model.ts), and the two agree on where a rifle is in space.
+ * `reach` is shoulder → grip: the box rig's 0.52, the model's arm plus a hand.
+ */
+function HeldWeapon({
+  reach = 0.52,
+  refs,
+  weapon,
+}: {
+  reach?: number
+  refs: AvatarRigRefs
+  weapon: string
+}) {
+  const Weapon = WEAPON_COMPONENT[weapon]
+  const muzzle = refs.fx ? remoteMuzzle(weapon) : null
+  if (!Weapon) return null
+  return (
+    <group position={[0, -reach, 0.02]} rotation={[-Math.PI / 2, 0, 0]}>
+      <Weapon />
+        {/* Muzzle fx, parented to the gun: the flash points wherever the
+            peer aims for free, through the arm chain, with no per-frame
+            math of ours. Mounted once and toggled, like the speaking dot,
+            so firing is a boolean rather than a mid-firefight remount. */}
+        {muzzle ? (
+          <group position={muzzle} ref={refs.fx} visible={false}>
+            <group ref={refs.flash}>
+              <mesh geometry={FLASH_CORE_GEO} material={FLASH_MATERIAL} />
+              <mesh
+                geometry={FLASH_CONE_GEO}
+                material={FLASH_MATERIAL}
+                position={[0, 0, -0.13]}
+                rotation={[-Math.PI / 2, 0, 0]}
+              />
+            </group>
+            {/* Tracer stub — a streak leaving the barrel, deliberately
+                NOT a beam to the target: the round's own impact already
+                throws dust and debris on this client. */}
+            <mesh
+              geometry={TRACER_GEO}
+              material={TRACER_MATERIAL}
+              position={[0, 0, -(TRACER_LEN / 2) - 0.1]}
+            />
+          </group>
+        ) : null}
+    </group>
+  )
+}
+
+// ── Tint bands for the model (shared geometry per body measurement) ──────────
+
+const bandGeometries = new Map<string, { hat: TorusGeometry; sleeve: CylinderGeometry }>()
+
+/** The hat band ring and the sleeve band, sized to the body they wrap. */
+function bandGeometriesFor(dims: PascalineDims) {
+  const key = `${dims.hatRadius}|${dims.armRadius}`
+  let entry = bandGeometries.get(key)
+  if (!entry) {
+    entry = {
+      hat: new TorusGeometry(dims.hatRadius, 0.014, 8, 40),
+      sleeve: new CylinderGeometry(dims.armRadius, dims.armRadius, 0.055, 18, 1, true),
+    }
+    bandGeometries.set(key, entry)
+  }
+  return entry
+}
+
+/**
+ * PASCALINE, THE MODEL — the mascot's own body (pascaline-model.ts), posed
+ * through the SAME six handles as the box rig. The animator gets the pivots;
+ * the weapon rides the right arm frame; the tint that tells players apart is a
+ * band on the hard hat and a band on each sleeve — the face, jacket and belt
+ * are hers and stay hers.
+ */
+function PascalineRig({
+  paletteIndex,
+  refs,
+  template,
+  weapon,
+}: {
+  paletteIndex: number
+  refs: AvatarRigRefs
+  template: PascalineTemplate
+  weapon: string
+}) {
+  const body = useMemo(() => instantiatePascaline(template), [template])
+  const { vest } = materialsFor(paletteIndex)
+  const geo = bandGeometriesFor(body.dims)
+  // The caller's refs object may be rebuilt per render (RemoteAvatar's is),
+  // but the handles inside are stable; re-pointing them is six assignments.
+  useLayoutEffect(() => {
+    refs.torso.current = body.pivots.torso
+    refs.head.current = body.pivots.head
+    refs.armL.current = body.pivots.armL
+    refs.armR.current = body.pivots.armR
+    refs.legL.current = body.pivots.legL
+    refs.legR.current = body.pivots.legR
+    refs.headDetail.current = body.detail.head
+    refs.bodyDetail.current = body.detail.body
+  })
+  const d = body.dims
+  return (
+    <>
+      {/* Geometry and materials are the template's, shared by every body on
+          the lot — never disposed with one avatar. */}
+      <primitive dispose={null} object={body.root} />
+      {createPortal(
+        <HeldWeapon reach={d.armLen + HAND_BELOW_WRIST} refs={refs} weapon={weapon} />,
+        body.armFrames.R,
+      )}
+      {/* Hat band: a ring around the shell just above the brim. */}
+      {createPortal(
+        <mesh
+          geometry={geo.hat}
+          material={vest}
+          position={[0, d.hatBandZ - d.neckZ, 0]}
+          rotation={[Math.PI / 2, 0, 0]}
+        />,
+        body.pivots.head,
+      )}
+      {/* Sleeve bands, a little below each shoulder, in the arm frame (hanging −y). */}
+      {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.L)}
+      {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.R)}
+    </>
+  )
+}
+
+/**
+ * THE BODY — the same one for every peer streamed off the wire and for the
+ * reflection in the depot mirror, which is what keeps the mirror honest: if it
+ * looks right in the glass, that IS what your teammates see.
+ *
+ * The mascot's model when it has loaded (usePascalineTemplate kicks the one
+ * decode off), the primitive box rig until then or if it never does. Both
+ * expose the same six pivots through `refs`, both hang the same weapon in the
+ * same frame, and every frame-by-frame decision — stand, facing, gait, LOD —
+ * stays the caller's.
+ */
+export function AvatarRig(props: { paletteIndex: number; refs: AvatarRigRefs; weapon: string }) {
+  const template = usePascalineTemplate()
+  if (!template) return <PrimitiveRig {...props} />
+  return <PascalineRig template={template} {...props} />
 }
 
 function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: RemotePlayer }) {

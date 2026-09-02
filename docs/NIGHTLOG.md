@@ -2772,3 +2772,80 @@ name — and upright on screen. Then the same on WebGPU, headless for the target
 (the picture is identical) and headed for the screen (headless Chromium does
 not composite a WebGPU canvas into a screenshot). `check-types` clean, `bun
 test` 2472 pass / 0 fail.
+
+## 2026-09-01 — Pascaline, the body: the mascot replaces the boxes
+
+Owner, mid-session: *"make sure my avatar doesn't look like that horrible boxy
+thing but looks like Pascaline from the repo we have on pascalorg and our
+design, fortnite-ish."* The repo (pascalorg/pascaline) holds the mascot as
+2048² renders in seven poses and the logos — no mesh anywhere. So the mesh was
+made, and the making is a script.
+
+### The chain
+
+1. **A T-pose she never posed for.** A generator binds arms cleanly only when
+   they are clear of the torso, and the mascot's renders all hold a tablet at
+   the hip. An image model (fal-ai/nano-banana/edit) redrew `fullbody.png` as a
+   strict T-pose — same hat, hair, jacket, belt, boots, face; no props; white
+   ground. Two draws, both faithful. (Kontext gave an A-pose with the pouches
+   in the wrong place; not used.)
+2. **Rodin** (fal-ai/hyper3d/rodin, PBR, `TAPose`, quality high) from that
+   image: a 96k-face mesh with 2K diffuse/normal/roughness — and an A-pose,
+   not the T it was asked for. Arms at 43° from vertical, clear of the body:
+   good enough, and the rig no longer assumes any pose (below). The first
+   attempt straight from the mascot's own render came back arms-down with the
+   tablet, and the fused three-pose attempt came standing on a pedestal.
+3. **`scripts/rig-pascaline.py`** in Blender 4.5, headless. Import, join,
+   1024 px textures, then FACING FROM THE TEXTURE: two Rodin runs faced
+   opposite ways and no silhouette cue — toes, hair mass, hat visor — read both
+   right, but at head height the only skin-coloured texels are the face.
+   Normalize to the rig's 1.85 m, feet on the ground; decimate to 24k faces;
+   measure the body (leg axes from a knee slice, the crotch from where the
+   inter-leg gap closes, the torso from the highest chest slice that still
+   splits into three shells, each arm as the principal axis of its shell above
+   the tool belt, the hat brim as the widest head slice, the sleeve radius off
+   the arm axis); build root → torso → head / armL / armR (+ hands), root →
+   legL / legR with bones ALONG the limbs; bind with OUR weights — Blender's
+   bone heat fails silently on a generated mesh (every vertex came back
+   weightless; the first export was a rigid puppet) — each vertex takes its two
+   nearest thick bone segments, 50/50 at the joint, one bone a blend width
+   away, never across the wrist; hue-shift the auburn hair to the design's
+   brown; write the measured dims as node extras; export a Draco GLB, 404 KB.
+   One bug cost three previews: the glTF importer leaves objects in QUATERNION
+   rotation mode, where an Euler assignment is silently ignored — the "turn to
+   face +Y" never happened and every preview showed her back.
+4. **`scripts/embed-avatar.mjs`** → `pascaline-glb.ts`: base64 in a module
+   that pascaline-model.ts imports dynamically. The plugin is a `file:`
+   dependency inside the host's bundle and the mascot repo is private, so the
+   body ships inside the plugin, as its own chunk, fetched by no one.
+
+### Same six handles, a real body
+
+`articulate` writes `rotation.x` on six pivots; that rule set is shared by
+every peer and the mirror and stays untouched. Skinned bones carry rest
+rotations, so `pascaline-model.ts` re-parents each articulated bone under an
+identity-rotated PIVOT at the bone's own position in its parent's frame
+(`insertPivot`, tested: no world matrix moves at rest) — the pivot's x axis is
+the body's lateral axis whatever the bone points along. The arm pivots carry a
+fixed `rotation.z` — the arm's measured rest angle, from the GLB — and three's
+XYZ Euler order hangs the arm first and swings it after, so `armAim = π/2`
+still means "level". Under each arm pivot an ARM FRAME rotated by the opposite
+z is exactly what the box rig saw (hanging −y from the shoulder), so the held
+weapon, its muzzle fx and the sleeve band use the box rig's literal offsets: a
+rifle is at the same point in space for the same pose on either body (tested
+against the box rig at four aims and three hang angles).
+
+`AvatarRig` is now a switch: the model once its one decode has landed, the
+box rig until then or forever if it fails (`PrimitiveRig`, unchanged). The
+tint that tells players apart moved from a vest plate to a band on the hard hat
+and a band on each sleeve — the face, jacket and belt are hers. `HeldWeapon` is
+one component both bodies mount.
+
+### Seen in the glass
+
+The mirror harness, re-pointed at the leg pivot by name (the model's first
+child is its root, not a leg), runs green with the model live: the tint bands
+read at chest height and centred, handedness both ways, upright on screen, the
+gait swinging and freezing — and the front shot shows Pascaline in the glass,
+hat band and sleeve bands in her colour, builder in hand, the bench and the
+yard behind her. `check-types` clean, `bun test` 2481 pass / 0 fail.

@@ -213,8 +213,10 @@ const readSelf = () =>
     return {
       at: [e[12], e[13], e[14]],
       facing: [fwd[0] / flen, fwd[1] / flen, fwd[2] / flen],
-      // AvatarRig's children, in order: left leg pivot, right leg pivot, torso.
-      legSwing: self.children?.[0]?.rotation?.x ?? null,
+      // The left leg's pivot: named on the model body (pascaline-model.ts), the
+      // first child on the primitive fallback rig.
+      legSwing: (self.getObjectByName('pivot-legL') ?? self.children?.[0])?.rotation?.x ?? null,
+      body: self.getObjectByName('pivot-legL') ? 'model' : 'primitive',
       playerFeet: player ? [player.x, player.y, player.z] : null,
       speed: player?.speed ?? null,
       visible: self.visible,
@@ -532,7 +534,12 @@ check(
 // ── 6. the body: full size, on the deck, facing the glass ────────────────────
 await standAt(1.4)
 const self = await readSelf()
-check('THE BODY IS THERE, AND HIDDEN FROM THE MAIN CAMERA', self !== null && self.visible === false, `visible ${self?.visible}`)
+check(
+  'THE BODY IS THERE, AND HIDDEN FROM THE MAIN CAMERA',
+  self !== null && self.visible === false,
+  `visible ${self?.visible}, body: ${self?.body}`,
+)
+check('IT IS THE MASCOT MODEL, NOT THE BOX FALLBACK', self?.body === 'model', `body '${self?.body}'`)
 if (self) {
   const rel = [self.at[0] - pane.at[0], self.at[1] - pane.at[1], self.at[2] - pane.at[2]]
   const standoff = dot(rel, pane.normal)
