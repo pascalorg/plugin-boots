@@ -28,6 +28,7 @@ import { Doors, doorsDebug } from './doors'
 import {
   newSettleMemory,
   SETTLE_CHECK_MS,
+  SETTLE_MAX_REANCHORS,
   SETTLE_SENTINEL_MS,
   type SettleAction,
   settleStep,
@@ -695,10 +696,18 @@ function ActiveGame() {
       // Quiet slows the watch to a sentinel; anything else keeps the full cadence.
       if (!settleMem.current.done) schedule(step.mem.quiet ? SETTLE_SENTINEL_MS : SETTLE_CHECK_MS)
     }
-    // A peer's record refused against our stamp is evidence, not noise: look
-    // again NOW, and let entry-settle waive its stability wait for this look.
+    // A peer's record refused against our stamp is evidence, not noise: it is
+    // ground truth that OUR stamp is the odd one, whatever the clock says. Look
+    // again NOW with the stability wait waived — and if the watcher had already
+    // given up (a loaded client whose transforms landed after the window), the
+    // refusal REVIVES it, bounded by the re-anchor cap so a genuinely
+    // un-correctable drift still latches for good.
     const offRefused = onGridRefused(() => {
-      if (settleMem.current.done) return
+      if (settleMem.current.done) {
+        if (settleMem.current.reanchors >= SETTLE_MAX_REANCHORS) return
+        settleMem.current = { ...settleMem.current, done: false, quiet: false }
+        settleStartedAt.current = Date.now()
+      }
       nudged = true
       schedule(0)
     })

@@ -233,6 +233,27 @@ describe('the window', () => {
     expect(step.mem.quiet).toBe(false)
   })
 
+  test('a STALE PUBLISHED STAMP re-anchors even when the anchor and ladder agree', () => {
+    // The blind spot: born on a frame stamped before its transforms landed,
+    // the joiner's anchor and ladder converge to the room's, but the stamp it
+    // PUBLISHED never does — peers refuse every record (refusedGrid), and an
+    // anchor-only drift check sees nothing. The stamp mismatch IS the drift.
+    const r = reading({ elapsedMs: 3000, installed: A, live: A, stampStale: true })
+    expect(settleDrifted(r)).toBe(true)
+    let step = settleStep(r, newSettleMemory())
+    expect(step.action).toBe('wait') // one reading: still wants a second look
+    step = settleStep(reading({ elapsedMs: 3400, installed: A, live: A, stampStale: true }), step.mem)
+    expect(step.action).toBe('reanchor')
+    // Agreeing anchor AND a fresh stamp: nothing to do.
+    expect(settleDrifted(reading({ installed: A, live: A }))).toBe(false)
+    // A stale stamp with a nudge acts at once.
+    const nudgedStale = settleStep(
+      reading({ elapsedMs: 3000, installed: A, live: A, nudged: true, stampStale: true }),
+      newSettleMemory(),
+    )
+    expect(nudgedStale.action).toBe('reanchor')
+  })
+
   test('a refused record is evidence: a nudged drifting reading corrects on the spot', () => {
     const step = settleStep(
       reading({ elapsedMs: 3000, installed: LOCAL, live: A, nudged: true }),

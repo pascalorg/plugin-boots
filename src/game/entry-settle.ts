@@ -124,6 +124,11 @@ export type SettleReading = {
    * mismatch — the loudest possible evidence that OUR frame is the odd one.
    * Waives the stability wait: the room has already agreed on a lattice. */
   nudged?: boolean
+  /** Our PUBLISHED grid stamp disagrees with the stamp our LIVE scene would
+   * produce — the frame drifted after we stamped it, but the anchor and ladder
+   * have since converged so `installed` and `live` no longer disclose it. This
+   * is the exact condition peers refuse on, seen from our own side. */
+  stampStale?: boolean
 }
 
 export type SettleAction =
@@ -195,7 +200,12 @@ export function settleDrifted(r: SettleReading): boolean {
   return (
     !anchorsAgree(r.installed, r.live) ||
     !laddersAgree(r.installedLadder, r.liveLadder) ||
-    r.liveWalls > r.collectedWalls
+    r.liveWalls > r.collectedWalls ||
+    // A stale published stamp counts even when the anchor and ladder now agree
+    // — it is the mismatch peers actually refuse on, and the one an anchor
+    // comparison misses once the scene has converged around a stamp published
+    // before its transforms landed.
+    Boolean(r.stampStale)
   )
 }
 
@@ -268,7 +278,11 @@ export function settleStep(
       mem: { ...waited, key: '', quiet: false, recollects: mem.recollects + 1, stable: 0 },
     }
   }
-  if (anchorDrift && canReanchor) {
+  // A stale stamp re-anchors even with the anchor agreeing: re-installing the
+  // frame republishes the stamp from the live scene, which is what the room
+  // already holds — the fix for the born-late joiner whose anchor converged
+  // but whose published stamp never did.
+  if ((anchorDrift || Boolean(r.stampStale)) && canReanchor) {
     return {
       action: 'reanchor',
       mem: { ...waited, key: '', quiet: false, reanchors: mem.reanchors + 1, stable: 0 },
