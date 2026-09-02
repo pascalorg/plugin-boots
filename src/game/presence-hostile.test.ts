@@ -317,7 +317,7 @@ describe('hostile frames — refused at the trust boundary', () => {
     }
   })
 
-  test('a normalized frame carries the ten wire fields and nothing else', () => {
+  test('a normalized frame carries the eleven wire fields and nothing else', () => {
     const frame = validateFrame({
       ...validFrame,
       nodes: { 'node-1': {} },
@@ -327,6 +327,7 @@ describe('hostile frames — refused at the trust boundary', () => {
     expect(Object.keys(frame as object).sort()).toEqual([
       'f',
       'g',
+      'nm',
       'p',
       'ph',
       'pitch',

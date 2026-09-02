@@ -36,7 +36,7 @@
  * ground's dissolve target and the sky's horizon band can never drift apart.
  */
 
-import { BufferAttribute, BufferGeometry, CanvasTexture, Path, SRGBColorSpace } from 'three'
+import { BufferAttribute, BufferGeometry, CanvasTexture, Path, Shape, ShapeGeometry, SRGBColorSpace } from 'three'
 
 // ── Radii ──────────────────────────────────────────────────────────────────
 // The host viewer's camera is `far={1000}` (drei PerspectiveCamera), so the
@@ -45,6 +45,46 @@ import { BufferAttribute, BufferGeometry, CanvasTexture, Path, SRGBColorSpace } 
 
 /** The lawn's true outer edge. Fully hazed by here, so it is not visible. */
 export const HORIZON_FAR = 600
+
+/**
+ * THE GREEN LAWN over a real lot's white horizon plate.
+ *
+ * A void lot already reads as infinite grass (nature.tsx's disc + skirt); a
+ * host SITE does not — the host's own 400 m+ ground plate (`pascalExport:'strip'`
+ * at y≈−0.07) surrounds the terrain and reads white/gray, so the world looks
+ * like a building on a white platter. This is one big grass-green disc laid a
+ * hair above that plate, out to HORIZON_FAR, with the terrain field rect punched
+ * out so it never covers (or z-fights) the host terrain itself — the SAME
+ * rectangular hole the host punches in its own plate. Opaque and polygon-offset,
+ * so it occludes the white cleanly across the whole plate, near and far.
+ *
+ * Rect is in the disc's local XY frame (world x = local x, world z = −local y),
+ * matching groundGeometry's convention. Pure; the mesh Y and the rect come from
+ * world.lotEdge.
+ */
+export function lawnGeometry(
+  rect: { x0: number; x1: number; y0: number; y1: number } | null,
+  radius = HORIZON_FAR,
+  segments = 64,
+): BufferGeometry {
+  const shape = new Shape()
+  shape.absarc(0, 0, radius, 0, Math.PI * 2, false)
+  if (rect) {
+    const hole = new Path()
+    hole.moveTo(rect.x0, rect.y0)
+    hole.lineTo(rect.x1, rect.y0)
+    hole.lineTo(rect.x1, rect.y1)
+    hole.lineTo(rect.x0, rect.y1)
+    hole.closePath()
+    shape.holes.push(hole)
+  }
+  const geometry = new ShapeGeometry(shape, segments)
+  const uv = geometry.getAttribute('uv')
+  for (let i = 0; i < uv.count; i++) {
+    uv.setXY(i, uv.getX(i) / (radius * 2) + 0.5, uv.getY(i) / (radius * 2) + 0.5)
+  }
+  return geometry
+}
 
 /** The sky dome radius — OUTSIDE HORIZON_FAR so the dome's below-equator
  * half stays covered by ground in every direction the player can look. */

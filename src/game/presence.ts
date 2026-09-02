@@ -104,6 +104,7 @@ export function framesEqual(a: PresenceFrame, b: PresenceFrame): boolean {
     a.g === b.g &&
     a.st === b.st &&
     a.f === b.f &&
+    a.nm === b.nm &&
     Math.abs(a.p[0] - b.p[0]) <= POS_EPSILON &&
     Math.abs(a.p[1] - b.p[1]) <= POS_EPSILON &&
     Math.abs(a.p[2] - b.p[2]) <= POS_EPSILON &&
@@ -149,6 +150,9 @@ export type LocalPose = {
   /** Monotone count of rounds this session has fired (playerRig.shots) — the
    * publisher wraps it into the wire's 0..255 counter. */
   f: number
+  /** Chosen display name (nickname.localDisplayName) — the tag peers show.
+   * Optional so hand-built poses in tests need not carry it. */
+  nm?: string
 }
 
 const round2 = (v: number): number => Math.round(v * 100) / 100
@@ -177,6 +181,7 @@ export function buildFrame(local: LocalPose, out: PresenceFrame): PresenceFrame 
   out.g = local.g
   out.st = local.st
   out.f = wrapShots(local.f)
+  out.nm = local.nm || undefined
   return out
 }
 
@@ -270,6 +275,8 @@ export type RemotePlayer = {
   ph: PresencePhase
   /** Last weapon seen (registry-level convenience for the QA dump). */
   w: string
+  /** Last chosen display name seen on this peer's pose ('' = use the roster). */
+  nick: string
   /** Local clock when this session entered 'game' (drives the scale-in). */
   joinedAt: number
 }
@@ -310,6 +317,7 @@ const emptyFrame = (): PresenceFrame => ({
   g: true,
   st: false,
   f: 0,
+  nm: undefined,
 })
 
 const state: PresenceState = {
@@ -343,7 +351,7 @@ function emit(type: 'join' | 'leave', remote: RemotePlayer): void {
     type,
     sessionId: remote.sessionId,
     userId: remote.userId,
-    name: participantName(remote.userId),
+    name: remote.nick || participantName(remote.userId),
   }
   for (const handler of eventHandlers) handler(event)
 }
@@ -419,12 +427,14 @@ export function ingestPoseFrame(msg: NetMessage<PresenceFrame>, now: number): vo
       clockOffset: Number.NaN,
       ph: 'editor',
       w: frame.w,
+      nick: frame.nm ?? '',
       joinedAt: now,
     }
     state.remotes.set(msg.sessionId, remote)
   }
   remote.lastReceivedAt = now
   remote.w = frame.w
+  remote.nick = frame.nm ?? ''
   const offset = now - msg.sentAt
   remote.clockOffset = Number.isFinite(remote.clockOffset)
     ? remote.clockOffset + (offset - remote.clockOffset) * 0.1
@@ -536,6 +546,7 @@ function wireCopy(frame: PresenceFrame): PresenceFrame {
     g: frame.g,
     st: frame.st,
     f: frame.f,
+    nm: frame.nm,
   }
 }
 
@@ -552,6 +563,7 @@ function copyFrame(from: PresenceFrame, to: PresenceFrame): void {
   to.g = from.g
   to.st = from.st
   to.f = from.f
+  to.nm = from.nm
 }
 
 /**
@@ -615,6 +627,57 @@ export function stopPresence(): void {
   // Close the transport last: presence is currently its only user, and a
   // session that ended should leave no subscription behind. When destruction
   // and build kinds land, this becomes the session owner's call instead.
+  stopNet()
+}
+
+/**
+ * SPECTATE — receive live players WITHOUT being one.
+ *
+ * A viewer looking at the project (the read-only /play lobby, or /editor with
+ * the game not entered) wants to watch the people who ARE in the game move,
+ * shoot and build — but has no avatar to broadcast. This is the RECEIVE HALF
+ * of `startPresence`: the same subscription and roster reconcile, the same
+ * staleness sweep, but `getLocal` stays null — and `presenceTick` already
+ * returns before the publish once `getLocal` is null, so we transmit nothing.
+ *
+ * Coexists with `startPresence` on the one shared adapter: if a game session is
+ * already live, this is a no-op (the session owns the subscription); and when a
+ * spectator later drops IN, `startPresence`'s idempotent branch just hands the
+ * running adapter a `getLocal` and publishing turns on with no reconnect.
+ */
+export function startSpectating(): boolean {
+  if (!startNet()) return false
+  // A live game session (or an existing spectate) already owns the adapter.
+  if (state.active) return true
+  state.active = true
+  state.getLocal = null // receive-only: presenceTick sweeps but never publishes
+  state.lastPublishAt = 0
+  state.lastSentFrame = null
+  registerFrameKind(POSE_KIND, validateFrame)
+  state.unsubscribe = onFrame<PresenceFrame>(POSE_KIND, (msg) => ingestPoseFrame(msg, Date.now()))
+  state.offParticipants = onParticipants((participants) => reconcileRoster(participants))
+  state.timer = setInterval(() => presenceTick(Date.now()), TICK_MS)
+  return true
+}
+
+/**
+ * Stop spectating. A NO-OP once the viewer has dropped in: a game session owns
+ * the adapter then (`getLocal` is set), and its own `stopPresence` — with the
+ * `ph:'editor'` goodbye — is the only thing allowed to tear it down. Otherwise
+ * this is the receive-only owner, so it closes the subscription and transport.
+ */
+export function stopSpectating(): void {
+  if (!state.active || state.getLocal) return
+  if (state.timer) clearInterval(state.timer)
+  state.timer = null
+  state.unsubscribe?.()
+  state.unsubscribe = null
+  state.offParticipants?.()
+  state.offParticipants = null
+  state.remotes.clear()
+  state.rosterVersion++
+  state.active = false
+  state.lastSentFrame = null
   stopNet()
 }
 

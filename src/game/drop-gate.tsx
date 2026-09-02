@@ -5,6 +5,7 @@ import { useEffect } from 'react'
 import { BOOTS_LOADER } from '../art'
 import { useBoots } from '../store'
 import { enterGame } from './session'
+import { currentNick, googleFirstName, setNick } from './nickname'
 
 /**
  * THE SHAREABLE-LINK DROP GATE (owner vision, refined): open a project URL
@@ -137,13 +138,34 @@ export function DropGate() {
     fill.style.cssText =
       'width:0%;height:100%;border-radius:5px;background:rgba(255,255,255,0.85);transition:width 0.25s linear'
     track.appendChild(fill)
+    // YOUR NAME — the tag other players see over your hard hat. Defaults to your
+    // Google first name (the placeholder); type to pick a nickname, which
+    // persists across reloads and rides your first pose frame to peers.
+    const nameRow = document.createElement('div')
+    nameRow.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:6px'
+    const nameLabel = document.createElement('div')
+    nameLabel.textContent = 'YOUR NAME'
+    nameLabel.style.cssText = `font:600 11px/1 ${FONT};letter-spacing:0.22em;color:rgba(255,255,255,0.45)`
+    const nameInput = document.createElement('input')
+    nameInput.type = 'text'
+    nameInput.maxLength = 16
+    nameInput.value = currentNick()
+    nameInput.placeholder = googleFirstName() || 'builder'
+    nameInput.dataset.bootsNameInput = '1' // QA hook
+    nameInput.style.cssText =
+      `font:600 18px/1 ${FONT};text-align:center;color:rgba(255,255,255,0.95);background:rgba(255,255,255,0.06);` +
+      'border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:11px 16px;width:min(260px,54vw);outline:none'
+    nameInput.oninput = () => setNick(nameInput.value)
+    // Keep the veil's own keyboard handling from swallowing typing.
+    nameInput.onkeydown = (e) => e.stopPropagation()
+    nameRow.append(nameLabel, nameInput)
     // The ONE button — hidden until the world is ready.
     const button = document.createElement('button')
     button.textContent = '⏵ JUMP IN'
     button.style.cssText =
       `display:none;font:700 20px/1 ${FONT};letter-spacing:0.12em;color:#0f1113;background:#e8c229;` +
       'border:none;border-radius:8px;padding:16px 44px;cursor:pointer'
-    veil.append(hero, word, track, button)
+    veil.append(hero, word, nameRow, track, button)
     document.body.appendChild(veil)
 
     const t0 = performance.now()

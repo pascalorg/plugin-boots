@@ -1,0 +1,167 @@
+'use client'
+
+/**
+ * Presentational low-poly cyber truck in metre-scale MODEL SPACE: the origin
+ * is the truck's ground-plane center, its nose points down -Z, and +X is right.
+ */
+
+export const CYBER_TRUCK_SIZE: readonly [number, number, number] = [2.0, 1.9, 5.7]
+export const CYBER_TRUCK_WHEELBASE = 3.6
+
+const BODY = '#c8ccd0'
+const GLASS = '#20262b'
+const TYRE = '#141518'
+const TRIM = '#2b2e33'
+const LIGHT = '#ffd27a'
+
+const WHEEL_POSITIONS: ReadonlyArray<readonly [number, number]> = [
+  [-0.82, -CYBER_TRUCK_WHEELBASE / 2],
+  [0.82, -CYBER_TRUCK_WHEELBASE / 2],
+  [-0.82, CYBER_TRUCK_WHEELBASE / 2],
+  [0.82, CYBER_TRUCK_WHEELBASE / 2],
+]
+
+const SIDE_WINDOW_POSITIONS: ReadonlyArray<readonly [number, number]> = [
+  [-0.902, -0.08],
+  [0.902, -0.08],
+  [-0.902, 0.55],
+  [0.902, 0.55],
+]
+
+export function CyberTruckModel() {
+  return (
+    <group>
+      {/* Long, low stainless lower body, centered evenly between the bumpers. */}
+      <mesh position={[0, 0.67, 0.1]}>
+        <boxGeometry args={[1.9, 0.48, 5.1]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 0.98, -0.18]}>
+        <boxGeometry args={[1.96, 0.32, 4.55]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+
+      {/* The shallow hood and low front face establish the wedge-shaped nose. */}
+      <mesh position={[0, 1.08, -1.75]} rotation={[-0.1, 0, 0]}>
+        <boxGeometry args={[1.86, 0.18, 1.85]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 0.78, -2.72]}>
+        <boxGeometry args={[1.9, 0.42, 0.26]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 0.49, -2.76]}>
+        <boxGeometry args={[1.94, 0.18, 0.18]} />
+        <meshStandardMaterial color={TRIM} metalness={0.35} roughness={0.5} />
+      </mesh>
+      {/* Warm full-width front light bar. */}
+      <mesh position={[0, 0.84, -2.842]}>
+        <boxGeometry args={[1.72, 0.075, 0.015]} />
+        <meshBasicMaterial color={LIGHT} toneMapped={false} />
+      </mesh>
+
+      {/* Faceted cabin core, raked windshield, and thin roof cap. */}
+      <mesh position={[0, 1.45, 0.28]}>
+        <boxGeometry args={[1.78, 0.56, 1.32]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 1.8, 0.25]} rotation={[0.04, 0, 0]}>
+        <boxGeometry args={[1.84, 0.14, 1.52]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 1.49, -0.71]} rotation={[0.61, 0, 0]}>
+        <boxGeometry args={[1.7, 0.8, 0.045]} />
+        <meshStandardMaterial
+          color={GLASS}
+          transparent
+          opacity={0.52}
+          metalness={0.1}
+          roughness={0.2}
+        />
+      </mesh>
+      {/* Stainless A-pillars frame the windshield's sharp rake. */}
+      <mesh position={[-0.88, 1.49, -0.71]} rotation={[0.61, 0, 0]}>
+        <boxGeometry args={[0.08, 0.82, 0.06]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0.88, 1.49, -0.71]} rotation={[0.61, 0, 0]}>
+        <boxGeometry args={[0.08, 0.82, 0.06]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+
+      {/* Paired dark side panes leave a solid central door pillar. */}
+      {SIDE_WINDOW_POSITIONS.map(([x, z]) => (
+        <mesh key={`${x}:${z}`} position={[x, 1.51, z]}>
+          <boxGeometry args={[0.025, 0.42, 0.54]} />
+          <meshStandardMaterial
+            color={GLASS}
+            transparent
+            opacity={0.52}
+            metalness={0.1}
+            roughness={0.2}
+          />
+        </mesh>
+      ))}
+      <mesh position={[0, 1.51, 0.951]}>
+        <boxGeometry args={[1.58, 0.38, 0.035]} />
+        <meshStandardMaterial
+          color={GLASS}
+          transparent
+          opacity={0.52}
+          metalness={0.1}
+          roughness={0.2}
+        />
+      </mesh>
+
+      {/* Open rear-third pickup bed: dark floor, raised rails, and tailgate. */}
+      <mesh position={[0, 1.16, 1.83]}>
+        <boxGeometry args={[1.56, 0.08, 1.68]} />
+        <meshStandardMaterial color={TRIM} metalness={0.25} roughness={0.62} />
+      </mesh>
+      <mesh position={[-0.885, 1.25, 1.83]}>
+        <boxGeometry args={[0.19, 0.32, 1.72]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0.885, 1.25, 1.83]}>
+        <boxGeometry args={[0.19, 0.32, 1.72]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 1.08, 2.72]}>
+        <boxGeometry args={[1.9, 0.42, 0.15]} />
+        <meshStandardMaterial color={BODY} metalness={0.6} roughness={0.35} />
+      </mesh>
+      <mesh position={[0, 1.27, 2.798]}>
+        <boxGeometry args={[1.72, 0.055, 0.018]} />
+        <meshStandardMaterial color={TRIM} metalness={0.35} roughness={0.5} />
+      </mesh>
+      <mesh position={[0, 0.49, 2.75]}>
+        <boxGeometry args={[1.94, 0.18, 0.2]} />
+        <meshStandardMaterial color={TRIM} metalness={0.35} roughness={0.5} />
+      </mesh>
+
+      {/* Dark rocker strips sharpen the lower side-panel break. */}
+      <mesh position={[-0.956, 0.61, 0.05]}>
+        <boxGeometry args={[0.018, 0.13, 4.55]} />
+        <meshStandardMaterial color={TRIM} metalness={0.25} roughness={0.6} />
+      </mesh>
+      <mesh position={[0.956, 0.61, 0.05]}>
+        <boxGeometry args={[0.018, 0.13, 4.55]} />
+        <meshStandardMaterial color={TRIM} metalness={0.25} roughness={0.6} />
+      </mesh>
+
+      {/* Four low-sided chunky tyres; their radius puts contact exactly at y=0. */}
+      {WHEEL_POSITIONS.map(([x, z]) => (
+        <mesh key={`tyre:${x}:${z}`} position={[x, 0.42, z]} rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.42, 0.42, 0.3, 12]} />
+          <meshStandardMaterial color={TYRE} roughness={0.92} />
+        </mesh>
+      ))}
+      {WHEEL_POSITIONS.map(([x, z]) => (
+        <mesh key={`hub:${x}:${z}`} position={[x, 0.42, z]} rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.19, 0.19, 0.315, 10]} />
+          <meshStandardMaterial color={TRIM} metalness={0.55} roughness={0.38} />
+        </mesh>
+      ))}
+    </group>
+  )
+}

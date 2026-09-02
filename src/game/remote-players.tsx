@@ -1320,7 +1320,8 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   // Change-gated React state: weapon swaps and late-resolving names are
   // EVENTS (a handful per session), so a state write from useFrame is fine.
   const [weapon, setWeapon] = useState(remote.w)
-  const [name, setName] = useState(() => participantName(remote.userId))
+  // The chosen nickname (off the peer's pose) wins over the host roster name.
+  const [name, setName] = useState(() => remote.nick || participantName(remote.userId))
 
   // The tint is the tag's business here (the rig paints itself from the index).
   const tint = AVATAR_PALETTE[paletteIndex % AVATAR_PALETTE.length]!
@@ -1449,9 +1450,9 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       }
     }
 
-    // Late-resolving roster names: re-check ~every 2 s until it lands.
-    if (++frame.current % 120 === 0 && name === 'builder') {
-      const fresh = participantName(remote.userId)
+    // A late-resolving roster name OR a peer's rename: re-check ~every 2 s.
+    if (++frame.current % 120 === 0) {
+      const fresh = remote.nick || participantName(remote.userId)
       if (fresh !== name) setName(fresh)
     }
   })

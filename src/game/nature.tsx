@@ -35,6 +35,7 @@ import {
   hazeGeometry,
   hazeTexture,
   skirtGeometry,
+  lawnGeometry,
 } from './horizon'
 import { type GameWorld, pointInPolygonXZ, pointOnRoad, siteGroundYAt } from './world'
 
@@ -218,6 +219,37 @@ export const SITE_FLAT_GROUND_Y = -0.05
  */
 export function shouldMountGroundDisc(world: Pick<GameWorld, 'site'>): boolean {
   return !world.site
+}
+
+/** The green lawn sits this far above the host horizon plate — enough that it
+ * opaquely occludes the white, close enough that no gap shows at the lot edge. */
+export const LAWN_LIFT = 0.02
+
+/** World Y for the green lawn over a real lot: the host plate height + lift. */
+export function lawnGroundY(world: Pick<GameWorld, 'lotEdge'>): number {
+  return (world.lotEdge?.y ?? SITE_FLAT_GROUND_Y) + LAWN_LIFT
+}
+
+/** The terrain rect to punch out of the lawn, in the disc's LOCAL XY frame
+ * (centered on `center`, world x = local x, world z = −local y) — the same
+ * rect the host punches in its own plate, so lawn and terrain never overlap.
+ * From lotEdge on a sculpted site, the site polygon bbox on a flat site, else
+ * null (no site → the void disc handles it). Exported for tests. */
+export function lawnHoleRect(
+  world: Pick<GameWorld, 'buildingAabb'>,
+  center: { x: number; z: number },
+): { x0: number; x1: number; y0: number; y1: number } | null {
+  // The BUILDING footprint, not the whole terrain rect: the green lawn covers
+  // the flat lot ground too (the surroundings read green right up to the walls),
+  // and only the building is cut out — the same hole the void disc uses. On a
+  // mostly-flat lobby lot the lawn sits a hair above the host pad and greens it;
+  // a sculpted lot's terrain still pokes up through the flat lawn like grass on
+  // a bank. Rect is in the disc's local XY (world x = local x, world z = −y).
+  const aabb = world.buildingAabb
+  if (!aabb || aabb.isEmpty()) return null
+  const min = aabb.min
+  const max = aabb.max
+  return { x0: min.x - center.x, x1: max.x - center.x, y0: center.z - max.z, y1: center.z - min.z }
 }
 
 /**
@@ -617,6 +649,22 @@ export function Nature({ world }: { world: GameWorld }) {
     [world],
   )
 
+  // THE GREEN LAWN over a real lot's white horizon plate (see lawnGeometry):
+  // mounts only when a host site owns the ground (the inverse of the void
+  // disc), a hole punched for the terrain so it never covers the lot itself.
+  const siteLot = !!world.site
+  const lawnCenter = world.buildingAabb.isEmpty()
+    ? { x: 0, z: 0 }
+    : (() => {
+        const c = world.buildingAabb.getCenter(new Vector3())
+        return { x: c.x, z: c.z }
+      })()
+  const lawnGeo = useMemo(
+    () => (siteLot ? lawnGeometry(lawnHoleRect(world, lawnCenter)) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [world, siteLot],
+  )
+
   // THE ENDLESS LOT (horizon.ts): the disc's own rim used to be the edge of
   // the world. The skirt carries the same grass out to HORIZON_FAR and the
   // haze plate dissolves it into the sky dome's horizon band, so the void
@@ -779,6 +827,24 @@ export function Nature({ world }: { world: GameWorld }) {
           ) : (
             <meshStandardMaterial color="#4e7c3a" roughness={1} />
           )}
+        </mesh>
+      )}
+      {/* The green lawn over a real lot's white host plate — opaque, polygon-
+          offset above the plate, terrain rect punched out. Static + frozen. */}
+      {lawnGeo && (
+        <mesh
+          geometry={lawnGeo}
+          position={[center.x, lawnGroundY(world), center.z]}
+          ref={freezeRef}
+          rotation={[-Math.PI / 2, 0, 0]}
+        >
+          <meshStandardMaterial
+            color="#4e7c3a"
+            polygonOffset
+            polygonOffsetFactor={-2}
+            polygonOffsetUnits={-2}
+            roughness={1}
+          />
         </mesh>
       )}
 

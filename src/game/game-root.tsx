@@ -49,6 +49,7 @@ import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
 import { MOVE } from './movement'
+import { localDisplayName } from './nickname'
 import { startWorldSync, stopWorldSync, worldSyncDebug,
   onGridRefused,
 } from './net-world'
@@ -152,7 +153,7 @@ function ResurrectionSweep() {
  * On exit everything restores; the limiter resumes its own saved clock
  * (one stale-dt frame in the editor, clamped by consumers).
  */
-function FrameBooster() {
+export function FrameBooster() {
   const advance = useThree((s) => s.advance)
   const gl = useThree((s) => s.gl)
   const size = useThree((s) => s.size)
@@ -448,6 +449,7 @@ const _localPose: LocalPose = {
   g: true,
   st: false,
   f: 0,
+  nm: '',
 }
 
 function sampleLocalPose(): LocalPose {
@@ -465,6 +467,7 @@ function sampleLocalPose(): LocalPose {
   // Gunfire rides the pose (see presence-interp's header): the viewmodel bumps
   // this on every round fired, the publisher wraps it into the wire counter.
   _localPose.f = playerRig.shots
+  _localPose.nm = localDisplayName()
   return _localPose
 }
 

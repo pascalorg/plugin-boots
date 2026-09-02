@@ -5,6 +5,7 @@ import { DropGate } from './drop-gate'
 import { GameRoot } from './game-root'
 import { restorePendingChanges } from './pending-lanes'
 import { PendingPreview } from './preview'
+import { SpectatorPlayers } from './spectator'
 
 /**
  * Put back whatever decision was still open when this project was last closed.
@@ -37,6 +38,7 @@ export default function BootsSystem() {
       <PendingRestore />
       <DropGate />
       <GameRoot />
+      <SpectatorPlayers />
       <PendingPreview />
     </>
   )

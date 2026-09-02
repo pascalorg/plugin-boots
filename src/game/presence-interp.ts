@@ -58,6 +58,8 @@ export type PresenceFrame = {
   s: number
   g: boolean
   st: boolean
+  /** Chosen display name (soft, added after v1): the tag over this peer. */
+  nm?: string
   /** Rounds fired this session, mod SHOT_COUNTER_MOD (see the header). */
   f: number
 }
@@ -76,6 +78,8 @@ export const STALE_MS = 3000
 export const POS_LIMIT = 1e5
 /** Weapon-id length bound (oversize guard — ids are short slugs). */
 export const WEAPON_ID_MAX = 24
+/** Longest nickname accepted off the wire (matches nickname.NICK_MAX). */
+export const NICK_WIRE_MAX = 16
 /** The fire counter wraps here (two hex digits on the wire). */
 export const SHOT_COUNTER_MOD = 256
 /**
@@ -391,5 +395,16 @@ function readFrame(data: unknown): PresenceFrame | null {
     // already bounds what a bad one can cost. Normalized into 0..255 here so
     // nothing downstream has to think about it.
     f: isFiniteNumber(f.f) ? ((Math.trunc(f.f) % SHOT_COUNTER_MOD) + SHOT_COUNTER_MOD) % SHOT_COUNTER_MOD : 0,
+    // Soft, like `f`: absent on an older peer, and a hostile value is capped,
+    // never a dropped pose. Control chars stripped so canvas fillText can't be
+    // fooled; length bounded so the tag texture never blows up.
+    nm:
+      typeof f.nm === 'string'
+        ? f.nm
+            .replace(/[\u0000-\u001f\u007f]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, NICK_WIRE_MAX) || undefined
+        : undefined,
   }
 }

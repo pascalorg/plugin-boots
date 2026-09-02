@@ -253,6 +253,10 @@ export type GameWorld = {
    * its own ground disc. Optional so hand-built test worlds don't have to
    * carry it; collectWorld always fills it (possibly null). */
   site?: SiteSnapshot | null
+  /** The adopted host horizon-plate edge (sculpted sites): plate Y + the
+   * terrain field rect. Nature reads it to lay a green lawn over the white
+   * plate just above it, with the terrain rect punched out. Null off-lot. */
+  lotEdge?: LotEdge | null
   buildingAabb: Box3
   spawn: Vector3
   spawnYaw: number
@@ -2591,6 +2595,7 @@ export function collectWorld(): GameWorld {
     gridAnchor,
     storeyLadder,
     site,
+    lotEdge,
     buildingAabb,
     spawn,
     spawnYaw,
