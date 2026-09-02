@@ -2908,3 +2908,7 @@ pistol, knife and mid-stride shots for the record. The two-client harness now
 checks the PEOPLE as well as the map: C sees A as the model body, planted on
 A's feet, and A's weapon change reaches C's hands (mesh count under the hand
 frame, elbow bent for a rifle).
+
+**Shipped.** Host PR #503 squash-merged to `main` as `0a17ab09d` on the owner's
+instruction, pinning plugin `6f3b778`: the real mirror, Pascaline's body with
+elbows and knees, the two-handed holds. Production follows `main`.
