@@ -26,6 +26,7 @@ import {
   WarhammerModel,
 } from './weapon-models'
 import { WEAPONS } from './weapons'
+import { WeaponHands } from './weapon-hands'
 import type { GameWorld } from './world'
 
 /**
@@ -48,7 +49,7 @@ export const VIEWMODEL_NAME = 'boots-viewmodel'
  * joins store.ts's WeaponId with the manager's one-liner — until then the
  * union lives here and one cast at the setWeapon boundary bridges it (the
  * fleet feature-detect idiom; the cast is a no-op after the one-liner). */
-type ToolId = WeaponId | 'paint'
+export type ToolId = WeaponId | 'paint'
 
 /**
  * Classic FPS anchor: low-right of screen, barrel converging on the crosshair.
@@ -658,12 +659,15 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       <group ref={poseRef} position={[0.3, -0.3, -0.42]}>
         <group visible={showKnife}>
           <KnifeModel />
+          <WeaponHands weapon="knife" />
         </group>
         <group visible={showPistol}>
           <PistolModel />
+          <WeaponHands weapon="pistol" />
         </group>
         <group visible={showRifle}>
           <RifleModel />
+          <WeaponHands weapon="rifle" />
         </group>
         <group
           visible={showMinigun}
@@ -680,18 +684,22 @@ export function Viewmodel({ world }: { world: GameWorld }) {
           }}
         >
           <MinigunModel />
+          <WeaponHands weapon="minigun" />
         </group>
         <group visible={showHammer}>
           <WarhammerModel />
+          <WeaponHands weapon="hammer" />
         </group>
         {/* Builder tool keeps the small claw hammer — the warhammer above is
             the slot-6 weapon. */}
         <group visible={showBuilder}>
           <HammerModel />
+          <WeaponHands weapon="builder" />
         </group>
         {/* Slot-7 paint sprayer — the can's label band tracks the palette. */}
         <group visible={showPaint}>
           <SprayerModel />
+          <WeaponHands weapon="paint" />
         </group>
         {/* Muzzle flash: repositioned to the active gun's muzzle at fire time. */}
         <mesh position={[0, 0, -0.4]} ref={flashRef} visible={false}>
