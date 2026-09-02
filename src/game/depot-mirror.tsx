@@ -1,7 +1,7 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { CanvasTexture, type Group, Matrix4, type Mesh } from 'three'
 import { useBoots } from '../store'
 import { DEPOT_NODE_ID, DEPOT_NODE_TYPE, depotWorldYaw, worldToDepotLocal } from './guntable'
@@ -15,6 +15,7 @@ import {
   createArticulation,
   createRigRefs,
   localPaletteIndex,
+  subscribeLocalPalette,
 } from './remote-players'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -186,6 +187,15 @@ export function DepotMirror({ world }: { world: GameWorld }) {
   // The dummy holds what we hold. A store subscription, so a weapon swap
   // re-renders the rig exactly once, like a peer's does off the wire.
   const weapon = useBoots((s) => s.weapon)
+  // And it wears what we wear. Our slot in the deal can MOVE when the roster
+  // changes (assignPalette walks collisions forward through the sorted id set),
+  // so this has to be a subscription: read once at mount and the glass would
+  // keep showing the color the lobby had already reassigned.
+  const paletteIndex = useSyncExternalStore(
+    subscribeLocalPalette,
+    localPaletteIndex,
+    localPaletteIndex,
+  )
   // The depot's yaw is fixed once the lot loads: the player's heading has to
   // come into this frame before it can be reflected in it.
   const yawOffset = useMemo(() => depotWorldYaw(world), [world])
@@ -331,7 +341,7 @@ export function DepotMirror({ world }: { world: GameWorld }) {
         userData={{ __boots: true }}
         visible={false}
       >
-        <AvatarRig paletteIndex={localPaletteIndex()} refs={refs} weapon={weapon} />
+        <AvatarRig paletteIndex={paletteIndex} refs={refs} weapon={weapon} />
       </group>
       {/* Always mounted, CONSTANT intensity — the depot's WebGPU rule. Hung at
           the top front of the cabinet so it rakes DOWN the body like display

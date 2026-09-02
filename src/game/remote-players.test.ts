@@ -104,6 +104,31 @@ describe('palette assignment — one tint each, agreed without coordination', ()
     expect(deal.get('ada')).toBe(paletteIndexFor('ada'))
   })
 
+  test('a joiner can MOVE an id already in the lot to another slot', () => {
+    // Why localPaletteIndex is a subscription and not a mount-time read (the
+    // depot mirror): collisions walk forward through the SORTED id set, so
+    // somebody arriving with a lower-sorted id and the same preferred slot
+    // takes it and pushes the sitting player to the next one. Find such a pair
+    // rather than assert a hash by hand — the hash is free to change.
+    let moved: [string, string] | null = null
+    for (let i = 0; i < 400 && !moved; i++) {
+      for (let j = 0; j < 400; j++) {
+        const a = `player-${i}`
+        const b = `player-${j}`
+        if (a >= b) continue
+        if (paletteIndexFor(a) !== paletteIndexFor(b)) continue
+        moved = [b, a] // b was alone; a sorts first and takes the slot
+        break
+      }
+    }
+    expect(moved).not.toBeNull()
+    const [sitting, joiner] = moved!
+    const alone = assignPalette([sitting])
+    const together = assignPalette([sitting, joiner])
+    expect(alone.get(sitting)).toBe(paletteIndexFor(sitting))
+    expect(together.get(sitting)).not.toBe(alone.get(sitting))
+  })
+
   test('past the palette size it degrades to the hash instead of failing', () => {
     const ids = Array.from({ length: 20 }, (_, i) => `user-${i}`)
     const deal = assignPalette(ids)

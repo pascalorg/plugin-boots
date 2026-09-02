@@ -915,6 +915,22 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
 
 /** The last deal RemotePlayers made — see localPaletteIndex. */
 let lastDeal: ReadonlyMap<string, number> = new Map()
+/** Told when OUR OWN slot moves (the depot mirror re-renders on it). */
+const localPaletteListeners = new Set<() => void>()
+
+/**
+ * Watch our own tint. Our slot is not fixed for the session: the deal walks
+ * collisions forward through the sorted id set, so a peer joining with a
+ * lower-sorted id and the same preferred slot pushes us to the next one. The
+ * mirror has to hear about that — showing yesterday's color is exactly the lie
+ * it exists to prevent.
+ */
+export function subscribeLocalPalette(fn: () => void): () => void {
+  localPaletteListeners.add(fn)
+  return () => {
+    localPaletteListeners.delete(fn)
+  }
+}
 
 /**
  * OUR OWN tint, the one the lot's deal reserved for us.
@@ -963,8 +979,13 @@ export function RemotePlayers() {
       const mine = localUserId()
       if (mine) ids.push(mine)
       const deal = assignPalette(ids)
-      // Published for localPaletteIndex (the depot mirror wears our own tint).
+      // Published for localPaletteIndex (the depot mirror wears our own tint),
+      // and anyone watching hears it only when OUR slot actually moved.
+      const wasMine = mine ? lastDeal.get(mine) : undefined
       lastDeal = deal
+      if (mine && deal.get(mine) !== wasMine) {
+        for (const listener of localPaletteListeners) listener()
+      }
       setColors(deal)
       // Chip rides the same edge (roster changes are the only count moves);
       // feature-detected like every cross-module hud call.
