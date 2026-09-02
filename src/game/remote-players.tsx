@@ -22,7 +22,8 @@ import { EYE_HEIGHT } from './collision'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
 import {
-  HAND_BELOW_WRIST,
+  DEFAULT_DIMS,
+  GRIP_IN_HAND,
   instantiatePascaline,
   type PascalineDims,
   type PascalineTemplate,
@@ -181,26 +182,162 @@ export function assignPalette(userIds: readonly string[]): Map<string, number> {
 export const GAIT_RATE = 7
 /** Peak leg swing (rad) at full normalized speed. */
 export const LEG_SWING_MAX = 0.55
-/** Counter-swing of the free (left) arm, fraction of the leg swing. */
+/** Peak knee flexion (rad) mid-swing at full speed — the lifted knee of a run. */
+export const KNEE_LIFT_MAX = 1.0
+/** Counter-swing of the free arm, fraction of the leg swing. */
 export const ARM_SWING_RATIO = 0.7
-/** Fixed airborne pose: legs split, free arm thrown back. */
+/** A free arm's resting elbow bend (rad) — nobody walks with a locked elbow. */
+export const FREE_ELBOW = 0.35
+/** Forward lean of the torso at full speed (rad). */
+export const RUN_LEAN = 0.12
+/** Fixed airborne pose: legs split, knees tucked, free arm thrown back. */
 export const AIR_LEG_SPLIT = 0.45
+export const AIR_KNEE = 0.7
 export const AIR_ARM_SWING = -0.5
-/** Slump lean while staggered (rad) + the hanging weapon arm. */
+/** Slump lean while staggered (rad), the hanging weapon arm, soft knees. */
 export const SLUMP_TORSO = 0.4
 export const SLUMP_ARM_AIM = 0.35
-/** Weapon arm at rest points forward (π/2 from hanging) and follows pitch. */
-const ARM_AIM_BASE = Math.PI / 2
+export const SLUMP_KNEE = 0.25
+/** Idle breathing on the torso: amplitude (rad) and rate (rad/s). */
+export const BREATH_AMP = 0.015
+export const BREATH_RATE = 1.3
+/**
+ * The arm the poses are solved for: shoulder half-width, upper arm, and the
+ * reach from elbow to the grip in the palm. The mascot model's numbers (the box
+ * fallback is close enough to borrow them).
+ */
+export type ArmDims = { shoulderX: number; upperArmLen: number; reach: number }
+export const MODEL_ARMS: ArmDims = {
+  shoulderX: DEFAULT_DIMS.shoulderX,
+  upperArmLen: DEFAULT_DIMS.upperArmLen,
+  reach: DEFAULT_DIMS.foreArmLen + GRIP_IN_HAND * DEFAULT_DIMS.handLen,
+}
+
+/**
+ * HOW EACH WEAPON IS HELD, as a point, not as angles: where the right hand
+ * grips it, relative to the right shoulder at zero pitch — [inward toward the
+ * body's centre line, up, forward] in metres — and how far along the barrel
+ * the left hand takes the foregrip (0 = no second hand). The whole hold pivots
+ * about the shoulder with the view pitch, and two-bone IK (solveArm) finds the
+ * shoulder swing, yaw and elbow that put each hand there. Points are what you
+ * tune by looking at the picture; angles never read as anything. The arms are
+ * stylized-short (0.49 m shoulder to palm), so every point — and the foregrip
+ * the left hand has to reach from ITS shoulder — must stay inside that; the
+ * tests check it.
+ */
+export const GRIPS = {
+  /** Long gun (rifle, minigun): shouldered — grip in front of the chest, close
+   * in, barrel level with the eyes, left hand well forward on the handguard. */
+  long: { hand: [0.14, -0.1, 0.18] as const, foregrip: 0.22, barrelFromDown: Math.PI / 2 },
+  /** Pistol: both arms out, hands cupped on the grip at chest height. */
+  short: { hand: [0.14, -0.02, 0.36] as const, foregrip: 0.05, barrelFromDown: Math.PI / 2 },
+  /** A tool (knife, hammer, builder, spray can): one relaxed hand low by the
+   * hip, the tool pointing forward-down. */
+  tool: { hand: [-0.03, -0.46, 0.15] as const, foregrip: 0, barrelFromDown: 1.0 },
+} as const
 const HEAD_PITCH_MAX = 0.6
+const PITCH_CLAMP = 1.2
+
+export type ArmSolution = {
+  /** rotation.x of the shoulder pivot (0 = hanging, π/2 = level forward). */
+  swing: number
+  /** rotation.y of the shoulder pivot (YXZ order: applied after the swing). */
+  yaw: number
+  /** Elbow flexion (rad, ≥ 0). */
+  elbow: number
+  /** Where the grip ended up, relative to the shoulder (three axes: x right, y up, −z forward). */
+  hand: [number, number, number]
+}
+
+/** The direction of a limb segment swung `theta` from hanging and yawed `yaw`
+ * about the vertical (three axes). Exported for the tests' forward kinematics. */
+export function limbDir(theta: number, yaw: number): [number, number, number] {
+  const st = Math.sin(theta)
+  return [-st * Math.sin(yaw), -Math.cos(theta), -st * Math.cos(yaw)]
+}
+
+/**
+ * Two-bone IK for one arm: the shoulder swing, yaw and elbow flexion that put
+ * the grip at `target` (relative to that shoulder, three axes: x right, y up,
+ * −z forward). Unreachable targets get a straight arm pointed at them. The
+ * elbow always bends the human way: forward/up, never back.
+ */
+export function solveArm(target: readonly [number, number, number], arms: ArmDims = MODEL_ARMS): ArmSolution {
+  const a = arms.upperArmLen
+  const c = arms.reach
+  const [vx, vy, vz] = target
+  const h = Math.hypot(vx, vz)
+  const yaw = h > 1e-6 ? Math.atan2(-vx, -vz) : 0
+  const t = Math.atan2(h, -vy) // from straight down toward the target
+  const D = Math.min(Math.hypot(h, vy), a + c - 1e-4)
+  const cosElbowOuter = clamp((a * a + c * c - D * D) / (2 * a * c), -1, 1)
+  const elbow = Math.PI - Math.acos(cosElbowOuter)
+  const alpha = Math.acos(clamp((a * a + D * D - c * c) / (2 * a * D), -1, 1))
+  const swing = t - alpha
+  const du = limbDir(swing, yaw)
+  const df = limbDir(swing + elbow, yaw)
+  const hand: [number, number, number] = [
+    a * du[0] + c * df[0],
+    a * du[1] + c * df[1],
+    a * du[2] + c * df[2],
+  ]
+  return { swing, yaw, elbow, hand }
+}
+
+/** A grip's hand point (inward, up, forward at zero pitch) as a right-shoulder-
+ * relative three vector, the whole hold pivoted about the shoulder by `pitch`. */
+function rightHandTarget(hand: readonly [number, number, number], pitch: number): [number, number, number] {
+  const [inward, up, fwd] = hand
+  const c = Math.cos(pitch)
+  const s = Math.sin(pitch)
+  return [-inward, fwd * s + up * c, -(fwd * c - up * s)]
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v
+}
+
+/** How a weapon is held — what the two arms do with it. */
+export type Grip = 'long' | 'short' | 'tool' | 'none'
+
+/** Weapon id → grip. An id this build does not know (a newer peer's weapon)
+ * reads as a tool in hand rather than as empty hands. */
+export function gripFor(weapon: string): Grip {
+  switch (weapon) {
+    case 'rifle':
+    case 'minigun':
+      return 'long'
+    case 'pistol':
+      return 'short'
+    case '':
+      return 'none'
+    default:
+      return 'tool'
+  }
+}
 
 export type AvatarArticulation = {
-  /** rotation.x of the LEFT leg pivot (right leg mirrors with -legSwing). */
+  /** rotation.x of the LEFT hip pivot (right leg mirrors with -legSwing). */
   legSwing: number
-  /** rotation.x of the LEFT (free) arm pivot — counter-swings the gait. */
+  /** Knee flexion per leg (rad, ≥ 0) — applied as −rotation.x on the knee pivot. */
+  kneeL: number
+  kneeR: number
+  /** rotation.x of the LEFT arm pivot: counter-swings the gait, or reaches the gun. */
   armSwing: number
-  /** rotation.x of the RIGHT (weapon) arm pivot — π/2 = level aim. */
+  /** rotation.y of the left arm pivot — negative brings a forward arm in toward the body. */
+  armLYaw: number
+  /** Left elbow flexion (rad, ≥ 0) — applied as +rotation.x on the elbow pivot. */
+  elbowL: number
+  /** rotation.x of the RIGHT (weapon) arm pivot. */
   armAim: number
-  /** rotation.x of the torso pivot (slump lean). */
+  /** rotation.y of the right arm pivot — positive brings it in toward the body. */
+  armRYaw: number
+  /** Right elbow flexion (rad, ≥ 0). */
+  elbowR: number
+  /** How far the held weapon is tilted off the forearm's line (rad, about the
+   * lateral axis) so its barrel points where the peer looks. */
+  weaponTilt: number
+  /** rotation.x of the torso pivot (slump, run lean, breathing). */
   torsoPitch: number
   /** rotation.x of the head pivot (tracks the remote view pitch). */
   headPitch: number
@@ -209,7 +346,21 @@ export type AvatarArticulation = {
 }
 
 export function createArticulation(): AvatarArticulation {
-  return { legSwing: 0, armSwing: 0, armAim: ARM_AIM_BASE, torsoPitch: 0, headPitch: 0, bobY: 0 }
+  return {
+    legSwing: 0,
+    kneeL: 0,
+    kneeR: 0,
+    armSwing: 0,
+    armLYaw: 0,
+    elbowL: FREE_ELBOW,
+    armAim: 0,
+    armRYaw: 0,
+    elbowR: FREE_ELBOW,
+    weaponTilt: 0,
+    torsoPitch: 0,
+    headPitch: 0,
+    bobY: 0,
+  }
 }
 
 /** Advance the walk-cycle phase: stride cadence scales with normalized
@@ -221,10 +372,18 @@ export function advanceGait(phase: number, s: number, dt: number): number {
 /**
  * Pose the rig from the sampled wire fields — the ONE articulation rule
  * set, pure so tests pin every stance:
- * - grounded gait: leg swing sine scaled by s, arm counter-swing, stride bob
- * - airborne (!g): fixed leg split + thrown-back arm, no bob
- * - staggered (st): torso slump, hung weapon arm, halved shuffle
- * - head and weapon arm track the remote pitch (clamped)
+ * - grounded gait: leg swing sine scaled by s, the leg that is swinging
+ *   forward lifts its knee (cos > 0 for the left, cos < 0 for the right),
+ *   stride bob, a forward lean that grows with speed
+ * - airborne (!g): legs split, knees tucked, free arm thrown back, no bob
+ * - staggered (st): torso slump, hung weapon arm, soft knees, halved shuffle
+ * - the WEAPON decides the arms (grip): a long gun is shouldered with both
+ *   hands and the free arm reaches across to the foregrip; a pistol is held
+ *   out in both hands; a tool rides in one relaxed hand at the hip while the
+ *   other swings; empty hands both swing. Each hold is a grip POINT near the
+ *   body (GRIPS) solved by two-bone IK for both arms, and the weapon is tilted
+ *   in the hand so its BARREL points where the peer looks
+ * - head tracks the remote pitch (clamped); `t` (s) drives the idle breath
  */
 export function articulate(
   out: AvatarArticulation,
@@ -233,33 +392,118 @@ export function articulate(
   pitch: number,
   grounded: boolean,
   staggered: boolean,
+  grip: Grip = 'tool',
+  t = 0,
+  arms: ArmDims = MODEL_ARMS,
 ): AvatarArticulation {
-  const clampedPitch = pitch < -1.2 ? -1.2 : pitch > 1.2 ? 1.2 : pitch
+  const clampedPitch = clamp(pitch, -PITCH_CLAMP, PITCH_CLAMP)
+
+  // Legs.
   if (grounded) {
     const swing = Math.sin(phase) * LEG_SWING_MAX * s
     out.legSwing = staggered ? swing * 0.5 : swing
-    out.armSwing = -Math.sin(phase) * LEG_SWING_MAX * ARM_SWING_RATIO * s
+    const lift = KNEE_LIFT_MAX * s
+    const soft = staggered ? SLUMP_KNEE : 0
+    out.kneeL = Math.max(0, Math.cos(phase)) * lift + soft
+    out.kneeR = Math.max(0, -Math.cos(phase)) * lift + soft
     out.bobY = Math.abs(Math.cos(phase)) * 0.04 * s
   } else {
     out.legSwing = AIR_LEG_SPLIT
-    out.armSwing = AIR_ARM_SWING
+    out.kneeL = AIR_KNEE
+    out.kneeR = AIR_KNEE
     out.bobY = 0
   }
+  // What an arm does when it has nothing to hold.
+  const freeSwing = grounded ? -Math.sin(phase) * LEG_SWING_MAX * ARM_SWING_RATIO * s : AIR_ARM_SWING
+
+  // Torso and head.
   if (staggered) {
     out.torsoPitch = SLUMP_TORSO
-    out.armAim = SLUMP_ARM_AIM
     out.headPitch = -0.35
+    out.armAim = SLUMP_ARM_AIM
+    out.armRYaw = 0
+    out.elbowR = 0.6
+    out.weaponTilt = 0
+    out.armSwing = freeSwing * 0.5
+    out.armLYaw = 0
+    out.elbowL = FREE_ELBOW
+    return out
+  }
+  out.torsoPitch = RUN_LEAN * (grounded ? s : 0) + BREATH_AMP * Math.sin(t * BREATH_RATE)
+  out.headPitch = clamp(clampedPitch, -HEAD_PITCH_MAX, HEAD_PITCH_MAX)
+
+  // Arms, by grip — solved from where the hands have to be.
+  if (grip === 'none') {
+    out.armAim = -freeSwing
+    out.armRYaw = 0
+    out.elbowR = FREE_ELBOW
+    out.weaponTilt = 0
+    out.armSwing = freeSwing
+    out.armLYaw = 0
+    out.elbowL = FREE_ELBOW
+    return out
+  }
+  const g = GRIPS[grip]
+  const right = solveArm(rightHandTarget(g.hand, clampedPitch), arms)
+  out.armAim = right.swing
+  out.armRYaw = right.yaw
+  out.elbowR = right.elbow
+  // The barrel points where the peer looks, whatever the forearm does.
+  const barrel = g.barrelFromDown + clampedPitch
+  out.weaponTilt = barrel - (right.swing + right.elbow)
+  if (g.foregrip > 0) {
+    // The left hand takes the foregrip: that far from the right hand along the
+    // barrel (which carries the right arm's yaw), a touch to the left of it.
+    const bd = limbDir(barrel, right.yaw)
+    const [hx, hy, hz] = right.hand
+    const leftTarget: [number, number, number] = [
+      hx + 2 * arms.shoulderX + g.foregrip * bd[0] - 0.03,
+      hy + g.foregrip * bd[1],
+      hz + g.foregrip * bd[2],
+    ]
+    const left = solveArm(leftTarget, arms)
+    out.armSwing = left.swing
+    out.armLYaw = left.yaw
+    out.elbowL = left.elbow
   } else {
-    out.torsoPitch = 0
-    out.armAim = ARM_AIM_BASE + clampedPitch
-    out.headPitch =
-      clampedPitch < -HEAD_PITCH_MAX
-        ? -HEAD_PITCH_MAX
-        : clampedPitch > HEAD_PITCH_MAX
-          ? HEAD_PITCH_MAX
-          : clampedPitch
+    out.armSwing = freeSwing
+    out.armLYaw = 0
+    out.elbowL = FREE_ELBOW
   }
   return out
+}
+
+/**
+ * Write a pose onto a body's handles — the one place the sign conventions
+ * live: the right leg mirrors the left, knees bend backward (−x), elbows bend
+ * forward (+x), arm yaws are written as given. Handles a body does not have
+ * (the box rig's elbows and knees) are simply absent.
+ */
+export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): void {
+  const setX = (r: { current: Group | null } | undefined, x: number) => {
+    if (r?.current) r.current.rotation.x = x
+  }
+  setX(refs.legL, a.legSwing)
+  setX(refs.legR, -a.legSwing)
+  setX(refs.kneeL, -a.kneeL)
+  setX(refs.kneeR, -a.kneeR)
+  const armL = refs.armL.current
+  if (armL) {
+    armL.rotation.x = a.armSwing
+    armL.rotation.y = a.armLYaw
+  }
+  const armR = refs.armR.current
+  if (armR) {
+    armR.rotation.x = a.armAim
+    armR.rotation.y = a.armRYaw
+  }
+  setX(refs.elbowL, a.elbowL)
+  setX(refs.elbowR, a.elbowR)
+  // The held weapon hangs barrel-down the forearm at rest (Rx(−π/2)); the
+  // tilt swings the barrel forward/up off that line.
+  setX(refs.weapon, -Math.PI / 2 + a.weaponTilt)
+  setX(refs.torso, a.torsoPitch)
+  setX(refs.head, a.headPitch)
 }
 
 // ── Join scale-in + name-tag gate (pure, tested) ─────────────────────────────
@@ -568,6 +812,13 @@ export type AvatarRigRefs = {
   headDetail: { current: Group | null }
   /** LOD group under the torso pivot (belt pouch, tape). */
   bodyDetail: { current: Group | null }
+  /** Elbows and knees — the model has them, the box rig does not. */
+  elbowL?: { current: Group | null }
+  elbowR?: { current: Group | null }
+  kneeL?: { current: Group | null }
+  kneeR?: { current: Group | null }
+  /** The held weapon's group (HeldWeapon) — tilted per frame so the barrel tracks the aim. */
+  weapon?: { current: Group | null }
   fx?: { current: Group | null }
   flash?: { current: Group | null }
 }
@@ -584,6 +835,11 @@ export function createRigRefs(): AvatarRigRefs {
     legR: { current: null },
     headDetail: { current: null },
     bodyDetail: { current: null },
+    elbowL: { current: null },
+    elbowR: { current: null },
+    kneeL: { current: null },
+    kneeR: { current: null },
+    weapon: { current: null },
   }
 }
 
@@ -655,7 +911,7 @@ function PrimitiveRig({
           </group>
         </group>
         {/* Free (left) arm counter-swings the gait — jacket sleeve, bare hand. */}
-        <group ref={refs.armL} position={[-0.28, 0.5, 0]}>
+        <group ref={refs.armL} position={[-0.28, 0.5, 0]} rotation-order="YXZ">
           <mesh
             geometry={LIMB_GEO}
             material={JACKET_MATERIAL}
@@ -666,7 +922,7 @@ function PrimitiveRig({
         </group>
         {/* Weapon (right) arm aims with the remote pitch; the held model
             hangs off the hand, barrel aligned down the arm. */}
-        <group ref={refs.armR} position={[0.28, 0.5, 0]}>
+        <group ref={refs.armR} position={[0.28, 0.5, 0]} rotation-order="YXZ">
           <mesh
             geometry={LIMB_GEO}
             material={JACKET_MATERIAL}
@@ -702,7 +958,7 @@ function HeldWeapon({
   const muzzle = refs.fx ? remoteMuzzle(weapon) : null
   if (!Weapon) return null
   return (
-    <group position={[0, -reach, 0.02]} rotation={[-Math.PI / 2, 0, 0]}>
+    <group position={[0, -reach, 0.02]} ref={refs.weapon} rotation={[-Math.PI / 2, 0, 0]}>
       <Weapon />
         {/* Muzzle fx, parented to the gun: the flash points wherever the
             peer aims for free, through the arm chain, with no per-frame
@@ -783,6 +1039,10 @@ function PascalineRig({
     refs.legR.current = body.pivots.legR
     refs.headDetail.current = body.detail.head
     refs.bodyDetail.current = body.detail.body
+    if (refs.elbowL) refs.elbowL.current = body.joints.elbowL
+    if (refs.elbowR) refs.elbowR.current = body.joints.elbowR
+    if (refs.kneeL) refs.kneeL.current = body.joints.kneeL
+    if (refs.kneeR) refs.kneeR.current = body.joints.kneeR
   })
   const d = body.dims
   return (
@@ -790,9 +1050,11 @@ function PascalineRig({
       {/* Geometry and materials are the template's, shared by every body on
           the lot — never disposed with one avatar. */}
       <primitive dispose={null} object={body.root} />
+      {/* In the hand frame under the elbow: the grip sits in the palm, the
+          barrel runs down the forearm, and a bent elbow raises the gun. */}
       {createPortal(
-        <HeldWeapon reach={d.armLen + HAND_BELOW_WRIST} refs={refs} weapon={weapon} />,
-        body.armFrames.R,
+        <HeldWeapon reach={d.foreArmLen + d.handLen * GRIP_IN_HAND} refs={refs} weapon={weapon} />,
+        body.handFrames.R,
       )}
       {/* Hat band: a ring around the shell just above the brim. */}
       {createPortal(
@@ -836,6 +1098,11 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   const armRRef = useRef<Group>(null)
   const legLRef = useRef<Group>(null)
   const legRRef = useRef<Group>(null)
+  const elbowLRef = useRef<Group>(null)
+  const elbowRRef = useRef<Group>(null)
+  const kneeLRef = useRef<Group>(null)
+  const kneeRRef = useRef<Group>(null)
+  const weaponRef = useRef<Group>(null)
   const tagRef = useRef<Group>(null)
   const tagMatRef = useRef<MeshBasicMaterial>(null)
   const speakRef = useRef<Mesh>(null)
@@ -853,6 +1120,25 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   // up to someone mid-magazine does not replay their whole magazine at you.
   const fxRef = useRef<Group>(null)
   const flashRef = useRef<Group>(null)
+  // One stable handle object for the body: every ref inside is stable, so the
+  // rig never sees a handle change, and the frame loop and the rig share it.
+  const rigRefs = useRef<AvatarRigRefs>({
+    torso: torsoRef,
+    head: headRef,
+    armL: armLRef,
+    armR: armRRef,
+    legL: legLRef,
+    legR: legRRef,
+    headDetail: headDetailRef,
+    bodyDetail: bodyDetailRef,
+    elbowL: elbowLRef,
+    elbowR: elbowRRef,
+    kneeL: kneeLRef,
+    kneeR: kneeRRef,
+    weapon: weaponRef,
+    fx: fxRef,
+    flash: flashRef,
+  }).current
   const flashT = useRef(0)
   const lastShots = useRef(-1)
   // Change-gated React state: weapon swaps and late-resolving names are
@@ -886,7 +1172,18 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     const distSq = dx * dx + dy * dy + dz * dz
 
     gaitPhase.current = advanceGait(gaitPhase.current, _pose.g ? _pose.s : 0, dt)
-    articulate(_artic, gaitPhase.current, _pose.s, _pose.pitch, _pose.g, _pose.st)
+    // The peer's own clock drives their breathing, so a lobby does not breathe
+    // in unison; the wire weapon decides the hold.
+    articulate(
+      _artic,
+      gaitPhase.current,
+      _pose.s,
+      _pose.pitch,
+      _pose.g,
+      _pose.st,
+      gripFor(_pose.w),
+      (now - remote.joinedAt) / 1000,
+    )
 
     // Wire positions are EYE positions — plant the feet.
     root.position.set(_pose.x, _pose.y - EYE_HEIGHT + _artic.bobY, _pose.z)
@@ -896,12 +1193,7 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       lastScale.current = scale
       root.scale.setScalar(scale)
     }
-    if (legLRef.current) legLRef.current.rotation.x = _artic.legSwing
-    if (legRRef.current) legRRef.current.rotation.x = -_artic.legSwing
-    if (armLRef.current) armLRef.current.rotation.x = _artic.armSwing
-    if (armRRef.current) armRRef.current.rotation.x = _artic.armAim
-    if (torsoRef.current) torsoRef.current.rotation.x = _artic.torsoPitch
-    if (headRef.current) headRef.current.rotation.x = _artic.headPitch
+    applyArticulation(rigRefs, _artic)
 
     // Weapon swap — change-gated, so per-frame calls are free while held.
     if (_pose.w !== weapon) setWeapon(_pose.w)
@@ -997,22 +1289,7 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       {/* The body — the same rig the depot mirror poses (AvatarRig). The refs
           object is rebuilt per render, but every ref INSIDE it is stable, so
           React never detaches a handle; renders here are weapon/name events. */}
-      <AvatarRig
-        paletteIndex={paletteIndex}
-        refs={{
-          torso: torsoRef,
-          head: headRef,
-          armL: armLRef,
-          armR: armRRef,
-          legL: legLRef,
-          legR: legRRef,
-          headDetail: headDetailRef,
-          bodyDetail: bodyDetailRef,
-          fx: fxRef,
-          flash: flashRef,
-        }}
-        weapon={weapon}
-      />
+      <AvatarRig paletteIndex={paletteIndex} refs={rigRefs} weapon={weapon} />
       {/* Name-tag billboard — hidden past 40 m, texture disposed on despawn. */}
       <group ref={tagRef} position={[0, 2.05, 0]}>
         {tagTexture ? (

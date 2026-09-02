@@ -39,9 +39,15 @@ import { itemModelLoader } from './item-place'
  *
  * THE ARM FRAME. Under each arm pivot sits a group rotated by the OPPOSITE z
  * (armFrame): inside it, the arm is exactly what the box rig saw — hanging
- * down −y from the shoulder, swinging with rotation.x — so the held weapon,
- * its muzzle fx and the sleeve band use the box rig's literal offsets, and a
- * rifle sits at the same point in space for the same pose on either body.
+ * down −y from the shoulder, swinging with rotation.x — so the sleeve band and
+ * the elbow use the box rig's literal offsets.
+ *
+ * ELBOWS AND KNEES. A stick arm cannot hold a gun with two hands and a stick
+ * leg cannot lift a knee, so the model has forearm and shin bones, each moved
+ * under a joint pivot in the limb's frame (Object3D.attach keeps the bind pose
+ * intact). The held weapon mounts in the HAND FRAME under the elbow — hanging
+ * −y from the elbow, barrel down the forearm — so bending the elbow raises
+ * the gun with the hand.
  */
 
 export const PIVOT_NAMES = ['torso', 'head', 'armL', 'armR', 'legL', 'legR'] as const
@@ -55,8 +61,14 @@ export type PascalineDims = {
   shoulderZ: number
   shoulderX: number
   legX: number
-  /** Shoulder joint → wrist (m). */
+  /** Shoulder joint → wrist (m), and its two halves plus the hand. */
   armLen: number
+  upperArmLen: number
+  foreArmLen: number
+  handLen: number
+  /** Hip → knee and knee → sole (m). */
+  thighLen: number
+  shinLen: number
   /** Hat band: height above the ground and horizontal radius. */
   hatBandZ: number
   hatRadius: number
@@ -76,6 +88,11 @@ export const DEFAULT_DIMS: PascalineDims = {
   shoulderX: 0.198,
   legX: 0.115,
   armLen: 0.431,
+  upperArmLen: 0.198,
+  foreArmLen: 0.233,
+  handLen: 0.13,
+  thighLen: 0.385,
+  shinLen: 0.444,
   hatBandZ: 1.698,
   hatRadius: 0.137,
   armRadius: 0.081,
@@ -83,16 +100,23 @@ export const DEFAULT_DIMS: PascalineDims = {
   armHangR: -0.768,
 }
 
-/** The box rig's hand: 0.52 below the shoulder. The model's reach is its arm plus a hand. */
-export const HAND_BELOW_WRIST = 0.07
+/** Where the grip sits in the hand: this far past the wrist, as a fraction of the hand. */
+export const GRIP_IN_HAND = 0.45
 
 export type PascalineTemplate = { scene: Object3D; dims: PascalineDims }
+
+export const JOINT_NAMES = ['elbowL', 'elbowR', 'kneeL', 'kneeR'] as const
+export type JointName = (typeof JOINT_NAMES)[number]
 
 export type PascalineInstance = {
   root: Object3D
   pivots: Record<PivotName, Group>
+  /** Elbow and knee pivots — identity frames at the joint, rotation.x bends. */
+  joints: Record<JointName, Group>
   /** The box rig's arm frame under each arm pivot (see the header). */
   armFrames: { L: Group; R: Group }
+  /** Under each elbow: the forearm hanging −y, where the held weapon mounts. */
+  handFrames: { L: Group; R: Group }
   /** Empty LOD handles — the model has no detail groups to drop, but callers toggle them. */
   detail: { head: Group; body: Group }
   dims: PascalineDims
@@ -179,12 +203,50 @@ export function instantiatePascaline(template: PascalineTemplate): PascalineInst
     L: frame(pivots.armL, dims.armHangL, 'arm-frame-L'),
     R: frame(pivots.armR, dims.armHangR, 'arm-frame-R'),
   }
+  // Arm pivots turn in YXZ: hang (z) first, then the swing (x), then a yaw (y)
+  // about the vertical that brings a forward-pointing arm in toward the body —
+  // the free hand reaching across to a gun's foregrip.
+  pivots.armL.rotation.order = 'YXZ'
+  pivots.armR.rotation.order = 'YXZ'
+
+  // ELBOWS AND KNEES. The joint pivot lives in the limb's box-rig frame (the
+  // arm frame / the leg pivot), straight below the parent joint at rest, so
+  // rotation.x bends it about the lateral axis. The forearm/shin BONE is then
+  // moved under it with its world transform preserved (Object3D.attach): the
+  // skeleton's bind pose does not change, the bone simply has a new parent
+  // whose rotation it inherits.
+  root.updateMatrixWorld(true)
+  const joint = (parent: Group, y: number, name: string, boneName: string): Group => {
+    const g = new Group()
+    g.name = name
+    g.position.set(0, -y, 0)
+    parent.add(g)
+    g.updateMatrixWorld(true)
+    const bone = root.getObjectByName(boneName)
+    if (!bone) throw new Error(`pascaline: bone '${boneName}' missing from the model`)
+    g.attach(bone)
+    return g
+  }
+  const joints = {
+    elbowL: joint(armFrames.L, dims.upperArmLen, 'pivot-elbowL', 'foreL'),
+    elbowR: joint(armFrames.R, dims.upperArmLen, 'pivot-elbowR', 'foreR'),
+    kneeL: joint(pivots.legL, dims.thighLen, 'pivot-kneeL', 'shinL'),
+    kneeR: joint(pivots.legR, dims.thighLen, 'pivot-kneeR', 'shinR'),
+  }
+  const hand = (elbow: Group, name: string) => {
+    const g = new Group()
+    g.name = name
+    elbow.add(g)
+    return g
+  }
+  const handFrames = { L: hand(joints.elbowL, 'hand-frame-L'), R: hand(joints.elbowR, 'hand-frame-R') }
+
   const detail = { head: new Group(), body: new Group() }
   detail.head.name = 'head-detail'
   detail.body.name = 'body-detail'
   pivots.head.add(detail.head)
   pivots.torso.add(detail.body)
-  return { root, pivots, armFrames, detail, dims }
+  return { root, pivots, joints, armFrames, handFrames, detail, dims }
 }
 
 // ── Loading (once per module, on demand) ─────────────────────────────────────

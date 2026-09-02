@@ -2849,3 +2849,62 @@ read at chest height and centred, handedness both ways, upright on screen, the
 gait swinging and freezing — and the front shot shows Pascaline in the glass,
 hat band and sleeve bands in her colour, builder in hand, the bench and the
 yard behind her. `check-types` clean, `bun test` 2481 pass / 0 fail.
+
+## 2026-09-02 — Elbows, knees, and a gun held with two hands
+
+Owner, after seeing her in the glass: *"motions for steps and holding the gun
+1-handed doesn't feel natural though."* Both complaints had the same cause: a
+stick rig. A hip pivot and a shoulder pivot cannot lift a knee or bend an
+elbow, so the stride was a compass and every weapon was held at the end of a
+straight arm like a torch.
+
+### The body grew joints
+
+`rig-pascaline.py` splits each limb in two — armL → foreL → handL, legL →
+shinL — elbow a little short of halfway (a forearm plus hand is the longer
+half), knee at the shin's own height; the weights blend across both new joints
+and still never across the wrist. `pascaline-model.ts` adds an elbow pivot
+under each arm frame and a knee pivot under each leg pivot, then moves the
+forearm and shin BONES under them with `Object3D.attach`, which keeps their
+world transform and so the bind pose (tested against a reference that hangs
+the arms without joints: 13 bones, no world matrix moves). The held weapon now
+mounts in a HAND FRAME under the elbow, so bending the elbow raises the gun
+with the hand. The arm pivots turn in YXZ — hang, swing, then a yaw about the
+vertical — so a forward arm can come in toward the body.
+
+### Poses are points, not angles
+
+The first cut of the new hold was a set of hand-picked angles: right upper arm
+0.95 rad, elbow so the forearm levels the barrel. The measure probe said the
+chain was exactly as specified — shoulder to elbow 0.198, forearm level at
+chest height, grip in the palm — and the three-quarter shot said it looked
+like a rifle held straight out. What was wrong was the specification.
+`articulate` now takes a GRIP POINT per weapon (`GRIPS`: where the right hand
+is relative to the shoulder, and how far along the barrel the left hand takes
+the foregrip), pivots the whole hold about the shoulder with the view pitch,
+and runs two-bone IK (`solveArm`, pure) for each arm. The weapon then gets its
+own tilt in the hand so the BARREL — not the forearm — points where the peer
+looks (tested: swing + elbow + tilt = level + pitch at every pitch). The model's
+arms are stylized-short (0.49 m shoulder to palm), and the first grip points
+put the foregrip out of the left hand's reach — the IK clamped and the hand
+landed short — so the tests now assert both hands are reachable from their own
+shoulders before asserting they land.
+
+Gait: the leg swinging forward lifts its knee (`cos φ > 0` for the left,
+`< 0` for the right, straight at heel strike and toe-off), the torso leans
+forward with speed and breathes at rest, the free arm keeps a resting elbow
+bend. Airborne tucks the knees; the stagger softens them. `applyArticulation`
+is the one place the sign conventions live (knees bend −x, elbows +x); both
+consumers — peers and the mirror — call it.
+
+### Seen
+
+`/tmp/mirror-shots.mjs` (a probe, not a harness) photographs each grip from
+the front and at three-quarter, a stride away from the glass: the rifle sits
+across the chest with the stock at the shoulder and the left hand forward on
+the receiver; the pistol is out in both hands at chest height; the knife rides
+low at the hip with the other arm hanging. The mirror harness adds rifle,
+pistol, knife and mid-stride shots for the record. The two-client harness now
+checks the PEOPLE as well as the map: C sees A as the model body, planted on
+A's feet, and A's weapon change reaches C's hands (mesh count under the hand
+frame, elbow bent for a rifle).

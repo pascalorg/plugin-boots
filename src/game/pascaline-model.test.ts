@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 import { Bone, Group, Matrix4, Object3D, Quaternion, Vector3 } from 'three'
-import { armHangZ, decodeBase64, insertPivot, PIVOT_NAMES } from './pascaline-model'
+import {
+  armHangZ,
+  DEFAULT_DIMS,
+  decodeBase64,
+  insertPivot,
+  instantiatePascaline,
+  JOINT_NAMES,
+  PIVOT_NAMES,
+} from './pascaline-model'
 
 /**
  * The graph surgery that lets `articulate` drive a skinned body the way it
@@ -169,5 +177,115 @@ describe('decodeBase64', () => {
     const bytes = new Uint8Array([0x67, 0x6c, 0x54, 0x46, 0, 1, 2, 250, 255])
     const b64 = btoa(String.fromCharCode(...bytes))
     expect(Array.from(decodeBase64(b64))).toEqual(Array.from(bytes))
+  })
+})
+
+/** The full skeleton the Blender script exports, as plain bones (no skin —
+ * the graph surgery is what is under test), in the rig's rest layout. */
+function fullSkeleton() {
+  const d = DEFAULT_DIMS
+  const mk = (name: string, x: number, y: number, z = 0) => {
+    const b = new Bone()
+    b.name = name
+    b.position.set(x, y, z)
+    return b
+  }
+  const scene = new Group()
+  const root = mk('root', 0, d.hipZ)
+  const torso = mk('torso', 0, 0)
+  const head = mk('head', 0, d.neckZ - d.hipZ)
+  const armL = mk('armL', -d.shoulderX, d.shoulderZ - d.hipZ)
+  const armR = mk('armR', d.shoulderX, d.shoulderZ - d.hipZ)
+  // A-pose forearms: out and down along the arm's rest direction.
+  const dirL = new Vector3(-Math.sin(d.armHangL), -Math.cos(d.armHangL), 0)
+  const dirR = new Vector3(Math.sin(-d.armHangR), -Math.cos(-d.armHangR), 0)
+  const foreL = mk('foreL', dirL.x * d.upperArmLen, dirL.y * d.upperArmLen)
+  const foreR = mk('foreR', dirR.x * d.upperArmLen, dirR.y * d.upperArmLen)
+  const handL = mk('handL', dirL.x * d.foreArmLen, dirL.y * d.foreArmLen)
+  const handR = mk('handR', dirR.x * d.foreArmLen, dirR.y * d.foreArmLen)
+  const legL = mk('legL', -d.legX, 0)
+  const legR = mk('legR', d.legX, 0)
+  const shinL = mk('shinL', 0, -d.thighLen)
+  const shinR = mk('shinR', 0, -d.thighLen)
+  // Bones carry rest rotations (the script lays them along the limbs).
+  for (const b of [armL, foreL, legL, shinL]) b.quaternion.setFromAxisAngle(new Vector3(0, 0, 1), 0.4)
+  scene.add(root)
+  root.add(torso, legL, legR)
+  torso.add(head, armL, armR)
+  armL.add(foreL)
+  foreL.add(handL)
+  armR.add(foreR)
+  foreR.add(handR)
+  legL.add(shinL)
+  legR.add(shinR)
+  scene.updateMatrixWorld(true)
+  return { scene, dims: d }
+}
+
+describe('instantiatePascaline — joints', () => {
+  test('elbows and knees exist, in the limb frames, and add no motion of their own', () => {
+    const template = fullSkeleton()
+    // Reference: the same skeleton with only the six pivots and the arm hang
+    // — what the body looked like before it had joints. The joints must
+    // reproduce exactly these world matrices for every bone.
+    const ref = template.scene.clone(true)
+    for (const name of PIVOT_NAMES) insertPivot(ref.getObjectByName(name)!, `pivot-${name}`)
+    ref.getObjectByName('pivot-armL')!.rotation.z = template.dims.armHangL
+    ref.getObjectByName('pivot-armR')!.rotation.z = template.dims.armHangR
+    ref.updateMatrixWorld(true)
+    const refWorld = new Map<string, Matrix4>()
+    ref.traverse((o) => {
+      if ((o as Bone).isBone) refWorld.set(o.name, o.matrixWorld.clone())
+    })
+    const body = instantiatePascaline(template)
+    body.root.updateMatrixWorld(true)
+    for (const name of JOINT_NAMES) expect(body.joints[name]).toBeDefined()
+    let compared = 0
+    body.root.traverse((o) => {
+      if (!(o as Bone).isBone) return
+      const before = refWorld.get(o.name)
+      expect(before).toBeDefined()
+      for (let k = 0; k < 16; k++) expect(o.matrixWorld.elements[k]!).toBeCloseTo(before!.elements[k]!, 9)
+      compared++
+    })
+    expect(compared).toBe(13)
+    // The elbow pivot hangs straight below the shoulder in the arm frame, by
+    // the upper arm's length; the knee below the hip by the thigh's.
+    expect(body.joints.elbowR.parent).toBe(body.armFrames.R)
+    expect(body.joints.elbowR.position.y).toBeCloseTo(-template.dims.upperArmLen, 12)
+    expect(body.joints.kneeL.parent).toBe(body.pivots.legL)
+    expect(body.joints.kneeL.position.y).toBeCloseTo(-template.dims.thighLen, 12)
+    // The forearm and shin bones now answer to the joints.
+    expect(body.root.getObjectByName('foreR')?.parent).toBe(body.joints.elbowR)
+    expect(body.root.getObjectByName('shinL')?.parent).toBe(body.joints.kneeL)
+    // The hand frame is the weapon's mount, under the elbow.
+    expect(body.handFrames.R.parent).toBe(body.joints.elbowR)
+    // Arm pivots turn hang-then-swing-then-yaw.
+    expect(body.pivots.armL.rotation.order).toBe('YXZ')
+    expect(body.pivots.armR.rotation.order).toBe('YXZ')
+  })
+
+  test('bending the elbow raises the hand frame forward; bending the knee tucks the shin back', () => {
+    const body = instantiatePascaline(fullSkeleton())
+    const probe = new Object3D()
+    probe.position.set(0, -0.2, 0)
+    body.handFrames.R.add(probe)
+    body.root.updateMatrixWorld(true)
+    const before = new Vector3().setFromMatrixPosition(probe.matrixWorld)
+    body.joints.elbowR.rotation.x = 1.2
+    body.root.updateMatrixWorld(true)
+    const after = new Vector3().setFromMatrixPosition(probe.matrixWorld)
+    expect(after.z).toBeLessThan(before.z) // forward is −Z
+    expect(after.y).toBeGreaterThan(before.y)
+
+    const shinProbe = new Object3D()
+    shinProbe.position.set(0, -0.3, 0)
+    body.joints.kneeL.add(shinProbe)
+    body.root.updateMatrixWorld(true)
+    const b2 = new Vector3().setFromMatrixPosition(shinProbe.matrixWorld)
+    body.joints.kneeL.rotation.x = -0.9 // applyArticulation writes −knee
+    body.root.updateMatrixWorld(true)
+    const a2 = new Vector3().setFromMatrixPosition(shinProbe.matrixWorld)
+    expect(a2.z).toBeGreaterThan(b2.z) // the foot goes back
   })
 })

@@ -645,13 +645,44 @@ if (m1.backend === 'webgpu' && !process.env.HEADED) {
 }
 
 // ── 10. the eyeball check ────────────────────────────────────────────────────
+// The three grips, square in the glass at a stride and a half: a long gun
+// (two hands, forearm level), a pistol (both hands out), a tool (one relaxed
+// hand). And the walk: a mid-stride frame with the rifle. These are for a
+// human to read — the articulation is unit-tested; how it LOOKS is not.
+const shotWith = async (weapon, name) => {
+  await page.evaluate((w) => {
+    const st = globalThis.__boots.state()
+    st.giveWeapon?.(w)
+    st.setWeapon(w)
+  }, weapon)
+  await page.waitForTimeout(400)
+  await page.screenshot({ path: `/tmp/boots-mirror-${name}.png` })
+}
+await standAt(1.6)
+await shotWith('rifle', 'rifle')
+await shotWith('pistol', 'pistol')
+await shotWith('knife', 'knife')
+// Mid-stride: walk at the glass from 3 m and shoot when the leg swing is large.
+await page.evaluate(() => globalThis.__boots.state().setWeapon('rifle'))
+await standAt(3.0)
+await page.keyboard.down('KeyW')
+for (let i = 0; i < 25; i++) {
+  const d = await readSelf()
+  if (typeof d?.legSwing === 'number' && Math.abs(d.legSwing) > 0.3) break
+  await page.waitForTimeout(80)
+}
+await page.screenshot({ path: '/tmp/boots-mirror-stride.png' })
+await page.keyboard.up('KeyW')
 // Knife in hand for the angle shot: the builder paints its blue placement
 // ghost over whatever wall you look at, which is the game working, not the
 // mirror — but it hides the picture this shot exists for.
 await page.evaluate(() => globalThis.__boots.state().setWeapon('knife'))
 await standAt(2.2, 0.6)
 await page.screenshot({ path: '/tmp/boots-mirror-angle.png' })
-log('shots: /tmp/boots-mirror-front.png /tmp/boots-mirror-angle.png /tmp/boots-mirror-target.png')
+log(
+  'shots: /tmp/boots-mirror-front.png /tmp/boots-mirror-angle.png /tmp/boots-mirror-target.png ' +
+    '/tmp/boots-mirror-{rifle,pistol,knife,stride}.png',
+)
 
 const passed = results.filter(Boolean).length
 log(`RESULT: ${passed}/${results.length} checks green  [${m1.backend}]`)

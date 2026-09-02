@@ -14,8 +14,9 @@ What it does, in order:
      Blender, which the glTF exporter maps to -Z in three — the direction every
      Pascaline in the game faces (`facing(yaw) = (-sin yaw, -cos yaw)`);
   3. decimates to a game budget and shrinks textures (JPEG on export);
-  4. builds the SIX-PIVOT skeleton the game articulates — root → torso → head,
-     torso → armL/armR (+ handL/handR at the wrists), root → legL/legR — with
+  4. builds the skeleton the game articulates — root → torso → head,
+     torso → armL/armR → foreL/foreR → handL/handR, root → legL/legR →
+     shinL/shinR (six pivots plus elbows and knees) — with
      bones laid ALONG the limbs so automatic weights bind the right vertices.
      Bone directions do not matter to the game: at load, AvatarRig wraps each
      articulated bone in an identity-rotated pivot in its parent's frame, and
@@ -263,15 +264,15 @@ def widest_gap_split(xs):
 # Legs: a slice at the knee separates cleanly into two shells; their centres are
 # the leg axes. The hip pivot height: where the crotch closes — scan down from
 # the waist for the first slice with a real inner gap.
-KNEE_Z = 0.28 * H
-knee_xs = slice_xs(KNEE_Z - 0.03, KNEE_Z + 0.03)
+KNEE_SLICE_Z = 0.28 * H
+knee_xs = slice_xs(KNEE_SLICE_Z - 0.03, KNEE_SLICE_Z + 0.03)
 leg_gap_x = widest_gap_split(knee_xs)
 legL_x = sum(x for x in knee_xs if x < leg_gap_x) / max(1, len([x for x in knee_xs if x < leg_gap_x]))
 legR_x = sum(x for x in knee_xs if x >= leg_gap_x) / max(1, len([x for x in knee_xs if x >= leg_gap_x]))
 # Walk UP from the knee: the legs are two shells with a gap between them
 # until the crotch closes it. The hip pivot sits a little above that.
 hip_z = 0.50 * H
-z = KNEE_Z
+z = KNEE_SLICE_Z
 while z < 0.62 * H:
     xs = slice_xs(z - 0.006, z + 0.006)
     inner = [b - a for a, b in zip(xs, xs[1:]) if a < leg_gap_x <= b]
@@ -402,23 +403,37 @@ def bone(name, head, tail, parent=None, connect=False):
 root = bone("root", (0, 0, hip_z), (0, 0, hip_z + 0.08))
 torso = bone("torso", (0, 0, hip_z), (0, 0, neck_z), root)
 head = bone("head", (0, 0, neck_z), (0, 0, H), torso)
+# Elbows and knees: the game bends them (a two-handed gun, a stride with a
+# lifted knee), so each limb is two bones. The elbow sits a little short of
+# halfway down the arm (a forearm plus hand is the longer half); the knee at
+# the shin's own height above the sole.
+ELBOW_AT = 0.46
+KNEE_Z = hip_z - 0.47 * (hip_z - 0.03)
+HAND_LEN = 0.07 * H
+
+
 def arm(name, g, parent):
     ux, uz = g["ux"], g["uz"]
-    upper = bone(name, (g["sx"], 0, g["sz"]), (g["sx"] + ux * g["len"], 0, g["sz"] + uz * g["len"]), parent)
-    hand = bone(
-        "hand" + name[-1],
-        upper.tail,
-        (upper.tail.x + ux * 0.07 * H, 0, upper.tail.z + uz * 0.07 * H),
-        upper,
-        connect=True,
-    )
-    return upper, hand
+    side = name[-1]
+    sx, sz = g["sx"], g["sz"]
+    ex, ez = sx + ux * g["len"] * ELBOW_AT, sz + uz * g["len"] * ELBOW_AT
+    wx, wz = sx + ux * g["len"], sz + uz * g["len"]
+    upper = bone(name, (sx, 0, sz), (ex, 0, ez), parent)
+    fore = bone("fore" + side, (ex, 0, ez), (wx, 0, wz), upper, connect=True)
+    hand = bone("hand" + side, (wx, 0, wz), (wx + ux * HAND_LEN, 0, wz + uz * HAND_LEN), fore, connect=True)
+    return upper, fore, hand
 
 
-armL, handL = arm("armL", armL_geo, torso)
-armR, handR = arm("armR", armR_geo, torso)
-legL = bone("legL", (legL_x, 0, hip_z), (legL_x, 0, 0.02), root)
-legR = bone("legR", (legR_x, 0, hip_z), (legR_x, 0, 0.02), root)
+def leg(name, x, parent):
+    thigh = bone(name, (x, 0, hip_z), (x, 0, KNEE_Z), parent)
+    shin = bone("shin" + name[-1], (x, 0, KNEE_Z), (x, 0, 0.02), thigh, connect=True)
+    return thigh, shin
+
+
+armL, foreL, handL = arm("armL", armL_geo, torso)
+armR, foreR, handR = arm("armR", armR_geo, torso)
+legL, shinL = leg("legL", legL_x, root)
+legR, shinR = leg("legR", legR_x, root)
 bpy.ops.object.mode_set(mode="OBJECT")
 
 # ── 6. bind ──────────────────────────────────────────────────────────────────
@@ -460,10 +475,14 @@ RADIUS = {
     "head": 0.10 * H,
     "armL": armL_geo["radius"] - 0.008,
     "armR": armR_geo["radius"] - 0.008,
+    "foreL": (armL_geo["radius"] - 0.008) * 0.85,
+    "foreR": (armR_geo["radius"] - 0.008) * 0.85,
     "handL": 0.04,
     "handR": 0.04,
-    "legL": 0.07,
-    "legR": 0.07,
+    "legL": 0.08,
+    "legR": 0.08,
+    "shinL": 0.065,
+    "shinR": 0.065,
 }
 
 
@@ -475,7 +494,7 @@ def bone_dist(p, b):
 # hand vertex is as good as an arm vertex; keep them as separate groups (the
 # game hangs the weapon off the hand bone) but never blend arm↔hand — that
 # seam does not move.
-seams = {("armL", "handL"), ("handL", "armL"), ("armR", "handR"), ("handR", "armR")}
+seams = {("foreL", "handL"), ("handL", "foreL"), ("foreR", "handR"), ("handR", "foreR")}
 blended = 0
 for v in body.data.vertices:
     p = body.matrix_world @ v.co
@@ -514,6 +533,11 @@ dims = {
     "shoulderX": round((abs(armL_geo["sx"]) + abs(armR_geo["sx"])) / 2, 4),
     "legX": round((abs(legL_x) + abs(legR_x)) / 2, 4),
     "armLen": round(ARM_LEN, 4),
+    "upperArmLen": round(ARM_LEN * ELBOW_AT, 4),
+    "foreArmLen": round(ARM_LEN * (1 - ELBOW_AT), 4),
+    "handLen": round(HAND_LEN, 4),
+    "thighLen": round(hip_z - KNEE_Z, 4),
+    "shinLen": round(KNEE_Z - 0.02, 4),
     "tPose": T_POSE,
     "hatBandZ": round(hat_band_z, 4),
     "hatRadius": round(hat_radius, 4),

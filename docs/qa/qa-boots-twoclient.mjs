@@ -657,6 +657,92 @@ if (aPose) {
   }
 }
 
+// ── 10. the body on the wire: C sees A as Pascaline, where A stands, holding what A holds ──
+// Everything above proves the MAP is shared. This proves the PEOPLE are: the
+// remote body is the mascot model (not the box fallback), planted on A's feet
+// (the wire carries A's eye; remote-players plants EYE − EYE_HEIGHT), and the
+// weapon in its hand follows A's weapon changes.
+log('\n=== 10. the body on the wire ===')
+const remoteBody = (page) =>
+  page.evaluate(() => {
+    const world = globalThis.__boots?.world
+    // Any remote root: the first group named boots-remote-*.
+    let root = null
+    const scene = (() => {
+      let o = (world?.colliders ?? [])[0]?.mesh ?? null
+      while (o?.parent) o = o.parent
+      return o
+    })()
+    scene?.traverse((o) => {
+      if (!root && typeof o.name === 'string' && o.name.startsWith('boots-remote-')) root = o
+    })
+    if (!root) return null
+    root.updateWorldMatrix(true, false)
+    const e = root.matrixWorld.elements
+    const hand = root.getObjectByName('hand-frame-R')
+    let weaponMeshes = 0
+    hand?.traverse((o) => {
+      if (o.isMesh) weaponMeshes++
+    })
+    return {
+      at: [e[12], e[13], e[14]],
+      body: root.getObjectByName('pivot-legL') ? 'model' : 'primitive',
+      elbowR: root.getObjectByName('pivot-elbowR')?.rotation?.x ?? null,
+      weaponMeshes,
+    }
+  })
+const aFeet = await a.page.evaluate(() => {
+  const s = globalThis.__bootsPlayer?.sample?.()
+  return s ? [s.x, s.y, s.z] : null
+})
+// A pose frame is published from A's render loop, and a background tab's loop
+// is throttled to nothing — so A must be the front tab while it changes hands,
+// then C while it looks (the co-presence section alternates for the same reason).
+// Sampled over time, not once: the frame has to be published (A's timers),
+// carried (the bus), ingested (C's ring) and rendered (C's React) — and a
+// single reading cannot tell a slow wire from a dead one.
+const holdAndLook = async (weapon) => {
+  await a.page.bringToFront()
+  const pubBefore = (await presence(a))?.published ?? 0
+  await a.page.evaluate((w) => {
+    const st = globalThis.__boots.state()
+    st.giveWeapon?.(w)
+    st.setWeapon(w)
+  }, weapon)
+  const timeline = []
+  let seen = null
+  for (let i = 0; i < 20; i++) {
+    // A in front for the first half (its publisher ticks), C for the second (its scene updates).
+    if (i === 8) await cPage.bringToFront()
+    await (i < 8 ? a.page : cPage).waitForTimeout(250)
+    const r = (await presence(c))?.remotes?.[0] ?? null
+    const body = await remoteBody(cPage)
+    timeline.push(`${(i + 1) * 250}ms:${r?.w ?? '?'}/${r?.ageMs ?? '?'}ms/${body?.weaponMeshes ?? '?'}m`)
+    seen = body
+    if (r?.w === weapon && body && body.weaponMeshes > 0 && i >= 8) break
+  }
+  const pubAfter = (await presence(a))?.published ?? 0
+  log(`  A → ${weapon}: A published +${pubAfter - pubBefore}; C saw ${timeline.join(' ')}`)
+  return { ...seen, wire: (await presence(c))?.remotes?.[0]?.w ?? null }
+}
+const seenKnife = await holdAndLook('knife')
+const seenRifle = await holdAndLook('rifle')
+log(`[C] sees A: ${JSON.stringify(seenKnife)} → with rifle ${JSON.stringify(seenRifle)}; A's feet ${JSON.stringify(aFeet?.map((v) => +v.toFixed(2)))}`)
+const bodyIsModel = seenRifle?.body === 'model'
+const planted =
+  seenRifle && aFeet
+    ? Math.hypot(seenRifle.at[0] - aFeet[0], seenRifle.at[1] - aFeet[1], seenRifle.at[2] - aFeet[2]) < 0.35
+    : false
+const weaponFollows =
+  seenKnife !== null &&
+  seenRifle !== null &&
+  seenRifle.wire === 'rifle' &&
+  seenRifle.weaponMeshes > seenKnife.weaponMeshes &&
+  seenRifle.elbowR > 0.5
+log(`  C SEES THE MASCOT BODY: ${bodyIsModel}  (${seenRifle?.body})`)
+log(`  PLANTED ON A'S FEET: ${planted}`)
+log(`  A'S WEAPON CHANGE REACHES C'S HANDS: ${weaponFollows}  (wire ${seenKnife?.wire} → ${seenRifle?.wire}; knife ${seenKnife?.weaponMeshes} meshes → rifle ${seenRifle?.weaponMeshes}, elbow ${seenRifle?.elbowR?.toFixed?.(2)})`)
+
 for (const client of [...clients.filter((x) => x !== b), c]) {
   await client.page.screenshot({ path: `${SHOT}-${client.label}.png` }).catch(() => {})
   log(`[${client.label}] page errors: ${client.errors.length}`)
@@ -670,5 +756,6 @@ log(`  destruction B→A ${damageBtoA}  A→B ${damageAtoB}`)
 log(`  gunfire A→B ${fireAtoB}  B→A ${fireBtoA}`)
 log(`  spray A→B ${spraySynced}   relayed to a latecomer ${coatRelayed}`)
 log(`  grid stamp healthy ${stampOk}   latecomer got the map ${relayOk}`)
+log(`  body on the wire: model ${bodyIsModel}  planted ${planted}  weapon follows ${weaponFollows}`)
 
 await browser.close()

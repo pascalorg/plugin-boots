@@ -24,11 +24,13 @@ import { MOVE } from './movement'
 import { playerRig } from './player'
 import {
   advanceGait,
+  applyArticulation,
   articulate,
   type AvatarArticulation,
   AvatarRig,
   createArticulation,
   createRigRefs,
+  gripFor,
   localPaletteIndex,
   subscribeLocalPalette,
 } from './remote-players'
@@ -178,6 +180,7 @@ export function DepotMirror({ world }: { world: GameWorld }) {
   // useRef calls — the rig's shape is the rig's business).
   const refs = useRef(createRigRefs()).current
   const gaitPhase = useRef(0)
+  const clock = useRef(0)
   // The body holds what we hold. A store subscription, so a weapon swap
   // re-renders the rig exactly once, like a peer's does off the wire.
   const weapon = useBoots((s) => s.weapon)
@@ -266,19 +269,24 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     const s = Math.min(1, playerRig.speed / MOVE.runSpeed)
     const staggered = useBoots.getState().staggered
     gaitPhase.current = advanceGait(gaitPhase.current, playerRig.grounded ? s : 0, dt)
-    articulate(_artic, gaitPhase.current, s, playerRig.pitch, playerRig.grounded, staggered)
+    clock.current += dt
+    articulate(
+      _artic,
+      gaitPhase.current,
+      s,
+      playerRig.pitch,
+      playerRig.grounded,
+      staggered,
+      gripFor(weapon),
+      clock.current,
+    )
     // playerRig.position is the EYE (feet + EYE_HEIGHT + bob) — exactly what
     // goes out on the wire, so plant the feet exactly as remote-players does.
     _local.copy(playerRig.position)
     parent.worldToLocal(_local)
     self.position.set(_local.x, _local.y - EYE_HEIGHT + _artic.bobY, _local.z)
     self.rotation.y = playerRig.yaw - yawOffset
-    if (refs.legL.current) refs.legL.current.rotation.x = _artic.legSwing
-    if (refs.legR.current) refs.legR.current.rotation.x = -_artic.legSwing
-    if (refs.armL.current) refs.armL.current.rotation.x = _artic.armSwing
-    if (refs.armR.current) refs.armR.current.rotation.x = _artic.armAim
-    if (refs.torso.current) refs.torso.current.rotation.x = _artic.torsoPitch
-    if (refs.head.current) refs.head.current.rotation.x = _artic.headPitch
+    applyArticulation(refs, _artic)
 
     // ── the camera: the reflected eye, frustum fitted to the glass ─────────
     camera.getWorldPosition(_eye)

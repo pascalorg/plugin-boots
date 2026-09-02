@@ -19,9 +19,10 @@ Provenance (2026-09-01):
    Rodin's auburn to the design's dark brown, facing detected from the
    texture, normalized to 1.85 m, decimated to 24k faces, 1024 px JPEG
    textures, our own smooth two-bone weights on root → torso → head /
-   armL / armR (+ hands), root → legL / legR. Measured dims (shoulders, arm
-   rest angles, hat band, sleeve radius) ride along as node extras
-   (`rigDims`) and the game reads them at load.
+   armL → foreL → handL / armR → foreR → handR, root → legL → shinL /
+   legR → shinR (elbows and knees the game bends). Measured dims (shoulders,
+   segment lengths, arm rest angles, hat band, sleeve radius) ride along as
+   node extras (`rigDims`) and the game reads them at load.
 
 Preview any GLB, posed or not:
 

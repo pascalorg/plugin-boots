@@ -25,6 +25,18 @@ import {
   tagOpacity,
   tagVisible,
   TRACER_LEN,
+  AIR_KNEE,
+  BREATH_AMP,
+  BREATH_RATE,
+  FREE_ELBOW,
+  GRIPS,
+  limbDir,
+  MODEL_ARMS,
+  solveArm,
+  KNEE_LIFT_MAX,
+  RUN_LEAN,
+  SLUMP_KNEE,
+  gripFor,
 } from './remote-players'
 
 /**
@@ -152,11 +164,11 @@ describe('detail LOD — the small parts fall away with distance', () => {
 })
 
 describe('articulation — gait, airborne, slump', () => {
-  test('grounded gait: leg swing sine scales with s, arms counter-swing', () => {
+  test('grounded gait: leg swing sine scales with s, the free arm counter-swings', () => {
     const out = createArticulation()
     articulate(out, Math.PI / 2, 1, 0, true, false) // sin=1, full speed
     expect(out.legSwing).toBeCloseTo(LEG_SWING_MAX)
-    expect(out.armSwing).toBeLessThan(0) // counter-phase
+    expect(out.armSwing).toBeLessThan(0) // counter-phase (default grip: a tool, so the left arm is free)
     articulate(out, Math.PI / 2, 0.5, 0, true, false)
     expect(out.legSwing).toBeCloseTo(LEG_SWING_MAX * 0.5)
     articulate(out, Math.PI / 2, 0, 0, true, false)
@@ -164,33 +176,173 @@ describe('articulation — gait, airborne, slump', () => {
     expect(out.bobY).toBe(0)
   })
 
-  test('airborne pose: fixed leg split + thrown-back arm, no bob', () => {
+  test('the knee lifts on the leg that is swinging forward, and only then', () => {
+    const out = createArticulation()
+    // Left leg mid-swing forward (hip angle rising through zero): left knee up.
+    articulate(out, 0, 1, 0, true, false)
+    expect(out.kneeL).toBeCloseTo(KNEE_LIFT_MAX)
+    expect(out.kneeR).toBe(0)
+    // Half a cycle on: the right leg's turn.
+    articulate(out, Math.PI, 1, 0, true, false)
+    expect(out.kneeR).toBeCloseTo(KNEE_LIFT_MAX)
+    expect(out.kneeL).toBe(0)
+    // Heel strike / toe-off (hip at its extremes): both knees straight.
+    articulate(out, Math.PI / 2, 1, 0, true, false)
+    expect(out.kneeL).toBeCloseTo(0)
+    expect(out.kneeR).toBeCloseTo(0)
+    // Scales with speed; still means straight.
+    articulate(out, 0, 0.5, 0, true, false)
+    expect(out.kneeL).toBeCloseTo(KNEE_LIFT_MAX * 0.5)
+    articulate(out, 0, 0, 0, true, false)
+    expect(out.kneeL).toBe(0)
+  })
+
+  test('running leans the torso forward with speed; standing, it just breathes', () => {
+    const out = createArticulation()
+    articulate(out, 0, 1, 0, true, false, 'tool', 0)
+    expect(out.torsoPitch).toBeCloseTo(RUN_LEAN)
+    articulate(out, 0, 0, 0, true, false, 'tool', 0)
+    const still = out.torsoPitch
+    articulate(out, 0, 0, 0, true, false, 'tool', Math.PI / 2 / BREATH_RATE)
+    expect(out.torsoPitch - still).toBeCloseTo(BREATH_AMP)
+    expect(Math.abs(out.torsoPitch)).toBeLessThan(0.05) // a breath, not a bow
+  })
+
+  test('airborne pose: legs split, knees tucked, free arm thrown back, no bob', () => {
     const out = createArticulation()
     articulate(out, 1.3, 0.8, 0, false, false)
     expect(out.legSwing).toBe(AIR_LEG_SPLIT)
+    expect(out.kneeL).toBe(AIR_KNEE)
+    expect(out.kneeR).toBe(AIR_KNEE)
     expect(out.armSwing).toBe(AIR_ARM_SWING)
     expect(out.bobY).toBe(0)
   })
 
-  test('slump when staggered: torso lean, hung weapon arm, half shuffle', () => {
+  test('slump when staggered: torso lean, hung weapon arm, soft knees, half shuffle', () => {
     const out = createArticulation()
-    articulate(out, Math.PI / 2, 1, 0, true, true)
+    articulate(out, Math.PI / 2, 1, 0, true, true, 'long')
     expect(out.torsoPitch).toBe(SLUMP_TORSO)
-    expect(out.armAim).toBe(SLUMP_ARM_AIM)
+    expect(out.armAim).toBe(SLUMP_ARM_AIM) // even a rifle hangs
     expect(out.legSwing).toBeCloseTo(LEG_SWING_MAX * 0.5)
+    expect(out.kneeL).toBeGreaterThanOrEqual(SLUMP_KNEE)
     expect(out.headPitch).toBeLessThan(0) // head hangs
   })
 
-  test('head and weapon arm track the remote pitch (clamped)', () => {
+  test('head tracks the remote pitch (clamped)', () => {
     const out = createArticulation()
     articulate(out, 0, 0, 0.4, true, false)
     expect(out.headPitch).toBeCloseTo(0.4)
-    expect(out.armAim).toBeCloseTo(Math.PI / 2 + 0.4)
     articulate(out, 0, 0, 3, true, false) // absurd pitch clamps
     expect(out.headPitch).toBeCloseTo(0.6)
-    expect(out.armAim).toBeCloseTo(Math.PI / 2 + 1.2)
     articulate(out, 0, 0, -3, true, false)
     expect(out.headPitch).toBeCloseTo(-0.6)
+  })
+
+  test('solveArm puts the grip on the target, elbow bending the human way', () => {
+    const a = MODEL_ARMS
+    const fk = (sol: { swing: number; yaw: number; elbow: number }) => {
+      const du = limbDir(sol.swing, sol.yaw)
+      const df = limbDir(sol.swing + sol.elbow, sol.yaw)
+      return [0, 1, 2].map((i) => a.upperArmLen * du[i]! + a.reach * df[i]!)
+    }
+    for (const target of [
+      [-0.1, -0.1, -0.24],
+      [0.05, -0.3, -0.2],
+      [-0.2, 0.05, -0.3],
+      [0.0, -0.4, -0.05],
+    ] as const) {
+      const sol = solveArm(target, a)
+      const hand = fk(sol)
+      for (let i = 0; i < 3; i++) expect(hand[i]).toBeCloseTo(target[i]!, 9)
+      for (let i = 0; i < 3; i++) expect(sol.hand[i]).toBeCloseTo(target[i]!, 9)
+      expect(sol.elbow).toBeGreaterThanOrEqual(0)
+      expect(sol.elbow).toBeLessThanOrEqual(Math.PI)
+    }
+    // Out of reach: a (nearly) straight arm pointed at it.
+    const far = solveArm([0, -0.2, -2], a)
+    expect(far.elbow).toBeLessThan(0.06)
+    expect(far.swing).toBeCloseTo(Math.atan2(2, 0.2), 1)
+  })
+
+  test('with a gun, the BARREL points where the peer looks, whatever the arm does', () => {
+    const out = createArticulation()
+    for (const grip of ['long', 'short'] as const) {
+      for (const pitch of [-0.8, -0.3, 0, 0.4, 1.0]) {
+        articulate(out, 0, 0, pitch, true, false, grip)
+        expect(out.armAim + out.elbowR + out.weaponTilt).toBeCloseTo(GRIPS[grip].barrelFromDown + pitch, 9)
+        expect(out.elbowR).toBeGreaterThanOrEqual(0)
+      }
+      articulate(out, 0, 0, 3, true, false, grip) // clamped, like the head
+      expect(out.armAim + out.elbowR + out.weaponTilt).toBeCloseTo(GRIPS[grip].barrelFromDown + 1.2, 9)
+    }
+  })
+
+  test('guns are held with BOTH hands: the left lands on the foregrip along the barrel, and both hands are within reach', () => {
+    const out = createArticulation()
+    const a = MODEL_ARMS
+    const fk = (swing: number, yaw: number, elbow: number) => {
+      const du = limbDir(swing, yaw)
+      const df = limbDir(swing + elbow, yaw)
+      return [0, 1, 2].map((i) => a.upperArmLen * du[i]! + a.reach * df[i]!)
+    }
+    for (const grip of ['long', 'short'] as const) {
+      for (const pitch of [-0.4, 0, 0.5]) {
+        articulate(out, Math.PI / 2, 1, pitch, true, false, grip) // mid-stride: the hold does not swing
+        const right = fk(out.armAim, out.armRYaw, out.elbowR) // relative to the right shoulder
+        const left = fk(out.armSwing, out.armLYaw, out.elbowL) // relative to the left shoulder
+        const barrel = limbDir(GRIPS[grip].barrelFromDown + pitch, out.armRYaw)
+        // Left hand = right hand + foregrip along the barrel (a touch to the left), in one frame.
+        const expectLeft = [
+          right[0]! + 2 * a.shoulderX + GRIPS[grip].foregrip * barrel[0] - 0.03,
+          right[1]! + GRIPS[grip].foregrip * barrel[1],
+          right[2]! + GRIPS[grip].foregrip * barrel[2],
+        ]
+        // Both hands must be REACHABLE from their shoulders — a clamped IK lands short.
+        const reach = a.upperArmLen + a.reach
+        expect(Math.hypot(...right)).toBeLessThan(reach)
+        expect(Math.hypot(...expectLeft)).toBeLessThan(reach)
+        for (let i = 0; i < 3; i++) expect(left[i]).toBeCloseTo(expectLeft[i]!, 6)
+        expect(left[2]).toBeLessThanOrEqual(right[2]! + 1e-9) // never behind the right hand
+        expect(out.armLYaw).toBeLessThan(0) // in toward the body
+        expect(out.armRYaw).toBeGreaterThan(0)
+        expect(out.elbowL).toBeGreaterThan(0)
+      }
+    }
+    // The gun arm never stride-swings — the same pose whatever the phase.
+    articulate(out, 0, 1, 0, true, false, 'long')
+    const held = { ...out }
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'long')
+    expect(out.armAim).toBeCloseTo(held.armAim)
+    expect(out.armSwing).toBeCloseTo(held.armSwing)
+  })
+
+  test('a tool rides in one relaxed hand by the hip while the other arm swings free', () => {
+    const out = createArticulation()
+    articulate(out, Math.PI / 2, 1, 0.5, true, false, 'tool')
+    expect(out.elbowR).toBeGreaterThan(0.2) // bent, not locked
+    expect(out.armAim).toBeLessThan(Math.PI / 4) // low, not raised
+    expect(out.armSwing).toBeLessThan(0) // counter-swinging the stride
+    expect(out.armLYaw).toBe(0)
+    expect(out.elbowL).toBe(FREE_ELBOW)
+    // The tool points forward-down, not at the sky.
+    const dir = out.armAim + out.elbowR + out.weaponTilt
+    expect(dir).toBeCloseTo(GRIPS.tool.barrelFromDown + 0.5, 9)
+  })
+
+  test('empty hands: both arms swing, in opposition', () => {
+    const out = createArticulation()
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'none')
+    expect(out.armSwing).toBeLessThan(0)
+    expect(out.armAim).toBeCloseTo(-out.armSwing)
+  })
+
+  test('gripFor: guns by length, tools in hand, nothing in empty hands, strangers as tools', () => {
+    expect(gripFor('rifle')).toBe('long')
+    expect(gripFor('minigun')).toBe('long')
+    expect(gripFor('pistol')).toBe('short')
+    for (const w of ['knife', 'hammer', 'builder', 'paint']) expect(gripFor(w)).toBe('tool')
+    expect(gripFor('')).toBe('none')
+    expect(gripFor('laser-from-the-future')).toBe('tool')
   })
 
   test('gait phase advances with speed and settles when stopped', () => {
