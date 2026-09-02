@@ -14,6 +14,7 @@ import {
 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { DepotMirror } from './depot-mirror'
 import { armWaves, disarmWaves, waveState } from './enemies-state'
 import { clearScatterInRadius } from './nature'
 import { playerRig } from './player'
@@ -548,6 +549,13 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         width={1.2}
         height={0.24}
       />
+
+      {/* ── THE MIRROR (far end of the back wall, past the rack) ────────
+       * Owner ask: "maybe somewhere in the depot with the guns you can have a
+       * mirror so people check themselves". A glazed wall cabinet with a
+       * Pascaline inside who copies you — the only place in a first-person
+       * game where you get to see the avatar everyone else sees. */}
+      <DepotMirror world={world} />
 
       {/* ── BREAKER PANEL (right end wall, outside): the combat opt-in ── */}
       <BreakerPanel world={world} />

@@ -2513,3 +2513,194 @@ wall top (the lintel fix), **crossed while OPEN: true / while SHUT: false**, E
 re-closes it point-blank via the fixed fallback, the prism retires, and the
 window sash swings while adding no prism. 0 page errors. `check-types` clean,
 `bun test` 2377 pass / 0 fail.
+
+## OTHER PEOPLE'S GUNS, AND OTHER PEOPLE'S PAINT (2026-09-01)
+
+Two owner sentences drove this round. **"So last time I could not hear or see
+other players shoot. I shoot. I see my gun and I could hear it. I want the others
+to shoot the same. Everyone nearby should hear it close and everyone far should
+just hear a little bit of it far. Opening on distance. And some visual too for
+the shooting."** And, after the first spray fix landed: **"spray looks good, i
+hope every player sees the same sprays and builds"** — a hope, which is the same
+thing as a test that has not been written yet.
+
+### A shot is a fact about the shooter, not a message about a bullet
+
+The counter was already on the wire: presence carries a monotone rounds-fired
+number per peer. So nothing new had to be published — a remote muzzle flash and
+report are *derived* from a number going up, which means they cost nothing when
+nobody is shooting and they cannot desync (a missed frame loses one flash, not
+the state). The distance law is pure and therefore pinned by tests rather than by
+ear: level on an inverse power so 2 m startles and 40 m is background, the top
+end eaten by air absorption on a 20 m e-fold so the timbre **opens** from crack
+to thump-and-roll exactly as asked, a propagation delay so the bang lags its own
+flash (most of why a distant shot reads as *distant* rather than as *quiet*), and
+a linear window to zero at 110 m so walking out of earshot fades instead of
+clicking. Twelve peers on miniguns is 288 rounds a second, so a rolling
+90 ms window voices at most six and silently drops the rest — a wall of
+simultaneous cracks is indistinguishable from six of them.
+
+The visual is a flash at the peer's actual muzzle plus a tracer stub, gated to
+the three weapons that *have* a muzzle: a knife swing or a spray-can trigger
+blooming a muzzle flash is worse than no effect at all.
+
+### THE NAME A SURFACE TRAVELS UNDER — one definition, two lanes
+
+"i hope every player sees the same sprays" turned out to be three defects deep,
+and the first was an identity bug the damage lane had already solved months ago.
+
+A host wall's node id comes from the document: it means the same thing in every
+browser. A **player-built** wall's does not — `store.ts` numbers pieces from a
+counter that restarts on every page load, so my second wall and yours are both
+`__boots-piece-2`. The damage lane knew this and translated (`wireNodeId` out,
+`localNodeId` in: a shared piece travels under its **record** id, which carries
+its author and reads identically everywhere). The paint lane published the raw
+local number. Two-client QA caught it in one line: A sprayed a wall it had built,
+B folded the coat onto a wall of its own that happened to wear the same number —
+or, more often, onto nothing at all. Those two functions are now exported and
+shared, so there is exactly one answer to "the name a target travels under", and
+a target named by NUMBER on the wire is **refused, never resolved** (`#` is
+illegal in a peer id, so the two namespaces cannot be confused, and a forged
+`__boots-piece-1` may not point at whatever of mine wears that number).
+
+### The counters were the only witness
+
+Every way a coat can fail to cross is silent from both ends: the sprayer's wall
+goes blue regardless, and the peer sees a wall that was simply never painted,
+which looks exactly like a quiet wire. So the lane counts — `published`,
+`unnamed`, `folded`, `foldUnnamed`, `foldNoTarget` — the same lesson the grid
+stamp taught with `gridStampPublishes`/`blindGrid`. The second defect was
+readable *only* through them: `folded 1` on the receiver with **zero cells**
+deposited. At writing range the cone is a few centimetres wide and its ball
+clears every cell centre; the local spray has always coated the single nearest
+cell instead, and the remote fold had no such rescue. The sprayer could read what
+they wrote and nobody else could. Same rule now runs on both sides — and a ball
+that misses by more than the cell's own reach still deposits nothing, exactly as
+it does locally.
+
+**And the harness itself was lying twice.** It compared node ids across clients —
+but a player-built wall legitimately wears a different number on each screen, so
+the only honest cross-client oracle is *cells that a client did not put there*
+(`cells > 0 && remote > 0`). And it asked `identifyAim` what the crosshair was
+on, which walks the three.js graph, while `sprayPaint` resolves against
+colliders and voxel targets — so it reported `nodeId: null` for surfaces that
+paint perfectly. Spray first, ask the ledger after.
+
+### A record is delivered once, so anything that loses one loses it forever
+
+The third defect is the deepest, and it is a property of the model rather than a
+slip. Records are grow-only and re-delivery is idempotent, which is exactly why
+nothing is ever re-sent. A **stroke** is grid-free, so a joiner accepts it
+whatever lot it thinks it is standing on; a **piece** is slot-addressed, so the
+same frame's walls can be refused (a stale stamp) or simply not have arrived. The
+stroke was consumed either way — and the coat on a player-built wall was dropped
+for the rest of the session. QA read it as `foldUnnamed 1` on the latecomer with
+the wall standing right there.
+
+So the fold now hands back what it could not place, and the build lane keeps it
+(`pendingStrokes`, capped, newest-wins). Installing a piece re-offers the list —
+and *that was not enough*: the install is a store write, and the wall is only
+paintable once its mesh exists and has been voxelized, a frame or more later.
+The next run said so precisely: `foldNoTarget`, with the wall standing. A piece
+install is an **event**; "the surface became paintable" is a **state**, and
+states want a heartbeat. The paint lane drains the waiting list four times a
+second while it is non-empty.
+
+### The ledger is derived; the records are the truth
+
+Which finally explained the intermittency. The strokes were arriving, the names
+were resolving, and the coat still vanished on some runs — with a bookkeeping
+contradiction no coat census could explain: `foldNoTarget 1`, `folded 0`,
+`pendingStrokes 0`. A record that was neither deposited nor waiting. Two new
+counters answered it in one run: **`paintMounts 2`** — `PaintTool` mounts twice,
+and its mount effect resets the ledger. A coat that folded before the second
+mount was erased, and the record that carried it was long consumed.
+
+The fix is the right category rather than a guard: the ledger is *derived state*
+and the world keeps every live stroke forever, so a wiped ledger can be
+**rebuilt** — `refoldSharedStrokes()`, asked for whenever the paint lane installs
+its applier. Two consequences fell out of writing it honestly:
+
+- **Folding is not idempotent against an already-folded ledger.** `foldCoats`
+  accumulates, so re-offering a record deposits a second coat's worth of
+  strength. "Folded" now means "deposited", tracked per record id — which also
+  hardens the lane against a relay handing us what we already have.
+- **Attribution is by AUTHOR, not by the path a record came down.** A rebuild
+  re-folds our own strokes too, and the fold marks what it deposits as somebody
+  else's work — that mark is what keeps a stranger's paint out of this player's
+  Save. Attributing by delivery path would have quietly deleted the player's own
+  paint from their own file.
+
+Green on the record, three consecutive two-client runs: builds both ways,
+destruction both ways, gunfire both ways with the counter moving on the peer,
+**SPRAY SYNCED A→B true**, grid stamp healthy on both, a latecomer who gets the
+whole map *and* the coat on a wall its builder never described to it, 0 page
+errors on all three clients. `check-types` clean, `bun test` 2444 pass / 0 fail.
+
+## THE MIRROR — the one thing a first-person game hides from you (2026-09-01)
+
+Owner ask, verbatim: *"maybe somewhere in the depot with the guns you can have a
+mirror so people check themselves"*. It is a small feature with one hard
+requirement hiding in it: whatever it shows has to be **exactly** what the rest
+of the lobby sees. A mirror that flattered you, or that ran its own rig, would be
+worse than no mirror — it would be a lie about the only thing it exists to report.
+
+So the dummy behind the glass is not a model of a Pascaline; it *is* the peer rig.
+`remote-players.tsx` grew `AvatarRig` + `createRigRefs`, and the component every
+remote player renders and the one standing in the cabinet are now the same
+declaration, posed through the same `advanceGait`/`articulate` rules, wearing the
+tint the roster deal reserved for our own id (`localPaletteIndex` — the deal is
+published as it is made, so the mirror cannot invent a color the lobby doesn't
+know). If it looks right in there, that *is* what they are looking at.
+
+**It is a deliberately shallow mirror, and the math says so.** A true reflection
+stands as far behind the glass as you stand in front of it — through a steel wall,
+three metres into the yard. `reflectStand` keeps the part of a reflection that
+carries information and compresses the part that would only lose you: depth
+clamped into the 0.5 m cabinet, lateral offset geared to 0.35 and capped, so
+backing off or stepping aside moves the reflection (a fixed dummy reads as a
+poster) but never slides it out of its own frame. Heading is *not* compressed:
+`reflectYaw` is the textbook plane mirror, π − φ, because a mirror that turned
+the wrong way reads as broken instantly. 18 unit tests pin that, including a
+sweep of the whole deck asserting the reflection is inside the box from every
+spot a player can stand.
+
+### What the tests could not know, and the harness caught in one run
+
+`qa-boots-mirror.mjs` finds the pane **by name in `world.colliders`** and reads
+its live `matrixWorld` — position and its own normal — so it works in the scene's
+frame and re-derives nothing about the depot. Three findings, none of which a
+pure test could have produced:
+
+- **A doubled frame.** The cabinet group was translated to `MIRROR_PANE_X` while
+  `reflectStand` returns absolute depot-local x, so the reflection stood 2.3 m
+  sideways, through the far end wall. The harness said `lateral 2.32`. The group
+  is now untranslated: one frame, the depot's.
+- **A mirror under the horizon.** The sill was 16 cm off the deck plate, so the
+  first screenshots were taken looking 30° *down* into a cabinet around your
+  knees — and the second pair, from a camera the teleport had put above the 2.6 m
+  roof, because `teleport` takes feet and the harness was passing pane-height. The
+  cabinet moved up (`MIRROR_SILL_Y` 0.5, plinth riding it) so the dummy's chest
+  lands on the standing eye line, with a test that says so in those words.
+- **A blown-out white Pascaline.** The cabinet light at chest height on intensity
+  3.5 washed the vest to paper. A mirror you cannot read your own color in is not
+  a mirror; it now rakes down from the top of the box at 1.1.
+
+Two of the three were only ever going to be found by *looking at the picture*.
+
+**The gait check needed three attempts, and the third is the honest one.** The
+question "does it freeze when you stop?" has no reliable wall-clock answer in
+headless: dt is capped to 1/30 s at ~3 fps, so deceleration takes seconds, and
+the depot can be seated where the deck never quite lets you stop (1.5 s caught it
+coasting at 0.053 rad; 6 s off a sprint caught 0.435). But `articulate` scales the
+entire gait by speed — so on any frame the game itself reports stopped, the swing
+must be *exactly* zero. The harness hunts for one such frame instead of waiting
+for one. Final: `stopped at 0.000 m/s with swing 0.000000 rad`, against a walking
+swing spread of 0.529 rad.
+
+Green: pane registered as `__boots-depot`/`fixture` (armored — nobody walks into
+the alcove to be seen from behind, bullets spark on the glass), asleep across the
+lot and awake at the pane, behind the glass and inside the box, facing you at
+1.000, a +0.5 rad turn mirrored to −0.500, wearing a lot tint, 0 page errors —
+and two screenshots that finally look like a mirror. `check-types` clean,
+`bun test` 2462 pass / 0 fail.
