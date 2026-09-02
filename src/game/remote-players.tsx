@@ -17,6 +17,7 @@ import {
   SphereGeometry,
   TorusGeometry,
 } from 'three'
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js'
 import { type RemoteShotKind, sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
 import { localUserId } from './net'
@@ -185,7 +186,7 @@ export const LEG_SWING_MAX = 0.55
 /** Peak knee flexion (rad) mid-swing at full speed — the lifted knee of a run. */
 export const KNEE_LIFT_MAX = 1.0
 /** Counter-swing of the free arm, fraction of the leg swing. */
-export const ARM_SWING_RATIO = 0.7
+export const ARM_SWING_RATIO = 0.85
 /** A free arm's resting elbow bend (rad) — nobody walks with a locked elbow. */
 export const FREE_ELBOW = 0.35
 /** Forward lean of the torso at full speed (rad). */
@@ -199,8 +200,38 @@ export const SLUMP_TORSO = 0.4
 export const SLUMP_ARM_AIM = 0.35
 export const SLUMP_KNEE = 0.25
 /** Idle breathing on the torso: amplitude (rad) and rate (rad/s). */
-export const BREATH_AMP = 0.015
+export const BREATH_AMP = 0.02
 export const BREATH_RATE = 1.3
+/** Below this normalized speed the idle layer is fully in; it fades out by IDLE_FADE_S. */
+export const IDLE_FADE_S = 0.25
+/** The idle layer: a standing body is never still. Slow weight shift (torso
+ * roll + alternating soft knees + a lateral lean), a slower sway (torso yaw),
+ * the head looking around on two incommensurate sines, the free arm drifting. */
+export const IDLE = {
+  swayYaw: 0.07,
+  swayRate: 0.45,
+  shiftRoll: 0.035,
+  shiftRate: 0.6,
+  shiftKnee: 0.1,
+  shiftLean: 0.02,
+  lookYaw: 0.3,
+  lookPitch: 0.06,
+  armDrift: 0.05,
+} as const
+/** The stride layer: the shoulders twist against the legs, the hips roll over
+ * the stance leg, the head counters the twist to stay on target, the root sways. */
+export const STRIDE = {
+  twist: 0.09,
+  roll: 0.045,
+  headCounter: 0.6,
+  sway: 0.015,
+  /** A free arm swinging forward bends its elbow this much more (per rad of swing). */
+  elbowPerSwing: 0.6,
+} as const
+/** Pose blending rates (1/s): legs stay crisp, arms and the trunk ease. */
+export const BLEND_RATE = { legs: 22, arms: 12, trunk: 9, hands: 14 } as const
+/** A hand holding something collapses to this scale (its fist mesh takes over). */
+export const HAND_COLLAPSE = 0.02
 /**
  * The arm the poses are solved for: shoulder half-width, upper arm, and the
  * reach from elbow to the grip in the palm. The mascot model's numbers (the box
@@ -337,12 +368,22 @@ export type AvatarArticulation = {
   /** How far the held weapon is tilted off the forearm's line (rad, about the
    * lateral axis) so its barrel points where the peer looks. */
   weaponTilt: number
+  /** Hands closed on something (0 open … 1 fist): the hand bone collapses and a fist shows. */
+  gripL: number
+  gripR: number
   /** rotation.x of the torso pivot (slump, run lean, breathing). */
   torsoPitch: number
+  /** rotation.y / rotation.z of the torso pivot (stride twist, idle sway / hip roll, weight shift). */
+  torsoYaw: number
+  torsoRoll: number
   /** rotation.x of the head pivot (tracks the remote view pitch). */
   headPitch: number
+  /** rotation.y of the head pivot (counters the twist; looks around at rest). */
+  headYaw: number
   /** Root bob (m) riding the stride. */
   bobY: number
+  /** Root lateral sway (m, the body's own +x) — stride and weight shift. */
+  swayX: number
 }
 
 export function createArticulation(): AvatarArticulation {
@@ -357,9 +398,15 @@ export function createArticulation(): AvatarArticulation {
     armRYaw: 0,
     elbowR: FREE_ELBOW,
     weaponTilt: 0,
+    gripL: 0,
+    gripR: 0,
     torsoPitch: 0,
+    torsoYaw: 0,
+    torsoRoll: 0,
     headPitch: 0,
+    headYaw: 0,
     bobY: 0,
+    swayX: 0,
   }
 }
 
@@ -395,31 +442,49 @@ export function articulate(
   grip: Grip = 'tool',
   t = 0,
   arms: ArmDims = MODEL_ARMS,
+  seed = 0,
 ): AvatarArticulation {
   const clampedPitch = clamp(pitch, -PITCH_CLAMP, PITCH_CLAMP)
+  // How much of the idle layer applies: all of it standing, none at a jog.
+  const idle = grounded ? clamp(1 - s / IDLE_FADE_S, 0, 1) : 0
 
-  // Legs.
+  // Legs, and the trunk's stride and idle layers.
+  const shift = Math.sin(t * IDLE.shiftRate + seed) // slow weight shift, −1..1
   if (grounded) {
     const swing = Math.sin(phase) * LEG_SWING_MAX * s
     out.legSwing = staggered ? swing * 0.5 : swing
     const lift = KNEE_LIFT_MAX * s
     const soft = staggered ? SLUMP_KNEE : 0
-    out.kneeL = Math.max(0, Math.cos(phase)) * lift + soft
-    out.kneeR = Math.max(0, -Math.cos(phase)) * lift + soft
+    // Standing, the weight sits on one leg and the other knee softens.
+    out.kneeL = Math.max(0, Math.cos(phase)) * lift + soft + idle * IDLE.shiftKnee * (0.5 + 0.5 * shift)
+    out.kneeR = Math.max(0, -Math.cos(phase)) * lift + soft + idle * IDLE.shiftKnee * (0.5 - 0.5 * shift)
     out.bobY = Math.abs(Math.cos(phase)) * 0.04 * s
+    out.swayX = Math.sin(phase) * STRIDE.sway * s + idle * IDLE.shiftLean * shift
+    out.torsoYaw = -Math.sin(phase) * STRIDE.twist * s + idle * IDLE.swayYaw * Math.sin(t * IDLE.swayRate + seed * 2)
+    out.torsoRoll = Math.sin(phase) * STRIDE.roll * s + idle * IDLE.shiftRoll * shift
   } else {
     out.legSwing = AIR_LEG_SPLIT
     out.kneeL = AIR_KNEE
     out.kneeR = AIR_KNEE
     out.bobY = 0
+    out.swayX = 0
+    out.torsoYaw = 0
+    out.torsoRoll = 0
   }
-  // What an arm does when it has nothing to hold.
-  const freeSwing = grounded ? -Math.sin(phase) * LEG_SWING_MAX * ARM_SWING_RATIO * s : AIR_ARM_SWING
+  // What an arm does when it has nothing to hold: counter-swings the stride,
+  // and at rest drifts a little so it never hangs like a rope.
+  const freeSwing = grounded
+    ? -Math.sin(phase) * LEG_SWING_MAX * ARM_SWING_RATIO * s + idle * IDLE.armDrift * Math.sin(t * 0.9 + seed)
+    : AIR_ARM_SWING
+  const freeElbow = FREE_ELBOW + STRIDE.elbowPerSwing * Math.max(0, freeSwing)
 
   // Torso and head.
   if (staggered) {
     out.torsoPitch = SLUMP_TORSO
+    out.torsoYaw = 0
+    out.torsoRoll = 0
     out.headPitch = -0.35
+    out.headYaw = 0
     out.armAim = SLUMP_ARM_AIM
     out.armRYaw = 0
     out.elbowR = 0.6
@@ -427,20 +492,30 @@ export function articulate(
     out.armSwing = freeSwing * 0.5
     out.armLYaw = 0
     out.elbowL = FREE_ELBOW
+    out.gripR = grip === 'none' ? 0 : 1
+    out.gripL = 0
     return out
   }
-  out.torsoPitch = RUN_LEAN * (grounded ? s : 0) + BREATH_AMP * Math.sin(t * BREATH_RATE)
-  out.headPitch = clamp(clampedPitch, -HEAD_PITCH_MAX, HEAD_PITCH_MAX)
+  out.torsoPitch = RUN_LEAN * (grounded ? s : 0) + BREATH_AMP * Math.sin(t * BREATH_RATE + seed)
+  // The head counters the shoulders' twist to stay on target, and at rest
+  // looks around on two sines that never line up.
+  out.headYaw =
+    -out.torsoYaw * STRIDE.headCounter +
+    idle * IDLE.lookYaw * Math.sin(t * 0.33 + seed * 5) * Math.sin(t * 0.21 + seed)
+  out.headPitch =
+    clamp(clampedPitch, -HEAD_PITCH_MAX, HEAD_PITCH_MAX) + idle * IDLE.lookPitch * Math.sin(t * 0.5 + seed * 3)
 
   // Arms, by grip — solved from where the hands have to be.
   if (grip === 'none') {
     out.armAim = -freeSwing
     out.armRYaw = 0
-    out.elbowR = FREE_ELBOW
+    out.elbowR = FREE_ELBOW + STRIDE.elbowPerSwing * Math.max(0, -freeSwing)
     out.weaponTilt = 0
     out.armSwing = freeSwing
     out.armLYaw = 0
-    out.elbowL = FREE_ELBOW
+    out.elbowL = freeElbow
+    out.gripL = 0
+    out.gripR = 0
     return out
   }
   const g = GRIPS[grip]
@@ -465,19 +540,47 @@ export function articulate(
     out.armSwing = left.swing
     out.armLYaw = left.yaw
     out.elbowL = left.elbow
+    out.gripL = 1
   } else {
     out.armSwing = freeSwing
     out.armLYaw = 0
-    out.elbowL = FREE_ELBOW
+    out.elbowL = freeElbow
+    out.gripL = 0
   }
+  out.gripR = 1
   return out
+}
+
+const LEG_FIELDS = ['legSwing', 'kneeL', 'kneeR', 'bobY', 'swayX'] as const
+const ARM_FIELDS = ['armSwing', 'armLYaw', 'elbowL', 'armAim', 'armRYaw', 'elbowR', 'weaponTilt'] as const
+const TRUNK_FIELDS = ['torsoPitch', 'torsoYaw', 'torsoRoll', 'headPitch', 'headYaw'] as const
+const HAND_FIELDS = ['gripL', 'gripR'] as const
+
+/**
+ * Ease the live pose toward the target — the one thing that turns a set of
+ * rules into motion. A weapon swap, a stop, a jump no longer snap: arms and
+ * trunk arrive over a few frames, legs stay crisp so the stride keeps its
+ * beat. Exponential, frame-rate independent: k = 1 − e^(−rate·dt).
+ */
+export function blendArticulation(live: AvatarArticulation, target: AvatarArticulation, dt: number): void {
+  const step = (rate: number) => 1 - Math.exp(-rate * Math.max(0, dt))
+  const kLegs = step(BLEND_RATE.legs)
+  const kArms = step(BLEND_RATE.arms)
+  const kTrunk = step(BLEND_RATE.trunk)
+  const kHands = step(BLEND_RATE.hands)
+  for (const f of LEG_FIELDS) live[f] += (target[f] - live[f]) * kLegs
+  for (const f of ARM_FIELDS) live[f] += (target[f] - live[f]) * kArms
+  for (const f of TRUNK_FIELDS) live[f] += (target[f] - live[f]) * kTrunk
+  for (const f of HAND_FIELDS) live[f] += (target[f] - live[f]) * kHands
 }
 
 /**
  * Write a pose onto a body's handles — the one place the sign conventions
  * live: the right leg mirrors the left, knees bend backward (−x), elbows bend
- * forward (+x), arm yaws are written as given. Handles a body does not have
- * (the box rig's elbows and knees) are simply absent.
+ * forward (+x), arm yaws are written as given, a gripping hand collapses to
+ * HAND_COLLAPSE and its fist shows. Handles a body does not have (the box
+ * rig's elbows, knees, hands) are simply absent. The root's bob and sway are
+ * the caller's — it owns the root's world position.
  */
 export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): void {
   const setX = (r: { current: Group | null } | undefined, x: number) => {
@@ -502,8 +605,40 @@ export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): v
   // The held weapon hangs barrel-down the forearm at rest (Rx(−π/2)); the
   // tilt swings the barrel forward/up off that line.
   setX(refs.weapon, -Math.PI / 2 + a.weaponTilt)
-  setX(refs.torso, a.torsoPitch)
-  setX(refs.head, a.headPitch)
+  const torso = refs.torso.current
+  if (torso) {
+    torso.rotation.x = a.torsoPitch
+    torso.rotation.y = a.torsoYaw
+    torso.rotation.z = a.torsoRoll
+  }
+  const head = refs.head.current
+  if (head) {
+    head.rotation.x = a.headPitch
+    head.rotation.y = a.headYaw
+  }
+  const hand = (
+    bone: { current: Group | null } | undefined,
+    fist: { current: Group | null } | undefined,
+    grip: number,
+  ) => {
+    if (bone?.current) bone.current.scale.setScalar(1 + (HAND_COLLAPSE - 1) * grip)
+    if (fist?.current) fist.current.visible = grip > 0.5
+  }
+  hand(refs.handL, refs.fistL, a.gripL)
+  hand(refs.handR, refs.fistR, a.gripR)
+}
+
+/** Where the root goes this frame: feet at `feet`, lifted by the bob, swayed
+ * along the body's own +x (facing −Z at yaw 0, +x is (cos yaw, 0, −sin yaw)). */
+export function placeRoot(
+  root: { position: { set(x: number, y: number, z: number): unknown } },
+  feetX: number,
+  feetY: number,
+  feetZ: number,
+  yaw: number,
+  a: AvatarArticulation,
+): void {
+  root.position.set(feetX + a.swayX * Math.cos(yaw), feetY + a.bobY, feetZ - a.swayX * Math.sin(yaw))
 }
 
 // ── Join scale-in + name-tag gate (pure, tested) ─────────────────────────────
@@ -819,6 +954,11 @@ export type AvatarRigRefs = {
   kneeR?: { current: Group | null }
   /** The held weapon's group (HeldWeapon) — tilted per frame so the barrel tracks the aim. */
   weapon?: { current: Group | null }
+  /** Hand bones (collapse while gripping) and the fists that replace them. */
+  handL?: { current: Group | null }
+  handR?: { current: Group | null }
+  fistL?: { current: Group | null }
+  fistR?: { current: Group | null }
   fx?: { current: Group | null }
   flash?: { current: Group | null }
 }
@@ -840,6 +980,10 @@ export function createRigRefs(): AvatarRigRefs {
     kneeL: { current: null },
     kneeR: { current: null },
     weapon: { current: null },
+    handL: { current: null },
+    handR: { current: null },
+    fistL: { current: null },
+    fistR: { current: null },
   }
 }
 
@@ -992,6 +1136,8 @@ function HeldWeapon({
 // ── Tint bands for the model (shared geometry per body measurement) ──────────
 
 const bandGeometries = new Map<string, { hat: TorusGeometry; sleeve: CylinderGeometry }>()
+/** A fist: what a hand looks like closed on a grip. Shared by every body. */
+const FIST_GEO = new RoundedBoxGeometry(0.08, 0.075, 0.09, 3, 0.022)
 
 /** The hat band ring and the sleeve band, sized to the body they wrap. */
 function bandGeometriesFor(dims: PascalineDims) {
@@ -1043,6 +1189,8 @@ function PascalineRig({
     if (refs.elbowR) refs.elbowR.current = body.joints.elbowR
     if (refs.kneeL) refs.kneeL.current = body.joints.kneeL
     if (refs.kneeR) refs.kneeR.current = body.joints.kneeR
+    if (refs.handL) refs.handL.current = body.hands.L as Group | null
+    if (refs.handR) refs.handR.current = body.hands.R as Group | null
   })
   const d = body.dims
   return (
@@ -1069,6 +1217,22 @@ function PascalineRig({
       {/* Sleeve bands, a little below each shoulder, in the arm frame (hanging −y). */}
       {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.L)}
       {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.R)}
+      {/* Fists, at each grip point in the hand frames: shown while that hand
+          holds something (applyArticulation collapses the skinned hand and
+          shows this). An open hand modelled around a grip never closes; a
+          fist that replaces it does. */}
+      {createPortal(
+        <group position={[0, -(d.foreArmLen + d.handLen * GRIP_IN_HAND) + 0.015, 0.01]} ref={refs.fistL} visible={false}>
+          <mesh geometry={FIST_GEO} material={SKIN_MATERIAL} />
+        </group>,
+        body.handFrames.L,
+      )}
+      {createPortal(
+        <group position={[0, -(d.foreArmLen + d.handLen * GRIP_IN_HAND) + 0.015, 0.01]} ref={refs.fistR} visible={false}>
+          <mesh geometry={FIST_GEO} material={SKIN_MATERIAL} />
+        </group>,
+        body.handFrames.R,
+      )}
     </>
   )
 }
@@ -1103,6 +1267,14 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   const kneeLRef = useRef<Group>(null)
   const kneeRRef = useRef<Group>(null)
   const weaponRef = useRef<Group>(null)
+  const handLRef = useRef<Group>(null)
+  const handRRef = useRef<Group>(null)
+  const fistLRef = useRef<Group>(null)
+  const fistRRef = useRef<Group>(null)
+  // The LIVE pose this body wears, eased toward each frame's target.
+  const pose = useRef(createArticulation())
+  // A per-peer phase so a lobby does not breathe, sway and glance in unison.
+  const idleSeed = useMemo(() => ((hashUserId(remote.userId) % 1000) / 1000) * Math.PI * 2, [remote.userId])
   const tagRef = useRef<Group>(null)
   const tagMatRef = useRef<MeshBasicMaterial>(null)
   const speakRef = useRef<Mesh>(null)
@@ -1136,6 +1308,10 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     kneeL: kneeLRef,
     kneeR: kneeRRef,
     weapon: weaponRef,
+    handL: handLRef,
+    handR: handRRef,
+    fistL: fistLRef,
+    fistR: fistRRef,
     fx: fxRef,
     flash: flashRef,
   }).current
@@ -1183,17 +1359,20 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       _pose.st,
       gripFor(_pose.w),
       (now - remote.joinedAt) / 1000,
+      MODEL_ARMS,
+      idleSeed,
     )
+    blendArticulation(pose.current, _artic, dt)
 
     // Wire positions are EYE positions — plant the feet.
-    root.position.set(_pose.x, _pose.y - EYE_HEIGHT + _artic.bobY, _pose.z)
+    placeRoot(root, _pose.x, _pose.y - EYE_HEIGHT, _pose.z, _pose.yaw, pose.current)
     root.rotation.y = _pose.yaw
     const scale = spawnScale(now - remote.joinedAt)
     if (scale !== lastScale.current) {
       lastScale.current = scale
       root.scale.setScalar(scale)
     }
-    applyArticulation(rigRefs, _artic)
+    applyArticulation(rigRefs, pose.current)
 
     // Weapon swap — change-gated, so per-frame calls are free while held.
     if (_pose.w !== weapon) setWeapon(_pose.w)

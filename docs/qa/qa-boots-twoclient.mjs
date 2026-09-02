@@ -554,9 +554,11 @@ for (let round = 0; round < 12; round++) {
   if (cKeys.size >= aKeysBefore.size) break
 }
 const cSync = await worldSync(c)
+const cSettle = await c.page.evaluate(() => globalThis.__boots?.settle?.() ?? null)
 const relayedIn = [...aKeysBefore].filter((key) => cKeys.has(key))
 log(`[C] phase ${await phase(c)} pieces ${cKeys.size}   of A's ${aKeysBefore.size}: ${relayedIn.length}`)
 log(`[C] worldSync ${JSON.stringify(cSync)}`)
+log(`[C] settle ${JSON.stringify(cSettle)}`)
 const relayOk = cKeys.size >= aKeysBefore.size && (cSync?.relayed ?? 0) > 0
 log(`  LATECOMER GOT THE WHOLE MAP: ${relayOk}  (relayed ${cSync?.relayed})`)
 

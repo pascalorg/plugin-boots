@@ -117,6 +117,8 @@ export type PascalineInstance = {
   armFrames: { L: Group; R: Group }
   /** Under each elbow: the forearm hanging −y, where the held weapon mounts. */
   handFrames: { L: Group; R: Group }
+  /** The hand bones — collapsed while gripping so a fist can take their place. */
+  hands: { L: Object3D | null; R: Object3D | null }
   /** Empty LOD handles — the model has no detail groups to drop, but callers toggle them. */
   detail: { head: Group; body: Group }
   dims: PascalineDims
@@ -240,13 +242,14 @@ export function instantiatePascaline(template: PascalineTemplate): PascalineInst
     return g
   }
   const handFrames = { L: hand(joints.elbowL, 'hand-frame-L'), R: hand(joints.elbowR, 'hand-frame-R') }
+  const hands = { L: root.getObjectByName('handL') ?? null, R: root.getObjectByName('handR') ?? null }
 
   const detail = { head: new Group(), body: new Group() }
   detail.head.name = 'head-detail'
   detail.body.name = 'body-detail'
   pivots.head.add(detail.head)
   pivots.torso.add(detail.body)
-  return { root, pivots, joints, armFrames, handFrames, detail, dims }
+  return { root, pivots, joints, armFrames, handFrames, hands, detail, dims }
 }
 
 // ── Loading (once per module, on demand) ─────────────────────────────────────

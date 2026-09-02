@@ -1,6 +1,7 @@
 'use client'
 
 import { useFrame } from '@react-three/fiber'
+import { EYE_HEIGHT } from './collision'
 import { useEffect, useRef, useState } from 'react'
 import {
   BoxGeometry,
@@ -19,6 +20,13 @@ import { collideCapsule } from './collision'
 import { collideVoxelTargets, raycastVoxelTargets } from './destruction'
 import { doorsDebug } from './doors'
 import {
+  withinVerticalReach,
+  tellProgress,
+  STRIKE_SLACK,
+  STRIKE_FLASH_S,
+  stepWindup,
+  startWindup,
+  postStaggerGrace,
   ACCENT_PALETTE,
   accrueDoorStuck,
   ALERT_SECONDS,
@@ -233,6 +241,10 @@ export function meleeBlocked(world: GameWorld, bot: Bot): boolean {
   return false
 }
 
+/** The post-stagger grace, horde-wide (see enemies-state's postStaggerGrace). */
+let graceLeft = 0
+let prevStaggered = false
+
 export function Enemies({ world }: { world: GameWorld }) {
   const [tick, setTick] = useState(0)
   /** Rolling hash of (id, state) per bot — the remount change gate below
@@ -355,6 +367,8 @@ export function Enemies({ world }: { world: GameWorld }) {
 
     // Integrate bots.
     const frozen = debugFlags.botsFrozen // dev/E2E: hold poses, no attacks
+    graceLeft = postStaggerGrace(prevStaggered, staggered, graceLeft, dt)
+    prevStaggered = staggered
     // Refill the horde-wide budget for terrain re-probes triggered by a bot
     // having WALKED off its cached landing plane (see BOT_PROBE_BUDGET). The
     // per-bot cadence probe is never budgeted.
@@ -369,9 +383,11 @@ export function Enemies({ world }: { world: GameWorld }) {
         continue
       }
       bot.attackCooldown -= dt
-      // Legs freeze while a hand fumbles at a door handle — part of the tell.
+      if (bot.strikeT > 0) bot.strikeT = Math.max(0, bot.strikeT - dt)
+      // Legs freeze while a hand fumbles at a door handle, and while the body
+      // winds up a swing — both are part of the tell.
       const fumbling = bot.doorId !== null && bot.doorFumbleT > 0
-      if (!fumbling) bot.phase += dt * (bot.kind === 'dog' ? 11 : 6)
+      if (!fumbling && bot.windupT <= 0) bot.phase += dt * (bot.kind === 'dog' ? 11 : 6)
 
       _toPlayer.set(
         playerRig.position.x - bot.position.x,
@@ -449,6 +465,25 @@ export function Enemies({ world }: { world: GameWorld }) {
         nearestDrone = Math.min(nearestDrone, bot.position.distanceTo(playerRig.position))
       }
 
+      // THE STRIKE lands at the end of its wind-up — and only if the player is
+      // still there: in reach (a little slack), on the same storey, behind no
+      // wall, not downed, not inside the post-stagger grace. Step back in
+      // time and the swing misses. A frozen horde neither winds nor strikes.
+      const windup = stepWindup(bot, frozen ? 0 : dt)
+      if (windup === 'strike') {
+        bot.attackCooldown = 1.1
+        bot.strikeT = STRIKE_FLASH_S
+        const playerFeetY = playerRig.position.y - EYE_HEIGHT
+        const stillInReach =
+          reachDist <= stats.reach + STRIKE_SLACK &&
+          withinVerticalReach(bot.kind, bot.position.y, playerFeetY)
+        if (!staggered && graceLeft <= 0 && stillInReach && !meleeBlocked(world, bot)) {
+          // bot→player XZ direction; damagePlayer normalizes and handles
+          // knockback, directional flash, sfx and the stagger routing.
+          damagePlayer(stats.damage, { x: dirX, z: dirZ })
+        }
+      }
+
       // Steering intent (m/s). Positions only move through this + the
       // capsule pass below — the WALL RULE owns final placement.
       let moveX = 0
@@ -457,6 +492,8 @@ export function Enemies({ world }: { world: GameWorld }) {
       if (frozen) {
         // Dev freeze (debugFlags.botsFrozen): no steering, no attacks — the
         // walk cycle keeps idling so frozen bots still read as alive.
+      } else if (windup === 'winding') {
+        // Planted: a body mid-swing does not steer.
       } else if (staggered) {
         // Mercy window: nobody attacks a downed player. Ground bots steer to
         // hold a 4–6 m standoff ring; drones freeze in place (climb above).
@@ -528,11 +565,17 @@ export function Enemies({ world }: { world: GameWorld }) {
             bot.followT = FOLLOW_TIME
             bot.followSign = bot.seed % 2 < 1 ? 1 : -1
           }
+        } else if (
+          graceLeft > 0 ||
+          !withinVerticalReach(bot.kind, bot.position.y, playerRig.position.y - EYE_HEIGHT)
+        ) {
+          // Getting-up grace, or a player a storey above/below (a droid under
+          // a balcony edge): hold, and look again shortly.
+          bot.attackCooldown = 0.35
         } else {
-          bot.attackCooldown = 1.1
-          // bot→player XZ direction; damagePlayer normalizes and handles
-          // knockback, directional flash, sfx and the stagger routing.
-          damagePlayer(stats.damage, { x: dirX, z: dirZ })
+          // The tell: wind up, announce it, land it at the end (above).
+          startWindup(bot)
+          sfx.botTell(bot.kind, dist)
         }
       }
 
@@ -724,7 +767,21 @@ function BotModel({ bot }: { bot: Bot }) {
     const group = ref.current
     if (!group) return
     group.position.copy(bot.position)
-    group.rotation.set(0, bot.yaw, 0)
+    // THE TELL, on the body: the droid draws both arms back and leans in, the
+    // dog crouches and rears, the drone dips — then the strike snaps the
+    // other way for a beat (strikeT). Read by the player as "swing coming".
+    const tell = tellProgress(bot)
+    const strike = bot.strikeT > 0 ? bot.strikeT / STRIKE_FLASH_S : 0
+    const v = bot.visual
+    if (bot.kind === 'dog') {
+      group.rotation.set(-0.3 * tell + 0.25 * strike, bot.yaw, 0)
+      group.scale.set(v.scale, v.scale * (1 - 0.28 * tell + 0.08 * strike), v.scale * (1 + 0.15 * strike))
+    } else if (bot.kind === 'drone') {
+      group.rotation.set(0.2 * tell - 0.15 * strike, bot.yaw, 0)
+      group.position.y -= 0.4 * tell - 0.2 * strike
+    } else {
+      group.rotation.set(0.22 * tell - 0.12 * strike, bot.yaw, 0)
+    }
     if (bot.state === 'dying') {
       const t = Math.min(1, bot.deadT / 0.5)
       group.rotation.z = (Math.PI / 2) * t
@@ -744,8 +801,12 @@ function BotModel({ bot }: { bot: Bot }) {
       const part = child.userData as BotPart
       if (part.role === 'legL') child.rotation.x = swing * (part.amp ?? 0.7)
       else if (part.role === 'legR') child.rotation.x = -swing * (part.amp ?? 0.7)
-      else if (part.role === 'armL') child.rotation.x = -swing * (part.amp ?? 0.5)
-      else if (part.role === 'armR') child.rotation.x = swing * (part.amp ?? 0.5)
+      else if (part.role === 'armL' || part.role === 'armR') {
+        // Both arms draw back through the wind-up and slam forward on the strike.
+        const armed = tell > 0 || strike > 0
+        const gait = (part.role === 'armL' ? -swing : swing) * (part.amp ?? 0.5)
+        child.rotation.x = armed ? -1.5 * tell + 1.1 * strike : gait
+      }
       else if (part.role === 'gait') child.rotation.x = Math.sin(bot.phase + (part.off ?? 0)) * 0.65
       else if (part.role === 'tail') child.rotation.y = Math.sin(bot.phase * 1.7) * 0.55
       else if (part.role === 'rotor') {

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { Group } from 'three'
 import {
   advanceGait,
   AIR_ARM_SWING,
@@ -37,6 +38,14 @@ import {
   RUN_LEAN,
   SLUMP_KNEE,
   gripFor,
+  blendArticulation,
+  IDLE,
+  placeRoot,
+  STRIDE,
+  HAND_COLLAPSE,
+  applyArticulation,
+  BLEND_RATE,
+  IDLE_FADE_S,
 } from './remote-players'
 
 /**
@@ -190,11 +199,12 @@ describe('articulation — gait, airborne, slump', () => {
     articulate(out, Math.PI / 2, 1, 0, true, false)
     expect(out.kneeL).toBeCloseTo(0)
     expect(out.kneeR).toBeCloseTo(0)
-    // Scales with speed; still means straight.
+    // Scales with speed; still means no LIFT — only the idle weight shift is left.
     articulate(out, 0, 0.5, 0, true, false)
-    expect(out.kneeL).toBeCloseTo(KNEE_LIFT_MAX * 0.5)
+    expect(out.kneeL).toBeCloseTo(KNEE_LIFT_MAX * 0.5 + IDLE.shiftKnee * 0.5 * (1 - 0.5 / IDLE_FADE_S) * 0)
     articulate(out, 0, 0, 0, true, false)
-    expect(out.kneeL).toBe(0)
+    expect(out.kneeL).toBeLessThanOrEqual(IDLE.shiftKnee + 1e-9)
+    expect(out.kneeR).toBeLessThanOrEqual(IDLE.shiftKnee + 1e-9)
   })
 
   test('running leans the torso forward with speed; standing, it just breathes', () => {
@@ -343,6 +353,153 @@ describe('articulation — gait, airborne, slump', () => {
     for (const w of ['knife', 'hammer', 'builder', 'paint']) expect(gripFor(w)).toBe('tool')
     expect(gripFor('')).toBe('none')
     expect(gripFor('laser-from-the-future')).toBe('tool')
+  })
+
+  test('a standing body is never still: the idle layer moves torso, head, knees and the free arm over time', () => {
+    const a = createArticulation()
+    const b = createArticulation()
+    articulate(a, 0, 0, 0, true, false, 'tool', 1.0)
+    articulate(b, 0, 0, 0, true, false, 'tool', 3.7)
+    // Something moved between the two instants, in every idle channel.
+    expect(a.torsoYaw).not.toBeCloseTo(b.torsoYaw, 4)
+    expect(a.torsoRoll).not.toBeCloseTo(b.torsoRoll, 4)
+    expect(a.headYaw).not.toBeCloseTo(b.headYaw, 4)
+    expect(a.armSwing).not.toBeCloseTo(b.armSwing, 4)
+    expect(a.kneeL + a.kneeR).toBeGreaterThan(0) // weight on one leg, the other knee soft
+    // ...but all of it is subtle: a shift of weight, not a dance.
+    for (const o of [a, b]) {
+      expect(Math.abs(o.torsoYaw)).toBeLessThanOrEqual(IDLE.swayYaw + 1e-9)
+      expect(Math.abs(o.headYaw)).toBeLessThanOrEqual(IDLE.lookYaw + 1e-9)
+      expect(Math.abs(o.swayX)).toBeLessThanOrEqual(IDLE.shiftLean + 1e-9)
+    }
+  })
+
+  test('the idle layer fades out with speed and is gone at a jog', () => {
+    const still = createArticulation()
+    const jog = createArticulation()
+    // Same phase (π/2: no stride twist), same instant — only the speed differs.
+    articulate(still, Math.PI / 2, 0, 0, true, false, 'tool', 2.0)
+    articulate(jog, Math.PI / 2, 1, 0, true, false, 'tool', 2.0)
+    expect(Math.abs(still.torsoYaw)).toBeGreaterThan(0)
+    expect(jog.torsoYaw).toBeCloseTo(-STRIDE.twist * Math.sin(Math.PI / 2), 9) // stride only, no idle sway
+    expect(jog.headYaw).toBeCloseTo(-jog.torsoYaw * STRIDE.headCounter, 9)
+  })
+
+  test('two peers with different seeds do not move in unison', () => {
+    const a = createArticulation()
+    const b = createArticulation()
+    articulate(a, 0, 0, 0, true, false, 'tool', 2.0, MODEL_ARMS, 0)
+    articulate(b, 0, 0, 0, true, false, 'tool', 2.0, MODEL_ARMS, 2.1)
+    expect(a.headYaw).not.toBeCloseTo(b.headYaw, 4)
+    expect(a.torsoPitch).not.toBeCloseTo(b.torsoPitch, 4)
+  })
+
+  test('the stride twists the shoulders against the legs, rolls the hips, sways the root, and the head counters', () => {
+    const out = createArticulation()
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0)
+    // Left leg forward (legSwing > 0): shoulders twist the other way.
+    expect(out.legSwing).toBeGreaterThan(0)
+    expect(out.torsoYaw).toBeCloseTo(-STRIDE.twist, 9)
+    expect(out.torsoRoll).toBeCloseTo(STRIDE.roll, 9)
+    expect(out.swayX).toBeCloseTo(STRIDE.sway, 9)
+    expect(out.headYaw).toBeCloseTo(STRIDE.twist * STRIDE.headCounter, 9)
+    // Half a cycle later everything mirrors.
+    articulate(out, -Math.PI / 2, 1, 0, true, false, 'tool', 0)
+    expect(out.torsoYaw).toBeCloseTo(STRIDE.twist, 9)
+    expect(out.torsoRoll).toBeCloseTo(-STRIDE.roll, 9)
+    // The free arm swinging forward bends its elbow more than one hanging back.
+    articulate(out, -Math.PI / 2, 1, 0, true, false, 'tool', 0) // armSwing > 0: forward
+    const fwd = out.elbowL
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0)
+    expect(fwd).toBeGreaterThan(out.elbowL)
+  })
+
+  test('hands close on what they hold: right for anything, left only for a two-handed gun', () => {
+    const out = createArticulation()
+    articulate(out, 0, 0, 0, true, false, 'none')
+    expect(out.gripL).toBe(0)
+    expect(out.gripR).toBe(0)
+    articulate(out, 0, 0, 0, true, false, 'tool')
+    expect(out.gripR).toBe(1)
+    expect(out.gripL).toBe(0)
+    articulate(out, 0, 0, 0, true, false, 'long')
+    expect(out.gripR).toBe(1)
+    expect(out.gripL).toBe(1)
+    articulate(out, 0, 0, 0, true, true, 'long') // staggered: the gun hangs in one hand
+    expect(out.gripR).toBe(1)
+    expect(out.gripL).toBe(0)
+  })
+
+  test('blendArticulation eases toward the target, frame-rate independent, legs faster than arms', () => {
+    const live = createArticulation()
+    const target = createArticulation()
+    target.armAim = 1.0
+    target.legSwing = 0.5
+    target.gripR = 1
+    // One 1/60 step: partway there, legs further along than arms.
+    blendArticulation(live, target, 1 / 60)
+    const legFrac = live.legSwing / 0.5
+    const armFrac = live.armAim / 1.0
+    expect(legFrac).toBeGreaterThan(armFrac)
+    expect(armFrac).toBeGreaterThan(0)
+    expect(armFrac).toBeLessThan(1)
+    // Sixty 1/60 steps ≈ one 1 s step (exponential, not per-frame).
+    const a = createArticulation()
+    for (let i = 0; i < 60; i++) blendArticulation(a, target, 1 / 60)
+    const b = createArticulation()
+    blendArticulation(b, target, 1)
+    expect(a.armAim).toBeCloseTo(b.armAim, 6)
+    // After a second it has essentially arrived.
+    expect(a.armAim).toBeCloseTo(1.0, 3)
+    expect(a.gripR).toBeCloseTo(1, 3)
+    // A zero or negative dt never moves it backward or explodes.
+    const c = createArticulation()
+    blendArticulation(c, target, 0)
+    expect(c.armAim).toBe(0)
+    blendArticulation(c, target, -1)
+    expect(c.armAim).toBe(0)
+  })
+
+  test('applyArticulation collapses a gripping hand and shows its fist; releases both when open', () => {
+    const mk = () => ({ current: new Group() })
+    const refs = {
+      torso: mk(), head: mk(), armL: mk(), armR: mk(), legL: mk(), legR: mk(),
+      headDetail: mk(), bodyDetail: mk(), handL: mk(), handR: mk(), fistL: mk(), fistR: mk(),
+    }
+    const a = createArticulation()
+    a.gripR = 1
+    a.gripL = 0
+    applyArticulation(refs, a)
+    expect(refs.handR.current.scale.x).toBeCloseTo(HAND_COLLAPSE, 9)
+    expect(refs.fistR.current.visible).toBe(true)
+    expect(refs.handL.current.scale.x).toBe(1)
+    expect(refs.fistL.current.visible).toBe(false)
+    a.gripR = 0
+    applyArticulation(refs, a)
+    expect(refs.handR.current.scale.x).toBe(1)
+    expect(refs.fistR.current.visible).toBe(false)
+    // Torso yaw/roll and head yaw land on the pivots too.
+    a.torsoYaw = 0.1
+    a.torsoRoll = -0.05
+    a.headYaw = 0.2
+    applyArticulation(refs, a)
+    expect(refs.torso.current.rotation.y).toBeCloseTo(0.1, 12)
+    expect(refs.torso.current.rotation.z).toBeCloseTo(-0.05, 12)
+    expect(refs.head.current.rotation.y).toBeCloseTo(0.2, 12)
+  })
+
+  test('placeRoot lifts by the bob and sways along the body\'s own +x, whatever the yaw', () => {
+    const root = new Group()
+    const a = createArticulation()
+    a.bobY = 0.03
+    a.swayX = 0.02
+    placeRoot(root, 1, 2, 3, 0, a) // facing −Z: +x is world +x
+    expect(root.position.x).toBeCloseTo(1.02, 12)
+    expect(root.position.y).toBeCloseTo(2.03, 12)
+    expect(root.position.z).toBeCloseTo(3, 12)
+    placeRoot(root, 1, 2, 3, Math.PI / 2, a) // facing −X: +x is world −Z
+    expect(root.position.x).toBeCloseTo(1, 12)
+    expect(root.position.z).toBeCloseTo(3 - 0.02, 12)
   })
 
   test('gait phase advances with speed and settles when stopped', () => {

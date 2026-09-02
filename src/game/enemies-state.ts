@@ -50,6 +50,12 @@ export type Bot = {
   /** Seconds since death started (tumble + fade). */
   deadT: number
   attackCooldown: number
+  /** Seconds left in the melee wind-up (0 = not swinging). The TELL: every
+   * strike is announced this long before it lands, and lands only if the
+   * player is still in reach then. */
+  windupT: number
+  /** Seconds left of the strike pose after a swing (visual only). */
+  strikeT: number
   /** Per-bot animation phase. */
   phase: number
   /** Drone hover seed. */
@@ -186,6 +192,61 @@ export const BOT_STATS: Record<
   droid: { health: 65, speed: 2.4, damage: 12, reach: 1.6, bodyY: 1.0, radius: 0.45 },
   dog: { health: 40, speed: 4.6, damage: 9, reach: 1.3, bodyY: 0.45, radius: 0.42 },
   drone: { health: 18, speed: 3.4, damage: 14, reach: 1.1, bodyY: 0, radius: 0.34 },
+}
+
+// ── The tell (pure, tested) ─────────────────────────────────────────────────
+//
+// A hit you never saw coming is not difficulty, it is noise. Every melee now
+// has a WIND-UP — the droid draws both arms back, the dog crouches, the drone
+// dips — with its own sound, and the strike lands at the END of it, only if
+// the player is still in reach, still in front of no wall, not downed and not
+// inside the grace that follows a stagger. Step back, and the swing misses.
+
+/** Wind-up length per kind (s): the dog is quickest, the droid the most readable. */
+export const WINDUP_S: Record<BotKind, number> = { droid: 0.55, dog: 0.42, drone: 0.5 }
+/** How long the strike pose holds after a swing (visual only). */
+export const STRIKE_FLASH_S = 0.18
+/** A swing still connects this far past the bot's reach — the player who
+ * steps back late gets clipped, the one who steps back early does not. */
+export const STRIKE_SLACK = 0.35
+/** Ground bots hit up to this far above or below their own feet. A droid under
+ * a balcony edge used to reach a player standing on it from a storey down. */
+export const GROUND_REACH_Y = 1.25
+/** After a stagger ends, no strike lands for this long — getting up is free. */
+export const STRIKE_GRACE_S = 1.0
+
+export function startWindup(bot: Bot): void {
+  bot.windupT = WINDUP_S[bot.kind]
+}
+
+/** Advance the wind-up; 'strike' exactly on the frame it completes. */
+export function stepWindup(bot: Bot, dt: number): 'idle' | 'winding' | 'strike' {
+  if (bot.windupT <= 0) return 'idle'
+  bot.windupT -= dt
+  if (bot.windupT > 0) return 'winding'
+  bot.windupT = 0
+  return 'strike'
+}
+
+/** How far into the tell a bot is, 0 (not swinging) … 1 (about to land). */
+export function tellProgress(bot: Bot): number {
+  if (bot.windupT <= 0) return 0
+  return Math.min(1, Math.max(0, 1 - bot.windupT / WINDUP_S[bot.kind]))
+}
+
+/** Can this bot's swing reach a player whose FEET are at `playerFeetY`? Ground
+ * bots' positions are their feet; drones fly to the player and always can. */
+export function withinVerticalReach(kind: BotKind, botFeetY: number, playerFeetY: number): boolean {
+  if (kind === 'drone') return true
+  return Math.abs(playerFeetY - botFeetY) <= GROUND_REACH_Y
+}
+
+/** The post-stagger grace: starts the frame the stagger ends, counts down,
+ * and is moot while staggered (the mercy window covers that). */
+export function postStaggerGrace(prevStaggered: boolean, staggered: boolean, graceLeft: number, dt: number): number {
+  if (staggered) return 0
+  if (prevStaggered) return STRIKE_GRACE_S
+  return Math.max(0, graceLeft - dt)
 }
 
 export const bots: Bot[] = []
@@ -341,6 +402,8 @@ export function spawnBot(
     state: 'alive',
     deadT: 0,
     attackCooldown: 1,
+    windupT: 0,
+    strikeT: 0,
     phase: Math.random() * Math.PI * 2,
     seed: Math.random() * 1000,
     blockedT: 0,

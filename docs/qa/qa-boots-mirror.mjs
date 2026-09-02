@@ -463,6 +463,11 @@ check(
   farB.engaged === false && farB.passes === farA.passes && (await glassShowsReflection()) === false,
   `engaged ${farB.engaged}, passes ${farA.passes} → ${farB.passes}, glass idle`,
 )
+// The first REAL pass used to hitch (pipelines for the target's format, the
+// skinned body's first draw). The mirror now compiles into the target and runs
+// one pass during the loading beat — so by the time anyone can walk up, at
+// least one pass has already happened.
+check('WARMED AT SESSION START', farA.passes >= 1, `${farA.passes} pass(es) before anyone approached`)
 
 // ── 2. someone at the glass: the pass runs, every frame ──────────────────────
 await standAt(1.4)
@@ -598,13 +603,29 @@ for (let i = 0; i < 40; i++) {
   }
   await page.waitForTimeout(250)
 }
-const froze = stillFrame ? Math.abs(stillFrame.legSwing) < 1e-6 : false
+// The live pose EASES toward its target (blendArticulation): on the very frame
+// the game first calls the player still, the legs are still settling. The
+// target has been zero since that frame, so HUNT for the frame where the ease
+// has arrived — never wait a fixed time: headless game time crawls (dt capped
+// at 1/30 at a few fps, slower still while the pass renders the scene twice).
+let settled = null
+if (stillFrame) {
+  for (let i = 0; i < 40; i++) {
+    const d = await readSelf()
+    if (typeof d?.legSwing === 'number' && Math.abs(d.legSwing) < 5e-3 && d.speed < 0.02) {
+      settled = d
+      break
+    }
+    await page.waitForTimeout(250)
+  }
+}
+const froze = settled !== null
 check(
   'IT STRIDES WITH YOU, AND STOPS WHEN YOU STOP',
   walk.spread > 0.03 && froze,
   `walking swing spread ${fmt(walk.spread)} rad at up to ${fmt(walk.topSpeed, 1)} m/s → ` +
     (stillFrame
-      ? `stopped at ${fmt(stillFrame.speed)} m/s with swing ${stillFrame.legSwing.toFixed(6)} rad`
+      ? `stopped at ${fmt(stillFrame.speed)} m/s (swing ${stillFrame.legSwing.toFixed(4)} rad, settling) → ${settled ? `settled at ${settled.legSwing.toFixed(5)} rad` : 'NEVER SETTLED within 10 s'}`
       : `NEVER STOPPED, slowest ${fmt(slowest)} m/s`),
 )
 

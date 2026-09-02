@@ -203,8 +203,51 @@ describe('the window', () => {
       mem = step.mem
     }
     const last = settleStep(reading({ elapsedMs: SETTLE_QUIET_CHECKS * 400 }), mem)
-    expect(last.action).toBe('settled')
-    expect(last.mem.done).toBe(true)
+    // Quiet is not done: the watch slows to a sentinel, only the window ends it.
+    expect(last.action).toBe('quiet')
+    expect(last.mem.quiet).toBe(true)
+    expect(last.mem.done).toBe(false)
+    const later = settleStep(reading({ elapsedMs: SETTLE_QUIET_CHECKS * 400 + 2000 }), last.mem)
+    expect(later.action).toBe('quiet')
+    const closed = settleStep(reading({ elapsedMs: SETTLE_WINDOW_MS }), later.mem)
+    expect(closed.action).toBe('settled')
+    expect(closed.mem.done).toBe(true)
+  })
+
+  test('THE LATE LANDING: quiet for six seconds on the wrong frame, then the transforms arrive — still corrected', () => {
+    // Measured 2026-09-02: the joiner agreed with itself (installed = live =
+    // LOCAL) until the level transforms landed at ~8 s; the first cut had
+    // latched "settled" by then and never re-anchored (refusedGrid 11,
+    // regrids 0). Quiet must keep one eye open.
+    let mem = newSettleMemory()
+    for (let n = 1; n <= SETTLE_QUIET_CHECKS + 2; n++) {
+      mem = settleStep(reading({ elapsedMs: n * 400, installed: LOCAL, live: LOCAL }), mem).mem
+    }
+    expect(mem.quiet).toBe(true)
+    // 8 s: the scene lands; the live anchor now reads the world point.
+    let step = settleStep(reading({ elapsedMs: 8000, installed: LOCAL, live: A }), mem)
+    expect(step.action).toBe('wait') // one drifting reading: not yet stable
+    step = settleStep(reading({ elapsedMs: 10000, installed: LOCAL, live: A }), step.mem)
+    expect(step.action).toBe('reanchor')
+    expect(step.mem.reanchors).toBe(1)
+    expect(step.mem.quiet).toBe(false)
+  })
+
+  test('a refused record is evidence: a nudged drifting reading corrects on the spot', () => {
+    const step = settleStep(
+      reading({ elapsedMs: 3000, installed: LOCAL, live: A, nudged: true }),
+      newSettleMemory(),
+    )
+    expect(step.action).toBe('reanchor')
+    // Without the nudge the same first reading only waits for a second look.
+    const unnudged = settleStep(reading({ elapsedMs: 3000, installed: LOCAL, live: A }), newSettleMemory())
+    expect(unnudged.action).toBe('wait')
+    // A nudge never overrides the guards: addressed pieces still block.
+    const guarded = settleStep(
+      reading({ elapsedMs: 3000, hasPieces: true, hasSlotPieces: true, installed: LOCAL, live: A, nudged: true }),
+      newSettleMemory(),
+    )
+    expect(guarded.action).toBe('blocked')
   })
 
   test('a scene that keeps changing never goes quiet — the cap ends it', () => {

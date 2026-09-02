@@ -41,6 +41,12 @@
  * damaged or built. Both are capped and both stop at the window: a session
  * that cannot be corrected safely says so ('blocked') instead of thrashing.
  *
+ * QUIET IS NOT DONE. The first cut stopped watching after six agreeing
+ * seconds; a joiner whose transforms landed at eight agreed with itself, then
+ * drifted with nobody looking. Now quiet only slows the watch to a sentinel
+ * cadence, the window alone ends it, and a peer's record refused against our
+ * stamp (a 'nudge' from net-world) waives the stability wait outright.
+ *
  * Pure decision math, no scene/React/three imports — the driver (game-root's
  * ActiveGame) samples the world and applies the verdict, and settle.test.ts
  * proves every branch headless.
@@ -68,6 +74,16 @@ export const SETTLE_STABLE_CHECKS = 2
  * cover a storey arriving after the ground floor, short enough that a healthy
  * session isn't polling for a minute. */
 export const SETTLE_QUIET_CHECKS = 15
+/**
+ * After quiet the watcher does NOT stop — it slows to this cadence until the
+ * window closes. Measured 2026-09-02 (two-client harness, headless): a late
+ * joiner agreed with itself on the still-unapplied level transforms for the
+ * first six seconds, the watcher latched "settled", and when the transforms
+ * landed at ~8 s the live anchor drifted 15 m with nobody left to look:
+ * `refusedGrid 11, regrids 0` for the whole session. A quiet scene is a
+ * scene that has stopped moving SO FAR.
+ */
+export const SETTLE_SENTINEL_MS = 2000
 
 /** Anchor agreement tolerances. The stamp quantizes position to millimetres
  * (world.quantPos) and yaw to 0.05°, so anything below these is the same
@@ -104,11 +120,17 @@ export type SettleReading = {
   hasPieces: boolean
   /** Any destruction target with a cell already gone. */
   hasDamage: boolean
+  /** A peer's slot-addressed record was just refused for a grid-stamp
+   * mismatch — the loudest possible evidence that OUR frame is the odd one.
+   * Waives the stability wait: the room has already agreed on a lattice. */
+  nudged?: boolean
 }
 
 export type SettleAction =
   /** Nothing to correct yet (or the scene is still moving). */
   | 'wait'
+  /** Agreeing and quiet: keep watching, slowly (SETTLE_SENTINEL_MS). */
+  | 'quiet'
   /** Re-install the lattice frame + re-publish the stamp. */
   | 'reanchor'
   /** Re-run collectWorld and adopt the fresh snapshot. */
@@ -125,12 +147,14 @@ export type SettleMemory = {
   key: string
   recollects: number
   reanchors: number
-  /** Latched once the watcher is finished (settled or blocked). */
+  /** The reading has been quiet: the driver polls at the sentinel cadence. */
+  quiet: boolean
+  /** Latched once the watcher is finished (window closed, or blocked). */
   done: boolean
 }
 
 export function newSettleMemory(): SettleMemory {
-  return { done: false, key: '', reanchors: 0, recollects: 0, stable: 0 }
+  return { done: false, key: '', quiet: false, reanchors: 0, recollects: 0, stable: 0 }
 }
 
 /** Same lattice? Missing on either side counts as disagreement ONLY when one
@@ -212,20 +236,25 @@ export function settleStep(
 
   if (!drifted) {
     // Agreement is the normal case (the first player into a room reads it on
-    // the first sample). Keep watching a while anyway — a scene can agree at
-    // 400 ms and still move a storey in seconds later — but leave once the
-    // reading has been quiet, so a healthy session stops polling.
-    if (expired || stable >= SETTLE_QUIET_CHECKS) {
-      return { action: 'settled', mem: { ...waited, done: true } }
+    // the first sample). Keep watching anyway — a scene can agree at 400 ms
+    // and still move a storey in seconds later — and once the reading has
+    // been quiet, keep watching SLOWLY: quiet means "stopped moving so far",
+    // and the joiner's transforms have landed eight seconds in. Only the
+    // window ends the watch.
+    if (expired) return { action: 'settled', mem: { ...waited, done: true } }
+    if (mem.quiet || stable >= SETTLE_QUIET_CHECKS) {
+      return { action: 'quiet', mem: { ...waited, quiet: true } }
     }
     return { action: 'wait', mem: waited }
   }
-
   // Drifting, but out of time — stop. Reporting 'blocked' here would be a lie:
   // we never got a stable reading to act on.
   if (expired) return { action: 'settled', mem: { ...waited, done: true } }
-
-  if (stable < SETTLE_STABLE_CHECKS) return { action: 'wait', mem: waited }
+  // Two identical drifting readings before acting — unless the room has just
+  // refused one of its records against our stamp, which settles the question.
+  if (stable < SETTLE_STABLE_CHECKS && !r.nudged) {
+    return { action: 'wait', mem: { ...waited, quiet: false } }
+  }
 
   const anchorDrift =
     !anchorsAgree(r.installed, r.live) || !laddersAgree(r.installedLadder, r.liveLadder)
@@ -236,13 +265,13 @@ export function settleStep(
   if (wallsShort && canRecollect) {
     return {
       action: 'recollect',
-      mem: { ...waited, key: '', recollects: mem.recollects + 1, stable: 0 },
+      mem: { ...waited, key: '', quiet: false, recollects: mem.recollects + 1, stable: 0 },
     }
   }
   if (anchorDrift && canReanchor) {
     return {
       action: 'reanchor',
-      mem: { ...waited, key: '', reanchors: mem.reanchors + 1, stable: 0 },
+      mem: { ...waited, key: '', quiet: false, reanchors: mem.reanchors + 1, stable: 0 },
     }
   }
   // A stable, real drift we may not touch: pieces already addressed in the old

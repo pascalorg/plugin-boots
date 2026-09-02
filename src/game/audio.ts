@@ -945,6 +945,38 @@ export const sfx = {
     thump(210 * v, 0.05, 0.18)
   },
 
+  /**
+   * A bot announcing its swing, heard from where it stands: the droid's servo
+   * winds up, the dog growls into the lunge, the drone's rotors pitch up before
+   * the dive. Rides the same distance law as remote gunfire so a swing behind
+   * you across the yard is a whisper and one at your back is not.
+   */
+  botTell(kind: 'droid' | 'dog' | 'drone', distance: number): void {
+    const mix = remoteShotMix(distance)
+    if (mix.level <= 0.004) return
+    const c = ensureContext()
+    if (!c || !master) return
+    const level = c.createGain()
+    level.gain.value = Math.min(1, mix.level * 1.4)
+    const air = c.createBiquadFilter()
+    air.type = 'lowpass'
+    air.frequency.value = Math.max(1400, mix.cutoffHz)
+    air.Q.value = 0.7
+    level.connect(air)
+    air.connect(master)
+    const dest: AudioNode = level
+    const v = rr()
+    if (kind === 'dog') {
+      thump(70 * v, 0.36, 0.5, 0, 'sawtooth', dest)
+      burst({ duration: 0.3, gain: 0.25, filterType: 'bandpass', freq: 220 * v, freqEnd: 460 * v, q: 3, dest }, 0.04)
+    } else if (kind === 'drone') {
+      burst({ duration: 0.42, gain: 0.3, freq: 900 * v, freqEnd: 2400 * v, q: 6, dest })
+    } else {
+      burst({ duration: 0.45, gain: 0.32, freq: 480 * v, freqEnd: 1700 * v, q: 8, dest })
+      thump(120 * v, 0.12, 0.25, 0.34, 'square', dest)
+    }
+  },
+
   botHit(): void {
     burst({ duration: 0.05, gain: 0.3, freq: 2200, q: 2.5 })
     thump(200, 0.05, 0.2)

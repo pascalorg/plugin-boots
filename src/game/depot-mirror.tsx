@@ -10,6 +10,7 @@ import {
   MeshBasicMaterial,
   MeshStandardMaterial,
   type Object3D,
+  OrthographicCamera,
   type PerspectiveCamera,
   PlaneGeometry,
   Vector3,
@@ -28,10 +29,12 @@ import {
   articulate,
   type AvatarArticulation,
   AvatarRig,
+  blendArticulation,
   createArticulation,
   createRigRefs,
   gripFor,
   localPaletteIndex,
+  placeRoot,
   subscribeLocalPalette,
 } from './remote-players'
 import { VIEWMODEL_NAME } from './viewmodel'
@@ -106,8 +109,10 @@ export const MIRROR_PANE_SIZE: readonly [number, number] = [1.04, 1.95]
 export const MIRROR_SILL_Y = 0.2
 /** Steel frame strip width (m), outside the glass. */
 export const MIRROR_FRAME = 0.04
-/** Nothing runs unless the player is within this distance of the pane (m). */
-export const MIRROR_RANGE = 4.5
+/** Nothing runs unless the player is within this distance of the pane (m):
+ * the whole depot and its approach. Beyond it the glass is a sliver on screen
+ * and reads as steel either way. */
+export const MIRROR_RANGE = 16
 /** Render target [width, height] — about half resolution at the pane's aspect. */
 export const MIRROR_TARGET_SIZE: readonly [number, number] = [512, 960]
 
@@ -165,6 +170,15 @@ const _pane: MirrorPane = {
 const VIEWMODEL_RESCAN = 30
 
 /**
+ * The warm-up camera: an orthographic box a few kilometres on a side, with a
+ * negative near, so its frustum contains the whole scene and compileAsync
+ * (which culls to the camera like a render does) sees every object. The
+ * projection never matters for a pipeline — only materials, geometry layouts
+ * and the target's format do.
+ */
+const _warmCam = new OrthographicCamera(-5000, 5000, 5000, -5000, -5000, 5000)
+
+/**
  * The glass, its frame, and the body it reflects. Rendered as a CHILD of the
  * depot's root group, so every number above is in the depot's own frame and
  * the whole thing rides the container's placement and yaw for free.
@@ -181,6 +195,15 @@ export function DepotMirror({ world }: { world: GameWorld }) {
   const refs = useRef(createRigRefs()).current
   const gaitPhase = useRef(0)
   const clock = useRef(0)
+  // The live pose the body wears, eased toward each frame's target.
+  const pose = useRef(createArticulation())
+  // WARM-UP. The first pass used to hitch: every material in the scene needed
+  // a pipeline for the render target's format (it differs from the canvas's),
+  // and the skinned body had never been drawn. Both now happen in the first
+  // frames after mount — inside the loading beat — with compileAsync into the
+  // target (frame 1) and one real pass (frame 2), whether or not anyone is at
+  // the glass. 0 = pending, 1 = compiled, 2 = warm.
+  const warm = useRef(0)
   // The body holds what we hold. A store subscription, so a weapon swap
   // re-renders the rig exactly once, like a peer's does off the wire.
   const weapon = useBoots((s) => s.weapon)
@@ -256,13 +279,35 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     // (the renderer would only do it at render time, after us).
     camera.updateMatrixWorld()
 
+    if (warm.current === 0) {
+      warm.current = 1
+      const gl = state.gl
+      const prevTarget = gl.getRenderTarget()
+      _warmCam.layers.mask = camera.layers.mask
+      // The render list is built synchronously inside compileAsync (only the
+      // pipeline builds are awaited), so the body can be shown for exactly
+      // that call and the target bound around it.
+      self.visible = true
+      gl.setRenderTarget(gear.target)
+      const compiling = gl.compileAsync(state.scene, _warmCam)
+      gl.setRenderTarget(prevTarget)
+      self.visible = false
+      compiling.catch(() => {
+        // A backend that cannot precompile still works — the first pass just pays.
+      })
+      return
+    }
+    const warmPass = warm.current === 1
+    if (warmPass) warm.current = 2
+
     const [lx, lz] = worldToDepotLocal(world, playerRig.position.x, playerRig.position.z)
     const engaged = mirrorEngaged(lx, lz) && paneInView(camera, pane)
     const face = engaged ? gear.live : gear.idle
     if (pane.material !== face) pane.material = face
     mirrorDebug.engaged = engaged
-    // Nobody at the glass: one hypot, one frustum test, and out.
-    if (!engaged) return
+    // Nobody at the glass: one hypot, one frustum test, and out (except the
+    // one warm pass, which renders regardless so the first real one is warm).
+    if (!engaged && !warmPass) return
 
     // ── the body: ours, posed like a peer's ────────────────────────────────
     const dt = Math.min(rawDt, 1 / 30)
@@ -280,13 +325,15 @@ export function DepotMirror({ world }: { world: GameWorld }) {
       gripFor(weapon),
       clock.current,
     )
+    blendArticulation(pose.current, _artic, dt)
     // playerRig.position is the EYE (feet + EYE_HEIGHT + bob) — exactly what
     // goes out on the wire, so plant the feet exactly as remote-players does.
     _local.copy(playerRig.position)
     parent.worldToLocal(_local)
-    self.position.set(_local.x, _local.y - EYE_HEIGHT + _artic.bobY, _local.z)
-    self.rotation.y = playerRig.yaw - yawOffset
-    applyArticulation(refs, _artic)
+    const localYaw = playerRig.yaw - yawOffset
+    placeRoot(self, _local.x, _local.y - EYE_HEIGHT, _local.z, localYaw, pose.current)
+    self.rotation.y = localYaw
+    applyArticulation(refs, pose.current)
 
     // ── the camera: the reflected eye, frustum fitted to the glass ─────────
     camera.getWorldPosition(_eye)

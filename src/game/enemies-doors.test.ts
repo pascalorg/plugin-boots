@@ -35,6 +35,8 @@ function makeBot(kind: BotKind, x: number, z: number): Bot {
     state: 'alive',
     deadT: 0,
     attackCooldown: 1,
+    windupT: 0,
+    strikeT: 0,
     phase: 0,
     seed: 0,
     blockedT: 0,

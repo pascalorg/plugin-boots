@@ -28,6 +28,7 @@ import { Doors, doorsDebug } from './doors'
 import {
   newSettleMemory,
   SETTLE_CHECK_MS,
+  SETTLE_SENTINEL_MS,
   type SettleAction,
   settleStep,
 } from './entry-settle'
@@ -47,7 +48,9 @@ import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
 import { PaintTool } from './paint'
 import { MOVE } from './movement'
-import { startWorldSync, stopWorldSync, worldSyncDebug } from './net-world'
+import { startWorldSync, stopWorldSync, worldSyncDebug,
+  onGridRefused,
+} from './net-world'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
 import { mirrorDebug } from './depot-mirror'
 import { Player, playerDebug, playerRig } from './player'
@@ -620,14 +623,18 @@ function ActiveGame() {
   useEffect(() => {
     if (settleMem.current.done) return
     if (settleStartedAt.current === 0) settleStartedAt.current = Date.now()
-    let id: ReturnType<typeof setInterval> | null = null
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let nudged = false
+    let stopped = false
+    const schedule = (ms: number) => {
+      if (timer) clearTimeout(timer)
+      timer = stopped ? null : setTimeout(tick, ms)
+    }
     const tick = () => {
-      // Latched finished (settled, or corrected as far as it may be): stop
-      // deriving. This watcher must not outlive the question it asks.
-      if (settleMem.current.done) {
-        if (id) clearInterval(id)
-        return
-      }
+      timer = null
+      // Latched finished (the window closed, or blocked): stop deriving. This
+      // watcher must not outlive the question it asks.
+      if (settleMem.current.done || stopped) return
       const live = deriveLiveGrid()
       const placed = useBoots.getState().placed
       let damaged = false
@@ -654,11 +661,19 @@ function ActiveGame() {
           live: live.anchor,
           liveLadder: [liveTerrainY, ...(normalizeStoreyLadder(live.ladder, liveTerrainY) ?? [])],
           liveWalls: live.wallCount,
+          nudged,
         },
         settleMem.current,
       )
       settleMem.current = step.mem
-      if (step.action !== 'wait') settleLast.current = { action: step.action, at: Date.now() }
+      if (step.action !== 'wait' && step.action !== 'quiet') {
+        // A refusal that arrived before the host transforms landed would be
+        // consumed on a not-yet-drifting reading and wasted; keep it armed
+        // until it actually corrects something, so the first drifting reading
+        // after the scene lands acts at once.
+        nudged = false
+        settleLast.current = { action: step.action, at: Date.now() }
+      }
       if (step.action === 'reanchor') {
         installGridFrame(live.anchor, live.ladder)
         console.info(
@@ -677,10 +692,21 @@ function ActiveGame() {
           '[boots] lot drifted after entry but the correction was refused (pieces or damage already exist) — peers may refuse slot-addressed pieces this session',
         )
       }
+      // Quiet slows the watch to a sentinel; anything else keeps the full cadence.
+      if (!settleMem.current.done) schedule(step.mem.quiet ? SETTLE_SENTINEL_MS : SETTLE_CHECK_MS)
     }
-    id = setInterval(tick, SETTLE_CHECK_MS)
+    // A peer's record refused against our stamp is evidence, not noise: look
+    // again NOW, and let entry-settle waive its stability wait for this look.
+    const offRefused = onGridRefused(() => {
+      if (settleMem.current.done) return
+      nudged = true
+      schedule(0)
+    })
+    schedule(SETTLE_CHECK_MS)
     return () => {
-      if (id) clearInterval(id)
+      stopped = true
+      if (timer) clearTimeout(timer)
+      offRefused()
     }
   }, [world])
 

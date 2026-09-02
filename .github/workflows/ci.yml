@@ -1,0 +1,22 @@
+# The plugin's own gate. Until this file existed, nothing outside a developer's
+# machine ran the plugin's type-check or its test suite; the host pin was bumped
+# on a self-reported green. Every push and PR now proves both.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run check-types
+      - run: bun test

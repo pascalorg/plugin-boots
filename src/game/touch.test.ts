@@ -8,7 +8,7 @@ import {
   EXIT,
   FIRE,
   SLOT_WEAPON,
-  SPRINT_AT,
+  WALK_BELOW,
   STICK_DEAD,
   STICK_RADIUS,
   stickKeys,
@@ -67,7 +67,7 @@ describe('stickVector', () => {
 
 describe('stickKeys', () => {
   test('the deadzone holds NOTHING (a resting thumb must not walk)', () => {
-    expect(stickKeys(0, 0)).toEqual({ codes: [], sprint: false })
+    expect(stickKeys(0, 0)).toEqual({ codes: [], walk: false })
     expect(stickKeys(STICK_DEAD * 0.9, 0).codes).toEqual([])
   })
 
@@ -97,12 +97,18 @@ describe('stickKeys', () => {
     expect(stickKeys(-0.3, -0.1).codes).toEqual(['KeyA'])
   })
 
-  test('sprint engages only at the rim', () => {
-    expect(stickKeys(0, SPRINT_AT - 0.01).sprint).toBe(false)
-    expect(stickKeys(0, SPRINT_AT).sprint).toBe(true)
-    expect(stickKeys(0, 1).sprint).toBe(true)
-    // …and a full diagonal sprints too (magnitude, not per-axis).
-    expect(stickKeys(Math.SQRT1_2, Math.SQRT1_2).sprint).toBe(true)
+  test('a gentle push walks, a firm push runs — never the other way round', () => {
+    // Shift is WALK in the game; the first cut held it at the rim, so a phone
+    // player who pushed harder went slower.
+    expect(stickKeys(0, WALK_BELOW - 0.01).walk).toBe(true)
+    expect(stickKeys(0, WALK_BELOW).walk).toBe(false)
+    expect(stickKeys(0, 1).walk).toBe(false)
+    // …and a full diagonal runs too (magnitude, not per-axis).
+    expect(stickKeys(Math.SQRT1_2, Math.SQRT1_2).walk).toBe(false)
+    // A nudge just past the dead zone still moves — and creeps.
+    const nudge = stickKeys(0, 0.25)
+    expect(nudge.codes).toEqual(['KeyW'])
+    expect(nudge.walk).toBe(true)
   })
 })
 

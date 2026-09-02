@@ -20,7 +20,8 @@ import type { GameInput } from './input'
  *    written as WASD membership rather than an analog axis — every movement
  *    consumer (player.tsx's fwd/side, the sprint gate, the stagger checks)
  *    keeps reading exactly what a keyboard produces, so nothing downstream
- *    learns that a phone exists. Past SPRINT_AT the stick also holds Shift.
+ *    learns that a phone exists. A gentle push (under WALK_BELOW) also holds
+ *    Shift — walk; a firm push runs.
  *  - DRAG TO LOOK, anywhere outside the stick zone and the buttons, scaled by
  *    LOOK_GAIN into `state.lookX/lookY` — the same accumulator mousemove feeds,
  *    drained by player.tsx through consumeLook().
@@ -57,8 +58,15 @@ import type { GameInput } from './input'
 export const STICK_RADIUS = 58
 /** Below this fraction of full deflection the stick is centred (no keys). */
 export const STICK_DEAD = 0.18
-/** At or past this fraction the stick also holds Shift. */
-export const SPRINT_AT = 0.86
+/**
+ * Below this fraction of full deflection the stick also holds Shift — a gentle
+ * push WALKS, a firm push runs. Shift means walk everywhere in the game
+ * (player.tsx's `walk: keys.has('ShiftLeft')`), which the first cut had
+ * backwards: it held Shift at the RIM, so the harder a phone player pushed,
+ * the slower they went. Half the ring is the boundary so an ordinary push
+ * runs and only a deliberate nudge creeps.
+ */
+export const WALK_BELOW = 0.5
 /** Per-axis fraction that counts as "pushed" — 45° gives 0.707, so a diagonal
  * lands both keys and a straight push lands exactly one. */
 export const AXIS_ON = 0.38
@@ -75,7 +83,7 @@ export const FIRE = 'FIRE'
 export const AIM = 'AIM'
 export const EXIT = 'EXIT'
 
-export type StickKeys = { codes: string[]; sprint: boolean }
+export type StickKeys = { codes: string[]; walk: boolean }
 
 /**
  * Stick vector → the key set a keyboard would be holding. `nx` is right-positive
@@ -83,7 +91,7 @@ export type StickKeys = { codes: string[]; sprint: boolean }
  */
 export function stickKeys(nx: number, ny: number): StickKeys {
   const mag = Math.hypot(nx, ny)
-  if (mag < STICK_DEAD) return { codes: [], sprint: false }
+  if (mag < STICK_DEAD) return { codes: [], walk: false }
   const codes: string[] = []
   if (ny >= AXIS_ON) codes.push('KeyW')
   if (ny <= -AXIS_ON) codes.push('KeyS')
@@ -95,7 +103,7 @@ export function stickKeys(nx: number, ny: number): StickKeys {
     if (Math.abs(ny) >= Math.abs(nx)) codes.push(ny > 0 ? 'KeyW' : 'KeyS')
     else codes.push(nx > 0 ? 'KeyD' : 'KeyA')
   }
-  return { codes, sprint: mag >= SPRINT_AT }
+  return { codes, walk: mag < WALK_BELOW }
 }
 
 /** Thumb offset from the stick origin → normalised vector, capped at the ring.
@@ -525,17 +533,21 @@ export class TouchControls {
     const input = this.input
     if (!input) return
     const { nx, ny } = stickVector(dx, dy)
-    const { codes, sprint } = stickKeys(nx, ny)
+    const { codes, walk } = stickKeys(nx, ny)
     const keys = input.state.keys
     for (const code of MOVE_CODES) {
-      const want = code === 'ShiftLeft' ? sprint : codes.includes(code)
+      const want = code === 'ShiftLeft' ? walk : codes.includes(code)
       if (want) keys.add(code)
       else keys.delete(code)
     }
     const len = Math.hypot(dx, dy)
     const cap = len > STICK_RADIUS ? STICK_RADIUS / len : 1
     this.moveKnob(dx * cap, dy * cap)
-    if (this.ring) this.ring.style.borderColor = sprint ? 'rgba(255,204,51,0.60)' : 'rgba(255,255,255,0.22)'
+    // The ring lights up when you are RUNNING (a firm push), dims for a creep.
+    const moving = codes.length > 0
+    if (this.ring) {
+      this.ring.style.borderColor = moving && !walk ? 'rgba(255,204,51,0.60)' : 'rgba(255,255,255,0.22)'
+    }
   }
 
   private clearMove(): void {

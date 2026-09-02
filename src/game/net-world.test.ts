@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import {
+  answerDelayMs,
   HEAL_PERIOD_MS,
   MAX_WIRE_TEXT,
   PUBLISH_TICK_MS,
@@ -889,5 +890,28 @@ describe('the constants are the policy', () => {
     // The host keeps the latest value per (plugin, event) per 66 ms. Ticking
     // faster cannot make frames leave sooner, it only manufactures 'deferred'.
     expect(PUBLISH_TICK_MS).toBeGreaterThanOrEqual(66)
+  })
+})
+
+describe('a join answer is deferred, never dropped', () => {
+  test('outside the gap it fires after the jitter alone', () => {
+    expect(answerDelayMs(10_000, 0, 250)).toBe(250)
+    expect(answerDelayMs(10_000, 6_000, 0)).toBe(0)
+  })
+
+  test('inside the gap it waits for the rest of the gap, plus the jitter', () => {
+    // Our last snapshot went out 1 s ago; the gap is 3 s.
+    expect(answerDelayMs(4_000, 3_000, 0)).toBe(2_000)
+    expect(answerDelayMs(4_000, 3_000, 300)).toBe(2_300)
+    // Right on the edge: nothing left to wait.
+    expect(answerDelayMs(3_000 + 3_000, 3_000, 0)).toBe(0)
+  })
+
+  test('a negative jitter never pulls an answer inside the gap', () => {
+    expect(answerDelayMs(4_000, 3_000, -500)).toBe(2_000)
+  })
+
+  test("the default gap is the publisher's own", () => {
+    expect(answerDelayMs(0, 0, 0)).toBe(3_000)
   })
 })

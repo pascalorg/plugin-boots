@@ -2912,3 +2912,80 @@ frame, elbow bent for a rifle).
 **Shipped.** Host PR #503 squash-merged to `main` as `0a17ab09d` on the owner's
 instruction, pinning plugin `6f3b778`: the real mirror, Pascaline's body with
 elbows and knees, the two-handed holds. Production follows `main`.
+
+## 2026-09-02 — The CTO pass: four fixes the owner asked for, three the review found
+
+Owner brief: the mirror hitches the first time you step in front of it and
+does nothing from far away; the hands look wrong around the gun; the body
+moves unnaturally and stands too still; then "think like a new CTO", list ten
+improvements, ship the top three. Notes for the pass live in
+`~/Downloads/BOOTS-CTO-PLAN.md`.
+
+### The four
+
+- **Hitch.** The first pass compiled a pipeline for every material in the
+  scene against the render target's format (it is not the canvas's) and drew
+  the skinned body for the first time. `DepotMirror` now warms both inside
+  the loading beat: frame one binds the target and calls `compileAsync` with
+  an orthographic camera whose frustum is a five-kilometre box (compileAsync
+  culls like a render; a perspective camera cannot see behind itself), body
+  visible for exactly that synchronous list-building call; frame two runs one
+  real pass whatever the gating says. The harness asserts a pass has run
+  before anyone approaches.
+- **Range.** 4.5 m became 16: the whole depot and its approach. The frustum
+  gate still decides.
+- **Hands.** An open hand modelled around nothing never closes on a grip; a
+  fist that replaces it does. `gripL/gripR` in the articulation; the hand bone
+  collapses to 2% and a rounded fist in the skin material sits at the grip
+  point in the hand frame — right hand for anything held, left only for a
+  two-handed gun.
+- **Motion.** Three layers on the one articulation. IDLE (fades out by a
+  quarter of run speed): slow weight shift — torso roll, alternating soft
+  knees, a lateral lean — a slower torso sway, the head looking around on two
+  incommensurate sines, the free arm drifting; per-peer seed so a lobby never
+  breathes in unison. STRIDE: shoulders twist against the legs, hips roll over
+  the stance leg, the root sways, the head counters the twist, a forward arm
+  bends its elbow more. BLEND: `blendArticulation` eases the live pose toward
+  the target — legs 22/s so the beat stays crisp, arms 12, trunk 9, hands 14
+  — so a weapon swap, a stop or a jump arrives over a few frames instead of
+  snapping. The harness's "stops when you stop" check had to learn this: it
+  now hunts for the frame the ease has settled instead of demanding zero on
+  the first still frame.
+
+### The review
+
+Thirty-three agents: eleven read one subsystem each (player, combat,
+destruction, building, multiplayer, voice/HUD, avatar, runtime, audio,
+quality, product), three ranked the dossier through a lens (player
+experience, engineering health, robustness at scale), a judge merged them
+into ten, and eighteen skeptics tried to refute the top six by reading the
+code — every one of the six survived, most with adjustments that changed the
+implementation (the reach gate must compare feet to feet; the deferred join
+answer must re-check the gap when it fires). The ten are in the notes. The
+three shipped:
+
+1. **The phone stick ran backwards.** `SPRINT_AT` held Shift at the rim, and
+   Shift is WALK in player.tsx: the harder a phone player pushed, the slower
+   they went. Half the ring is now the boundary the other way round.
+2. **Every melee is telegraphed.** A bot's swing winds up — the droid draws
+   both arms back and leans in, the dog crouches and rears, the drone dips,
+   each with its own sound on the remote-gunfire distance law — and lands at
+   the END, only if the player is still in reach (a little slack), on the same
+   storey (feet to feet: a droid under a balcony edge no longer hits the
+   player standing on it), behind no wall, not downed, and not inside the one
+   second of grace that follows getting up. Step back in time and it misses.
+3. **The late joiner who never got the map.** The two-client harness failed
+   its relay section once tonight and the counters said why: `refusedGrid 11,
+   regrids 0`. The joiner's settle watcher had agreed with itself for six quiet
+   seconds on level transforms the host had not applied yet, latched
+   "settled", and was gone when they landed two seconds later; every piece in
+   the room was refused for the session. Quiet is not done: the watcher now
+   slows to a two-second sentinel until the ninety-second window closes, and a
+   peer's record refused against our stamp nudges it to look immediately and
+   act on that look. The other half: a join request inside the answerer's
+   three-second gap was DROPPED — two friends clicking one link seconds apart
+   left the second with an empty lot — and is now deferred to the gap's end.
+
+Plus the review's top engineering item, at effort one: `.github/workflows/
+ci.yml` runs `check-types` and `bun test` on every push and PR. Until tonight
+nothing outside a developer's machine ran either.

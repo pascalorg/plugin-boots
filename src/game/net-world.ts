@@ -104,6 +104,7 @@ import {
   detachBuildSync,
   onGridStampChange,
   remintSharedRecords,
+  refoldSharedStrokes,
 } from './shared-build'
 import {
   createOutbox,
@@ -147,6 +148,38 @@ export const SNAP_MIN_GAP_MS = 3000
 /** Spread simultaneous answers so N peers do not all publish in one window. */
 export const SNAP_JITTER_MS = 400
 
+/**
+ * How long to hold a join answer: nothing once the gap since our last snapshot
+ * has passed, else the rest of the gap — plus the jitter either way. Pure, so
+ * the deferral (not a drop: two friends clicking one link three seconds apart
+ * used to leave the second with an empty lot) is pinned by tests.
+ */
+export function answerDelayMs(now: number, lastSnapAt: number, jitter: number, minGap = SNAP_MIN_GAP_MS): number {
+  return Math.max(0, lastSnapAt + minGap - now) + Math.max(0, jitter)
+}
+
+/**
+ * After a re-anchor the room re-sends its pieces and we re-install them as NEW
+ * instances — but the coats had already folded onto the old ones (measured:
+ * `regrids 1, relayed 3, landed 2` and the latecomer's wall bare). For this
+ * long after a stamp change every ingest re-offers the room's whole stroke
+ * ledger; folding is idempotent by construction, so a coat already right is
+ * a no-op and a coat on a replaced piece comes back.
+ */
+export const REFOLD_AFTER_REGRID_MS = 10_000
+let refoldUntil = 0
+
+/** Told whenever a peer's slot-addressed record is refused against our grid
+ * stamp — the settle watcher (game-root) treats it as evidence and looks again
+ * right away. */
+const gridRefusedListeners = new Set<() => void>()
+export function onGridRefused(fn: () => void): () => void {
+  gridRefusedListeners.add(fn)
+  return () => {
+    gridRefusedListeners.delete(fn)
+  }
+}
+
 type Counters = {
   /** Frames the host accepted. */
   sent: number
@@ -189,7 +222,8 @@ type Counters = {
    * corrected, which is a bug, not a recovery.
    */
   regrids: number
-  /** Snapshot answers suppressed by the rate limit. */
+  /** Join answers that had to wait for the rate-limit gap (deferred to its
+   * end, never dropped). */
   throttled: number
   /**
    * Frames a lane offered through its OWN sink and we dropped on the floor,
@@ -425,12 +459,21 @@ function ingest(msg: NetMessage<SharedDelta>): void {
     counters.refusedGrid++
     // Whose fault it was, recorded at the only moment anyone can tell.
     if (s.world.gridStamp === 0) counters.blindGrid++
+    for (const fn of gridRefusedListeners) fn()
   }
   counters.relayed += fx.relayed
   try {
     applyBuildEffects(fx)
   } catch {
     counters.applyErrors++
+  }
+  // Pieces re-installed after a re-anchor need their coats back (see refoldUntil).
+  if (Date.now() < refoldUntil) {
+    try {
+      refoldSharedStrokes()
+    } catch {
+      counters.applyErrors++
+    }
   }
   try {
     applySharedDamage(fx)
@@ -505,21 +548,25 @@ export function startWorldSync(): boolean {
     onStateRequest((req) => {
       if (req.of !== WORLD_KIND) return
       const live = session
+      // One pending answer serves every request behind it (it carries the
+      // whole map either way).
       if (!live || live.answer) return
-      const now = Date.now()
-      if (now - live.lastSnapAt < SNAP_MIN_GAP_MS) {
-        counters.throttled++
-        return
+      const delay = answerDelayMs(Date.now(), live.lastSnapAt, Math.random() * SNAP_JITTER_MS)
+      if (delay > SNAP_JITTER_MS) counters.throttled++ // deferred to the gap's end, never dropped
+      const fire = () => {
+        const still = session
+        if (!still) return
+        // Re-check at fire time: a heal or a re-key may have refreshed the
+        // gap while we waited. Never answer inside it.
+        const again = answerDelayMs(Date.now(), still.lastSnapAt, 0)
+        if (again > 0) {
+          still.answer = setTimeout(fire, again)
+          return
+        }
+        still.answer = null
+        queueSnapshot(still, Date.now())
       }
-      live.answer = setTimeout(
-        () => {
-          const still = session
-          if (!still) return
-          still.answer = null
-          queueSnapshot(still, Date.now())
-        },
-        Math.random() * SNAP_JITTER_MS,
-      )
+      live.answer = setTimeout(fire, delay)
     }),
   )
 
@@ -542,6 +589,7 @@ export function startWorldSync(): boolean {
     const live = session
     if (!live) return
     counters.regrids++
+    refoldUntil = Date.now() + REFOLD_AFTER_REGRID_MS
     queueSnapshot(live, Date.now())
     requestState(WORLD_KIND)
   })
@@ -569,6 +617,7 @@ export function stopWorldSync(): void {
   if (s.answer) clearTimeout(s.answer)
   for (const off of s.offs) off()
   onGridStampChange(null) // the listener closes over `session`; don't outlive it
+  refoldUntil = 0
   detachBuildSync()
   setDamageSync(null)
 }
