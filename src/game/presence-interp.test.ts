@@ -9,8 +9,11 @@ import {
   lerpAngle,
   type PresenceFrame,
   pushSnapshot,
+  MAX_SHOTS_PER_SAMPLE,
   RING_CAP,
   sampleAt,
+  SHOT_COUNTER_MOD,
+  shotsFired,
   STALE_MS,
   TELEPORT_SNAP_M,
   validateFrame,
@@ -28,6 +31,7 @@ function frame(overrides: Partial<PresenceFrame> = {}): PresenceFrame {
     s: 0.6,
     g: true,
     st: false,
+    f: 0,
     ...overrides,
   }
 }
@@ -90,6 +94,60 @@ describe('validateFrame — the trust boundary', () => {
     expect(validateFrame(frame({ s: 4 }))!.s).toBe(1)
     expect(validateFrame(frame({ s: -0.5 }))!.s).toBe(0)
     expect(validateFrame(frame({ s: Number.NaN }))).toBeNull()
+  })
+
+  /**
+   * `f` arrived after v1 shipped, so it is a SOFT field: a peer still running
+   * the older build sends nine fields, and refusing those frames would cost
+   * them their whole avatar over a feature they cannot send. Junk normalizes to
+   * 0 (no shot) rather than rejecting, for the same reason.
+   */
+  test('the fire counter defaults to 0 and normalizes into a byte', () => {
+    expect(validateFrame({ ...frame(), f: undefined })!.f).toBe(0)
+    expect(validateFrame(frame({ f: 'many' as never }))!.f).toBe(0)
+    expect(validateFrame(frame({ f: Number.NaN }))!.f).toBe(0)
+    expect(validateFrame(frame({ f: -3 }))!.f).toBe(SHOT_COUNTER_MOD - 3)
+    expect(validateFrame(frame({ f: 300 }))!.f).toBe(44)
+    expect(validateFrame(frame({ f: 12.9 }))!.f).toBe(12)
+    expect(validateFrame(frame({ f: 255 }))!.f).toBe(255)
+  })
+})
+
+describe('shotsFired — a counter difference, not an event', () => {
+  test('the first sighting of a peer never replays their magazine', () => {
+    // -1 is "never sampled": walking up to someone who has fired 57 rounds must
+    // not open with 57 muzzle flashes at once.
+    expect(shotsFired(-1, 57)).toBe(0)
+    expect(shotsFired(-1, 0)).toBe(0)
+  })
+
+  test('a steady stream is one shot per step', () => {
+    expect(shotsFired(4, 5)).toBe(1)
+    expect(shotsFired(4, 4)).toBe(0)
+  })
+
+  test('a dropped frame becomes a burst, not a lost shot', () => {
+    expect(shotsFired(4, 6)).toBe(2)
+    expect(shotsFired(4, 7)).toBe(3)
+  })
+
+  test('the byte wrap is invisible', () => {
+    expect(shotsFired(SHOT_COUNTER_MOD - 1, 0)).toBe(1)
+    expect(shotsFired(SHOT_COUNTER_MOD - 2, 1)).toBe(3)
+  })
+
+  test(`a big jump is capped at ${MAX_SHOTS_PER_SAMPLE}`, () => {
+    // A peer who was out of range for a whole minigun burst comes back with a
+    // gap of 200 on their counter. That is not 200 flashes and 200 reports; it
+    // is "they were shooting", and a few rounds say so at bounded cost.
+    expect(shotsFired(0, 200)).toBe(MAX_SHOTS_PER_SAMPLE)
+    expect(shotsFired(0, SHOT_COUNTER_MOD - 1)).toBe(MAX_SHOTS_PER_SAMPLE)
+  })
+
+  test('junk counters are silent', () => {
+    expect(shotsFired(0, Number.NaN)).toBe(0)
+    expect(shotsFired(Number.NaN, 5)).toBe(0)
+    expect(shotsFired(0, Number.POSITIVE_INFINITY)).toBe(0)
   })
 })
 
@@ -176,6 +234,36 @@ describe('sampleAt — lerp between brackets', () => {
     expect(out.w).toBe('minigun')
     expect(out.g).toBe(false)
     expect(out.st).toBe(true)
+  })
+
+  /**
+   * The fire counter is the ONE discrete field that rides the OLDER snapshot,
+   * and this test is why: a shot is an instant, not a state. Sampling 10 ms into
+   * a 100 ms bracket, the avatar is still 90 ms of travel away from where the
+   * newer snapshot was taken — voicing that snapshot's round now would put the
+   * bang ahead of the body it came out of. The older side is exactly where the
+   * pose currently IS, so the flash, the report and the arm agree.
+   */
+  test('the fire counter rides the OLDER bracket snapshot', () => {
+    const ring = createRing()
+    push(ring, 1000, { f: 4, p: [0, 0, 0] })
+    push(ring, 1100, { f: 6, p: [1, 0, 0] })
+    const out = createSampledPose()
+    sampleAt(ring, 1010, out)
+    expect(out.f).toBe(4)
+    // …and it reaches the newer count once the sample gets there.
+    sampleAt(ring, 1100, out)
+    expect(out.f).toBe(6)
+  })
+
+  test('a lone snapshot and an extrapolated pose both carry its count', () => {
+    const ring = createRing()
+    push(ring, 1000, { f: 9, p: [0, 0, 0] })
+    const out = createSampledPose()
+    sampleAt(ring, 1000, out)
+    expect(out.f).toBe(9)
+    sampleAt(ring, 1000 + EXTRAPOLATE_MAX_MS, out) // past the newest, frozen
+    expect(out.f).toBe(9)
   })
 
   test('before the oldest snapshot the pose clamps to it', () => {

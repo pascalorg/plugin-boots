@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from 'react'
 import { type Object3D, Raycaster, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { GameBoundary } from './boundary'
-import { Builder, PlacedPieces } from './builder'
+import { Builder, installGridFrame, PlacedPieces } from './builder'
 import { craterSlots } from './craters'
 import { clearDebris, Debris, debrisDump, setDebrisGroundProbe } from './debris'
 import {
@@ -25,12 +25,19 @@ import {
   type VoxelTarget,
 } from './destruction'
 import { Doors, doorsDebug } from './doors'
+import {
+  newSettleMemory,
+  SETTLE_CHECK_MS,
+  type SettleAction,
+  settleStep,
+} from './entry-settle'
 import { clearDust, dustDebug, DustSystem, setDustFloorProbe } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { PlacedFittings } from './fittings'
 import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
+import { getGridAnchor, getStoreyLadder, gridTerrainY, normalizeStoreyLadder } from './grid'
 import { groundSurfaceY, resetGround } from './ground'
 import { GunTable } from './guntable'
 import { HostPostTuning, hostPostDebug } from './host-post'
@@ -79,6 +86,7 @@ import {
   collectSolidRoots,
   collectWorld,
   countCoplanarSuspects,
+  deriveLiveGrid,
   type GameWorld,
   gridAudit,
   installGroundProbes,
@@ -434,6 +442,7 @@ const _localPose: LocalPose = {
   s: 0,
   g: true,
   st: false,
+  f: 0,
 }
 
 function sampleLocalPose(): LocalPose {
@@ -448,6 +457,9 @@ function sampleLocalPose(): LocalPose {
   _localPose.s = Math.min(1, playerRig.speed / MOVE.runSpeed)
   _localPose.g = playerRig.grounded
   _localPose.st = s.staggered
+  // Gunfire rides the pose (see presence-interp's header): the viewmodel bumps
+  // this on every round fired, the publisher wraps it into the wire counter.
+  _localPose.f = playerRig.shots
   return _localPose
 }
 
@@ -579,6 +591,96 @@ function ActiveGame() {
     if (world.walls.size > 0) return
     const fresh = collectWorld()
     if (fresh.walls.size > 0) setWorld(fresh)
+  }, [world])
+
+  // THE LOT SETTLES AFTER YOU LAND — the late joiner's snapshot, corrected.
+  //
+  // The snapshot above is taken the instant Jump in is clicked, and for the
+  // first player into a room that is a scene that finished mounting long ago.
+  // A player who joins by link is different: measured 2026-09-01 on two
+  // clients in the same document, the second one collected 236 of 347 walls
+  // and derived the build lattice from wall roots STILL AT IDENTITY — it
+  // published a grid stamp naming a lot 15 m from the one it stood in, so
+  // every piece the two players built was refused across the wire, all
+  // session. The owner reported exactly that: "others couldn't see my
+  // constructions… we should always all see the state of the map as it is
+  // currently." Its own derivation was correct ~5 s later; nothing was
+  // unknowable, the snapshot was simply early.
+  //
+  // So: poll what we WOULD publish against what we DID, and once the readings
+  // stop moving, correct — re-anchor (cheap, fixes the wire) or, when the
+  // snapshot is also short of walls and the session holds nothing to lose,
+  // re-collect (the frame comes back through PlacedPieces' [world] effect).
+  // entry-settle.ts owns every rule, including the refusals; this is only the
+  // sampler. Bounded by SETTLE_WINDOW_MS and by both correction caps.
+  const settleMem = useRef(newSettleMemory())
+  const settleStartedAt = useRef(0)
+  const settleLast = useRef<{ action: SettleAction; at: number } | null>(null)
+  useEffect(() => {
+    if (settleMem.current.done) return
+    if (settleStartedAt.current === 0) settleStartedAt.current = Date.now()
+    let id: ReturnType<typeof setInterval> | null = null
+    const tick = () => {
+      // Latched finished (settled, or corrected as far as it may be): stop
+      // deriving. This watcher must not outlive the question it asks.
+      if (settleMem.current.done) {
+        if (id) clearInterval(id)
+        return
+      }
+      const live = deriveLiveGrid()
+      const placed = useBoots.getState().placed
+      let damaged = false
+      for (const target of useDestruction.getState().targets.values()) {
+        if (target.grid.aliveCount < target.grid.alive.length) {
+          damaged = true
+          break
+        }
+      }
+      // Compare the STAMP PREIMAGE, not the raw ladders: the installed one is
+      // normalized (grid.setStoreyLadder), and the terrain rung belongs to
+      // whichever anchor is being measured — the live ladder is normalized
+      // against the ground under the LIVE anchor for the same reason.
+      const liveTerrainY = groundSurfaceY(live.anchor.x, live.anchor.z)
+      const step = settleStep(
+        {
+          collectedWalls: world.walls.size,
+          elapsedMs: Date.now() - settleStartedAt.current,
+          hasDamage: damaged,
+          hasPieces: placed.length > 0,
+          hasSlotPieces: placed.some((p) => Boolean(p.slotId)),
+          installed: getGridAnchor(),
+          installedLadder: [gridTerrainY(), ...(getStoreyLadder() ?? [])],
+          live: live.anchor,
+          liveLadder: [liveTerrainY, ...(normalizeStoreyLadder(live.ladder, liveTerrainY) ?? [])],
+          liveWalls: live.wallCount,
+        },
+        settleMem.current,
+      )
+      settleMem.current = step.mem
+      if (step.action !== 'wait') settleLast.current = { action: step.action, at: Date.now() }
+      if (step.action === 'reanchor') {
+        installGridFrame(live.anchor, live.ladder)
+        console.info(
+          `[boots] lot settled — re-anchored the build lattice at (${live.anchor.x.toFixed(2)}, ${live.anchor.z.toFixed(2)}) and re-published the grid stamp`,
+        )
+      } else if (step.action === 'recollect') {
+        const fresh = collectWorld()
+        console.info(
+          `[boots] lot settled — re-collected the world (${world.walls.size} → ${fresh.walls.size} walls)`,
+        )
+        setWorld(fresh) // PlacedPieces' [world] effect re-installs the frame
+      } else if (step.action === 'blocked') {
+        // Honest dead end: the session already holds work the correction would
+        // move or drop. Say so — a silent 'wait' forever reads as healthy.
+        console.info(
+          '[boots] lot drifted after entry but the correction was refused (pieces or damage already exist) — peers may refuse slot-addressed pieces this session',
+        )
+      }
+    }
+    id = setInterval(tick, SETTLE_CHECK_MS)
+    return () => {
+      if (id) clearInterval(id)
+    }
   }, [world])
 
   // Co-presence adapter lifecycle — keyed on the session serial (ActiveGame
@@ -860,6 +962,17 @@ function ActiveGame() {
       // anchor, the ladder, the levels behind it and the longest walls the
       // anchor votes on (world.gridAudit).
       gridAudit: () => gridAudit(),
+      // …and whether the entry snapshot had to be CORRECTED (entry-settle.ts).
+      // A latecomer that re-anchors reports `reanchors 1` here and a matching
+      // `gridStampPublishes` bump in buildSync — the pair is how a harness
+      // tells "the late joiner was born right" apart from "the late joiner was
+      // fixed", which look identical from the wire.
+      settle: () => ({
+        ...settleMem.current,
+        collectedWalls: world.walls.size,
+        lastAction: settleLast.current?.action ?? null,
+        sinceEntryMs: settleStartedAt.current === 0 ? 0 : Date.now() - settleStartedAt.current,
+      }),
       // Voice QA dump (voice.ts): one line per peer with its real
       // RTCPeerConnection state, what description it still owes, its mixed gain
       // and whether a track has actually arrived — plus `notSent`/`given_up`,

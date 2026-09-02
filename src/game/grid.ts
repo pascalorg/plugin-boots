@@ -183,10 +183,21 @@ export function resetGridTerrainY(): void {
  * boundaries — or a null — resets to the uniform-STOREY fallback.
  * world.ts derives it; builder.tsx wires it alongside the grid anchor. */
 export function setStoreyLadder(ys: readonly number[] | null | undefined): void {
-  if (!ys || ys.length < 2) {
-    _storeyY = null
-    return
-  }
+  _storeyY = normalizeStoreyLadder(ys, _terrainY)
+}
+
+/**
+ * The normalization setStoreyLadder applies, as pure math over an explicit
+ * terrain elevation. Exported because the entry-settle watcher has to compare
+ * a LIVE re-derivation against the INSTALLED ladder, and the installed one is
+ * normalized — comparing raw against normalized reads as a permanent
+ * disagreement and would re-publish the stamp forever.
+ */
+export function normalizeStoreyLadder(
+  ys: readonly number[] | null | undefined,
+  terrainY: number,
+): number[] | null {
+  if (!ys || ys.length < 2) return null
   const ladder: number[] = []
   for (const y of ys) {
     if (!Number.isFinite(y)) continue
@@ -204,17 +215,17 @@ export function setStoreyLadder(ys: readonly number[] | null | undefined): void 
   // storey prepended; basement ladders (bottom rung a storey or more DOWN)
   // keep their own ground-level rung untouched. _terrainY is the ground
   // under the building, 0 on a flat lot.
-  if (ladder.length > 0 && Math.abs(ladder[0]! - _terrainY) > TERRAIN_EPS) {
-    if (ladder[0]! - _terrainY >= MIN_TERRAIN_SPAN) {
-      ladder.unshift(_terrainY)
+  if (ladder.length > 0 && Math.abs(ladder[0]! - terrainY) > TERRAIN_EPS) {
+    if (ladder[0]! - terrainY >= MIN_TERRAIN_SPAN) {
+      ladder.unshift(terrainY)
     } else if (
-      ladder[0]! - _terrainY > -MIN_TERRAIN_SPAN &&
-      (ladder.length < 2 || ladder[1]! > _terrainY + TERRAIN_EPS)
+      ladder[0]! - terrainY > -MIN_TERRAIN_SPAN &&
+      (ladder.length < 2 || ladder[1]! > terrainY + TERRAIN_EPS)
     ) {
-      ladder[0] = _terrainY
+      ladder[0] = terrainY
     }
   }
-  _storeyY = ladder.length >= 2 ? ladder : null
+  return ladder.length >= 2 ? ladder : null
 }
 
 /** The live ladder (normalized), or null in legacy uniform mode — QA/tests

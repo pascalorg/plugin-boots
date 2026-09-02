@@ -9,10 +9,13 @@ import {
   createArticulation,
   DETAIL_MAX_DIST,
   detailVisible,
+  flashScale,
   hashUserId,
   LEG_SWING_MAX,
   materialsFor,
   paletteIndexFor,
+  remoteMuzzle,
+  shotKindFor,
   SLUMP_ARM_AIM,
   SLUMP_TORSO,
   SPAWN_SCALE_MS,
@@ -21,6 +24,7 @@ import {
   TAG_MAX_DIST,
   tagOpacity,
   tagVisible,
+  TRACER_LEN,
 } from './remote-players'
 
 /**
@@ -211,5 +215,60 @@ describe('join scale-in + name-tag gate', () => {
     for (let d = 0; d <= 60; d += 0.5) {
       if (tagOpacity(d * d) > 0) expect(tagVisible(d * d)).toBe(true)
     }
+  })
+})
+
+/**
+ * Remote gunfire, the pure half. The flash itself is R3F assembly reviewed
+ * live, but WHICH weapons flash, which report they use and how big the flash
+ * gets are rules, and rules get pinned.
+ */
+describe('remote gunfire — only guns flash', () => {
+  test('the three guns have a muzzle, in the weapon-model space', () => {
+    for (const gun of ['pistol', 'rifle', 'minigun']) {
+      const muzzle = remoteMuzzle(gun)
+      expect(muzzle).not.toBeNull()
+      // Grip at the origin, barrel down -Z: the muzzle is always in front.
+      expect(muzzle![2]).toBeLessThan(0)
+    }
+    // A longer gun's muzzle is farther out — the flash sits at the tip, not
+    // somewhere inside the receiver.
+    expect(remoteMuzzle('minigun')![2]).toBeLessThan(remoteMuzzle('pistol')![2])
+  })
+
+  test('nothing else does — a knife swing can never bloom a muzzle flash', () => {
+    for (const held of ['knife', 'hammer', 'builder', 'paint', '', 'ar15', 'railgun']) {
+      expect(remoteMuzzle(held)).toBeNull()
+    }
+  })
+
+  test('each gun gets its own report; unknown ids fall back audible', () => {
+    expect(shotKindFor('pistol')).toBe('pistol')
+    expect(shotKindFor('minigun')).toBe('minigun')
+    expect(shotKindFor('rifle')).toBe('rifle')
+    // A newer peer holding something this build has never heard of still makes
+    // a noise: a shot you cannot place beats a silent one.
+    expect(shotKindFor('plasma-thing')).toBe('rifle')
+    expect(shotKindFor('')).toBe('rifle')
+  })
+
+  test('the flash grows with range, monotonically and bounded', () => {
+    expect(flashScale(0)).toBe(1)
+    let previous = 0
+    for (let d = 0; d <= 200; d += 1) {
+      const scale = flashScale(d)
+      expect(scale).toBeGreaterThanOrEqual(previous)
+      expect(scale).toBeLessThanOrEqual(4) // never a beach ball at the fence
+      previous = scale
+    }
+    expect(flashScale(50)).toBe(4)
+    expect(flashScale(-10)).toBe(1) // behind the camera is still point blank
+  })
+
+  test('the tracer is a stub, not a beam to the target', () => {
+    // Impacts announce themselves with their own dust and debris on this
+    // client, so the streak only has to say "that barrel just fired".
+    expect(TRACER_LEN).toBeGreaterThan(1)
+    expect(TRACER_LEN).toBeLessThan(5)
   })
 })

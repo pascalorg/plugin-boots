@@ -24,6 +24,7 @@ import {
   getPaintedByNode,
   PAINT_PALETTE,
   paintColorOf,
+  paintDebug,
   paintStrengthOf,
   paintValue,
   remoteCoatedCells,
@@ -38,10 +39,13 @@ import {
   attachBuildSync,
   buildSyncOn,
   detachBuildSync,
+  drainPendingStrokes,
   forgetGridStamp,
   forgetSharedPieces,
   isForeignPiece,
   isForeignPlacement,
+  isOurRecord,
+  onGridStampChange,
   pieceRecordOf,
   publishAperture,
   publishGridStamp,
@@ -49,6 +53,7 @@ import {
   publishStroke,
   receiveBuildDelta,
   reconcileSharedPieces,
+  refoldSharedStrokes,
   remintSharedRecords,
   resetSharedBuild,
   setBuildAppliers,
@@ -64,7 +69,9 @@ import {
   emptyDelta,
   liveRecords,
   localWork,
+  PIECE_TARGET_PREFIX,
   type PieceRec,
+  pieceTargetId,
   quantYaw,
   rekeySharedWorld,
   type SharedDelta,
@@ -187,13 +194,20 @@ function fakeTarget(nodeId: string): VoxelTarget {
     nodeId,
     kind: 'wall',
     dormant: false,
-    grid: { count, alive: new Uint8Array(count).fill(1), centers, cellY: 0.15 },
+    // All three cell dimensions, because the coat rescue sizes its reach off
+    // them (coatReachFor): a stub missing cellX/cellZ reads as NaN and every
+    // near-miss silently deposits nothing.
+    grid: { count, alive: new Uint8Array(count).fill(1), centers, cellX: 0.15, cellY: 0.15, cellZ: 0.12 },
   } as unknown as VoxelTarget
 }
 
-/** foldRemoteStrokes only reads `world` to voxelize a node it cannot find;
- * every test pre-seeds the target, so the argument is never touched. */
-const NO_WORLD = {} as unknown as GameWorld
+/**
+ * A world with nothing in it. foldRemoteStrokes reaches for `world` only to
+ * voxelize a node it has no target for; an EMPTY one is the honest stand-in
+ * (ensureVoxelTarget finds no meshes and returns null), which is what the
+ * deferral tests need — a resolvable name with nothing yet to paint.
+ */
+const NO_WORLD = { walls: new Map(), colliders: [] } as unknown as GameWorld
 
 /**
  * The appliers item-place.tsx's GameItems and paint.tsx's PaintTool install
@@ -336,6 +350,89 @@ describe('the grid frame survives the mount order', () => {
     const world = createSharedWorld('us')
     attachBuildSync(world)
     expect(world.gridStamp).toBe(0)
+  })
+})
+
+/**
+ * A RE-ANCHOR HAS TO REACH THE WIRE (entry-settle.ts).
+ *
+ * A session that entered the game before its scene finished arriving publishes a
+ * stamp naming the wrong lot; the settle watcher notices and re-publishes. That
+ * correction is worthless on its own: everything the room sent while we were
+ * wrong was refused by the grid gate, and a refusal leaves NOTHING behind for a
+ * retry to find — no record, no seen-mark. So the corrected peer has to ask
+ * again, and re-offer its own work, which is what this notification is for.
+ * Measured 2026-09-01: the latecomer's stamp went 2665421742 → 474931770 (its
+ * peer's) once the wall roots landed.
+ */
+describe('a corrected grid frame announces itself', () => {
+  test('the first publish is not a correction — entry already asks the room', () => {
+    let told = 0
+    onGridStampChange(() => {
+      told++
+    })
+    attachBuildSync(createSharedWorld('us'))
+    publishGridStamp(0, 0, 0, LADDER)
+    expect(told).toBe(0)
+  })
+
+  test('re-publishing the SAME lot is silent (mount churn, a re-collect that agrees)', () => {
+    let told = 0
+    attachBuildSync(createSharedWorld('us'))
+    publishGridStamp(0, 0, 0, LADDER)
+    onGridStampChange(() => {
+      told++
+    })
+    publishGridStamp(0, 0, 0, LADDER)
+    publishGridStamp(0, 0, 0, [...LADDER])
+    expect(told).toBe(0)
+  })
+
+  test('a publish naming a DIFFERENT lot notifies once, with the world already updated', () => {
+    const world = createSharedWorld('us')
+    attachBuildSync(world)
+    const wrong = publishGridStamp(4.177, -15.425, 0, LADDER) // the late joiner's lot
+    const seen = { stamp: 0 }
+    onGridStampChange(() => {
+      // Ordering matters: the listener re-offers our records on the wire, so the
+      // world must ALREADY carry the corrected stamp when it runs.
+      seen.stamp = world.gridStamp
+    })
+    const right = publishGridStamp(19.602, -11.249, 0, LADDER)
+    expect(right).not.toBe(wrong)
+    expect(seen.stamp).toBe(right)
+  })
+
+  test('the ladder alone is a different lot (it is in the preimage)', () => {
+    let told = 0
+    attachBuildSync(createSharedWorld('us'))
+    publishGridStamp(0, 0, 0, LADDER)
+    onGridStampChange(() => {
+      told++
+    })
+    publishGridStamp(0, 0, 0, [...LADDER, LADDER[LADDER.length - 1]! + 2.8])
+    expect(told).toBe(1)
+  })
+
+  test('unsubscribing is honoured, and a new session starts silent', () => {
+    attachBuildSync(createSharedWorld('us'))
+    publishGridStamp(0, 0, 0, LADDER)
+    let told = 0
+    onGridStampChange(() => {
+      told++
+    })
+    onGridStampChange(null)
+    publishGridStamp(5, 5, 0, LADDER)
+    expect(told).toBe(0)
+
+    // Session teardown: the next session's first publish is a first frame, not
+    // a correction — it must not ask the room to re-send at entry.
+    forgetGridStamp()
+    onGridStampChange(() => {
+      told++
+    })
+    publishGridStamp(7, 7, 0, LADDER)
+    expect(told).toBe(0)
   })
 })
 
@@ -874,6 +971,277 @@ describe('remote strokes fold into the one coat ledger', () => {
     expect(repainted).toBe(paintValue(5, 0.45)) // not 0.9 carried across colours
   })
 
+  /**
+   * WHOSE WALL DID THAT SPRAY LAND ON?
+   *
+   * A stroke names its surface, and a PLAYER-BUILT wall has no document id to
+   * name — store.ts numbers pieces from a counter that restarts on every page
+   * load, so my second wall and yours are both `__boots-piece-2`. Two-client QA
+   * caught the consequence on 2026-09-01: A sprayed a wall it had built, the
+   * record travelled under A's own number, and B folded the coat onto nothing.
+   *
+   * The damage lane had already solved this (shared-damage's wireNodeId /
+   * localNodeId — a shared piece is named by its RECORD id, which carries its
+   * author and reads the same everywhere). The paint lane now uses the SAME two
+   * functions, so there is one answer to "the name a target travels under".
+   */
+  test('a stroke on a peer’s wall lands on this client’s copy of it', () => {
+    const h = boot()
+    installAppliers()
+    // Their wall arrives first, and gets whatever local number this session
+    // hands out — deliberately NOT the number in the record.
+    const wall = theirWall(h, WALL_SLOT)
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(wall)), 'them')
+    const localId = useBoots.getState().placed[0]!.id
+    const localNode = `${PIECE_TARGET_PREFIX}${localId}`
+    useDestruction.getState().targets.set(localNode, fakeTarget(localNode))
+
+    // The stroke names the wall the way the wire does: by record.
+    const stroke = addLocalStroke(h.theirs, {
+      node: pieceTargetId(wall.id),
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(stroke)), 'them')
+
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: localNode, remote: 3 }])
+    // …and nothing was written under the wire name itself, which is not a node.
+    expect(getPaintedByNode().get(pieceTargetId(wall.id))).toBeUndefined()
+  })
+
+  test('a writing-range stroke that clears every cell centre still lands', () => {
+    /**
+     * Up close the spray is a stroke a few centimetres wide, so its ball fits
+     * BETWEEN cell centres: sprayPaint coats the single cell under the
+     * crosshair instead (nearestCoatCell). The fold had no such rescue, so the
+     * sprayer saw a mark nobody else did — the two-client harness read
+     * "folded 2, zero cells" until the fold used the same rule (2026-09-01).
+     */
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    // The strip's cells sit at x = −0.3 … 0.3, spaced 0.15. Aim between two of
+    // them with a radius far too small to reach either centre.
+    const tight = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: 3,
+      x: 0.075,
+      y: 0,
+      z: 0,
+      radius: 0.01,
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(tight)), 'them')
+    expect(paintDebug.coated()).toEqual([{ cells: 1, nodeId: 'wall_a', remote: 1 }])
+
+    // A ball genuinely off the wall is still nothing — the rescue is a
+    // half-cell reach, not a magnet.
+    const away = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: 3,
+      x: 0.075,
+      y: 4,
+      z: 0,
+      radius: 0.01,
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(away)), 'them')
+    expect(paintDebug.coated()).toEqual([{ cells: 1, nodeId: 'wall_a', remote: 1 }])
+  })
+
+  test('a stroke that arrives before its wall waits for it, then lands', () => {
+    /**
+     * A stroke is grid-free and a piece is slot-addressed, so a joiner on a
+     * stale grid stamp accepts the paint and refuses the wall it belongs to —
+     * and records are grow-only, so the stroke is never re-offered. That dropped
+     * a latecomer's coat for the whole session (`foldUnnamed 1` with the wall
+     * standing right there, two-client QA 2026-09-01).
+     */
+    const h = boot()
+    installAppliers()
+    const wall = theirWall(h, WALL_SLOT)
+    const stroke = addLocalStroke(h.theirs, {
+      node: pieceTargetId(wall.id),
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+
+    // The paint first, with nothing here to put it on.
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(stroke)), 'them')
+    expect(paintDebug.coated()).toEqual([])
+    expect(sharedBuildDebug().pendingStrokes).toBe(1)
+
+    // The wall arrives. It is voxelized lazily, so the retry that runs with it
+    // still finds no grid — and the stroke keeps waiting rather than dying.
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(wall)), 'them')
+    const localNode = `${PIECE_TARGET_PREFIX}${useBoots.getState().placed[0]!.id}`
+    expect(sharedBuildDebug().pendingStrokes).toBe(1)
+
+    // Once there is something to paint, the next piece install re-offers it.
+    useDestruction.getState().targets.set(localNode, fakeTarget(localNode))
+    receiveBuildDelta(
+      frame(h, 'them', (d) => d.pieces.push(theirWall(h, OTHER_SLOT))),
+      'them',
+    )
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: localNode, remote: 3 }])
+    expect(sharedBuildDebug().pendingStrokes).toBe(0)
+
+    // And it is not folded twice: the coat is the same strength as one stroke.
+    expect(paintStrengthOf(getPaintedByNode().get(localNode)!.get(2)!)).toBeCloseTo(0.45, 2)
+  })
+
+  test('a wiped coat ledger rebuilds itself from the records the room holds', () => {
+    /**
+     * The ledger is DERIVED and the records are the truth, but delivery happens
+     * once: a ledger emptied after a stroke arrived could never get that coat
+     * back. And it does get emptied — PaintTool's mount effect resets it, and QA
+     * caught `paintMounts 2` on a joiner, which is the owner's "others couldn't
+     * see my constructions" in its paint form.
+     */
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const stroke = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(stroke)), 'them')
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: 'wall_a', remote: 3 }])
+    const coat = paintStrengthOf(getPaintedByNode().get('wall_a')!.get(2)!)
+
+    // The tool remounts: the ledger is gone, and so is any hope of the record
+    // being sent again.
+    resetPaint()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    expect(paintDebug.coated()).toEqual([])
+
+    // Asking the record set rebuilds the same coat, still attributed to them.
+    refoldSharedStrokes()
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: 'wall_a', remote: 3 }])
+    expect(paintStrengthOf(getPaintedByNode().get('wall_a')!.get(2)!)).toBeCloseTo(coat, 5)
+
+    // And a SECOND rebuild is not a second coat — a record is deposited once.
+    refoldSharedStrokes()
+    refoldSharedStrokes()
+    expect(paintStrengthOf(getPaintedByNode().get('wall_a')!.get(2)!)).toBeCloseTo(coat, 5)
+  })
+
+  test('a rebuild leaves our own strokes ours, so Save still writes them', () => {
+    /**
+     * A rebuild re-folds the whole room's stroke set, ours included — and the
+     * fold marks what it deposits as somebody else's work, which is what keeps a
+     * stranger's paint out of this player's Save. Attributing by the PATH the
+     * record came down would therefore delete the player's own paint from their
+     * own file. Attribution is by AUTHOR.
+     */
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const mine = addLocalStroke(h.mine, {
+      node: 'wall_a',
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    expect(isOurRecord(mine.id)).toBe(true)
+
+    refoldSharedStrokes()
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: 'wall_a', remote: 0 }])
+    expect(getOwnPaintedByNode().get('wall_a')?.size).toBe(3)
+  })
+
+  test('a waiting stroke lands on the drain when no second piece ever comes', () => {
+    /**
+     * The install-driven retry is not enough on its own: the frame that installs
+     * the wall has no grid for it yet, and in a real room nothing else may be
+     * built for minutes. The heartbeat is what closes that hole — and it counts
+     * the wait ONCE however many times it retries (under the first reason: this
+     * stroke waited for its NAME before it waited for a grid), so the counters
+     * read as "records that had to wait" and not as "attempts".
+     */
+    const h = boot()
+    installAppliers()
+    const wall = theirWall(h, WALL_SLOT)
+    const stroke = addLocalStroke(h.theirs, {
+      node: pieceTargetId(wall.id),
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(stroke)), 'them')
+    receiveBuildDelta(frame(h, 'them', (d) => d.pieces.push(wall)), 'them')
+    const localNode = `${PIECE_TARGET_PREFIX}${useBoots.getState().placed[0]!.id}`
+    expect(paintDebug.coated()).toEqual([])
+
+    // Beating against a wall with no grid changes nothing, and says so once.
+    drainPendingStrokes()
+    drainPendingStrokes()
+    expect(sharedBuildDebug().pendingStrokes).toBe(1)
+    const waits = paintDebug.wire()
+    expect(waits.foldUnnamed + waits.foldNoTarget).toBe(1)
+
+    // Then the voxel target exists, and the very next beat coats it.
+    useDestruction.getState().targets.set(localNode, fakeTarget(localNode))
+    drainPendingStrokes()
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: localNode, remote: 3 }])
+    expect(sharedBuildDebug().pendingStrokes).toBe(0)
+
+    // An empty list is a no-op, not another fold of what already landed.
+    drainPendingStrokes()
+    expect(paintStrengthOf(getPaintedByNode().get(localNode)!.get(2)!)).toBeCloseTo(0.45, 2)
+  })
+
+  test('a stroke naming a piece by NUMBER is refused, not resolved', () => {
+    // `__boots-piece-1` on the wire is a peer's own counter (or a forgery). The
+    // one thing it is not is a reference to whatever of MINE wears that number,
+    // so the coat is dropped rather than sprayed across a stranger's wall.
+    const h = boot()
+    installAppliers()
+    const mine = myWall(WALL_SLOT)
+    const localNode = `${PIECE_TARGET_PREFIX}${mine}`
+    useDestruction.getState().targets.set(localNode, fakeTarget(localNode))
+    const stroke = addLocalStroke(h.theirs, {
+      node: localNode,
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(stroke)), 'them')
+    expect(paintDebug.coated()).toEqual([])
+  })
+
+  test('a stroke on a HOST wall needs no translation at all', () => {
+    // The common case, and the reason the translation is a lookup and not a
+    // rewrite: a document node id already means the same thing everywhere.
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    const stroke = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: 3,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(stroke)), 'them')
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: 'wall_a', remote: 3 }])
+  })
+
   test('re-delivering the same strokes does not double-coat', () => {
     const h = boot()
     installAppliers()
@@ -943,6 +1311,38 @@ describe('remote strokes fold into the one coat ledger', () => {
     for (const value of own.values()) expect(paintColorOf(value)).toBe(7)
     // And the shared ledger still holds the full picture for the drain.
     expect(getPaintedByNode().get('wall_a')!.size).toBe(3)
+  })
+
+  test('the QA coat report names the node and how much of it is theirs', () => {
+    // The oracle the two-client harness reads: censuses count stamps in the
+    // representation THIS client chose (decals on a pristine wall, sprites on a
+    // shot-up one), so only cells can answer "the same spray on both screens".
+    const h = boot()
+    installAppliers()
+    useDestruction.getState().targets.set('wall_a', fakeTarget('wall_a'))
+    expect(paintDebug.coated()).toEqual([])
+
+    const rec = addLocalStroke(h.theirs, {
+      node: 'wall_a',
+      color: 4,
+      x: 0,
+      y: 0,
+      z: 0,
+      radius: coatRadiusFor(0.5),
+    })!
+    receiveBuildDelta(frame(h, 'them', (d) => d.strokes.push(rec)), 'them')
+    expect(paintDebug.coated()).toEqual([{ cells: 3, nodeId: 'wall_a', remote: 3 }])
+
+    // Our own spray over the middle takes those cells back — same node, same
+    // count, and the receiving-side marker drops.
+    const mesh = new Mesh(new PlaneGeometry(6, 6))
+    mesh.updateMatrixWorld(true)
+    spawnPaintDecal(mesh, 'wall_a', new Vector3(0, 0, 0), new Vector3(0, 0, 1), 0.4, 7)
+    convertDecalsForNode('wall_a')
+    const after = paintDebug.coated()[0]!
+    expect(after.nodeId).toBe('wall_a')
+    expect(after.cells).toBe(3)
+    expect(after.remote).toBeLessThan(3)
   })
 })
 

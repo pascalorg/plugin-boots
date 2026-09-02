@@ -209,7 +209,8 @@ Rides the envelope as `kind: 'pose'`:
   "w": "rifle",       // held weapon id (unknown ids render bare hands)
   "s": 0.62,          // horizontal speed normalized 0..1 (gait cadence)
   "g": true,          // grounded (false = airborne tuck pose)
-  "st": false         // staggered (true = slump pose)
+  "st": false,        // staggered (true = slump pose)
+  "f": 37             // rounds fired this session, mod 256 (see Gunfire)
 }
 ```
 
@@ -219,12 +220,21 @@ positions or angles, non-boolean flags and oversize weapon ids are dropped
 silently; `s` is clamped instead of dropped; unknown extra fields are
 stripped (forward compatibility, so a newer peer's frame still renders).
 
+`f` is the one SOFT field: it arrived after v1 shipped, so a frame without it
+is accepted and reads 0. A peer still running the older build keeps their
+avatar and simply never flashes — refusing their frames instead would cost
+them their whole presence over a feature they cannot send. Junk normalizes to
+0 (no shot) for the same reason.
+
 ## Publish policy (pinned by tests)
 
 - 12 Hz base; 10 Hz once MORE than 4 remotes are live (crowd back-off).
 - Idle skip: a pose unchanged beyond epsilons (1.5 cm / ~0.09° / discrete
   fields exact) is not re-sent — but never stay silent longer than 500 ms
-  (the keep-alive that feeds peers' staleness clocks).
+  (the keep-alive that feeds peers' staleness clocks). The fire counter is
+  part of "unchanged": a player standing still and emptying a magazine is
+  idle by every other measure, and without `f` in the comparison their shots
+  would arrive in one lump up to half a second late.
 - `'deferred'` is a SKIP, not a queue: the frame is dropped and the next tick
   builds a fresh one. Stale poses are worse than missing ones.
 - `stopPresence()` publishes one final explicit `ph:'editor'` frame so peers
@@ -283,6 +293,66 @@ Opacity is change-gated so a stationary crowd writes no material state.
 WebGPU-safe throughout: primitives + standard materials + CanvasTexture
 only; zero per-frame allocations (module temps, ring slots reused).
 
+## Gunfire (`f`, one counter, no new lane)
+
+Owner report, 2026-09-01: *"last time I could not hear or see other players
+shoot. I shoot. I see my gun and I could hear it. I want the others to shoot
+the same. Everyone nearby should hear it close and everyone far should just
+hear a little bit of it far. Opening on distance. And some visual too."*
+
+A shot is not a fact about the world, it is part of a pose — so it rides the
+pose, as a counter, not an event on a lane of its own:
+
+- `playerRig.shots` increments once per round in the viewmodel's gun branch
+  (melee and the spray can are elsewhere and never touch it). Nothing local
+  reads it; the publisher carries it as `f = shots mod 256`.
+- A receiver keeps the last count it SAW for that peer and voices the
+  DIFFERENCE (`shotsFired`, pure): a dropped frame becomes a delta of 2 rather
+  than a lost shot, the byte wrap is invisible, a first sighting is 0 (nobody
+  walks into a 57-round salvo), and a gap wider than
+  `MAX_SHOTS_PER_SAMPLE` (3) is capped — "they were shooting" at bounded cost.
+- No new kind, no new trust boundary, no second clock: flash, report and the
+  arm that fired all arrive through the one interpolation that was already
+  there.
+
+**`f` rides the OLDER side of an interpolation bracket** — the only discrete
+field that does (`w`/`g`/`st` all take the newer one). A shot is an instant:
+sampling 10 ms into a 100 ms bracket, the avatar is still 90 ms of travel away
+from where the newer snapshot was taken, so voicing that snapshot's round now
+would put the bang ahead of the body it came out of. The older side is exactly
+where the pose currently is.
+
+What a receiver draws and plays (`remote-players.tsx`, `audio.ts`):
+
+- a 50 ms muzzle flash (hot core + gas cone) and a 2.6 m tracer stub,
+  parented to the muzzle of the gun the peer is holding — so they point
+  wherever that peer aims, through the arm chain, with no math of ours.
+  `remoteMuzzle` returns null for knife/hammer/builder/paint, which is what
+  keeps a flash from blooming off the end of a crowbar. Shared geometry and
+  materials across the lobby, so firing is a `visible` toggle (a shared
+  material has one opacity — the `SPEAK_MATERIAL` lesson).
+- the flash SCALE grows with range (capped at 4×) so a firefight across the
+  lot still reads at 60 m instead of being two pixels.
+- one `sfx.remoteShot(kind, distance, pan, offset)`. `remoteShotMix` is the
+  pure distance law and moves four cues together: level (audible edge fading
+  to exactly 0 at `REMOTE_SHOT_MAX_M` = 110 m), an air-absorption lowpass
+  (18 kHz → floored at 320 Hz: the crack goes first, the boom survives the
+  trip — the "opening on distance"), propagation delay (`d/343 s`, capped at
+  350 ms, so a far shot lands after its flash), and a boom weight that adds a
+  rolling low tail past ~2 m. `pan` is the shooter's bearing projected on the
+  camera's right axis, softened to ±0.8.
+- rounds that arrived in the SAME sample are staggered 40 ms apart, because a
+  24/s minigun outruns a 12 Hz publisher and two rounds must not stack into
+  one loud click.
+- `remoteShotVoiceGate` caps voices per rolling 90 ms window, so twelve
+  miniguns cost what six do. An inaudible shot returns BEFORE the gate, so it
+  never spends an audible peer's slot.
+
+The IMPACT end needs nothing from this lane: a remote carve already throws its
+own debris, dust and `sfx.crumble` where the round landed (destruction.ts's
+remote damage runtime). Flash at the shooter, dust at the target, and the
+shot reads end to end.
+
 ## Invariants (standing rules applied to multiplayer)
 
 - **A remote frame NEVER writes the scene store.** Neither `net.ts` nor
@@ -320,8 +390,13 @@ omission — these belong to the shared-world kinds on the same bus:
 
 ## QA surface
 
-- `__boots.presence()` → `{ remotes: [{sessionId, name, p, w, ageMs}],
-  published, received, culled, cap }` (plain copies).
+- `__boots.presence()` → `{ remotes: [{sessionId, name, p, w, f, ageMs}],
+  published, received, culled, cap }` (plain copies). `f` is that peer's fire
+  counter as last received — the one number a headless run can use to prove
+  gunfire crossed the wire, since a muzzle flash lasts 50 ms and a report
+  cannot be read out of a browser. `__bootsPlayer.sample().shots` is the local
+  end of the same number, which separates "A never fired" from "the counter
+  never arrived".
 - Counters: `published` = frames the bus accepted (`'sent'` only),
   `received` = valid non-self pose frames ingested, `culled` = valid frames
   refused by the crowd ceiling.
@@ -339,15 +414,20 @@ omission — these belong to the shared-world kinds on the same bus:
    gait cadence tracks speed, airborne pose on jumps.
 3. A swaps weapons: B sees the silhouette change; A staggers: B sees slump.
    (Spawn holds the BUILDER — press Digit1 before any firing probe.)
-4. Name tag is solid up close, fades out walking away, gone past 40 m.
-5. A presses Esc: avatar despawns on B INSTANTLY (goodbye frame), leave
+4. A fires: B sees a muzzle flash at A's barrel and hears the report from
+   A's direction; B walks away and the same shots get quieter, duller and
+   later, gone by ~110 m. B's `presence().remotes[0].f` climbs while A holds
+   the trigger. (Sections 6-7 of `qa-boots-twoclient.mjs` assert the wire
+   half of this; the timbre is an ear check.)
+5. Name tag is solid up close, fades out walking away, gone past 40 m.
+6. A presses Esc: avatar despawns on B INSTANTLY (goodbye frame), leave
    toast fires, chip clears. Re-entry re-joins with the 200 ms scale-in.
-6. Kill A's tab instead: B despawns it within ~3 s (staleness).
-7. B reloads mid-session: A is there immediately, exactly once — no ghost of
+7. Kill A's tab instead: B despawns it within ~3 s (staleness).
+8. B reloads mid-session: A is there immediately, exactly once — no ghost of
    B's previous session lingers on A.
-8. A edits the scene from the editor while B plays: B's console shows the
+9. A edits the scene from the editor while B plays: B's console shows the
    calm lease info line, ZERO invariant errors, world stays frozen until Esc.
-9. Solo regression: on `:3002` (no bus) everything above is absent and
+10. Solo regression: on `:3002` (no bus) everything above is absent and
    `presence()` reads empty/zero — the game is untouched.
 
 # Part 3 — the shared world on this bus

@@ -35,6 +35,7 @@ import {
   startPresence,
   stopPresence,
   wrapAngle,
+  wrapShots,
 } from './presence'
 import type { PresenceFrame } from './presence-interp'
 import { latestSnapshot, STALE_MS } from './presence-interp'
@@ -124,6 +125,7 @@ function localPose(over: Partial<LocalPose> = {}): LocalPose {
     s: 0.5,
     g: true,
     st: false,
+    f: 0,
     ...over,
   }
 }
@@ -139,6 +141,7 @@ function gameFrame(over: Partial<PresenceFrame> = {}): PresenceFrame {
     s: 0.3,
     g: true,
     st: false,
+    f: 0,
     ...over,
   }
 }
@@ -306,6 +309,20 @@ describe('publish policy — cadence, idle skip, keep-alive', () => {
     expect(framesEqual(a, gameFrame({ st: true }))).toBe(false)
     expect(framesEqual(a, gameFrame({ ph: 'editor' }))).toBe(false)
   })
+
+  /**
+   * The one that makes remote gunfire audible at all: a player standing still
+   * and emptying a magazine is IDLE by every other measure on the frame, so
+   * without the fire counter in the comparison the idle skip would sit on those
+   * rounds until the 500 ms keep-alive and the shots would arrive in a clump
+   * half a second late.
+   */
+  test('framesEqual: a changed fire counter is never idle', () => {
+    expect(framesEqual(gameFrame(), gameFrame({ f: 1 }))).toBe(false)
+    expect(framesEqual(gameFrame({ f: 7 }), gameFrame({ f: 7 }))).toBe(true)
+    // Even across the wrap, where the count goes DOWN.
+    expect(framesEqual(gameFrame({ f: 255 }), gameFrame({ f: 0 }))).toBe(false)
+  })
 })
 
 // ── Frame building ───────────────────────────────────────────────────────────
@@ -326,6 +343,27 @@ describe('buildFrame — wire quantization', () => {
     expect(wrapAngle(Math.PI * 3)).toBeCloseTo(Math.PI)
     expect(wrapAngle(-Math.PI * 2.5)).toBeCloseTo(-Math.PI / 2)
     expect(wrapAngle(0.25)).toBe(0.25)
+  })
+
+  test('the fire counter rides the frame, wrapped into a byte', () => {
+    const out = gameFrame()
+    buildFrame(localPose({ f: 41 }), out)
+    expect(out.f).toBe(41)
+    // A long session keeps counting locally; the wire only ever sees a byte,
+    // and peers read DIFFERENCES, so the wrap costs nothing.
+    buildFrame(localPose({ f: 300 }), out)
+    expect(out.f).toBe(44)
+  })
+
+  test('wrapShots: byte-wrapped, non-negative, junk-proof', () => {
+    expect(wrapShots(0)).toBe(0)
+    expect(wrapShots(255)).toBe(255)
+    expect(wrapShots(256)).toBe(0)
+    expect(wrapShots(257)).toBe(1)
+    expect(wrapShots(12.7)).toBe(12) // a counter is a count
+    expect(wrapShots(-5)).toBe(0)
+    expect(wrapShots(Number.NaN)).toBe(0)
+    expect(wrapShots(Number.POSITIVE_INFINITY)).toBe(0)
   })
 })
 

@@ -16,15 +16,20 @@
  * same voxels die. Both directions, because a one-way wire looks identical to a
  * working one from whichever end happens to be driving.
  *
- * Three more sections were added after the owner played it with a friend
+ * Five more sections were added after the owner played it with a friend
  * (2026-09-01), each pinned to one of his sentences:
  *   5. the GRID STAMP counters — the failure that was invisible in development
  *      and total in production ("others couldn't see my constructions / only
  *      some destructions");
- *   6. B builds, B LEAVES, and a peer who was never in the room while B was
+ *   6. one peer's GUNFIRE reaching the other ("last time I could not hear or see
+ *      other players shoot");
+ *   7. one peer's SPRAY landing on the other's copy of the same wall ("i hope
+ *      every player sees the same sprays and builds") — and again on a peer who
+ *      arrives after the can was put down;
+ *   8. B builds, B LEAVES, and a peer who was never in the room while B was
  *      there still gets B's wall ("we should always all see the state of the map
  *      as it is currently");
- *   7. a remote avatar photographed at 6 m and 20 m, either side of the detail
+ *   9. a remote avatar photographed at 6 m and 20 m, either side of the detail
  *      LOD ("our avatars should look like pascalines").
  *
  *   SCENE=… node qa-boots-twoclient.mjs
@@ -283,6 +288,226 @@ for (const client of clients) {
 log(`  GRID STAMP HEALTHY: ${stampOk}`)
 
 /**
+ * GUNFIRE, SEEN AND HEARD — "last time I could not hear or see other players
+ * shoot. I shoot. I see my gun and I could hear it. I want the others to shoot
+ * the same." (owner, 2026-09-01)
+ *
+ * A muzzle flash lasts 50 ms and a report cannot be read out of a headless
+ * browser, so what is asserted is the thing both of them hang off: the fire
+ * counter on the pose. If B's copy of A's pose shows the counter ADVANCING
+ * while A holds the trigger, then B's frame loop is being handed the shots, and
+ * flash/tracer/report are downstream of that one number.
+ *
+ * The weapon id is checked in the same breath, because the flash is parented to
+ * the muzzle of the gun B thinks A is holding — a counter that arrives while B
+ * still shows a builder would flash nothing.
+ */
+log('\n=== 6. gunfire crosses the wire ===')
+const seenBy = async (watcher, sessionId) => {
+  const p = await presence(watcher)
+  return (p?.remotes ?? []).find((r) => r.sessionId === sessionId) ?? null
+}
+const gunfireProbe = async (shooter, watcher, weapon, slot) => {
+  log(`\n--- ${shooter.label} fires a ${weapon} → ${watcher.label} sees the counter move`)
+  const before = await seenBy(watcher, shooter.identity.sessionId)
+  await shooter.page.bringToFront()
+  // The depot is where guns come from; a scripted session skips the errand.
+  await shooter.page.evaluate((w) => globalThis.__boots?.state?.()?.giveWeapon?.(w), weapon)
+  await shooter.page.keyboard.press(slot)
+  await shooter.page.waitForTimeout(900)
+  const held = await shooter.page.evaluate(() => globalThis.__boots?.state?.()?.weapon ?? null)
+  await shooter.page.mouse.move(640, 470)
+  await shooter.page.mouse.down()
+  await shooter.page.waitForTimeout(2500) // headless runs ~3 fps: give it frames
+  await shooter.page.mouse.up()
+  const fired = await shooter.page.evaluate(
+    () => globalThis.__bootsPlayer?.sample?.()?.shots ?? null,
+  )
+  // THE READ HAS TO BE POLLED, AND ON THE WATCHER'S OWN TAB. A headless session
+  // spends 1–3 s inside a single frame while voxels die, and presenceTick is a
+  // timer that queues behind those long tasks — so the shooter can go silent for
+  // longer than STALE_MS (3 s) and the watcher REAPS the avatar mid-probe. That
+  // is what a fixed sleep read as "the counter never arrived" (2026-09-01: `f 0
+  // → -`, weapon undefined, while a third client saw the same shooter's f=2).
+  //
+  // Polling is not a workaround for a real race: the count is a FIELD ON THE
+  // POSE, so the very next frame the shooter publishes still carries it, whole,
+  // however late it is. An event lane would have been genuinely lost here.
+  await watcher.page.bringToFront()
+  let after = null
+  for (let round = 0; round < 16; round++) {
+    await watcher.page.waitForTimeout(700)
+    const seen = await seenBy(watcher, shooter.identity.sessionId)
+    if (seen) after = seen
+    if (seen && seen.w === weapon && (!before || seen.f !== before.f)) break
+  }
+  // A re-admitted avatar starts a fresh ring, so its first count IS the delta.
+  const delta =
+    before && after ? (after.f - before.f + 256) % 256 : after ? after.f : 0
+  log(`[${shooter.label}] holds ${held}   local rounds fired: ${fired}`)
+  log(`[${watcher.label}] sees f ${before?.f ?? '-'} → ${after?.f ?? '-'} (Δ${delta}), weapon ${after?.w}, age ${after?.ageMs} ms`)
+  const ok = held === weapon && delta > 0 && after?.w === weapon
+  log(`  GUNFIRE SYNCED ${shooter.label}→${watcher.label}: ${ok}`)
+  return ok
+}
+const fireAtoB = await gunfireProbe(a, b, 'rifle', 'Digit3')
+const fireBtoA = await gunfireProbe(b, a, 'pistol', 'Digit2')
+
+/**
+ * THE SPRAY IS THE SAME COAT ON BOTH SCREENS — "spray looks good, i hope every
+ * player sees the same sprays and builds" (owner, 2026-09-01).
+ *
+ * Paint is the one lane with no grid stamp in it: strokes are grid-free records
+ * folded in canonical (lamport, id) order, so they cannot be refused the way
+ * slot-addressed pieces were. That is an argument, not evidence — this is the
+ * evidence. A sprays, and the SAME node's paint census has to grow on B.
+ *
+ * The candidate sweep exists because paint only lands on paintable surfaces and
+ * a headless session cannot be trusted to be facing one: each pose is tried and
+ * the first one that actually deposits is the one used (the qa-paint-flash
+ * recipe — three earlier attempts there read all-zeros and looked like a bug).
+ */
+log('\n=== 7. sprays are the same coat on both screens ===')
+/**
+ * THE ORACLE IS THE LEDGER, NOT THE RENDERER.
+ *
+ * Three earlier cuts of this section read all-zeros and looked like a broken
+ * paint lane. Both mistakes were in the harness:
+ *
+ * 1. It pre-resolved a target with `identifyAim`, which walks the THREE.JS
+ *    scene and reports `userData.nodeId`. sprayPaint resolves against
+ *    `world.colliders` (and the voxel skins) instead, so the probe kept
+ *    returning surfaces with `nodeId: null` — real geometry the spray would
+ *    happily coat, which the harness then skipped for lack of a name.
+ * 2. `census(node)` counts STAMPS in whatever representation the client chose:
+ *    a pristine wall wears clipped decals, a shot-up one wears voxel sprites.
+ *    Two clients holding the identical coat can therefore report different
+ *    censuses — and a peer that never fired reports zero sprites.
+ *
+ * Cells are what actually travels on the wire, so `paintDebug.coated()` is the
+ * oracle: spray first, then ask BOTH clients which node holds how many cells.
+ * A's spray must appear on B under the SAME nodeId, and on B those cells must
+ * be marked `remote` — which is the difference between "B sees my spray" and
+ * "B has some paint of its own somewhere".
+ */
+const coatedNodes = (client) =>
+  client.page.evaluate(() => globalThis.__bootsPaint?.coated?.() ?? [])
+const cellsOn = (list, nodeId) => list.find((n) => n.nodeId === nodeId)?.cells ?? 0
+const sprayBurst = async (client, ms) => {
+  await client.page.evaluate(() => {
+    globalThis.__bootsPaint.holdFire = true
+  })
+  await client.page.waitForTimeout(ms)
+  await client.page.evaluate(() => {
+    globalThis.__bootsPaint.holdFire = false
+  })
+  await client.page.waitForTimeout(1800) // the fold + the wire
+}
+await a.page.bringToFront()
+await a.page.keyboard.press('Digit7') // the sprayer — always reachable, never owned
+await a.page.waitForTimeout(900)
+/**
+ * WHERE TO STAND AND WHICH WAY TO LOOK — in WORLD space, and with a frame in
+ * between. Two more harness bugs lived here:
+ *
+ * 1. `wallNodes()` returns the SCENE nodes, whose start/end are the building's
+ *    own 2-D coordinates. The game places that building under a site transform
+ *    — the whole reason a grid anchor exists — so teleporting to a wall's
+ *    midpoint lands nowhere near the wall. `placed` pieces, by contrast, carry
+ *    a WORLD position and a slot id whose prefix names the run: `Wx:…` is a
+ *    wall along x, so its faces look ±z.
+ * 2. `teleport` writes playerRig.yaw and the feet synchronously, but
+ *    `playerRig.position` — the origin the spray rays from — is recomputed in
+ *    the frame loop. A sweep inside ONE page.evaluate therefore rays every step
+ *    from the position the rig had BEFORE the first teleport. Every step must be
+ *    its own await with a real frame in it.
+ *
+ * Forward is (-sin yaw, ·, -cos yaw), so looking along a unit vector (fx, fz)
+ * means yaw = atan2(-fx, -fz).
+ */
+const yawToward = (fx, fz) => Math.atan2(-fx, -fz)
+const sprayPoses = await a.page.evaluate(() => {
+  const out = []
+  const STANDOFF = 2.2
+  for (const piece of globalThis.__boots?.pieces?.() ?? []) {
+    const [px, , pz] = piece.position ?? []
+    if (typeof px !== 'number' || typeof pz !== 'number') continue
+    // Wx runs along x (faces ±z); anything else is treated as running along z.
+    const alongX = String(piece.slotId ?? '').startsWith('Wx')
+    for (const side of [1, -1]) {
+      const nx = alongX ? 0 : side
+      const nz = alongX ? side : 0
+      out.push({ nx, nz, pitch: 0, x: px + nx * STANDOFF, z: pz + nz * STANDOFF })
+    }
+  }
+  return out
+})
+// The yaw is computed OUT here: page.evaluate ships a function, not a closure,
+// so a helper defined in this file does not exist inside the page.
+for (const pose of sprayPoses) pose.yaw = yawToward(-pose.nx, -pose.nz)
+// FALLBACK POSES: stand where the player already is and TURN — 8 yaws at eye
+// level, then 8 tilted down. A lot whose pieces were all levelled in section 3
+// leaves nothing to stand off, and the original building is still all around.
+const here = await a.page.evaluate(() => {
+  const s = globalThis.__bootsPlayer?.sample?.()
+  return { x: s?.x ?? 0, z: s?.z ?? 0 }
+})
+for (let step = 0; step < 16; step++) {
+  sprayPoses.push({
+    pitch: step < 8 ? 0 : -0.7,
+    x: here.x,
+    yaw: ((step % 8) / 8) * Math.PI * 2,
+    z: here.z,
+  })
+}
+let sprayNode = null
+let spraySynced = false
+let sprayRemote = 0
+for (const pose of sprayPoses) {
+  await a.page.evaluate((p) => globalThis.__boots?.teleport?.(p.x, p.z, p.yaw, p.pitch ?? 0), pose)
+  await a.page.waitForTimeout(700) // one real frame at headless rates
+  const before = await coatedNodes(a)
+  const bBefore = await coatedNodes(b)
+  await sprayBurst(a, 1500)
+  const after = await coatedNodes(a)
+  const grew = after.find((n) => n.cells > cellsOn(before, n.nodeId))
+  log(
+    `  from ${pose.x.toFixed(1)},${pose.z.toFixed(1)} yaw ${pose.yaw.toFixed(2)} pitch ${pose.pitch}: ` +
+      (grew ? `coated ${grew.nodeId} ${cellsOn(before, grew.nodeId)}→${grew.cells}` : 'nothing'),
+  )
+  if (!grew) continue
+  sprayNode = grew.nodeId
+  /**
+   * B MAY NOT CALL THE WALL WHAT A CALLS IT — and that is the fix, not a bug.
+   *
+   * A host wall is named by the document, so both clients key the coat under
+   * the same id. A PLAYER-BUILT wall is named by a per-client counter, so the
+   * stroke crosses under its shared record id and B re-resolves it to B's own
+   * number (shared-damage's wireNodeId / localNodeId, now used by both lanes).
+   * Comparing the two ledgers by node id therefore proves nothing; what proves
+   * it is that B gained cells it did not put there, in the window where the only
+   * thing spraying was A.
+   */
+  const theirs = (await coatedNodes(b)).find(
+    (n) => n.cells > cellsOn(bBefore, n.nodeId) && n.remote > 0,
+  )
+  sprayRemote = theirs?.remote ?? 0
+  log(
+    `  A ${grew.nodeId}: ${grew.cells} cells (remote ${grew.remote})   ` +
+      `B ${theirs?.nodeId ?? '—'}: ${theirs?.cells ?? 0} cells (${sprayRemote} of them somebody else's)`,
+  )
+  spraySynced = (theirs?.cells ?? 0) > 0 && sprayRemote > 0
+  break
+}
+// The four silent failures, from both ends (paintDebug.wire): A's `unnamed` is
+// a stroke with no room-wide name, B's `foldUnnamed` is a name B could not
+// resolve, `foldNoTarget` is a name it resolved onto nothing paintable.
+for (const client of [a, b]) {
+  log(`[${client.label}] paintWire ${JSON.stringify(await client.page.evaluate(() => globalThis.__bootsPaint?.wire?.() ?? null))}`)
+}
+log(`  SPRAY SYNCED A→B: ${spraySynced}  (node ${sprayNode}, ${sprayRemote} cells marked remote on B)`)
+
+/**
  * THE FORT OUTLIVES ITS BUILDER — the relay gate, end to end.
  *
  * Under a per-frame authorship gate a record's only courier is its author, so
@@ -294,7 +519,7 @@ log(`  GRID STAMP HEALTHY: ${stampOk}`)
  * B builds, B LEAVES, and a peer who was never in the room while B was there
  * must still be handed B's wall, by A.
  */
-log('\n=== 6. a fort outlives its builder (relay) ===')
+log('\n=== 8. a fort outlives its builder (relay) ===')
 const bKeys = keysOf(await pieces(b))
 const aKeysBefore = keysOf(await pieces(a))
 // Only the pieces A holds that B authored can prove a relay: anything A built
@@ -336,6 +561,72 @@ const relayOk = cKeys.size >= aKeysBefore.size && (cSync?.relayed ?? 0) > 0
 log(`  LATECOMER GOT THE WHOLE MAP: ${relayOk}  (relayed ${cSync?.relayed})`)
 
 /**
+ * WHEN THE LATECOMER GETS NOTHING, SAY WHY IN THE SAME RUN.
+ *
+ * A refused snapshot and an unsent one look identical from the pieces list, and
+ * the difference is two counters plus one hash. `refusedGrid > 0` with
+ * `blindGrid 0` is the gate saying "we genuinely disagree about this lot" — and
+ * a hash only ever says THAT two peers differ, never WHICH input does, so the
+ * preimage of both stamps is printed side by side. This is the diagnostic that
+ * found the wall-root yaw residue on 2026-09-01; a stamp mismatch is a
+ * recurring failure mode and it should never again cost a run to see it.
+ */
+if (!relayOk) {
+  for (const client of [a, c]) {
+    const bs = await buildSync(client)
+    log(`[${client.label}] stamp ${bs?.gridStamp} frame ${JSON.stringify(bs?.gridFrame)}`)
+    // `wallNodes()` is the set that was COLLECTED (frozen when this session
+    // entered the game and derived its anchor); gridAudit's wallCount is the
+    // LIVE registry now. Different numbers mean the world was collected while
+    // the scene was still filling — which changes which wall is longest, and
+    // the anchor IS the longest wall's start.
+    const collected = await client.page.evaluate(
+      () => (globalThis.__boots?.wallNodes?.() ?? []).length,
+    )
+    log(`[${client.label}] walls collected ${collected}`)
+    log(`[${client.label}] gridAudit ${JSON.stringify(await client.page.evaluate(() => globalThis.__boots?.gridAudit?.() ?? null))}`)
+  }
+}
+
+// The coat, too: a stroke is a record like a piece, so a peer who was not in the
+// room when the can was held must still be handed the paint. (C has to hold the
+// sprayer for its census handle to exist — it publishes with the tool.)
+let coatRelayed = null
+if (sprayNode) {
+  await cPage.bringToFront()
+  await cPage.keyboard.press('Digit7')
+  await cPage.waitForTimeout(1500)
+  // Cells, not stamps, and never by node id: C never fired, so its copy of the
+  // wall is pristine and wears decals where A's wears voxel sprites — and if the
+  // wall was player-built, C's number for it is its own (see section 7).
+  const cCoat = (await coatedNodes(c)).find((n) => n.cells > 0 && n.remote > 0)
+  const aCoat = (await coatedNodes(a)).find((n) => n.nodeId === sprayNode)
+  coatRelayed = Boolean(cCoat)
+  log(
+    `  LATECOMER GOT THE COAT: ${coatRelayed}  (C ${cCoat?.nodeId ?? '—'}: ${cCoat?.cells ?? 0} cells / ` +
+      `${cCoat?.remote ?? 0} remote vs A ${sprayNode}: ${aCoat?.cells ?? 0})`,
+  )
+  log(`[C] paintWire ${JSON.stringify(await cPage.evaluate(() => globalThis.__bootsPaint?.wire?.() ?? null))}`)
+  // WHY a waiting stroke can still not land: it needs the piece's NAME (the
+  // record→runtime map) and a voxel GRID for that name. Print both sides so a
+  // `foldNoTarget` reads as either "no such piece here" or "piece here, not
+  // voxelized yet" without guessing.
+  log(
+    `[C] pieces ${JSON.stringify(
+      await cPage.evaluate(() => (globalThis.__boots?.pieces?.() ?? []).map((p) => p.id)),
+    )} pieceTargets ${JSON.stringify(
+      await cPage.evaluate(() =>
+        (globalThis.__boots?.targets?.() ?? [])
+          .map((t) => t.nodeId)
+          .filter((id) => id.startsWith('__boots-piece-')),
+      ),
+    )} strokeAudit ${JSON.stringify((await buildSync(c))?.strokes)} paintMounts ${await cPage.evaluate(
+      () => globalThis.__bootsPaint?.mounts?.() ?? null,
+    )}`,
+  )
+}
+
+/**
  * THE AVATARS — "our avatars should look like pascalines, only slightly
  * customized (each new player has a different color?)".
  *
@@ -348,7 +639,7 @@ log(`  LATECOMER GOT THE WHOLE MAP: ${relayOk}  (relayed ${cSync?.relayed})`)
  * remote avatar has blinked out before. The shots are for a human to read; what
  * is asserted here is only that there WAS someone to photograph.
  */
-log('\n=== 7. the avatar in frame ===')
+log('\n=== 9. the avatar in frame ===')
 const aPose = (await presence(c))?.remotes?.[0] ?? null
 log(`[C] sees remote ${JSON.stringify(aPose)}`)
 if (aPose) {
@@ -376,6 +667,8 @@ log(`[B] page errors: ${b.errors.length}`)
 log('\n=== verdict ===')
 log(`  builds A→B ${buildAtoB}  B→A ${buildBtoA}`)
 log(`  destruction B→A ${damageBtoA}  A→B ${damageAtoB}`)
+log(`  gunfire A→B ${fireAtoB}  B→A ${fireBtoA}`)
+log(`  spray A→B ${spraySynced}   relayed to a latecomer ${coatRelayed}`)
 log(`  grid stamp healthy ${stampOk}   latecomer got the map ${relayOk}`)
 
 await browser.close()

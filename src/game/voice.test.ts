@@ -365,6 +365,7 @@ const localPose: LocalPose = {
   s: 0,
   g: true,
   st: false,
+  f: 0,
 }
 
 function poseFrame(over: Partial<PresenceFrame> = {}): PresenceFrame {
@@ -378,6 +379,7 @@ function poseFrame(over: Partial<PresenceFrame> = {}): PresenceFrame {
     s: 0,
     g: true,
     st: false,
+    f: 0,
     ...over,
   }
 }

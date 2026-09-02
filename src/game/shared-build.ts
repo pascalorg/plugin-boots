@@ -102,11 +102,137 @@ export type BuildAppliers = {
   spawnAperture?: (rec: ApertureRec) => number | null
   /** Drop a placement this module previously spawned. */
   removePlacement?: (runtimeId: number) => void
-  /** Fold remote strokes into the local coat ledger (paint.tsx owns it). */
-  foldStrokes?: (strokes: readonly StrokeRec[]) => void
+  /**
+   * Fold remote strokes into the local coat ledger (paint.tsx owns it), and
+   * hand back the ones whose SURFACE was not here yet — see pendingStrokes.
+   */
+  foldStrokes?: (strokes: readonly StrokeRec[]) => readonly StrokeRec[] | void
 }
 
 let appliers: BuildAppliers = {}
+
+/**
+ * STROKES THAT ARRIVED BEFORE THE WALL THEY LANDED ON.
+ *
+ * A stroke is grid-free, so a joiner accepts it whatever lot it thinks it is
+ * standing on; a PIECE is slot-addressed, so the same frame's walls can be
+ * refused (a stale grid stamp) or simply not have arrived yet. The record is
+ * consumed either way — records are grow-only and a re-delivery is idempotent —
+ * so without this list the coat on a player-built wall was dropped for the rest
+ * of the session. Two-client QA read it as `foldUnnamed 1` on the latecomer with
+ * the wall standing right there (2026-09-01).
+ *
+ * A piece INSTALL re-offers the list, but that event alone is not enough: the
+ * install is a store write, and the wall is only paintable once its mesh exists
+ * and has been voxelized, a frame or more later. QA read exactly that — the
+ * latecomer retried on the install and reported `foldNoTarget`, with the wall
+ * standing. So the paint lane also drains the list on a heartbeat
+ * (drainPendingStrokes). Capped, newest-wins — a name that never resolves (a
+ * piece deleted before we joined) must not accumulate.
+ */
+const pendingStrokes: StrokeRec[] = []
+const PENDING_STROKE_CAP = 512
+
+/**
+ * WHERE A WAITING STROKE WENT — the ledger of the ledger.
+ *
+ * A record is grow-only and delivered once, so anything that loses one loses a
+ * coat for the whole session. QA read `foldNoTarget 1` with `pendingStrokes 0`
+ * and nothing painted, which is a record that vanished between the two — a
+ * bookkeeping question no coat census can answer. `landed + kept + cleared +
+ * noApplier` must account for `offered`.
+ */
+const strokeAudit = {
+  offered: 0,
+  landed: 0,
+  kept: 0,
+  cleared: 0,
+  drains: 0,
+  noApplier: 0,
+  refolds: 0,
+}
+
+/** Fold `records` plus everything still waiting, and keep what did not land. */
+function foldWithPending(records: readonly StrokeRec[]): void {
+  const fold = appliers.foldStrokes
+  if (!fold) {
+    strokeAudit.noApplier += records.length
+    return
+  }
+  // ONE COPY OF EACH RECORD. A rebuild (refoldSharedStrokes) offers the room's
+  // whole stroke set, which can already hold what is waiting here — and folding
+  // one record twice would deposit two coats' worth of strength.
+  const batch = dedupeById(records.length === 0 ? pendingStrokes : [...pendingStrokes, ...records])
+  if (batch.length === 0) return
+  pendingStrokes.length = 0
+  strokeAudit.offered += records.length
+  const unplaced = fold(batch)
+  strokeAudit.landed += batch.length - (unplaced?.length ?? 0)
+  for (const rec of unplaced ?? []) {
+    if (pendingStrokes.length >= PENDING_STROKE_CAP) pendingStrokes.shift()
+    pendingStrokes.push(rec)
+  }
+  // `kept` is the CURRENT wait list, so it has to be written on the empty path
+  // too: reporting the last non-zero length made a drained queue read as if it
+  // were still holding coats nobody had seen (QA run 2: landed 2, kept 2).
+  strokeAudit.kept = pendingStrokes.length
+}
+
+/** The same records, one copy each, first occurrence wins. */
+function dedupeById(records: readonly StrokeRec[]): StrokeRec[] {
+  const seen = new Set<string>()
+  const out: StrokeRec[] = []
+  for (const rec of records) {
+    if (seen.has(rec.id)) continue
+    seen.add(rec.id)
+    out.push(rec)
+  }
+  return out
+}
+
+/**
+ * REBUILD THE COAT LEDGER FROM THE RECORDS THE ROOM ALREADY HOLDS.
+ *
+ * The paint ledger is derived state and the records are the truth — the world
+ * keeps every live stroke, grow-only, forever. But delivery happens once: a
+ * ledger wiped after a record arrived could never get it back, and QA caught
+ * exactly that (`paintMounts 2` on a joiner — the tool's mount effect resets the
+ * ledger, and a second mount threw away coats that had already folded, which is
+ * the owner's "others couldn't see my constructions" in its paint form).
+ *
+ * So the paint lane asks for a rebuild whenever it installs its applier. Folding
+ * is idempotent by construction (canonical order, accumulate-or-restart), so a
+ * rebuild over a ledger that is already right is a no-op, not a double coat.
+ */
+export function refoldSharedStrokes(): void {
+  const s = sync
+  if (!s || !appliers.foldStrokes) return
+  const all = liveRecords(s.world.strokes)
+  if (all.length === 0) return
+  strokeAudit.refolds++
+  foldWithPending(all)
+}
+
+/**
+ * Is this record one THIS player published? The paint lane needs it per record,
+ * because a rebuild re-folds our own strokes alongside everyone else's and only
+ * the foreign ones may be marked as somebody else's work (that mark is what
+ * keeps a stranger's paint out of our Save).
+ */
+export function isOurRecord(id: RecordId): boolean {
+  return sync !== null && isOurs(sync.world, id)
+}
+
+/**
+ * Re-offer the waiting strokes — the paint lane's heartbeat, a few times a
+ * second while the list is not empty. Free when it is: nothing is touched, and
+ * a record that lands is gone from the list for good.
+ */
+export function drainPendingStrokes(): void {
+  if (pendingStrokes.length === 0) return
+  strokeAudit.drains++
+  foldWithPending([])
+}
 
 /** Install (or clear, with `{}`) the lane appliers. Mount/unmount paired. */
 export function setBuildAppliers(patch: BuildAppliers): void {
@@ -184,6 +310,10 @@ export function attachBuildSync(
 export function detachBuildSync(): void {
   sync = null
   resetBindings()
+  // A waiting stroke names a record from THIS room; it must not follow us into
+  // the next one.
+  strokeAudit.cleared += pendingStrokes.length
+  pendingStrokes.length = 0
 }
 
 export function setBuildSyncSink(sink: DeltaSink | null): void {
@@ -235,6 +365,28 @@ type GridFrame = { x: number; z: number; yaw: number; ys: readonly number[] }
 let gridFrame: GridFrame | null = null
 /** How many times a stamp reached a world (QA: 0 means the frame never landed). */
 let gridStampPublishes = 0
+/** The last stamp published, to tell a re-publish of the SAME frame (mount
+ * churn, a re-collect that derived the same lot) from a real change of lot. */
+let lastStamp = 0
+let stampChanged: (() => void) | null = null
+
+/**
+ * Called when the published stamp names a DIFFERENT lot than the last one —
+ * i.e. the session re-anchored (entry-settle.ts corrected a snapshot taken
+ * before the scene finished arriving).
+ *
+ * WHY THE WIRE HAS TO HEAR ABOUT IT. Everything the room sent us while our
+ * stamp was wrong was refused by the grid gate, and a refusal leaves no trace
+ * for a retry to find: nothing is marked seen, so the records simply are not
+ * here. They come back on the next heal snapshot — up to HEAL_PERIOD_MS later.
+ * The owner's requirement is "streamed to everyone live with as little latency
+ * as possible", so net-world uses this to ask the room again immediately, and
+ * to re-offer our own records under the corrected stamp (peers refused those
+ * too, symmetrically). Bounded by the settle watcher's re-anchor cap.
+ */
+export function onGridStampChange(cb: (() => void) | null): void {
+  stampChanged = cb
+}
 
 export function publishGridStamp(
   anchorX: number,
@@ -250,6 +402,11 @@ export function publishGridStamp(
     setGridStamp(sync.world, stamp)
     gridStampPublishes++
   }
+  const moved = lastStamp !== 0 && stamp !== lastStamp
+  lastStamp = stamp
+  // After the world knows, never before: the listener re-offers our records and
+  // they must go out stamped with the lot we just adopted.
+  if (moved) stampChanged?.()
   return stamp
 }
 
@@ -261,6 +418,10 @@ export function publishGridStamp(
  */
 export function forgetGridStamp(): void {
   gridFrame = null
+  // The NEXT session's first publish is not a change of lot, it is a first
+  // frame — leaving this set would have it ask the room to re-send at entry,
+  // when it is already asking.
+  lastStamp = 0
 }
 
 // ── Registries (authorship, and runtime ↔ record) ────────────────────────────
@@ -960,9 +1121,14 @@ function applyEffectsInner(s: BuildSync, fx: SharedEffects): void {
   // runtime binding to fall back on — the coat ledger is the only record that
   // they landed — so this filter is the ONLY thing standing between a rename
   // and our own paint being folded over itself, twice as strong.
-  if (fx.addedStrokes.length > 0 && appliers.foldStrokes) {
+  if (appliers.foldStrokes) {
     const theirs = fx.addedStrokes.filter((rec) => !isOurs(s.world, rec.id))
-    if (theirs.length > 0) appliers.foldStrokes(theirs)
+    // Installing a piece is the one event that can give a waiting stroke its
+    // surface, so a frame that installed one re-offers the list even when it
+    // carried no paint of its own.
+    if (theirs.length > 0 || (fx.addedPieces.length > 0 && pendingStrokes.length > 0)) {
+      foldWithPending(theirs)
+    }
   }
 }
 
@@ -990,6 +1156,10 @@ export function sharedBuildDebug(): {
    * first — so a disagreement can be read off two dumps instead of guessed at.
    */
   gridFrame: { x: number; z: number; yaw: number; ys: number[] } | null
+  /** Strokes still waiting for the wall they landed on (see pendingStrokes). */
+  pendingStrokes: number
+  /** Where every offered stroke ended up (see strokeAudit) — QA arithmetic. */
+  strokes: typeof strokeAudit
 } {
   return {
     on: sync !== null,
@@ -1004,6 +1174,8 @@ export function sharedBuildDebug(): {
     gridFrameHeld: gridFrame !== null,
     gridStampPublishes,
     gridFrame: gridFrame ? { x: gridFrame.x, z: gridFrame.z, yaw: gridFrame.yaw, ys: [...gridFrame.ys] } : null,
+    pendingStrokes: pendingStrokes.length,
+    strokes: { ...strokeAudit },
   }
 }
 
@@ -1016,4 +1188,16 @@ export function resetSharedBuild(): void {
   refusedGridSaid = false
   gridFrame = null
   gridStampPublishes = 0
+  lastStamp = 0
+  stampChanged = null
+  pendingStrokes.length = 0
+  // The audit survives a detach on purpose (a coat lost at session exit is the
+  // interesting case), so only the hard reset zeroes it.
+  strokeAudit.offered = 0
+  strokeAudit.landed = 0
+  strokeAudit.kept = 0
+  strokeAudit.cleared = 0
+  strokeAudit.drains = 0
+  strokeAudit.noApplier = 0
+  strokeAudit.refolds = 0
 }

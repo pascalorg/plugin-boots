@@ -258,8 +258,15 @@ function inboundName(
  *   · the spawn fixtures (`__boots-table*`, `__boots-switch`), which each
  *     client builds for itself at its own spawn point. They are not the same
  *     object in two browsers and sharing their damage would be meaningless.
+ *
+ * EXPORTED because the paint lane has exactly the same problem: a stroke names
+ * the surface it landed on, and a stroke on a player-built wall named it with
+ * this client's counter. Two-client QA caught it — A sprayed
+ * `__boots-piece-2` and B, whose copy of that wall wears a different number,
+ * folded the coat onto nothing (2026-09-01). One definition of "the name a
+ * target travels under", used by both lanes.
  */
-function wireNodeId(nodeId: NodeId): NodeId | null {
+export function wireNodeId(nodeId: NodeId): NodeId | null {
   if (!nodeId.startsWith(SESSION_TARGET_PREFIX)) return nodeId
   if (nodeId.startsWith(PIECE_TARGET_PREFIX)) {
     return outboundName(nodeId, PIECE_TARGET_PREFIX, pieceRecordOf, pieceTargetId)
@@ -284,9 +291,9 @@ function wireNodeId(nodeId: NodeId): NodeId | null {
  * `materialize` then finds no target and the effect is counted as deferred.
  *
  * Either way a target named by NUMBER is REFUSED rather than resolved — see
- * inboundName.
+ * inboundName. Exported alongside `wireNodeId` for the paint lane.
  */
-function localNodeId(nodeId: NodeId): NodeId | null {
+export function localNodeId(nodeId: NodeId): NodeId | null {
   if (!nodeId.startsWith(SESSION_TARGET_PREFIX)) return nodeId
   if (nodeId.startsWith(PIECE_TARGET_PREFIX)) {
     return inboundName(nodeId, PIECE_TARGET_PREFIX, pieceRuntimeOf)

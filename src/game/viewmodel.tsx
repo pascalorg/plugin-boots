@@ -436,6 +436,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
             recoilT.current = 0
             flashT.current = def.id === 'minigun' ? 0.03 : 0.045
             playerRig.recoil += def.kick
+            // One round has left a barrel — bump the counter the pose publisher
+            // carries, so peers get this shot's flash, tracer and bang at the
+            // pose it was fired from (presence-interp's `f`). Guns only: a knife
+            // swing is not gunfire, and the branch below is where melee lives.
+            playerRig.shots++
             const muzzle = def.id === 'knife' ? MUZZLE_OFFSETS.rifle : MUZZLE_OFFSETS[def.id]
             const flash = flashRef.current
             if (flash) {

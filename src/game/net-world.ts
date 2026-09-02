@@ -102,6 +102,7 @@ import {
   applyBuildEffects,
   attachBuildSync,
   detachBuildSync,
+  onGridStampChange,
   remintSharedRecords,
 } from './shared-build'
 import {
@@ -179,6 +180,15 @@ type Counters = {
   relayed: number
   /** Snapshots queued (join answers + heals). */
   snapshots: number
+  /**
+   * Times our own grid frame was CORRECTED mid-session (entry-settle.ts caught a
+   * snapshot taken before the scene finished arriving) and we re-offered our
+   * records and re-asked the room for theirs. A latecomer that reads
+   * `regrids 1, refusedGrid > 0, relayed > 0` was born into the wrong lot and
+   * repaired itself; `regrids 0, refusedGrid > 0` is a disagreement nothing
+   * corrected, which is a bug, not a recovery.
+   */
+  regrids: number
   /** Snapshot answers suppressed by the rate limit. */
   throttled: number
   /**
@@ -233,6 +243,7 @@ const counters: Counters = {
   blindGrid: 0,
   relayed: 0,
   snapshots: 0,
+  regrids: 0,
   throttled: 0,
   laneSinkIgnored: 0,
   rekeys: 0,
@@ -520,6 +531,21 @@ export function startWorldSync(): boolean {
     if (live) queueSnapshot(live, Date.now())
   }, HEAL_PERIOD_MS)
 
+  // A RE-ANCHOR IS A NEW LOT AS FAR AS THE WIRE IS CONCERNED. While our stamp
+  // named the wrong lot the grid gate refused the room's slot-addressed pieces
+  // and the room refused ours — symmetrically, silently, and without leaving
+  // anything for a retry to notice. So the moment the frame is corrected, do
+  // both halves of the repair at once instead of waiting out a heal period:
+  // ask the room to re-send, and re-offer our own records under the new stamp.
+  // Bounded: the settle watcher re-anchors at most SETTLE_MAX_REANCHORS times.
+  onGridStampChange(() => {
+    const live = session
+    if (!live) return
+    counters.regrids++
+    queueSnapshot(live, Date.now())
+    requestState(WORLD_KIND)
+  })
+
   // Ask the room what happened before we arrived.
   requestState(WORLD_KIND)
   return true
@@ -542,6 +568,7 @@ export function stopWorldSync(): void {
   if (s.heal) clearInterval(s.heal)
   if (s.answer) clearTimeout(s.answer)
   for (const off of s.offs) off()
+  onGridStampChange(null) // the listener closes over `session`; don't outlive it
   detachBuildSync()
   setDamageSync(null)
 }
@@ -601,6 +628,7 @@ export function resetWorldSyncCounters(): void {
   counters.blindGrid = 0
   counters.relayed = 0
   counters.snapshots = 0
+  counters.regrids = 0
   counters.throttled = 0
   counters.laneSinkIgnored = 0
   counters.rekeys = 0

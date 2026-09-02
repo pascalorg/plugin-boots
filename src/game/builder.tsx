@@ -83,7 +83,7 @@ import {
   setBuildSyncNotice,
   sharedBuildDebug,
 } from './shared-build'
-import { bvhFor, type ColliderEntry, type GameWorld } from './world'
+import { bvhFor, type ColliderEntry, type GameWorld, installGroundProbes } from './world'
 
 /**
  * Build mode, grid-locked grammar (BUILD-GRAMMAR-V2 + REVIEW): wall / floor
@@ -1276,6 +1276,47 @@ function PlacedPieceMesh({ piece, world }: { piece: PlacedPiece; world: GameWorl
   )
 }
 
+/**
+ * INSTALL THE LATTICE FRAME + PUBLISH ITS FINGERPRINT — the whole grid
+ * identity of a session, in the one order that is correct.
+ *
+ * Extracted from PlacedPieces' session effect because it runs TWICE now: once
+ * per collected world (below), and again if the entry snapshot turns out to
+ * have been taken before the scene finished arriving (entry-settle.ts — a late
+ * joiner whose wall roots were still at identity published a lattice metres
+ * off the lot and had every peer's piece refused). Same call, same order,
+ * both times: whoever re-derives the frame must re-publish the stamp with it.
+ *
+ * ORDER IS LOAD-BEARING:
+ * - THE DIRT the storeys are measured from goes in before the ladder — its
+ *   terrain rung normalizes against this. 0 on a flat lot, so hand-built
+ *   worlds and legacy tests are unchanged.
+ * - SLOT IDS ARE ADDRESSES IN THIS FRAME, so a peer only means the same thing
+ *   by "Wx:1,0,0" if it installed the same one. Publish the fingerprint the
+ *   moment the frame exists — a peer whose stamp differs has its
+ *   slot-addressed pieces refused rather than landed in the wrong place
+ *   (shared-build surfaces that refusal to the player). The call is a RETAINED
+ *   FACT, not an event: the caller's effect is a child's and runs BEFORE the
+ *   parent effect that attaches the transport, so shared-build holds the frame
+ *   and republishes it on attach. It used to no-op in that window, which cost
+ *   the whole pieces lane in production — see publishGridStamp.
+ * - The terrain rung goes into the preimage: with no ladder the storeys are
+ *   measured from it, so two lots at different elevations are genuinely
+ *   different grids even when the anchor and the ladder match. The anchor's
+ *   YAW counts for the same reason: slotPose carries the lattice across the
+ *   seam by rotating about the anchor, so the same slot id under two rotations
+ *   is two different places.
+ */
+export function installGridFrame(anchor: GridAnchor, ladder: number[] | null): void {
+  setGridAnchor(anchor)
+  setGridTerrainY(groundSurfaceY(anchor.x, anchor.z))
+  setStoreyLadder(ladder)
+  publishGridStamp(anchor.x, anchor.z, anchor.yaw, [
+    gridTerrainY(),
+    ...(getStoreyLadder() ?? []),
+  ])
+}
+
 /** Solid, collidable render of everything placed this session — and the
  * session wiring for the slot registry: installs the scene-support probe,
  * re-registers any stored pieces (re-entry with a pending Keep/Discard),
@@ -1295,35 +1336,25 @@ export function PlacedPieces({ world }: { world: GameWorld }) {
     // GRID ANCHOR: the build lattice adopts the building's frame for the
     // whole session — same lifecycle as the scene-support probe. Hand-built
     // worlds without one run the legacy identity grid.
-    const anchor = world.gridAnchor ?? IDENTITY_ANCHOR
-    setGridAnchor(anchor)
-    // THE DIRT the storeys are measured from: the ground under the anchor
-    // (the start of the building's longest wall). 0 on a flat lot, so
-    // hand-built worlds and legacy tests are unchanged. MUST precede the
-    // ladder — its terrain rung normalizes against this.
-    setGridTerrainY(groundSurfaceY(anchor.x, anchor.z))
-    // STOREY LADDER: the storeys adopt the building's real level elevations
-    // (same lifecycle). Worlds without one keep the uniform 2.8 fallback.
-    setStoreyLadder(world.storeyLadder ?? null)
-    // SLOT IDS ARE ADDRESSES IN THIS FRAME, so a peer only means the same
-    // thing by "Wx:1,0,0" if it installed the same one. Publish the
-    // fingerprint the moment the frame exists — a peer whose stamp differs has
-    // its slot-addressed pieces refused rather than landed in the wrong place
-    // (shared-build surfaces that refusal to the player). The call is a
-    // RETAINED FACT, not an event: this effect is a child's and runs BEFORE the
-    // parent effect that attaches the transport, so shared-build holds the
-    // frame and republishes it on attach. It used to no-op in that window,
-    // which cost the whole pieces lane in production — see publishGridStamp.
-    // The terrain rung goes in first: with no ladder the storeys are measured
-    // from it, so two lots at different elevations are genuinely different
-    // grids even when the anchor and the ladder match. The anchor's YAW counts
-    // for the same reason: slotPose carries the lattice across the seam by
-    // rotating about the anchor, so the same slot id under two rotations is two
-    // different places.
-    publishGridStamp(anchor.x, anchor.z, anchor.yaw, [
-      gridTerrainY(),
-      ...(getStoreyLadder() ?? []),
-    ])
+    // THE GROUND FIRST, and from THIS effect. The frame's terrain rung is
+    // groundSurfaceY under the anchor, and that probe lives in a module
+    // closure installed by collectWorld / ActiveGame's session effect — a
+    // PARENT effect, which React runs AFTER this child's, and whose cleanup
+    // resets the probe. So on any re-run (StrictMode's double invoke, a
+    // re-collect) this effect measured the ground with no probe installed and
+    // read 0. Measured live 2026-09-01 on a sculpted lot: the stamp went out
+    // with terrain rung 0 while the ground under the anchor was 1.39 — two
+    // peers agreed only because they were both wrong, and a peer that
+    // re-derived the frame correctly would have disagreed with both.
+    // installGroundProbes is idempotent (one closure + a scan of the site
+    // colliders), so installing it here as well costs nothing and makes this
+    // effect independent of effect order.
+    installGroundProbes(world)
+    // …then the whole sequence, in installGridFrame (above): anchor, the dirt
+    // the storeys measure from, the ladder, then the stamp that names all
+    // three. The settle watcher (entry-settle.ts) re-runs the same call if the
+    // snapshot turns out to predate the scene it snapshotted.
+    installGridFrame(world.gridAnchor ?? IDENTITY_ANCHOR, world.storeyLadder ?? null)
     for (const p of useBoots.getState().placed) {
       if (p.slotId) registerPlacement(p.slotId, p.id)
     }

@@ -1909,6 +1909,42 @@ export function snapLevelsForSnapshot(): void {
   }
 }
 
+/**
+ * COMPOSE THE MATRICES BEFORE READING THEM — the latecomer's lot, fixed.
+ *
+ * Everything spatial in `collectWorld` is read off `root.matrixWorld`: collider
+ * inverse matrices, voxel-grid origins, the building AABB, the spawn, and the
+ * grid anchor (the longest wall's world START). three.js composes those
+ * matrices during render, and `snapLevelsForSnapshot()` above has just written
+ * group positions by hand — so whether the numbers are the building's real
+ * world coordinates depends on whether a frame happened to have run in between.
+ *
+ * That is not a theory. Measured on 2026-09-01 with two clients on one lot: the
+ * first player and a late joiner both collected 347 walls and both picked the
+ * SAME longest wall, and read its start at (19.602, −11.249) and (4.177,
+ * −15.425) respectively — the joiner got the LEVEL-LOCAL point, because the
+ * level/site groups above it had not been composed yet. Thirty seconds later the
+ * same registry gave the joiner the same answer as the first player, but the
+ * grid stamp is published once per collected world: the joiner spent the whole
+ * session addressing slots in a lattice 15 m from everyone else's, so every
+ * piece anybody built was refused (refusedGrid 10, blindGrid 0) and its own
+ * build ghost hovered out on the lawn.
+ *
+ * One forced `updateMatrixWorld` from the top of the registered graph is exactly
+ * what a render would have done, is idempotent, and costs one pass at session
+ * start. It goes FIRST, before any reader.
+ */
+export function composeSceneMatrices(): void {
+  let top: Object3D | null = null
+  for (const root of sceneRegistry.nodes.values()) {
+    top = root
+    break
+  }
+  if (!top) return
+  while (top.parent) top = top.parent
+  top.updateMatrixWorld(true)
+}
+
 // ---------------------------------------------------------------------------
 // Spawn ground settle — the player must START ON the surface, never in it
 // ---------------------------------------------------------------------------
@@ -2219,6 +2255,47 @@ export function deriveStoreyLadder(
 }
 
 /**
+ * The grid frame as the live scene would derive it RIGHT NOW — the same
+ * inputs collectWorld hands to deriveGridAnchor/deriveStoreyLadder, read at
+ * call time instead of at snapshot time.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM THE SNAPSHOT. The snapshot is taken the
+ * instant the player jumps in, and on a late joiner the scene is still
+ * arriving: measured 2026-09-01 on two clients in the same room, the second
+ * one's wall roots were still at IDENTITY when it collected (audit `origin`
+ * [0,0] against the first client's [4.177,−15.425], with `local` identical on
+ * both — the store agreed, the matrices didn't), so it derived the anchor from
+ * a level-LOCAL point and stamped a lattice 15 m off the lot it was standing
+ * in. Every slot-addressed piece between the two was then refused, which is
+ * exactly the owner's report: "others couldn't see my constructions".
+ *
+ * A snapshot cannot be re-taken cheaply, but this can be called every few
+ * hundred ms — which is what makes the settle watcher (entry-settle.ts) possible:
+ * compare what we PUBLISHED against what we would publish now, and correct
+ * once the scene stops moving.
+ */
+export function deriveLiveGrid(): {
+  anchor: GridAnchor
+  ladder: number[] | null
+  wallCount: number
+} {
+  // Compose first: an anchor derived from stale matrices is the bug above.
+  composeSceneMatrices()
+  const nodes = useScene.getState().nodes as Record<string, Record<string, unknown>>
+  const collected: Array<{ node: WallNodeLike; root: Object3D }> = []
+  for (const id of sceneRegistry.byType.wall ?? []) {
+    const root = sceneRegistry.nodes.get(id)
+    const node = nodes[id] as WallNodeLike | undefined
+    if (root && node?.start && node?.end) collected.push({ node, root })
+  }
+  return {
+    anchor: deriveGridAnchor(collected),
+    ladder: deriveStoreyLadder(collectStackedLevels(), nodes),
+    wallCount: collected.length,
+  }
+}
+
+/**
  * WHY THE TWO PEERS DISAGREED ABOUT THE LOT — the preimage, readable live.
  *
  * A slot id ("Wx:3,6,0") is an address in the lattice, and the lattice is the
@@ -2236,32 +2313,65 @@ export function gridAudit(): {
   anchor: GridAnchor
   ladder: number[] | null
   levels: Array<{ id: string; y: number }>
-  walls: Array<{ id: string; length: number }>
+  walls: Array<{
+    id: string
+    length: number
+    start: [number, number]
+    local: [number, number]
+    origin: [number, number]
+  }>
+  wallCount: number
 } {
+  // Read the same composed matrices a collect would (see composeSceneMatrices):
+  // an audit that reports uncomposed numbers accuses the wrong input.
+  const live = deriveLiveGrid()
   const nodes = useScene.getState().nodes as Record<string, Record<string, unknown>>
   const levels = collectStackedLevels()
-  const walls: Array<{ id: string; length: number }> = []
+  const walls: Array<{
+    id: string
+    length: number
+    start: [number, number]
+    local: [number, number]
+    origin: [number, number]
+  }> = []
   const ids = sceneRegistry.byType.wall ?? []
   for (const id of ids) {
     const node = nodes[id] as Partial<WallNodeLike> | undefined
     if (!node?.start || !node?.end) continue
+    // The WORLD start, which is what the anchor actually takes — a peer whose
+    // roots are still untransformed reads the level-local point here and stamps
+    // a lot metres from the one it is standing in. Node coordinates alone cannot
+    // show that (they are identical on every client by construction).
+    const root = sceneRegistry.nodes.get(id)
+    _anchorStart.set(node.start[0], 0, node.start[1])
+    if (root) _anchorStart.applyMatrix4(root.matrixWorld)
+    // The world start has exactly two inputs. Report BOTH separately, because
+    // they accuse different bugs: `local` is the node's own coordinate (comes
+    // from the shared document, so a difference means the STORE disagrees) and
+    // `origin` is the root's world translation (a difference means the MATRIX
+    // disagrees). Reporting only the product cannot tell them apart.
+    const e = root?.matrixWorld.elements
     walls.push({
       id,
       length: Math.hypot(node.end[0] - node.start[0], node.end[1] - node.start[1]),
+      local: [quantPos(node.start[0]), quantPos(node.start[1])],
+      origin: e ? [quantPos(e[12] ?? 0), quantPos(e[14] ?? 0)] : [0, 0],
+      start: [quantPos(_anchorStart.x), quantPos(_anchorStart.z)],
     })
   }
   walls.sort((a, b) => b.length - a.length)
-  const collected: Array<{ node: WallNodeLike; root: Object3D }> = []
-  for (const id of ids) {
-    const root = sceneRegistry.nodes.get(id)
-    const node = nodes[id] as WallNodeLike | undefined
-    if (root && node?.start && node?.end) collected.push({ node, root })
-  }
   return {
-    anchor: deriveGridAnchor(collected),
-    ladder: deriveStoreyLadder(levels, nodes),
+    anchor: live.anchor,
+    ladder: live.ladder,
     levels: levels.map((l) => ({ id: l.id, y: l.y })),
     walls: walls.slice(0, 6),
+    // How many walls the LIVE registry holds. The other half of the question a
+    // stamp mismatch asks: the anchor is the longest wall's start, so a peer
+    // that collected its world while the registry was still filling picks a
+    // different wall — and never re-picks (the stamp is published once per
+    // collected world). Compare against `wallNodes().length`, which is the
+    // COLLECTED set, frozen at that moment.
+    wallCount: live.wallCount,
   }
 }
 
@@ -2269,6 +2379,8 @@ export function collectWorld(): GameWorld {
   // Whole-building presence: bake the snapshot at true stacked elevations,
   // never mid-lerp (see snapLevelsForSnapshot).
   snapLevelsForSnapshot()
+  // …and then COMPOSE what that just moved, before a single matrix is read.
+  composeSceneMatrices()
 
   const nodes = useScene.getState().nodes as Record<
     string,

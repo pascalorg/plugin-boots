@@ -67,6 +67,13 @@
  * triangle blip, softer than hitmarker(); metalPing() — metallic impact
  * ring for metal-flagged item hits (shooting.ts's spark lane).
  *
+ * Multiplayer: sfx.remoteShot(kind, distance, pan) — another player's gun,
+ * heard from where they are. remoteShotMix() is the pure distance law (level,
+ * air-absorption cutoff, propagation delay, boom weight) and
+ * remoteShotVoiceGate() caps voices per rolling window, so a lobby full of
+ * miniguns costs a bounded amount. pistolShot/rifleShot stay the LOCAL guns —
+ * dry and undelayed, because your own muzzle is at your ear.
+ *
  * Phase-6 char-feel: charSnap(depth) — depth = prior snaps on the SAME
  * tree; each successive snap sits ~9% lower with a deeper, longer thunk
  * (trees-destruct passes CHAR_HITS - charHits - 1). emberCrackle() — 2–3
@@ -199,6 +206,92 @@ export function resetSnapVoiceGate(): void {
   snapWindowCount = 0
 }
 
+// ── Remote gunfire: the distance mix (pure, tested) ─────────────────────────
+
+/**
+ * Past this range (m) another player's shot is not voiced at all. Deliberately
+ * far beyond a lot — the point of the feature is that a firefight two houses
+ * over is AUDIBLE — but finite, so a lobby spread across a neighbourhood costs
+ * nothing for the peers who are nowhere near it.
+ */
+export const REMOTE_SHOT_MAX_M = 110
+
+/** Sound is slow (m/s). Far gunfire arrives after the muzzle flash, which is
+ * most of why distant shots read as distant rather than as quiet. */
+export const SPEED_OF_SOUND_MS = 343
+
+/** Air absorption e-folding distance (m) — the "opening" the owner asked for:
+ * the crack loses its top end first, so what survives the trip is the boom. */
+const SHOT_AIR_ABSORB_M = 20
+
+/** Distance (m) at which the rolling low tail is at full weight. */
+const SHOT_BOOM_FULL_M = 45
+
+/** What one remote shot sounds like from `distance` metres away. */
+export type RemoteShotMix = {
+  /** Overall level 0..1 — 0 means "do not voice this at all". */
+  level: number
+  /** Lowpass cutoff (Hz) standing in for air absorption. */
+  cutoffHz: number
+  /** Propagation delay (s) — the bang lags its own muzzle flash. */
+  delayS: number
+  /** Weight 0..1 of the rolling low tail that replaces the crack far away. */
+  boom: number
+}
+
+/**
+ * THE distance law for other people's gunfire (pure, so the whole curve is
+ * pinned by tests rather than by ear).
+ *
+ * Three things move together, because in the real world they do: level falls
+ * off on an inverse power (not linearly — a shot 2 m away has to be startling
+ * and one 40 m away has to be background), the top end is eaten by the air so
+ * the timbre opens from CRACK to thump-and-roll, and the whole thing arrives
+ * late. The level also rides a linear window to exactly 0 at REMOTE_SHOT_MAX_M,
+ * so the audible edge is a fade rather than a click when someone walks out of
+ * range mid-burst.
+ */
+export function remoteShotMix(distance: number): RemoteShotMix {
+  const d = distance > 0 ? distance : 0
+  const cutoffHz = Math.max(320, 18000 * Math.exp(-d / SHOT_AIR_ABSORB_M))
+  const delayS = Math.min(0.35, d / SPEED_OF_SOUND_MS)
+  const boom = Math.min(1, d / SHOT_BOOM_FULL_M)
+  if (d >= REMOTE_SHOT_MAX_M) return { level: 0, cutoffHz, delayS, boom }
+  const window = 1 - d / REMOTE_SHOT_MAX_M
+  const near = 1 / (1 + (d / 8) ** 1.2)
+  return { level: near * window, cutoffHz, delayS, boom }
+}
+
+/**
+ * Remote-gunfire voice governor. Twelve peers on miniguns is 288 rounds a
+ * second; every one of them would build a filter chain. Full voices per
+ * rolling window are capped and the rest are dropped silently — a wall of
+ * simultaneous cracks is indistinguishable from six of them anyway, and the
+ * cap is what keeps a crowded lobby's audio cost bounded by construction.
+ */
+export const REMOTE_SHOT_WINDOW_MS = 90
+export const REMOTE_SHOT_VOICE_CAP = 6
+let remoteShotWindowStart = Number.NEGATIVE_INFINITY
+let remoteShotWindowCount = 0
+
+export function remoteShotVoiceGate(nowMs: number): 'voice' | 'skip' {
+  if (nowMs - remoteShotWindowStart > REMOTE_SHOT_WINDOW_MS) {
+    remoteShotWindowStart = nowMs
+    remoteShotWindowCount = 0
+  }
+  remoteShotWindowCount++
+  return remoteShotWindowCount <= REMOTE_SHOT_VOICE_CAP ? 'voice' : 'skip'
+}
+
+/** Test hook — clears the rolling window (module state outlives a test file). */
+export function resetRemoteShotVoiceGate(): void {
+  remoteShotWindowStart = Number.NEGATIVE_INFINITY
+  remoteShotWindowCount = 0
+}
+
+/** Weapon classes a remote shot can be voiced as (unknown ids read as rifle). */
+export type RemoteShotKind = 'pistol' | 'rifle' | 'minigun'
+
 type BurstOpts = {
   duration: number
   gain: number
@@ -207,6 +300,9 @@ type BurstOpts = {
   freqEnd?: number
   q?: number
   delay?: number
+  /** Route into a caller-owned chain instead of straight to `master` — the
+   * distance rig for remote gunfire (see remoteShot) is the only user. */
+  dest?: AudioNode
 }
 
 /** Enveloped noise through a filter — the workhorse voice. */
@@ -227,13 +323,20 @@ function burst(o: BurstOpts, when = 0): void {
   gain.gain.exponentialRampToValueAtTime(0.0001, t + o.duration)
   src.connect(filter)
   filter.connect(gain)
-  gain.connect(master)
+  gain.connect(o.dest ?? master)
   src.start(t)
   src.stop(t + o.duration + 0.05)
 }
 
 /** Short pitched thump — body for shots, lands, thunks. */
-function thump(freq: number, duration: number, gainValue: number, when = 0, type: OscillatorType = 'sine'): void {
+function thump(
+  freq: number,
+  duration: number,
+  gainValue: number,
+  when = 0,
+  type: OscillatorType = 'sine',
+  dest?: AudioNode,
+): void {
   const c = ensureContext()
   if (!c || !master) return
   const t = c.currentTime + when
@@ -245,7 +348,7 @@ function thump(freq: number, duration: number, gainValue: number, when = 0, type
   gain.gain.setValueAtTime(gainValue, t)
   gain.gain.exponentialRampToValueAtTime(0.0001, t + duration)
   osc.connect(gain)
-  gain.connect(master)
+  gain.connect(dest ?? master)
   osc.start(t)
   osc.stop(t + duration + 0.05)
 }
@@ -399,6 +502,96 @@ export const sfx = {
     burst({ duration: 0.07, gain: 0.5, freq: 2400 * v, q: 0.5 })
     thump(110 * v, 0.13, 0.9)
     burst({ duration: 0.09, gain: 0.2, filterType: 'highpass', freq: 500 * v }, 0.08)
+  },
+
+  /**
+   * SOMEBODY ELSE'S SHOT, heard from `distance` metres (owner ask, 2026-09-01:
+   * "everyone nearby should hear it close and everyone far should just hear a
+   * little bit of it far. Opening on distance").
+   *
+   * The pair above are the shooter's OWN gun: dry, loud, right at the ear, no
+   * distance in them at all. This one is the same timbre family put through one
+   * per-shot rig — gain → lowpass → stereo pan → master — whose settings come
+   * from remoteShotMix, plus a rolling low tail that grows with range. So the
+   * far version is not merely a quieter near version: the crack goes, the thump
+   * stays, the whole thing lands late by d/343 s, and it arrives from the side
+   * the shooter is actually on.
+   *
+   * `pan` is the listener-relative left/right of the shooter (−1..1, the caller
+   * projects it onto the camera's right vector); it is softened to ±0.8 so a
+   * shot never comes from strictly one ear. `offsetS` staggers the rounds of a
+   * burst that arrived in ONE pose frame (a 24/s minigun outruns the 12 Hz
+   * publisher, so two rounds land together and must not stack into one loud
+   * click). Beyond REMOTE_SHOT_MAX_M, over the per-window voice cap, or without
+   * WebAudio: silent no-op.
+   */
+  remoteShot(kind: RemoteShotKind, distance: number, pan = 0, offsetS = 0): void {
+    const mix = remoteShotMix(distance)
+    // Under ~0.4% of full scale is below the noise floor of everything else in
+    // the mix — spend nothing on it (and skip the gate, so an inaudible shot
+    // never uses up an audible peer's slot in the window).
+    if (mix.level <= 0.004) return
+    if (remoteShotVoiceGate(performance.now()) === 'skip') return
+    const c = ensureContext()
+    if (!c || !master) return
+
+    const level = c.createGain()
+    level.gain.value = mix.level
+    const air = c.createBiquadFilter()
+    air.type = 'lowpass'
+    air.frequency.value = mix.cutoffHz
+    air.Q.value = 0.7
+    level.connect(air)
+    // StereoPannerNode is universal on the browsers this ships to, but the
+    // graph must still build without it (older WebKit, test doubles).
+    const panner = typeof c.createStereoPanner === 'function' ? c.createStereoPanner() : null
+    if (panner) {
+      panner.pan.value = Math.max(-0.8, Math.min(0.8, pan * 0.8))
+      air.connect(panner)
+      panner.connect(master)
+    } else {
+      air.connect(master)
+    }
+    const dest: AudioNode = level
+
+    const v = rr()
+    const t = mix.delayS + (offsetS > 0 ? Math.min(0.25, offsetS) : 0)
+    if (kind === 'pistol') {
+      burst({ duration: 0.09, gain: 0.9, filterType: 'highpass', freq: 900 * v, dest }, t)
+      burst({ duration: 0.05, gain: 0.5, freq: 3200 * v, q: 0.6, dest }, t)
+      thump(150 * v, 0.1, 0.8, t, 'sine', dest)
+    } else if (kind === 'minigun') {
+      // One round of the stream: shorter and flatter than the rifle, so a
+      // 24/s burst reads as a rip instead of 24 separate rifle shots.
+      burst({ duration: 0.06, gain: 0.85, filterType: 'highpass', freq: 700 * v, dest }, t)
+      thump(95 * v, 0.08, 0.85, t, 'sine', dest)
+    } else {
+      burst({ duration: 0.11, gain: 1.0, filterType: 'highpass', freq: 600 * v, dest }, t)
+      burst({ duration: 0.07, gain: 0.5, freq: 2400 * v, q: 0.5, dest }, t)
+      thump(110 * v, 0.13, 0.9, t, 'sine', dest)
+    }
+    // Slap-back off the buildings — always there, but it is most of what is
+    // left of a shot from across the lot, so it grows with the boom weight.
+    burst(
+      { duration: 0.09 + 0.18 * mix.boom, gain: 0.18 + 0.3 * mix.boom, filterType: 'highpass', freq: 500 * v, dest },
+      t + 0.075,
+    )
+    if (mix.boom > 0.05) {
+      // The rolling low end: a slow thump plus a diffuse lowpassed tail. This
+      // is the "little bit of it, far" — audible long after the crack is gone.
+      thump(68 * v, 0.2 + 0.34 * mix.boom, 0.55 * mix.boom, t + 0.015, 'sine', dest)
+      burst(
+        {
+          duration: 0.22 + 0.4 * mix.boom,
+          gain: 0.3 * mix.boom,
+          filterType: 'lowpass',
+          freq: 480,
+          q: 0.6,
+          dest,
+        },
+        t + 0.03,
+      )
+    }
   },
 
   knifeSwing(): void {

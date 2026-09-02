@@ -13,6 +13,7 @@ import {
 } from './net'
 import {
   createRing,
+  SHOT_COUNTER_MOD,
   isStale,
   latestSnapshot,
   angleDist,
@@ -34,7 +35,9 @@ import {
  * and the game is byte-for-byte unaffected.
  *
  * What flows over the wire HERE is presence only — pose frames (protocol v1,
- * presence-interp.ts). No game state, no destruction, no scene writes: this
+ * presence-interp.ts), including the fire counter `f`, because a shot is part of
+ * a pose rather than a fact about the world (presence-interp's header argues
+ * it). No game state, no destruction, no scene writes: this
  * module imports neither the scene store nor any Save bridge, and a test
  * pins that (presence-hostile.test.ts). Destruction and build sync are
  * separate kinds owned elsewhere on the same bus.
@@ -84,13 +87,23 @@ export function publishIntervalMs(remoteCount: number): number {
   return 1000 / (remoteCount > CROWDED_REMOTES ? PUBLISH_HZ_CROWDED : PUBLISH_HZ_BASE)
 }
 
-/** Change gate between the last SENT frame and the next candidate. */
+/**
+ * Change gate between the last SENT frame and the next candidate.
+ *
+ * The fire counter is in here as an EXACT comparison, and that is the whole
+ * reason a standing player's gunfire reaches anyone: a peer holding still and
+ * emptying a magazine is idle by every other measure — same position, same
+ * angles, same speed — so the idle skip would sit on those frames for up to
+ * 500 ms and the shots would arrive in one lump, after the fact. A changed
+ * count is a changed frame, published at the next rate tick.
+ */
 export function framesEqual(a: PresenceFrame, b: PresenceFrame): boolean {
   return (
     a.ph === b.ph &&
     a.w === b.w &&
     a.g === b.g &&
     a.st === b.st &&
+    a.f === b.f &&
     Math.abs(a.p[0] - b.p[0]) <= POS_EPSILON &&
     Math.abs(a.p[1] - b.p[1]) <= POS_EPSILON &&
     Math.abs(a.p[2] - b.p[2]) <= POS_EPSILON &&
@@ -133,6 +146,9 @@ export type LocalPose = {
   s: number
   g: boolean
   st: boolean
+  /** Monotone count of rounds this session has fired (playerRig.shots) — the
+   * publisher wraps it into the wire's 0..255 counter. */
+  f: number
 }
 
 const round2 = (v: number): number => Math.round(v * 100) / 100
@@ -160,7 +176,16 @@ export function buildFrame(local: LocalPose, out: PresenceFrame): PresenceFrame 
   out.s = round2(local.s < 0 ? 0 : local.s > 1 ? 1 : local.s)
   out.g = local.g
   out.st = local.st
+  out.f = wrapShots(local.f)
   return out
+}
+
+/** The session's shot count as the wire carries it: a whole number in
+ * 0..SHOT_COUNTER_MOD-1. Total — a NaN or negative counter reads as 0 rather
+ * than poisoning every frame after it. */
+export function wrapShots(shots: number): number {
+  if (!Number.isFinite(shots) || shots <= 0) return 0
+  return Math.trunc(shots) % SHOT_COUNTER_MOD
 }
 
 // ── Crowd ceiling (pure) ─────────────────────────────────────────────────────
@@ -284,6 +309,7 @@ const emptyFrame = (): PresenceFrame => ({
   s: 0,
   g: true,
   st: false,
+  f: 0,
 })
 
 const state: PresenceState = {
@@ -509,6 +535,7 @@ function wireCopy(frame: PresenceFrame): PresenceFrame {
     s: frame.s,
     g: frame.g,
     st: frame.st,
+    f: frame.f,
   }
 }
 
@@ -524,6 +551,7 @@ function copyFrame(from: PresenceFrame, to: PresenceFrame): void {
   to.s = from.s
   to.g = from.g
   to.st = from.st
+  to.f = from.f
 }
 
 /**
@@ -592,7 +620,14 @@ export function stopPresence(): void {
 
 /** Plain-data QA dump for `__boots.presence()` — copies, never live refs. */
 export function presenceDebug(): {
-  remotes: Array<{ sessionId: string; name: string; p: [number, number, number]; w: string; ageMs: number }>
+  remotes: Array<{
+    sessionId: string
+    name: string
+    p: [number, number, number]
+    w: string
+    f: number
+    ageMs: number
+  }>
   published: number
   received: number
   culled: number
@@ -604,6 +639,7 @@ export function presenceDebug(): {
     name: string
     p: [number, number, number]
     w: string
+    f: number
     ageMs: number
   }> = []
   for (const remote of state.remotes.values()) {
@@ -613,6 +649,10 @@ export function presenceDebug(): {
       name: participantName(remote.userId),
       p: snap ? [snap.x, snap.y, snap.z] : [0, 0, 0],
       w: remote.w,
+      // Their fire counter as last received — the ONE number a two-client QA run
+      // can use to prove remote gunfire crossed the wire, since a muzzle flash
+      // lasts 50 ms and a report cannot be read out of a headless browser.
+      f: snap ? snap.f : 0,
       ageMs: now - remote.lastReceivedAt,
     })
   }

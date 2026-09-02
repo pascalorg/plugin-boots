@@ -146,6 +146,16 @@ export const playerRig = {
   /** Aim-down-sights blend 0..1 (see the API block): viewmodel writes it,
    * the frame loop lerps FOV 92→60 and scales look sensitivity by fov/92. */
   ads: 0,
+  /**
+   * Rounds fired this session — monotone, incremented by the viewmodel on every
+   * round that actually leaves a barrel (never on melee swings). Nothing local
+   * reads it: it exists so the co-presence publisher can carry gunfire as a
+   * counter on the pose frame (presence-interp's `f`), which is how peers get to
+   * see and hear us shoot. A counter rather than a callback because the wire
+   * wants an idempotent number, and because a pull we publish twice must not be
+   * two bangs on their screen.
+   */
+  shots: 0,
   /** Knockback: queue an XZ impulse (m/s); consumed into velocity next frame. */
   shove(dirX: number, dirZ: number, power: number): void {
     const len = Math.hypot(dirX, dirZ)
@@ -244,6 +254,9 @@ export type PlayerSample = {
   staggerT: number
   recoverT: number
   speed: number
+  /** Rounds fired this session — the local end of remote gunfire (peers read
+   * this counter off the pose frame and voice the difference). */
+  shots: number
 }
 
 /** How far under the lot floor counts as "fell out of the world". */
@@ -339,6 +352,10 @@ export function Player({ world }: { world: GameWorld }) {
     playerRig.pitchVelocity = 0
     playerRig.speedScale = 1
     playerRig.ads = 0
+    // Not reset with the rest: the fire counter is a WIRE counter, and peers
+    // track it by difference against the last value they saw. Rewinding it to 0
+    // between sessions would read as a 200-round jump — harmless (the delta is
+    // capped) but pointless. It wraps on its own at 256.
     // Fresh combat clock per session.
     shoveAccum.x = 0
     shoveAccum.z = 0
@@ -368,6 +385,10 @@ export function Player({ world }: { world: GameWorld }) {
         staggerT,
         recoverT,
         speed: playerRig.speed,
+        // Remote-gunfire QA: what the pose publisher is carrying, so a
+        // two-client run can tell "A never fired" apart from "the counter
+        // never crossed the wire" — two very different bugs.
+        shots: playerRig.shots,
         // Climb-feel QA: the contact plane the next tick's velocity rides
         // (projectOnWalkableSlope) + whether the mover is grounded at all.
         grounded: playerRig.grounded,

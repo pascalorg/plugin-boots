@@ -7,6 +7,7 @@ import {
   CanvasTexture,
   CircleGeometry,
   Color,
+  ConeGeometry,
   CylinderGeometry,
   type Group,
   type Mesh,
@@ -15,6 +16,7 @@ import {
   Quaternion,
   SphereGeometry,
 } from 'three'
+import { type RemoteShotKind, sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
@@ -23,6 +25,7 @@ import {
   INTERP_DELAY_MS,
   sampleAt,
   type SampledPose,
+  shotsFired,
 } from './presence-interp'
 import {
   getRemotes,
@@ -36,6 +39,7 @@ import {
   HammerModel,
   KnifeModel,
   MinigunModel,
+  MUZZLE_OFFSETS,
   PistolModel,
   RifleModel,
   WarhammerModel,
@@ -74,6 +78,17 @@ import {
  * The roster this renders is HARD-CAPPED upstream at
  * presence.MAX_REMOTE_AVATARS, so the mounted rig count is bounded no matter
  * how busy the lobby gets.
+ *
+ * THEY SHOOT AND YOU KNOW IT (owner ask, 2026-09-01: "last time I could not
+ * hear or see other players shoot"). The pose carries a fire counter, so this
+ * file compares it against the last count it SAW for that peer and turns each
+ * new round into a muzzle flash + tracer streak at the actual muzzle of the
+ * actual gun they are holding — the fx hang off the weapon group, so they
+ * inherit the whole arm chain for free and point exactly where the peer aims —
+ * plus one sfx.remoteShot voiced at their distance and bearing. The flash grows
+ * slightly with range so a firefight across the lot still reads; the IMPACT end
+ * needs nothing from here, because a remote carve already throws its own dust
+ * and debris where the round landed (destruction.ts's remote runtime).
  *
  * ANTI-GOAL (deliberate, do not "fix"): avatars NEVER join the world's
  * colliders and are NEVER shootable. They are pure visuals — never pushed
@@ -286,6 +301,53 @@ export function tagOpacity(distSq: number): number {
   return (TAG_MAX_DIST - Math.sqrt(distSq)) / (TAG_MAX_DIST - TAG_FADE_START)
 }
 
+// ── Remote gunfire (pure, tested) ────────────────────────────────────────────
+
+/**
+ * Muzzle anchor for a held weapon id, in the weapon group's local space —
+ * or null when this peer is not holding a gun.
+ *
+ * Null is the whole point of the function: a peer swinging a knife, a hammer,
+ * the builder or a spray can still bumps their fire counter for the melee/paint
+ * branches one day, and a muzzle flash blooming off the end of a crowbar is
+ * worse than no effect at all. Only the three guns have a muzzle, so only the
+ * three guns flash.
+ */
+export function remoteMuzzle(weapon: string): [number, number, number] | null {
+  if (weapon === 'pistol' || weapon === 'rifle' || weapon === 'minigun') {
+    return MUZZLE_OFFSETS[weapon]
+  }
+  return null
+}
+
+/**
+ * Which voice a remote shot uses. Unknown ids from a newer peer fall back to
+ * the rifle report rather than going silent — a shot you cannot place is worse
+ * than a shot with the wrong timbre.
+ */
+export function shotKindFor(weapon: string): RemoteShotKind {
+  if (weapon === 'pistol') return 'pistol'
+  if (weapon === 'minigun') return 'minigun'
+  return 'rifle'
+}
+
+/** Muzzle flash lifetime (s) — one or two frames at 60 fps, like a real one. */
+export const FLASH_LIFE_S = 0.05
+/** Seconds between the voices of rounds that arrived in the SAME sample, so a
+ * burst recovered from a dropped frame reads as a burst instead of one clap. */
+export const BURST_STAGGER_S = 0.04
+
+/**
+ * Flash scale vs distance. A 7 cm flash is a couple of pixels across the lot,
+ * so it grows with range — the far one stays roughly the same size ON SCREEN,
+ * which is what "some visual for the shooting" has to mean at 60 m. Capped, or
+ * a peer at the fence would fire a beach ball.
+ */
+export function flashScale(distance: number): number {
+  const d = distance > 0 ? distance : 0
+  return 1 + (d * 0.06 > 3 ? 3 : d * 0.06)
+}
+
 // ── Cached geometries + materials (module-lifetime, bounded) ─────────────────
 
 const TORSO_GEO = new BoxGeometry(0.42, 0.55, 0.24)
@@ -356,6 +418,39 @@ const SPEAK_MATERIAL = new MeshBasicMaterial({
 /** Tan work boots, dark sole — the pack's are caramel leather, well worn. */
 const BOOT_MATERIAL = new MeshStandardMaterial({ color: '#9c6b3f', roughness: 0.85 })
 const SOLE_MATERIAL = new MeshStandardMaterial({ color: '#26221e', roughness: 0.95 })
+
+/**
+ * Muzzle flash + tracer stub: a hot core, a short cone of gas down the barrel,
+ * and one streak of tracer just past the muzzle.
+ *
+ * Unlit (MeshBasic) on purpose — a muzzle flash IS the light source, so it must
+ * not take a shading pass that would dim it in a shadowed room, which is where
+ * you most need to see who is shooting. The cone is open-ended (no cap) because
+ * you only ever see it from outside.
+ *
+ * Shared across every avatar, like SPEAK_MATERIAL and for the same reason: one
+ * program for the whole lobby. The same constraint follows — a shared material
+ * has ONE opacity, so a per-avatar fade is impossible here and the flash is a
+ * `visible` toggle instead. At 50 ms that is the right shape anyway; nobody
+ * watches a muzzle flash decay.
+ */
+const FLASH_CORE_GEO = new SphereGeometry(0.05, 6, 4)
+const FLASH_CONE_GEO = new ConeGeometry(0.075, 0.24, 5, 1, true)
+/** Tracer stub length (m) — a streak leaving the barrel, not a laser to the
+ * target: the impact end already announces itself with dust and debris. */
+export const TRACER_LEN = 2.6
+const TRACER_GEO = new BoxGeometry(0.018, 0.018, TRACER_LEN)
+const FLASH_MATERIAL = new MeshBasicMaterial({
+  color: '#ffe6a8',
+  depthWrite: false,
+  transparent: true,
+})
+const TRACER_MATERIAL = new MeshBasicMaterial({
+  color: '#ffd27a',
+  depthWrite: false,
+  opacity: 0.75,
+  transparent: true,
+})
 
 const _tint = new Color()
 const tintedMaterials = new Map<number, { vest: MeshStandardMaterial; band: MeshStandardMaterial }>()
@@ -443,6 +538,173 @@ const _pose: SampledPose = createSampledPose()
 const _artic: AvatarArticulation = createArticulation()
 const _worldQuat = new Quaternion()
 
+// ── The rig itself (shared: peers AND the depot mirror) ─────────────────────
+
+/**
+ * The handles an animator needs on one Pascaline. Structural `{ current }` so
+ * either a React ref or a plain object satisfies it.
+ *
+ * `fx`/`flash` are OPTIONAL, and that is the whole reason this is a type rather
+ * than a fixed list: omit them and the rig draws no gunfire hardware at all.
+ * The depot mirror's dummy is a reflection — it never fires, so it must not
+ * carry a muzzle flash waiting to be triggered.
+ */
+export type AvatarRigRefs = {
+  torso: { current: Group | null }
+  head: { current: Group | null }
+  armL: { current: Group | null }
+  armR: { current: Group | null }
+  legL: { current: Group | null }
+  legR: { current: Group | null }
+  /** LOD group under the head pivot (logotype, eyes, side locks). */
+  headDetail: { current: Group | null }
+  /** LOD group under the torso pivot (belt pouch, tape). */
+  bodyDetail: { current: Group | null }
+  fx?: { current: Group | null }
+  flash?: { current: Group | null }
+}
+
+/** A fresh set of empty handles — for callers that are not React components
+ * (or that just want one stable object instead of eight useRef calls). */
+export function createRigRefs(): AvatarRigRefs {
+  return {
+    torso: { current: null },
+    head: { current: null },
+    armL: { current: null },
+    armR: { current: null },
+    legL: { current: null },
+    legR: { current: null },
+    headDetail: { current: null },
+    bodyDetail: { current: null },
+  }
+}
+
+/**
+ * PASCALINE, IN PRIMITIVES — the body, with no opinion about whose it is.
+ *
+ * Purely presentational: it mounts the hierarchy (hip pivots, torso, neck, two
+ * arms, the held weapon, the two LOD groups) and hands the pivots back through
+ * `refs`. Every frame-by-frame decision — where she stands, which way she
+ * faces, how the gait swings, when detail drops — belongs to the caller, which
+ * is what lets the SAME rig be a peer streamed off the wire and the reflection
+ * in the depot mirror without either one knowing about the other.
+ *
+ * The root group is the caller's too: a peer's root carries the wire pose and
+ * a name tag, the mirror's carries the reflected stand and the dummy scale.
+ */
+export function AvatarRig({
+  paletteIndex,
+  refs,
+  weapon,
+}: {
+  paletteIndex: number
+  refs: AvatarRigRefs
+  weapon: string
+}) {
+  const { vest, band } = materialsFor(paletteIndex)
+  const Weapon = WEAPON_COMPONENT[weapon]
+  const muzzle = refs.fx ? remoteMuzzle(weapon) : null
+
+  return (
+    <>
+      {/* Legs: pivots at the hip so the gait swings them. Charcoal cargo
+          pants into tan boots on dark soles — the pack's exact stack. */}
+      <group ref={refs.legL} position={[-0.11, 0.85, 0]}>
+        <mesh geometry={LIMB_GEO} material={PANTS_MATERIAL} position={[0, -0.4, 0]} />
+        <mesh geometry={FOOT_GEO} material={BOOT_MATERIAL} position={[0, -0.81, -0.04]} />
+        <mesh geometry={SOLE_GEO} material={SOLE_MATERIAL} position={[0, -0.867, -0.04]} />
+      </group>
+      <group ref={refs.legR} position={[0.11, 0.85, 0]}>
+        <mesh geometry={LIMB_GEO} material={PANTS_MATERIAL} position={[0, -0.4, 0]} />
+        <mesh geometry={FOOT_GEO} material={BOOT_MATERIAL} position={[0, -0.81, -0.04]} />
+        <mesh geometry={SOLE_GEO} material={SOLE_MATERIAL} position={[0, -0.867, -0.04]} />
+      </group>
+      {/* Torso pivot at the hip — slumps forward while staggered. */}
+      <group ref={refs.torso} position={[0, 0.85, 0]}>
+        {/* Black jacket, with the site vest over it: one plate front, one
+            back, so a teammate's color reads whichever way they are facing. */}
+        <mesh geometry={TORSO_GEO} material={JACKET_MATERIAL} position={[0, 0.3, 0]} />
+        <mesh geometry={VEST_GEO} material={vest} position={[0, 0.3, -0.125]} />
+        <mesh geometry={VEST_GEO} material={vest} position={[0, 0.3, 0.125]} />
+        {/* Tool belt at the waist; pouch and tape are LOD detail. */}
+        <mesh geometry={BELT_GEO} material={LEATHER_MATERIAL} position={[0, 0.07, 0]} />
+        <group ref={refs.bodyDetail}>
+          <mesh geometry={POUCH_GEO} material={LEATHER_MATERIAL} position={[0.2, 0.0, 0.02]} />
+          <mesh geometry={TAPE_GEO} material={TAPE_MATERIAL} position={[-0.21, 0.03, 0.04]} />
+        </group>
+        {/* Head pivot at the neck. Hair falls behind to the shoulders, the
+            hard hat sits on top, the eyes mark the facing (-Z). */}
+        <group ref={refs.head} position={[0, 0.6, 0]}>
+          <mesh geometry={HEAD_GEO} material={SKIN_MATERIAL} position={[0, 0.15, 0]} />
+          <mesh geometry={HAIR_BACK_GEO} material={HAIR_MATERIAL} position={[0, 0.06, 0.075]} />
+          {/* Hard hat: white crown, flat brim, colored band, logotype. */}
+          <mesh geometry={HAT_CROWN_GEO} material={HAT_MATERIAL} position={[0, 0.27, 0]} />
+          <mesh geometry={HAT_BRIM_GEO} material={HAT_MATERIAL} position={[0, 0.275, -0.01]} />
+          <mesh geometry={HAT_BAND_GEO} material={band} position={[0, 0.295, 0]} />
+          <group ref={refs.headDetail}>
+            <mesh geometry={HAT_MARK_GEO} material={HAT_MARK_MATERIAL} position={[0, 0.35, -0.12]} />
+            <mesh geometry={HAIR_LOCK_GEO} material={HAIR_MATERIAL} position={[-0.145, 0.06, 0.02]} />
+            <mesh geometry={HAIR_LOCK_GEO} material={HAIR_MATERIAL} position={[0.145, 0.06, 0.02]} />
+            <mesh geometry={EYE_GEO} material={EYE_MATERIAL} position={[-0.06, 0.16, -0.132]} />
+            <mesh geometry={EYE_GEO} material={EYE_MATERIAL} position={[0.06, 0.16, -0.132]} />
+          </group>
+        </group>
+        {/* Free (left) arm counter-swings the gait — jacket sleeve, bare hand. */}
+        <group ref={refs.armL} position={[-0.28, 0.5, 0]}>
+          <mesh
+            geometry={LIMB_GEO}
+            material={JACKET_MATERIAL}
+            position={[0, -0.26, 0]}
+            scale={[0.85, 0.7, 0.85]}
+          />
+          <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
+        </group>
+        {/* Weapon (right) arm aims with the remote pitch; the held model
+            hangs off the hand, barrel aligned down the arm. */}
+        <group ref={refs.armR} position={[0.28, 0.5, 0]}>
+          <mesh
+            geometry={LIMB_GEO}
+            material={JACKET_MATERIAL}
+            position={[0, -0.26, 0]}
+            scale={[0.85, 0.7, 0.85]}
+          />
+          <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
+          {Weapon ? (
+            <group position={[0, -0.52, 0.02]} rotation={[-Math.PI / 2, 0, 0]}>
+              <Weapon />
+              {/* Muzzle fx, parented to the gun: the flash points wherever the
+                  peer aims for free, through the arm chain, with no per-frame
+                  math of ours. Mounted once and toggled, like the speaking dot,
+                  so firing is a boolean rather than a mid-firefight remount. */}
+              {muzzle ? (
+                <group position={muzzle} ref={refs.fx} visible={false}>
+                  <group ref={refs.flash}>
+                    <mesh geometry={FLASH_CORE_GEO} material={FLASH_MATERIAL} />
+                    <mesh
+                      geometry={FLASH_CONE_GEO}
+                      material={FLASH_MATERIAL}
+                      position={[0, 0, -0.13]}
+                      rotation={[-Math.PI / 2, 0, 0]}
+                    />
+                  </group>
+                  {/* Tracer stub — a streak leaving the barrel, deliberately
+                      NOT a beam to the target: the round's own impact already
+                      throws dust and debris on this client. */}
+                  <mesh
+                    geometry={TRACER_GEO}
+                    material={TRACER_MATERIAL}
+                    position={[0, 0, -(TRACER_LEN / 2) - 0.1]}
+                  />
+                </group>
+              ) : null}
+            </group>
+          ) : null}
+        </group>
+      </group>
+    </>
+  )
+}
+
 function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: RemotePlayer }) {
   const rootRef = useRef<Group>(null)
   const torsoRef = useRef<Group>(null)
@@ -462,12 +724,20 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   const gaitPhase = useRef(0)
   const lastScale = useRef(-1)
   const frame = useRef(0)
+  // Gunfire: the fx group at the muzzle, the inner group that takes the random
+  // roll, the flash's remaining life, and the last fire count we SAW for this
+  // peer. -1 means "never sampled" — shotsFired returns 0 for it, so walking
+  // up to someone mid-magazine does not replay their whole magazine at you.
+  const fxRef = useRef<Group>(null)
+  const flashRef = useRef<Group>(null)
+  const flashT = useRef(0)
+  const lastShots = useRef(-1)
   // Change-gated React state: weapon swaps and late-resolving names are
   // EVENTS (a handful per session), so a state write from useFrame is fine.
   const [weapon, setWeapon] = useState(remote.w)
   const [name, setName] = useState(() => participantName(remote.userId))
 
-  const { vest, band } = materialsFor(paletteIndex)
+  // The tint is the tag's business here (the rig paints itself from the index).
   const tint = AVATAR_PALETTE[paletteIndex % AVATAR_PALETTE.length]!
 
   const tagTexture = useMemo(() => makeNameTexture(name, tint), [name, tint])
@@ -484,6 +754,14 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
 
     // Capped dt like every game loop here (a hitch never teleports a limb).
     const dt = Math.min(rawDt, 1 / 30)
+
+    // ONE distance, spent three ways: the gunfire mix, the tag fade, the LOD.
+    const camera = rootState.camera
+    const dx = camera.position.x - _pose.x
+    const dy = camera.position.y - _pose.y
+    const dz = camera.position.z - _pose.z
+    const distSq = dx * dx + dy * dy + dz * dz
+
     gaitPhase.current = advanceGait(gaitPhase.current, _pose.g ? _pose.s : 0, dt)
     articulate(_artic, gaitPhase.current, _pose.s, _pose.pitch, _pose.g, _pose.st)
 
@@ -505,12 +783,40 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     // Weapon swap — change-gated, so per-frame calls are free while held.
     if (_pose.w !== weapon) setWeapon(_pose.w)
 
-    // ONE distance, spent twice: the tag fade and the detail LOD.
-    const camera = rootState.camera
-    const dx = camera.position.x - _pose.x
-    const dy = camera.position.y - _pose.y
-    const dz = camera.position.z - _pose.z
-    const distSq = dx * dx + dy * dy + dz * dz
+    // Gunfire: every round this peer has fired since the last sample becomes a
+    // flash at their muzzle and a report voiced at their distance and bearing.
+    // The fx group only exists while they hold a gun, so `fx` IS the melee and
+    // spray-can guard — a knife swing can never bloom a muzzle flash.
+    const shots = shotsFired(lastShots.current, _pose.f)
+    lastShots.current = _pose.f
+    const fx = fxRef.current
+    if (fx) {
+      if (shots > 0) {
+        const dist = Math.sqrt(distSq)
+        fx.visible = true
+        flashT.current = FLASH_LIFE_S
+        const flash = flashRef.current
+        if (flash) {
+          // A fresh roll and a little shimmer per round: without them, repeated
+          // flashes stamp the same shape in the same place and read as a decal
+          // glued to the barrel rather than as firing.
+          flash.rotation.z = Math.random() * Math.PI * 2
+          flash.scale.setScalar(flashScale(dist) * (0.85 + Math.random() * 0.3))
+        }
+        // Bearing: how far along the camera's own right axis (column 0 of its
+        // world matrix) the shooter sits, normalized to ±1 — so a shot from
+        // behind your left shoulder arrives in the left ear.
+        const e = camera.matrixWorld.elements
+        const pan = dist > 0.001 ? (-dx * e[0]! - dy * e[1]! - dz * e[2]!) / dist : 0
+        const kind = shotKindFor(weapon)
+        for (let n = 0; n < shots; n++) {
+          sfx.remoteShot(kind, dist, pan, n * BURST_STAGGER_S)
+        }
+      } else if (flashT.current > 0) {
+        flashT.current -= dt
+        if (flashT.current <= 0) fx.visible = false
+      }
+    }
 
     // Pascaline's small parts, dropped past 14 m — change-gated, so this is a
     // comparison per frame and two boolean writes per crossing.
@@ -556,8 +862,6 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     }
   })
 
-  const Weapon = WEAPON_COMPONENT[weapon]
-
   return (
     // Non-solid, non-shootable by construction (see the anti-goal above);
     // __boots tags every surface for identifyAim attribution.
@@ -567,75 +871,25 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       scale={0.001}
       userData={{ __boots: true, __bootsRemote: remote.sessionId }}
     >
-      {/* Legs: pivots at the hip so the gait swings them. Charcoal cargo
-          pants into tan boots on dark soles — the pack's exact stack. */}
-      <group ref={legLRef} position={[-0.11, 0.85, 0]}>
-        <mesh geometry={LIMB_GEO} material={PANTS_MATERIAL} position={[0, -0.4, 0]} />
-        <mesh geometry={FOOT_GEO} material={BOOT_MATERIAL} position={[0, -0.81, -0.04]} />
-        <mesh geometry={SOLE_GEO} material={SOLE_MATERIAL} position={[0, -0.867, -0.04]} />
-      </group>
-      <group ref={legRRef} position={[0.11, 0.85, 0]}>
-        <mesh geometry={LIMB_GEO} material={PANTS_MATERIAL} position={[0, -0.4, 0]} />
-        <mesh geometry={FOOT_GEO} material={BOOT_MATERIAL} position={[0, -0.81, -0.04]} />
-        <mesh geometry={SOLE_GEO} material={SOLE_MATERIAL} position={[0, -0.867, -0.04]} />
-      </group>
-      {/* Torso pivot at the hip — slumps forward while staggered. */}
-      <group ref={torsoRef} position={[0, 0.85, 0]}>
-        {/* Black jacket, with the site vest over it: one plate front, one
-            back, so a teammate's color reads whichever way they are facing. */}
-        <mesh geometry={TORSO_GEO} material={JACKET_MATERIAL} position={[0, 0.3, 0]} />
-        <mesh geometry={VEST_GEO} material={vest} position={[0, 0.3, -0.125]} />
-        <mesh geometry={VEST_GEO} material={vest} position={[0, 0.3, 0.125]} />
-        {/* Tool belt at the waist; pouch and tape are LOD detail. */}
-        <mesh geometry={BELT_GEO} material={LEATHER_MATERIAL} position={[0, 0.07, 0]} />
-        <group ref={bodyDetailRef}>
-          <mesh geometry={POUCH_GEO} material={LEATHER_MATERIAL} position={[0.2, 0.0, 0.02]} />
-          <mesh geometry={TAPE_GEO} material={TAPE_MATERIAL} position={[-0.21, 0.03, 0.04]} />
-        </group>
-        {/* Head pivot at the neck. Hair falls behind to the shoulders, the
-            hard hat sits on top, the eyes mark the facing (-Z). */}
-        <group ref={headRef} position={[0, 0.6, 0]}>
-          <mesh geometry={HEAD_GEO} material={SKIN_MATERIAL} position={[0, 0.15, 0]} />
-          <mesh geometry={HAIR_BACK_GEO} material={HAIR_MATERIAL} position={[0, 0.06, 0.075]} />
-          {/* Hard hat: white crown, flat brim, colored band, logotype. */}
-          <mesh geometry={HAT_CROWN_GEO} material={HAT_MATERIAL} position={[0, 0.27, 0]} />
-          <mesh geometry={HAT_BRIM_GEO} material={HAT_MATERIAL} position={[0, 0.275, -0.01]} />
-          <mesh geometry={HAT_BAND_GEO} material={band} position={[0, 0.295, 0]} />
-          <group ref={headDetailRef}>
-            <mesh geometry={HAT_MARK_GEO} material={HAT_MARK_MATERIAL} position={[0, 0.35, -0.12]} />
-            <mesh geometry={HAIR_LOCK_GEO} material={HAIR_MATERIAL} position={[-0.145, 0.06, 0.02]} />
-            <mesh geometry={HAIR_LOCK_GEO} material={HAIR_MATERIAL} position={[0.145, 0.06, 0.02]} />
-            <mesh geometry={EYE_GEO} material={EYE_MATERIAL} position={[-0.06, 0.16, -0.132]} />
-            <mesh geometry={EYE_GEO} material={EYE_MATERIAL} position={[0.06, 0.16, -0.132]} />
-          </group>
-        </group>
-        {/* Free (left) arm counter-swings the gait — jacket sleeve, bare hand. */}
-        <group ref={armLRef} position={[-0.28, 0.5, 0]}>
-          <mesh
-            geometry={LIMB_GEO}
-            material={JACKET_MATERIAL}
-            position={[0, -0.26, 0]}
-            scale={[0.85, 0.7, 0.85]}
-          />
-          <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
-        </group>
-        {/* Weapon (right) arm aims with the remote pitch; the held model
-            hangs off the hand, barrel aligned down the arm. */}
-        <group ref={armRRef} position={[0.28, 0.5, 0]}>
-          <mesh
-            geometry={LIMB_GEO}
-            material={JACKET_MATERIAL}
-            position={[0, -0.26, 0]}
-            scale={[0.85, 0.7, 0.85]}
-          />
-          <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
-          {Weapon ? (
-            <group position={[0, -0.52, 0.02]} rotation={[-Math.PI / 2, 0, 0]}>
-              <Weapon />
-            </group>
-          ) : null}
-        </group>
-      </group>
+      {/* The body — the same rig the depot mirror poses (AvatarRig). The refs
+          object is rebuilt per render, but every ref INSIDE it is stable, so
+          React never detaches a handle; renders here are weapon/name events. */}
+      <AvatarRig
+        paletteIndex={paletteIndex}
+        refs={{
+          torso: torsoRef,
+          head: headRef,
+          armL: armLRef,
+          armR: armRRef,
+          legL: legLRef,
+          legR: legRRef,
+          headDetail: headDetailRef,
+          bodyDetail: bodyDetailRef,
+          fx: fxRef,
+          flash: flashRef,
+        }}
+        weapon={weapon}
+      />
       {/* Name-tag billboard — hidden past 40 m, texture disposed on despawn. */}
       <group ref={tagRef} position={[0, 2.05, 0]}>
         {tagTexture ? (
@@ -657,6 +911,29 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       </group>
     </group>
   )
+}
+
+/** The last deal RemotePlayers made — see localPaletteIndex. */
+let lastDeal: ReadonlyMap<string, number> = new Map()
+
+/**
+ * OUR OWN tint, the one the lot's deal reserved for us.
+ *
+ * We never render ourselves, so nothing needed this until the depot mirror:
+ * a mirror that showed a different color than the one your teammates see would
+ * be worse than no mirror, because the whole point of the vest color is that
+ * "I'm the amber one" is a thing you can say out loud. So the mirror asks the
+ * same deal every avatar in the lot was painted from (assignPalette already
+ * includes the local id precisely to reserve the slot).
+ *
+ * Before any roster arrives — solo play, or the first frames of a session — it
+ * falls back to the hash of our id, which is the slot the deal would prefer
+ * anyway, and to the first tint when we have no id at all.
+ */
+export function localPaletteIndex(): number {
+  const mine = localUserId()
+  if (!mine) return 0
+  return lastDeal.get(mine) ?? paletteIndexFor(mine)
 }
 
 /**
@@ -685,7 +962,10 @@ export function RemotePlayers() {
       const ids = list.map((remote) => remote.userId)
       const mine = localUserId()
       if (mine) ids.push(mine)
-      setColors(assignPalette(ids))
+      const deal = assignPalette(ids)
+      // Published for localPaletteIndex (the depot mirror wears our own tint).
+      lastDeal = deal
+      setColors(deal)
       // Chip rides the same edge (roster changes are the only count moves);
       // feature-detected like every cross-module hud call.
       if (list.length !== chipCount.current) {

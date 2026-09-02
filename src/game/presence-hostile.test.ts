@@ -81,6 +81,7 @@ function startAtOrigin(): void {
     s: 0,
     g: true,
     st: false,
+    f: 0,
   }))
 }
 
@@ -316,7 +317,7 @@ describe('hostile frames — refused at the trust boundary', () => {
     }
   })
 
-  test('a normalized frame carries the nine wire fields and nothing else', () => {
+  test('a normalized frame carries the ten wire fields and nothing else', () => {
     const frame = validateFrame({
       ...validFrame,
       nodes: { 'node-1': {} },
@@ -324,6 +325,7 @@ describe('hostile frames — refused at the trust boundary', () => {
     })
     expect(frame).not.toBeNull()
     expect(Object.keys(frame as object).sort()).toEqual([
+      'f',
       'g',
       'p',
       'ph',
@@ -334,6 +336,11 @@ describe('hostile frames — refused at the trust boundary', () => {
       'w',
       'yaw',
     ])
+    // validFrame deliberately omits `f` (it predates the fire counter, exactly
+    // like a peer still pinned to the older build): the field is SOFT, so the
+    // frame is accepted and the counter reads 0 rather than the whole frame
+    // being refused and that peer losing their avatar.
+    expect(frame!.f).toBe(0)
     // A copy, never the sender's object: no retained prototype or getter.
     expect(Object.getPrototypeOf(frame as object)).toBe(Object.prototype)
   })

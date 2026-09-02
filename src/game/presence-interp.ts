@@ -9,7 +9,23 @@
  * Wire protocol v1 (~150 B/frame, see docs/MULTIPLAYER.md):
  *   { v:1, ph:'game'|'editor', p:[x,y,z] (2 decimals), yaw, pitch (3
  *     decimals), w: weapon id, s: 0..1 normalized horizontal speed,
- *     g: grounded, st: staggered }
+ *     g: grounded, st: staggered, f: rounds fired mod 256 }
+ *
+ * `f` IS THE GUNFIRE LANE, and it is a counter rather than an event on purpose.
+ * A shot is a thing that happened AT a pose — the muzzle is wherever the arm
+ * was — so carrying it as a field of the pose means the flash, the bang and the
+ * avatar that fired all arrive together and are rendered at the same instant by
+ * the same interpolation. An event on its own lane would land early or late by
+ * the interpolation delay, next to an avatar still standing at rest. It also
+ * costs no new lane, no new trust boundary, and it self-heals: peers compare
+ * against the last count they SAW, so a dropped frame is a delta of two, not a
+ * lost shot. Wrapping at 256 keeps it two hex digits on the wire.
+ *
+ * ADDED AFTER v1 SHIPPED, so `f` is optional on the wire and defaults to 0: a
+ * client pinned to the older build sends frames without it and must keep its
+ * avatar (an omitted field is "no shots seen", never an invalid frame), and its
+ * own reader ignores a field it does not know. Everything downstream of
+ * validateFrame sees a total shape.
  *
  * Sampling model (the classic snapshot-interpolation setup):
  * - Snapshots land in a ring (cap 24 ≈ 2 s at 12 Hz); out-of-order frames
@@ -42,6 +58,8 @@ export type PresenceFrame = {
   s: number
   g: boolean
   st: boolean
+  /** Rounds fired this session, mod SHOT_COUNTER_MOD (see the header). */
+  f: number
 }
 
 /** Ring capacity — 24 snapshots ≈ 2 s of history at the 12 Hz base rate. */
@@ -58,6 +76,33 @@ export const STALE_MS = 3000
 export const POS_LIMIT = 1e5
 /** Weapon-id length bound (oversize guard — ids are short slugs). */
 export const WEAPON_ID_MAX = 24
+/** The fire counter wraps here (two hex digits on the wire). */
+export const SHOT_COUNTER_MOD = 256
+/**
+ * Most shots one pose frame may ever be read as. A publish tick is ~83 ms and
+ * the fastest gun is 24 rounds/s, so two is the honest maximum and three is
+ * slack for a dropped frame; past that the delta is a peer who was firing while
+ * out of range, a reconnect, or a hostile counter, and the answer to all three
+ * is the same — voice a burst, not the difference of two integers.
+ */
+export const MAX_SHOTS_PER_SAMPLE = 3
+
+/**
+ * How many shots a peer fired between the count we last SAW and the one we are
+ * looking at now (pure, tested).
+ *
+ * `last < 0` means "never sampled": a peer who joins mid-magazine, or whose
+ * first frame we get at shot 57, must not open with a 57-round salvo, so the
+ * first sighting adopts the count silently and returns 0. Equal counts are 0.
+ * The subtraction is modular (the counter wraps) and the result is capped, so a
+ * garbage or hostile count costs a burst of MAX_SHOTS_PER_SAMPLE and no more.
+ */
+export function shotsFired(last: number, current: number): number {
+  if (!Number.isFinite(current) || current < 0) return 0
+  if (!Number.isFinite(last) || last < 0) return 0
+  const delta = (current - last + SHOT_COUNTER_MOD) % SHOT_COUNTER_MOD
+  return delta > MAX_SHOTS_PER_SAMPLE ? MAX_SHOTS_PER_SAMPLE : delta
+}
 
 /** One stored snapshot — a ring slot, mutated in place on push. */
 export type Snapshot = {
@@ -71,6 +116,7 @@ export type Snapshot = {
   s: number
   g: boolean
   st: boolean
+  f: number
 }
 
 export type SnapshotRing = {
@@ -96,6 +142,7 @@ export function createRing(cap = RING_CAP): SnapshotRing {
       s: 0,
       g: true,
       st: false,
+      f: 0,
     })
   }
   return { cap, slots, head: cap - 1, count: 0 }
@@ -120,6 +167,7 @@ export function pushSnapshot(ring: SnapshotRing, sentAt: number, frame: Presence
   slot.s = frame.s
   slot.g = frame.g
   slot.st = frame.st
+  slot.f = frame.f
   ring.head = head
   if (ring.count < ring.cap) ring.count++
   return true
@@ -140,12 +188,27 @@ export type SampledPose = {
   s: number
   g: boolean
   st: boolean
+  /** Fire counter of the snapshot whose moment this sample has REACHED — see
+   * sampleAt for why it is the older side of a bracket, not the newer. */
+  f: number
   /** True once extrapolation hit its 200 ms cap — the pose is frozen. */
   frozen: boolean
 }
 
 export function createSampledPose(): SampledPose {
-  return { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, w: 'knife', s: 0, g: true, st: false, frozen: false }
+  return {
+    x: 0,
+    y: 0,
+    z: 0,
+    yaw: 0,
+    pitch: 0,
+    w: 'knife',
+    s: 0,
+    g: true,
+    st: false,
+    f: 0,
+    frozen: false,
+  }
 }
 
 /** Shortest-arc angle interpolation — a→b across the ±π seam takes the
@@ -175,6 +238,7 @@ function copyPose(from: Snapshot, out: SampledPose): void {
   out.s = from.s
   out.g = from.g
   out.st = from.st
+  out.f = from.f
   out.frozen = false
 }
 
@@ -249,6 +313,14 @@ export function sampleAt(ring: SnapshotRing, renderTime: number, out: SampledPos
       out.w = b.w
       out.g = b.g
       out.st = b.st
+      // …EXCEPT the fire counter, which rides the OLDER one. Every other
+      // discrete field is a state we would rather show early than late; a shot
+      // is an INSTANT, and taking b's count the moment we start bracketing the
+      // pair would voice it a whole frame (~83 ms) before the avatar's pose got
+      // there. Reading a's means a count becomes visible exactly when render
+      // time reaches the snapshot that carried it — and it stays monotone,
+      // because the next bracket's older side is this bracket's newer one.
+      out.f = a.f
       out.frozen = false
       return true
     }
@@ -269,10 +341,11 @@ const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Num
  * Wire-frame validation — the trust boundary for everything a peer sends.
  * Rejects (returns null): non-objects, wrong protocol version, unknown
  * phase, malformed/NaN/oversize positions or angles, non-boolean flags,
- * oversize weapon ids. Clamps `s` into [0,1] (a soft field — never worth
- * dropping a frame over). Returns a NORMALIZED copy, never the input — so
- * no attacker-owned object, prototype or getter is ever retained, and only
- * the nine fields below can exist downstream.
+ * oversize weapon ids. Clamps `s` into [0,1] and folds `f` into 0..255 (soft
+ * fields — never worth dropping a frame over; `f` may be absent entirely on an
+ * older peer's frames). Returns a NORMALIZED copy, never the input — so no
+ * attacker-owned object, prototype or getter is ever retained, and only the ten
+ * fields below can exist downstream.
  *
  * TOTAL by construction: any throw while reading the payload (a hostile
  * getter — impossible through JSON transport, but the boundary owes nothing
@@ -312,5 +385,11 @@ function readFrame(data: unknown): PresenceFrame | null {
     s: f.s < 0 ? 0 : f.s > 1 ? 1 : f.s,
     g: f.g,
     st: f.st,
+    // Soft field, like `s`, and for the same reason twice over: it was added
+    // after v1 shipped (an older peer simply has none) and a nonsense count is
+    // never worth dropping a whole pose over — the shot-delta cap upstream
+    // already bounds what a bad one can cost. Normalized into 0..255 here so
+    // nothing downstream has to think about it.
+    f: isFiniteNumber(f.f) ? ((Math.trunc(f.f) % SHOT_COUNTER_MOD) + SHOT_COUNTER_MOD) % SHOT_COUNTER_MOD : 0,
   }
 }

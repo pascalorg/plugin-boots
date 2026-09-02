@@ -28,7 +28,16 @@ import { itemGhostActive } from './item-place'
 import { playerRig } from './player'
 import { primedCellColor } from './skin-tone'
 import { getSession } from './session'
-import { buildSyncOn, flushBuildSync, publishStroke, setBuildAppliers } from './shared-build'
+import {
+  buildSyncOn,
+  drainPendingStrokes,
+  flushBuildSync,
+  isOurRecord,
+  publishStroke,
+  refoldSharedStrokes,
+  setBuildAppliers,
+} from './shared-build'
+import { localNodeId, wireNodeId } from './shared-damage'
 import { foldCoats, strokesByNode } from './shared-derive'
 import type { StrokeRec } from './shared-world'
 import { aimDirection } from './shooting'
@@ -157,6 +166,11 @@ export function splatRadiusAt(distance: number): number {
 /** Painting nearer than this (m) is "writing mode" — the HUD says so. */
 export const WRITING_DISTANCE = 2
 
+/** Seconds between retries of a stroke waiting for its wall (pendingStrokes).
+ * Slow on purpose: the wall it wants is coming over a network, not this frame,
+ * and a missed retry costs a quarter second of a coat nobody is looking at. */
+const PENDING_STROKE_DRAIN = 0.25
+
 /** Node types a coat can voxelize (mirrors shooting's destructible lane —
  * paintable ⊆ destructible, so painting never voxelizes what bullets
  * couldn't). Placed builder pieces register as 'block'. */
@@ -233,6 +247,48 @@ const paintedByNode = new Map<string, Map<number, number>>()
 const nodeSerials = new Map<string, number>()
 
 /**
+ * WHY A PEER SEES NO PAINT — the four ways a coat can fail to cross, counted.
+ *
+ * Every one of them is silent from both ends: the sprayer sees its own wall go
+ * blue either way, and the peer sees a wall that was never painted, which looks
+ * exactly like a quiet wire. The grid stamp taught this lane the lesson
+ * (`gridStampPublishes` / `refusedGrid`): when a failure is invisible, a counter
+ * is the only thing a harness can read.
+ */
+const wireCounts = { published: 0, unnamed: 0, folded: 0, foldUnnamed: 0, foldNoTarget: 0 }
+
+/**
+ * Records already counted as having WAITED, so a retry is not a second failure.
+ *
+ * The build lane re-offers a waiting stroke several times a second (see
+ * drainPendingStrokes), and a counter that ticked on every attempt would read
+ * `foldNoTarget 400` for one stroke that landed fine a second later — the
+ * opposite of what these counters are for. One record counts ONCE, under the
+ * first reason it waited (a stroke that waits for a name and then for a grid is
+ * one waiting stroke, not two). Cleared with the session, and hard-capped
+ * because record ids are unbounded.
+ */
+const foldWaited = new Set<string>()
+const FOLD_WAITED_CAP = 4096
+
+/**
+ * Stroke records already deposited into the ledger — see the filter in
+ * foldRemoteStrokes. Grows with the room's stroke set (which the shared world
+ * retains anyway) and is cleared with the ledger.
+ */
+const foldedStrokes = new Set<string>()
+
+/** Count `recs` as waiting on `counter`, once each however often they retry. */
+function countWaited(recs: readonly StrokeRec[], counter: 'foldUnnamed' | 'foldNoTarget'): void {
+  for (const rec of recs) {
+    if (foldWaited.has(rec.id)) continue
+    if (foldWaited.size >= FOLD_WAITED_CAP) foldWaited.clear()
+    foldWaited.add(rec.id)
+    wireCounts[counter]++
+  }
+}
+
+/**
  * Cells whose coat came from ANOTHER PLAYER's stroke, per ledger node.
  *
  * One ledger holds everyone's paint, because a wall has one colour and every
@@ -288,11 +344,22 @@ export function remoteCoatedCells(nodeId: string): ReadonlySet<number> {
 
 const EMPTY_CELLS: ReadonlySet<number> = new Set<number>()
 
+/** Mounts of PaintTool on this page — see paintDebug.mounts. */
+let paintMounts = 0
+
 /** Fresh session, fresh coats — called from PaintTool's mount effect. */
 export function resetPaint(): void {
+  paintMounts++
   paintedByNode.clear()
   nodeSerials.clear()
   remoteCoated.clear()
+  wireCounts.published = 0
+  wireCounts.unnamed = 0
+  wireCounts.folded = 0
+  wireCounts.foldUnnamed = 0
+  wireCounts.foldNoTarget = 0
+  foldWaited.clear()
+  foldedStrokes.clear()
   lastHitDistance = null
   endPaintStroke()
 }
@@ -544,14 +611,56 @@ export type PaintCensus = {
   pendingSplatZeros: number
 }
 
+/** One painted node as `paintDebug.coated()` reports it (QA). */
+export type CoatedNode = {
+  nodeId: string
+  /** Ledger cells carrying a coat, whoever put it there. */
+  cells: number
+  /** How many of those cells came from another player's stroke. */
+  remote: number
+}
+
 /**
  * Dev-only handle (published as `globalThis.__bootsPaint` while the tool
  * runs — the `__bootsBuilder` pattern): headless E2E can't engage pointer
  * lock, so `holdFire` stands in for the held LMB (it is OR-ed with the real
  * input each frame). `census()` is read-only, for the losslessness proof.
  */
-export const paintDebug: { holdFire: boolean; census: (nodeId?: string) => PaintCensus } = {
+export const paintDebug: {
+  holdFire: boolean
+  census: (nodeId?: string) => PaintCensus
+  coated: () => CoatedNode[]
+  wire: () => typeof wireCounts
+  mounts: () => number
+} = {
   holdFire: false,
+  /** The four silent failures, counted (see wireCounts). */
+  wire: () => ({ ...wireCounts }),
+  /**
+   * How many times the tool has mounted this page. Above 1 means the ledger was
+   * wiped mid-session (the mount effect resets it) — and since a stroke record
+   * is delivered once, a coat that was folded before the wipe is gone for good.
+   * A remount is a suspect QA cannot see any other way.
+   */
+  mounts: () => paintMounts,
+  /**
+   * THE LEDGER, NOT THE RENDERER — which node holds how much paint, and how
+   * much of it came from someone else.
+   *
+   * `census()` counts stamps in THIS client's chosen representation (a pristine
+   * host wears decals, a shot-up one wears sprites), so two clients spraying
+   * the same wall can hold the same coat and report different censuses. Cells
+   * are the thing both tiers agree on — they are what travels on the wire —
+   * which makes this the honest oracle for "every player sees the same sprays":
+   * same nodeId, and on the receiving side `remote > 0`.
+   */
+  coated: () => {
+    const out: CoatedNode[] = []
+    for (const [nodeId, cells] of paintedByNode) {
+      out.push({ cells: cells.size, nodeId, remote: remoteCoatedCells(nodeId).size })
+    }
+    return out.sort((a, b) => b.cells - a.cells)
+  },
   census: (nodeId?: string) => ({
     decals: decalCensus(nodeId),
     bakedDecals: bakedPaintCensus(nodeId, 'decal'),
@@ -2147,15 +2256,43 @@ export function convertDecalsForNode(nodeId: string): void {
  * Colours outside the local palette are refused. The drain indexes
  * PAINT_PALETTE with no bounds check, and every remote input is hostile.
  */
-export function foldRemoteStrokes(world: GameWorld, strokes: readonly StrokeRec[]): void {
-  for (const [nodeId, list] of strokesByNode(strokes)) {
-    const usable = list.filter((rec) => rec.color < PAINT_PALETTE.length)
+export function foldRemoteStrokes(world: GameWorld, strokes: readonly StrokeRec[]): StrokeRec[] {
+  // Strokes whose SURFACE is not here (yet): handed back so the build lane can
+  // re-offer them when a piece installs. A stroke refused for its COLOUR is not
+  // in here — that one is permanently invalid, not early.
+  const unplaced: StrokeRec[] = []
+  for (const [wireId, list] of strokesByNode(strokes)) {
+    // The inverse of publishStrokes' translation: a room-wide piece name back
+    // to THIS client's number for the same wall. null means there is nothing
+    // here to paint — the piece has not arrived yet, or the name is a peer's
+    // own counter, which is refused rather than resolved (shared-damage's
+    // localNodeId owns that rule for both lanes).
+    const nodeId = localNodeId(wireId)
+    if (nodeId === null) {
+      countWaited(list, 'foldUnnamed')
+      unplaced.push(...list)
+      continue
+    }
+    // ONCE PER RECORD, EVER. `foldCoats` accumulates into the ledger, so the
+    // same stroke applied twice deposits two coats' worth of strength — and a
+    // record can be offered again by a rebuild, by a relay that hands us what we
+    // already have, or by the waiting list. This set is what makes "folded" mean
+    // "deposited", and it is cleared with the ledger it describes.
+    const usable = list.filter(
+      (rec) => rec.color < PAINT_PALETTE.length && !foldedStrokes.has(rec.id),
+    )
     if (usable.length === 0) continue
     // Force the target into existence BEFORE anything grid-dependent runs:
     // dormant prebuilds and shell-pending nodes have no grid to expand into
     // until they are woken.
     const target = useDestruction.getState().targets.get(nodeId) ?? ensureVoxelTarget(world, nodeId)
-    if (!target || target.dormant) continue
+    if (!target || target.dormant) {
+      countWaited(usable, 'foldNoTarget')
+      unplaced.push(...usable)
+      continue
+    }
+    wireCounts.folded += usable.length
+    for (const rec of usable) foldedStrokes.add(rec.id)
     let painted = paintedByNode.get(nodeId)
     if (!painted) {
       painted = new Map()
@@ -2173,8 +2310,34 @@ export function foldRemoteStrokes(world: GameWorld, strokes: readonly StrokeRec[
     foldCoats(
       usable,
       (rec) => {
-        const splats = splatCoat(target.grid, rec.x, rec.y, rec.z, rec.radius)
-        for (const splat of splats) mark.add(splat.cell)
+        let splats = splatCoat(target.grid, rec.x, rec.y, rec.z, rec.radius)
+        if (splats.length === 0) {
+          // THE SAME WRITING-RANGE RESCUE THE LOCAL SPRAY GETS — and the reason
+          // this section of the two-client harness read all-zeros with the wire
+          // counters saying the stroke had been folded (2026-09-01). Up close
+          // the cone is a writing stroke a few centimetres wide, so its ball
+          // clears every cell CENTER; sprayPaint coats the one cell under the
+          // crosshair instead. Without the same rescue here, the peer folded the
+          // record and deposited nothing: a coat the sprayer could see and
+          // nobody else could. A ball that misses by more than the cell's own
+          // reach still deposits nothing, exactly as it does locally.
+          const cell = nearestCoatCell(
+            target.grid,
+            rec.x,
+            rec.y,
+            rec.z,
+            coatReachFor(target.grid),
+          )
+          if (cell < 0) return splats
+          splats = [{ cell, add: COAT_ADD }]
+        }
+        // ATTRIBUTED BY AUTHOR, not by the path the record came down: a rebuild
+        // (refoldSharedStrokes) re-folds OUR OWN strokes through here too, and
+        // marking those as somebody else's would quietly drop the player's own
+        // paint from their Save. Last writer owns the cell, which is the rule
+        // the packed ledger value already follows.
+        if (isOurRecord(rec.id)) for (const splat of splats) claimCell(nodeId, splat.cell)
+        else for (const splat of splats) mark.add(splat.cell)
         return splats
       },
       { pack: paintValue, base: coatBaseStrength },
@@ -2186,6 +2349,7 @@ export function foldRemoteStrokes(world: GameWorld, strokes: readonly StrokeRec[
     // outcome anyway, and exactly what Save would have written.
     nodeSerials.set(nodeId, (nodeSerials.get(nodeId) ?? 0) + 1)
   }
+  return unplaced
 }
 
 /** Feature-detected registration — destruction.ts gains
@@ -2286,8 +2450,29 @@ function publishStrokes(
   coatRadius: number,
 ): void {
   if (!buildSyncOn()) return
-  for (const p of bridge) publishStroke(nodeId, colorIndex, p.x, p.y, p.z, coatRadius)
-  publishStroke(nodeId, colorIndex, _point.x, _point.y, _point.z, coatRadius)
+  // THE NAME THE SURFACE TRAVELS UNDER (shared-damage's wireNodeId — one
+  // definition for both lanes). A host wall passes through: its id comes from
+  // the document and means the same thing in every browser. A player-built
+  // wall does NOT — store.ts numbers pieces from a counter that restarts each
+  // page load, so my second wall and yours are both `__boots-piece-2` — so it
+  // travels under its shared RECORD id instead. null means this surface has no
+  // room-wide name (an unpublished piece, or a per-client spawn fixture): keep
+  // the paint local rather than coat a stranger's different wall.
+  const wire = wireNodeId(nodeId)
+  if (wire === null) {
+    wireCounts.unnamed++
+    return
+  }
+  // OUR OWN STROKE IS ALREADY IN THE LEDGER — the spray put it there before it
+  // was ever a record. Marking it deposited is what keeps a rebuild
+  // (refoldSharedStrokes) from folding this coat a second time on top of itself.
+  for (const p of bridge) {
+    const id = publishStroke(wire, colorIndex, p.x, p.y, p.z, coatRadius)
+    if (id) foldedStrokes.add(id)
+  }
+  const id = publishStroke(wire, colorIndex, _point.x, _point.y, _point.z, coatRadius)
+  if (id) foldedStrokes.add(id)
+  wireCounts.published += bridge.length + 1
   flushBuildSync()
 }
 
@@ -2795,6 +2980,8 @@ export function PaintTool({ world }: { world: GameWorld }) {
   /** Last R-cycle serial seen — the carousel flashes only on a real cycle,
    * never on equip (module serial survives weapon switches and sessions). */
   const lastCycle = useRef(paintCycleSerial())
+  /** Countdown to the next retry of strokes waiting for their wall (seconds). */
+  const strokeDrain = useRef(0)
 
   useEffect(() => {
     resetPaint()
@@ -2827,6 +3014,12 @@ export function PaintTool({ world }: { world: GameWorld }) {
   // holding. Never called with no world attached.
   useEffect(() => {
     setBuildAppliers({ foldStrokes: (strokes) => foldRemoteStrokes(world, strokes) })
+    // THE LEDGER IS DERIVED, THE RECORDS ARE THE TRUTH. The mount effect above
+    // just emptied it, and a stroke is delivered once — so every coat the room
+    // had already handed us would be gone for the session (QA: `paintMounts 2`
+    // on a joiner). Ask the record set to rebuild it; folding is idempotent, so
+    // this is a no-op on a ledger that is already right.
+    refoldSharedStrokes()
     return () => {
       setBuildAppliers({ foldStrokes: undefined })
     }
@@ -2842,6 +3035,17 @@ export function PaintTool({ world }: { world: GameWorld }) {
     const session = getSession()
     if (!session) return
     const dt = Math.min(rawDt, 1 / 30)
+
+    // A peer's coat can arrive before the wall it landed on, and that wall is
+    // paintable a frame or two AFTER it installs — so the waiting list needs a
+    // heartbeat and not just the install event. Runs whatever this player is
+    // holding: somebody else's paint must land while we carry a rifle.
+    strokeDrain.current -= dt
+    if (strokeDrain.current <= 0) {
+      strokeDrain.current = PENDING_STROKE_DRAIN
+      drainPendingStrokes()
+    }
+
     const state = useBoots.getState()
     const active = (state.weapon as string) === 'paint'
 
