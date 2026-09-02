@@ -169,7 +169,7 @@ describe('external support probe', () => {
 })
 
 describe('perf sanity', () => {
-  test('500 slots, 100 removals with collapse compute under 50ms', () => {
+  test('500 slots, 100 removals with collapse compute stays well under an algorithmic-blowup ceiling', () => {
     // A 50 × 10 wall of slots, bottom row grounded, 4-neighbor adjacency.
     const cols = 50
     const rows = 10
@@ -216,6 +216,12 @@ describe('perf sanity', () => {
     }
     const elapsed = performance.now() - start
     expect(removals).toBe(100)
-    expect(elapsed).toBeLessThan(50)
+    // A bound, not a benchmark: this guards against an ALGORITHMIC blowup (a
+    // quadratic computeCollapse at 500 slots would be hundreds of ms to
+    // seconds), so the ceiling is generous enough to hold on a shared CI
+    // runner — a dev-machine-tuned 50 ms flaked at 50.7 ms on GitHub's
+    // hardware (the wall-clock lesson, in a unit test). 300 ms still catches
+    // any real regression by an order of magnitude.
+    expect(elapsed).toBeLessThan(300)
   })
 })
