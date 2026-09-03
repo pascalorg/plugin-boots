@@ -65,6 +65,8 @@ export type HandsRefs = {
 }
 
 const TOOL_IDS: readonly ToolId[] = ['knife', 'pistol', 'rifle', 'minigun', 'hammer', 'builder', 'paint']
+/** The old camera-scale hand read as a mitten and hid the pistol controls. */
+export const FIRST_PERSON_HAND_SCALE = 0.82
 
 function makeRefs(): HandsRefs {
   return {
@@ -308,7 +310,7 @@ function OneHand({ g, side, refs }: { g: HandGrip; side: 'R' | 'L'; refs: HandsR
   const ref = side === 'R' ? refs.right : refs.left
   return (
     <group ref={ref} position={[g.position[0], g.position[1], g.position[2]]}>
-      <group quaternion={q}>
+      <group quaternion={q} scale={FIRST_PERSON_HAND_SCALE}>
         {side === 'R' && g.pose === 'trigger' ? (
           <ArticulatedHand pose={g.pose} side="R" triggerRefs={refs.trigger} />
         ) : (
@@ -317,7 +319,14 @@ function OneHand({ g, side, refs }: { g: HandGrip; side: 'R' | 'L'; refs: HandsR
       </group>
       {/* The sleeve is a SIBLING of the rotated hand: it hangs from the heel
           point and heads for the shoulder whatever the hand's roll. */}
-      <Forearm arm={g.arm} position={[heel[0] - g.position[0], heel[1] - g.position[1], heel[2] - g.position[2]]} />
+      <Forearm
+        arm={g.arm}
+        position={[
+          (heel[0] - g.position[0]) * FIRST_PERSON_HAND_SCALE,
+          (heel[1] - g.position[1]) * FIRST_PERSON_HAND_SCALE,
+          (heel[2] - g.position[2]) * FIRST_PERSON_HAND_SCALE,
+        ]}
+      />
     </group>
   )
 }

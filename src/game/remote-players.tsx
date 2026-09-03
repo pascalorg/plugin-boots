@@ -356,6 +356,8 @@ export const STRIDE = {
 export const BLEND_RATE = { legs: 60, arms: 12, trunk: 9, hands: 14 } as const
 /** A hand holding something collapses to this scale (its fist mesh takes over). */
 export const HAND_COLLAPSE = 0.02
+/** Procedural grip hands are camera-readable without dwarfing Pascaline arms. */
+export const AVATAR_GRIP_HAND_SCALE = 0.82
 /**
  * The arm the poses are solved for: shoulder half-width, upper arm, and the
  * reach from elbow to the grip in the palm. The mascot model's numbers (the box
@@ -1773,7 +1775,7 @@ function HeldWeapon({
         {/* The right hand on the grip (shown while gripping — always, with a
             weapon in hand; applyArticulation owns the boolean). */}
         <group position={[r[0], r[1], r[2]]} quaternion={qR} ref={refs.fistR}>
-          <HandMesh pose={hold.right.pose} side="R" />
+          <HandMesh pose={hold.right.pose} side="R" scale={AVATAR_GRIP_HAND_SCALE} />
         </group>
         {/* The support hand at its table point, hidden until the left arm
             has reached across (gripL > 0.5). */}
@@ -1784,7 +1786,7 @@ function HeldWeapon({
             ref={refs.fistL}
             visible={false}
           >
-            <HandMesh pose={support.pose} side="L" />
+            <HandMesh pose={support.pose} side="L" scale={AVATAR_GRIP_HAND_SCALE} />
           </group>
         ) : null}
       </group>

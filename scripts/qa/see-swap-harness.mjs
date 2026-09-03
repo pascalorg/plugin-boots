@@ -993,6 +993,17 @@ async function main() {
   const before = await spect(B)
   await B.bringToFront()
   await B.click('[data-boots-spectator-hint]', { timeout: 5000 }).catch((e) => fail(`B: pill click failed: ${String(e).slice(0, 120)}`))
+  // A browser that has not granted the mic deliberately needs two gestures:
+  // first ask for permission, then enter fullscreen/pointer-lock. In a
+  // previously granted profile the first click still enters immediately.
+  const gate = await waitFor(B, () => {
+    if (globalThis.__boots) return true
+    const el = document.querySelector('[data-boots-spectator-hint]')
+    return !!el && !el.disabled && /PLAY/i.test(el.textContent ?? '')
+  }, null, 12000)
+  if (gate.ok && !(await evalSafe(B, () => !!globalThis.__boots))) {
+    await B.click('[data-boots-spectator-hint]', { timeout: 5000 }).catch((e) => fail(`B: gated pill click failed: ${String(e).slice(0, 120)}`))
+  }
   const inB = await waitFor(B, () => !!globalThis.__boots, null, 45000)
   if (!inB.ok) fail('B: pill click did not enter the game')
   await sleep(2500)

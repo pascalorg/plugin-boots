@@ -194,13 +194,75 @@ const BUNDLED: readonly CatalogEntry[] = Array.isArray(
   : []
 
 /**
+ * The host owns the real catalog. Keep the bundle only as an offline/old-host
+ * fallback; once the same-origin API answers, its rows win by id so every
+ * Boots client places the current published asset rather than a stale copy.
+ */
+let activeCatalog: readonly CatalogEntry[] = BUNDLED
+let catalogHydration: Promise<readonly CatalogEntry[]> | null = null
+
+function isCatalogEntry(value: unknown): value is CatalogEntry {
+  if (!value || typeof value !== 'object') return false
+  const row = value as Record<string, unknown>
+  return (
+    typeof row.id === 'string' &&
+    row.id.length > 0 &&
+    typeof row.name === 'string' &&
+    typeof row.category === 'string' &&
+    typeof row.src === 'string' &&
+    row.src.length > 0 &&
+    typeof row.thumbnail === 'string'
+  )
+}
+
+export function mergeCatalog(
+  apiItems: readonly CatalogEntry[],
+  fallback: readonly CatalogEntry[] = BUNDLED,
+): CatalogEntry[] {
+  const seen = new Set(apiItems.map((item) => item.id))
+  return [...apiItems, ...fallback.filter((item) => !seen.has(item.id))]
+}
+
+export function ensureFullCatalog(
+  fetchImpl: typeof fetch = fetch,
+): Promise<readonly CatalogEntry[]> {
+  if (catalogHydration) return catalogHydration
+  catalogHydration = fetchImpl('/api/plugins/boots/catalog', {
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json' },
+  })
+    .then(async (response) => {
+      if (!response.ok) throw new Error(`catalog answered ${response.status}`)
+      const body: unknown = await response.json()
+      const rows =
+        body && typeof body === 'object' && Array.isArray((body as { items?: unknown }).items)
+          ? (body as { items: unknown[] }).items.filter(isCatalogEntry)
+          : []
+      if (rows.length === 0) throw new Error('catalog answered without placeable items')
+      activeCatalog = mergeCatalog(rows)
+      return activeCatalog
+    })
+    .catch(() => {
+      catalogHydration = null
+      return activeCatalog
+    })
+  return catalogHydration
+}
+
+/** Test seam: production only calls ensureFullCatalog. */
+export function setCatalog(items: readonly CatalogEntry[] | null): void {
+  activeCatalog = items ? [...items] : BUNDLED
+  catalogHydration = null
+}
+
+/**
  * v1 scope filter — pure, exported for tests: floor-standing GLB items
  * only. `attachTo` items (wall/ceiling/wall-side) need host attachment
  * frames the game does not model, and `tool` rows are editor affordances,
  * not placeable assets.
  */
 export function placeableCatalog(
-  items: readonly CatalogEntry[] = BUNDLED,
+  items: readonly CatalogEntry[] = activeCatalog,
 ): CatalogEntry[] {
   return items.filter((item) => !item.attachTo && !item.tool)
 }
@@ -263,6 +325,8 @@ type OpenMenu = {
   session: GameSession
   input: MenuInput
   root: HTMLDivElement
+  tabsEl: HTMLDivElement
+  titleHintEl: HTMLSpanElement
   gridEl: HTMLDivElement
   tabEls: HTMLButtonElement[]
   cardEls: HTMLDivElement[]
@@ -377,6 +441,8 @@ export function openItemMenu(
     session,
     input,
     root,
+    tabsEl: tabs,
+    titleHintEl: titleHint,
     gridEl: grid,
     tabEls,
     cardEls: [],
@@ -389,8 +455,37 @@ export function openItemMenu(
   }
   setCategory(0)
 
+  // Render the bundled fallback immediately, then replace it in-place when
+  // the API responds. The menu never flashes closed or steals pointer lock.
+  void ensureFullCatalog().then(() => {
+    if (menu?.root === root) refreshOpenMenuCatalog()
+  })
+
   if (document.pointerLockElement) document.exitPointerLock()
   return true
+}
+
+function refreshOpenMenuCatalog(): void {
+  const open = menu
+  if (!open) return
+  const previousCategory = open.categories[open.category]
+  open.items = [...placeableCatalog(), ...OPENING_ENTRIES]
+  open.categories = catalogCategories(open.items)
+  open.tabsEl.replaceChildren()
+  open.tabEls = open.categories.map((category, index) => {
+    const tab = document.createElement('button')
+    tab.type = 'button'
+    tab.textContent = `${index + 1} ${category}`
+    tab.style.cssText =
+      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;` +
+      'background:transparent;color:rgba(255,255,255,0.75);border:1px solid rgba(255,255,255,0.2)'
+    tab.addEventListener('click', () => setCategory(index))
+    open.tabsEl.appendChild(tab)
+    return tab
+  })
+  open.titleHintEl.textContent = `click or arrows + Enter · 1-${Math.min(open.categories.length, 9)} tabs · I close`
+  const preserved = previousCategory ? open.categories.indexOf(previousCategory) : -1
+  setCategory(preserved >= 0 ? preserved : 0)
 }
 
 /**

@@ -841,6 +841,38 @@ export function publishItem(
   return rec.id
 }
 
+/**
+ * Replace a placed item's immutable shared record while keeping its runtime
+ * identity. This is the M-to-move path: peers receive the old tombstone and
+ * the new grounded pose in one flushed delta, so nobody observes a private
+ * local teleport.
+ */
+export function moveSharedItem(
+  runtimeId: number,
+  catalogId: string,
+  position: readonly [number, number, number],
+  yaw: number,
+): RecordId | null {
+  const s = sync
+  if (!s) return null
+  const next = addLocalItem(s.world, {
+    catalogId,
+    x: position[0],
+    y: position[1],
+    z: position[2],
+    yaw,
+  })
+  if (!next) return null
+  const previous = unbindPlacement(runtimeId)
+  if (previous !== null && killRecord(s.world, 'items', previous)) {
+    outgoing().deadItems.push(previous)
+  }
+  bindPlacement(runtimeId, next.id, false)
+  outgoing().items.push(next)
+  flushBuildSync()
+  return next.id
+}
+
 /** Publish a locally placed door/window. Host-relative by construction, so
  * it survives a peer whose grid anchor differs entirely. */
 export function publishAperture(

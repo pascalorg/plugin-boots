@@ -8,6 +8,7 @@ import {
   isOpeningEntry,
   MENU_CATEGORY_CAP,
   MENU_COLUMNS,
+  mergeCatalog,
   moveSelection,
   OPENING_ENTRIES,
   OPENINGS_CATEGORY,
@@ -45,6 +46,15 @@ describe('placeableCatalog', () => {
 
   test('bundled default is safe under the test stub (no throw, an array)', () => {
     expect(Array.isArray(placeableCatalog())).toBe(true)
+  })
+})
+
+describe('API catalog merge', () => {
+  test('API rows win by id and retain bundled rows as an offline-compatible tail', () => {
+    const bundled = [entry('chair'), entry('lamp')]
+    const apiChair = entry('chair', { name: 'Current chair', src: 'https://api.test/chair.glb' })
+    const apiSofa = entry('sofa')
+    expect(mergeCatalog([apiChair, apiSofa], bundled)).toEqual([apiChair, apiSofa, bundled[1]!])
   })
 })
 

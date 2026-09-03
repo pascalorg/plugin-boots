@@ -45,8 +45,10 @@ import {
   isForeignPiece,
   isForeignPlacement,
   isOurRecord,
+  moveSharedItem,
   onGridStampChange,
   pieceRecordOf,
+  placementRecordOf,
   publishAperture,
   publishGridStamp,
   publishItem,
@@ -689,6 +691,23 @@ describe('what this player builds goes out once, quantized', () => {
     // Publishing the same runtime placement twice is refused, not duplicated.
     expect(publishItem(9001, ITEM.id, [1, 0, 1], 0)).toBeNull()
     expect(localWork(h.mine).items).toHaveLength(1)
+  })
+
+  test('moving an item replaces its shared record in one convergent update', () => {
+    const h = boot()
+    const first = publishItem(9001, ITEM.id, [1, 0, -2], 0)!
+    const second = moveSharedItem(9001, ITEM.id, [4, 0.5, -5], Math.PI / 2)!
+
+    expect(second).not.toBe(first)
+    expect(placementRecordOf(9001)).toBe(second)
+    expect(h.mine.items.dead.has(first)).toBe(true)
+    expect(liveRecords(h.mine.items)).toEqual([
+      expect.objectContaining({ id: second, x: 4, y: 0.5, z: -5, yaw: quantYaw(Math.PI / 2) }),
+    ])
+    expect(h.sent.at(-1)).toMatchObject({
+      deadItems: [first],
+      items: [expect.objectContaining({ id: second })],
+    })
   })
 })
 

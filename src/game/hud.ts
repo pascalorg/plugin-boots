@@ -136,7 +136,7 @@ const GHOST_REASON_LABEL: Record<Exclude<GhostReason, 'ok'>, string> = {
 }
 
 /** Bottom keybind bar, holstered/default loadout. */
-export const KEYBAR_DEFAULT = 'Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog'
+export const KEYBAR_DEFAULT = 'Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog · M move'
 
 /** Physical piece-hotkey codes → what they do. Mirrors builder.tsx's
  * PIECE_KEYS + the Q cycle (duplicated as display data — hud must not import
@@ -317,7 +317,7 @@ export const LOADING_TIPS = [
   'E gears you up at the depot behind you',
   'Face the breaker outside to start — or stop — the waves',
   '4 builds · Z X C V pick a piece',
-  'G throws a grenade · I opens the catalog',
+  'G throws a grenade · I opens the catalog · M moves furniture',
 ] as const
 
 /** Tip rotation pace — slow enough to read, fast enough to see a few. */

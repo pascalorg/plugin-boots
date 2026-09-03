@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
-import { BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D } from 'three'
+import { Box3, BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three'
 import { PLAYER_CAPSULE } from './collision'
 import { type CatalogEntry, OPENING_ENTRIES } from './inventory'
 import {
   aimWallPoint,
+  aimedPlacedItemId,
   anchorOnFloor,
   apertureFits,
   apertureRect,
@@ -12,6 +13,7 @@ import {
   ITEM_REACH,
   type ItemAnchor,
   itemFootprint,
+  itemBlockedByWorld,
   itemGhostActive,
   itemModelLoader,
   itemOverlapsPlayer,
@@ -153,12 +155,50 @@ describe('useItems store', () => {
     expect(useItems.getState().armed).not.toBeNull()
   })
 
+  test('M lift is reversible and a drop keeps the runtime identity', () => {
+    const original = useItems.getState().addItem(asset(), [1, 0, 2], Math.PI / 2)
+    expect(useItems.getState().beginMove(original.id)).toEqual(original)
+    expect(useItems.getState().items).toEqual([])
+    expect(useItems.getState().armed?.id).toBe(original.asset.id)
+
+    useItems.getState().cancelMove()
+    expect(useItems.getState().items).toEqual([original])
+
+    useItems.getState().beginMove(original.id)
+    const moved = useItems.getState().finishMove([4, 0, 5], -Math.PI / 2)
+    expect(moved).toMatchObject({ id: original.id, position: [4, 0, 5] })
+    expect(useItems.getState().moving).toBeNull()
+    expect(useItems.getState().armed).toBeNull()
+  })
+
   test('itemGhostActive tracks arm/disarm (menu closed headless)', () => {
     expect(itemGhostActive()).toBe(false)
     useItems.getState().arm(asset())
     expect(itemGhostActive()).toBe(true)
     useItems.getState().disarm()
     expect(itemGhostActive()).toBe(false)
+  })
+})
+
+describe('M aim and blocking', () => {
+  const collider = (nodeId: string, nodeType: string, min: [number, number, number], max: [number, number, number]) => ({
+    nodeId,
+    nodeType,
+    worldBox: new Box3(new Vector3(...min), new Vector3(...max)),
+  }) as never
+
+  test('selects the nearest placed item but never through a wall', () => {
+    const couch = collider('__boots-item-17', 'item', [-0.5, 0, -3.5], [0.5, 1, -2.5])
+    expect(aimedPlacedItemId([couch], { x: 0, y: 0.5, z: 0 }, 0, 0)).toBe(17)
+    const wall = collider('wall-1', 'wall', [-1, 0, -2], [1, 2.5, -1.9])
+    expect(aimedPlacedItemId([couch, wall], { x: 0, y: 0.5, z: 0 }, 0, 0)).toBeNull()
+  })
+
+  test('ground contact is allowed, but a wall in the volume or sightline blocks', () => {
+    const floor = collider('floor-1', 'floor', [-10, -0.2, -10], [10, 0, 10])
+    expect(itemBlockedByWorld([floor], 0, 0, -3, 0, [1, 1, 1], { x: 0, y: 1.58, z: 0 })).toBe(false)
+    const wall = collider('wall-1', 'wall', [-1, 0, -2], [1, 2.5, -1.9])
+    expect(itemBlockedByWorld([floor, wall], 0, 0, -3, 0, [1, 1, 1], { x: 0, y: 1.58, z: 0 })).toBe(true)
   })
 })
 

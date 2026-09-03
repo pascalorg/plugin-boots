@@ -14,6 +14,7 @@ import {
   Mesh,
   MeshStandardMaterial,
   type Object3D,
+  Ray,
   SRGBColorSpace,
   Vector3,
 } from 'three'
@@ -29,6 +30,7 @@ import { groundSurfaceY } from './ground'
 import {
   type CatalogEntry,
   closeItemMenu,
+  ensureFullCatalog,
   isItemMenuOpen,
   isOpeningEntry,
   type MenuEntry,
@@ -44,6 +46,7 @@ import {
   buildSyncOn,
   forgetSharedPlacements,
   isForeignPlacement,
+  moveSharedItem,
   publishAperture,
   publishItem,
   setBuildAppliers,
@@ -147,8 +150,14 @@ type ItemsState = {
   items: Placement[]
   /** Menu entry riding a ghost (furniture OR opening); null = stowed. */
   armed: MenuEntry | null
+  /** Furniture temporarily lifted by M; omitted from items so its old solid
+   * collider cannot obstruct its own grounded preview. */
+  moving: PlacedItem | null
   arm: (asset: MenuEntry) => void
   disarm: () => void
+  beginMove: (id: number) => PlacedItem | null
+  cancelMove: () => void
+  finishMove: (position: [number, number, number], yaw: number) => PlacedItem | null
   addItem: (asset: CatalogEntry, position: [number, number, number], yaw: number) => PlacedItem
   /** `size` overrides the entry's nominal dimensions — a REMOTE aperture is
    * materialized from its record, not re-derived from the local catalog. */
@@ -171,8 +180,34 @@ let itemId = 1
 export const useItems = create<ItemsState>((set, get) => ({
   items: [],
   armed: null,
-  arm: (armed) => set({ armed }),
+  moving: null,
+  arm: (armed) => set({ armed, moving: null }),
   disarm: () => set({ armed: null }),
+  beginMove: (id) => {
+    const moving = get().items.find((item): item is PlacedItem => item.kind === 'item' && item.id === id) ?? null
+    if (!moving) return null
+    set((state) => ({
+      items: state.items.filter((item) => item.id !== id),
+      armed: moving.asset,
+      moving,
+    }))
+    return moving
+  },
+  cancelMove: () => {
+    const moving = get().moving
+    if (!moving) {
+      set({ armed: null })
+      return
+    }
+    set((state) => ({ items: [...state.items, moving], armed: null, moving: null }))
+  },
+  finishMove: (position, yaw) => {
+    const moving = get().moving
+    if (!moving) return null
+    const placed: PlacedItem = { ...moving, position, yaw }
+    set((state) => ({ items: [...state.items, placed], armed: null, moving: null }))
+    return placed
+  },
   addItem: (asset, position, yaw) => {
     const stored: PlacedItem = { kind: 'item', id: itemId++, asset, position, yaw }
     set((s) => ({ items: [...s.items, stored] }))
@@ -193,7 +228,7 @@ export const useItems = create<ItemsState>((set, get) => ({
     return stored
   },
   removeItem: (id) => set((s) => ({ items: s.items.filter((p) => p.id !== id) })),
-  resolveItems: () => set({ items: [] }),
+  resolveItems: () => set({ items: [], moving: null }),
 }))
 
 /** True while a placed-item ghost owns the trigger (armed + menu closed) —
@@ -835,6 +870,87 @@ export function mountItemVisual(
 /** Collider nodeId prefix for placed items ('__boots' family: the keep /
  * demolition / paint capture paths all skip it). */
 const ITEM_NODE_PREFIX = '__boots-item-'
+const _itemRay = new Ray()
+const _itemRayDirection = new Vector3()
+const _itemRayHit = new Vector3()
+
+/** Nearest solid under the crosshair, but only returns a game-placed item.
+ * A wall or another prop in front wins the ray and prevents through-wall M. */
+export function aimedPlacedItemId(
+  colliders: readonly ColliderEntry[],
+  eye: { x: number; y: number; z: number },
+  yaw: number,
+  pitch: number,
+  reach = ITEM_REACH,
+): number | null {
+  const cp = Math.cos(pitch)
+  _itemRay.origin.set(eye.x, eye.y, eye.z)
+  _itemRayDirection.set(-Math.sin(yaw) * cp, Math.sin(pitch), -Math.cos(yaw) * cp)
+  _itemRay.direction.copy(_itemRayDirection)
+  let nearest = reach
+  let target: number | null = null
+  for (const collider of colliders) {
+    if (collider.disabled || collider.nodeType === 'site') continue
+    if (_itemRay.intersectBox(collider.worldBox, _itemRayHit) === null) continue
+    const distance = _itemRayHit.distanceTo(_itemRay.origin)
+    if (distance >= nearest) continue
+    nearest = distance
+    target = collider.nodeId.startsWith(ITEM_NODE_PREFIX)
+      ? Number.parseInt(collider.nodeId.slice(ITEM_NODE_PREFIX.length), 10)
+      : null
+  }
+  return target !== null && Number.isFinite(target) ? target : null
+}
+
+/** Candidate-volume + line-of-sight guard for both fresh placement and M.
+ * The surface whose top supports the item is ignored, but walls, furniture
+ * and every raised blocking surface refuse the drop. */
+export function itemBlockedByWorld(
+  colliders: readonly ColliderEntry[],
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+  footprint: [number, number, number],
+  eye: { x: number; y: number; z: number },
+): boolean {
+  const swapped = Math.round(yaw / HALF_PI) & 1
+  const width = swapped ? footprint[2] : footprint[0]
+  const depth = swapped ? footprint[0] : footprint[2]
+  const halfW = width / 2
+  const halfD = depth / 2
+  const top = y + footprint[1]
+
+  for (const collider of colliders) {
+    if (collider.disabled || collider.nodeType === 'site') continue
+    const box = collider.worldBox
+    // Contact with the supporting floor/table top is valid, as is anything
+    // entirely above the item. Remaining strict overlap blocks the volume.
+    if (box.max.y <= y + 0.025 || box.min.y >= top - 0.025) continue
+    if (
+      box.max.x > x - halfW &&
+      box.min.x < x + halfW &&
+      box.max.z > z - halfD &&
+      box.min.z < z + halfD
+    ) return true
+  }
+
+  const centerY = y + footprint[1] / 2
+  _itemRay.origin.set(eye.x, eye.y, eye.z)
+  _itemRayDirection.set(x - eye.x, centerY - eye.y, z - eye.z)
+  const targetDistance = _itemRayDirection.length()
+  if (targetDistance <= 0.05) return false
+  _itemRay.direction.copy(_itemRayDirection).multiplyScalar(1 / targetDistance)
+  const nearRadius = Math.max(0.05, Math.min(halfW, halfD))
+  for (const collider of colliders) {
+    if (collider.disabled || collider.nodeType === 'site') continue
+    const box = collider.worldBox
+    if (box.max.y <= y + 0.025) continue
+    if (_itemRay.intersectBox(box, _itemRayHit) === null) continue
+    if (_itemRayHit.distanceTo(_itemRay.origin) < targetDistance - nearRadius) return true
+  }
+  return false
+}
 
 // --- Aperture stand-in (jambs + header + leaf/glass primitive mock) ----------
 
@@ -1088,6 +1204,12 @@ export function GameItems({ world }: { world: GameWorld }) {
     wallFramesRef.current = null
   }, [world])
 
+  // Begin the shared published-catalog fetch before I is opened or a peer
+  // publishes a placement. The bundled list remains the instant fallback.
+  useEffect(() => {
+    void ensureFullCatalog()
+  }, [])
+
   // REMOTE PLACEMENTS. The catalog lane keeps its store module-private, so it
   // hands shared-build the three functions that can reach it rather than
   // letting shared-build import this file (which would close an import cycle
@@ -1150,7 +1272,13 @@ export function GameItems({ world }: { world: GameWorld }) {
                   width: p.width,
                   height: p.height,
                 }
-              : { kind: p.kind, id: p.id, asset: p.asset.id, position: [...p.position] },
+              : {
+                  kind: p.kind,
+                  id: p.id,
+                  asset: p.asset.id,
+                  position: [...p.position],
+                  yaw: p.yaw,
+                },
           ),
         }
       },
@@ -1211,7 +1339,7 @@ export function GameItems({ world }: { world: GameWorld }) {
   useEffect(
     () => () => {
       closeItemMenu(false)
-      useItems.getState().disarm()
+      useItems.getState().cancelMove()
       disposeItemModels()
     },
     [],
@@ -1231,12 +1359,15 @@ export function GameItems({ world }: { world: GameWorld }) {
     const actions = session.input.state.actions
     let toggleMenu = false
     let rotate = false
+    let move = false
     const armedNow = state.armed !== null && !isItemMenuOpen()
     let write = 0
     for (let read = 0; read < actions.length; read++) {
       const action = actions[read]!
       if (action === 'KeyI') {
         toggleMenu = true
+      } else if (action === 'KeyM') {
+        move = true
       } else if (action === 'KeyR' && armedNow) {
         rotate = true
       } else {
@@ -1246,7 +1377,34 @@ export function GameItems({ world }: { world: GameWorld }) {
     }
     actions.length = write
 
+    if (move && !isItemMenuOpen()) {
+      if (state.moving) {
+        state.cancelMove()
+        ghost.visible = false
+        sfx.weaponSwitch()
+        return
+      }
+      if (!state.armed) {
+        const id = aimedPlacedItemId(
+          world.colliders,
+          playerRig.position,
+          playerRig.yaw,
+          playerRig.pitch,
+        )
+        const picked = id === null ? null : state.beginMove(id)
+        if (picked) {
+          armedWeapon.current = useBoots.getState().weapon
+          yawTurns.current = 0
+          sfx.weaponSwitch()
+        } else {
+          session.hud.prompt('Aim at placed furniture, then press M', 'items')
+        }
+        return
+      }
+    }
+
     if (toggleMenu) {
+      if (state.moving) state.cancelMove()
       if (!closeItemMenu()) {
         openItemMenu(session, (item) => {
           useItems.getState().arm(item)
@@ -1275,7 +1433,8 @@ export function GameItems({ world }: { world: GameWorld }) {
     // tool the player armed it with.
     const weapon = useBoots.getState().weapon
     if (armedWeapon.current !== null && weapon !== armedWeapon.current) {
-      state.disarm()
+      if (state.moving) state.cancelMove()
+      else state.disarm()
       ghost.visible = false
       if (apGhost) apGhost.visible = false
       return
@@ -1288,7 +1447,8 @@ export function GameItems({ world }: { world: GameWorld }) {
     const alt = session.input.state.altFiring
     if (alt && !prevAlt.current) {
       prevAlt.current = alt
-      state.disarm()
+      if (state.moving) state.cancelMove()
+      else state.disarm()
       ghost.visible = false
       if (apGhost) apGhost.visible = false
       sfx.weaponSwitch()
@@ -1303,7 +1463,9 @@ export function GameItems({ world }: { world: GameWorld }) {
       session.hud.prompt(
         openingArmed
           ? 'LMB place on a wall · RMB stow · I catalog'
-          : 'LMB place · R rotate · RMB stow · I catalog',
+          : state.moving
+            ? 'LMB drop · R rotate · RMB cancel move'
+            : 'LMB place · R rotate · RMB stow · I catalog · M move aimed item',
         'items',
       )
     }
@@ -1442,7 +1604,11 @@ export function GameItems({ world }: { world: GameWorld }) {
     // aiming into a hole in the floor you stand on must not place the item on
     // the ground a storey below.
     const y = itemDropY(_anchor.y, snapped)
-    const yaw = ghostYaw(playerRig.yaw, yawTurns.current)
+    // A moved item keeps its old orientation until R is pressed. New catalog
+    // items continue to face the player on first appearance.
+    const yaw = state.moving
+      ? ghostYaw(state.moving.yaw - Math.PI, yawTurns.current)
+      : ghostYaw(playerRig.yaw, yawTurns.current)
     ghost.visible = true
     ghost.position.set(_anchor.x, y, _anchor.z)
     ghost.rotation.set(0, yaw, 0)
@@ -1461,6 +1627,15 @@ export function GameItems({ world }: { world: GameWorld }) {
         playerRig.position.x,
         floorY,
         playerRig.position.z,
+      ) ||
+      itemBlockedByWorld(
+        world.colliders,
+        _anchor.x,
+        y,
+        _anchor.z,
+        yaw,
+        armedFootprint.current,
+        playerRig.position,
       )
     session.hud.ghostStatus?.(
       _anchor.valid ? (blocked ? 'occupied' : null) : 'out-of-reach',
@@ -1479,10 +1654,20 @@ export function GameItems({ world }: { world: GameWorld }) {
       !useBoots.getState().staggered
     ) {
       const asset = state.armed as CatalogEntry
-      const stored = useItems.getState().addItem(asset, [_anchor.x, y, _anchor.z], yaw)
-      // The wire carries the catalog id, not the asset: every peer runs the
-      // same catalog, and a row is ~1 KB of JSON against 5 numbers.
-      publishItem(stored.id, asset.id, stored.position, stored.yaw)
+      // Capture the rendered preview itself. This is deliberately not a
+      // second ghostYaw calculation: the placed mesh, shared record and Save
+      // bridge all inherit the exact orientation the player clicked.
+      const previewYaw = ghost.rotation.y
+      const destination: [number, number, number] = [_anchor.x, y, _anchor.z]
+      const stored = state.moving
+        ? useItems.getState().finishMove(destination, previewYaw)
+        : useItems.getState().addItem(asset, destination, previewYaw)
+      if (stored) {
+        // The wire carries the catalog id, not the asset: every peer runs the
+        // same published API catalog, and a row is ~1 KB against 5 numbers.
+        if (state.moving) moveSharedItem(stored.id, asset.id, stored.position, stored.yaw)
+        else publishItem(stored.id, asset.id, stored.position, stored.yaw)
+      }
       sfx.place()
     }
     prevFire.current = firing

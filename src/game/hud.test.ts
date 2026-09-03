@@ -48,7 +48,7 @@ describe('builder keybind bar', () => {
   })
 
   test('the default bar is untouched (holstered contract)', () => {
-    expect(KEYBAR_DEFAULT).toBe('Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog')
+    expect(KEYBAR_DEFAULT).toBe('Esc exit · G grenade · R rotate/shape · F edit · U undo · I catalog · M move')
   })
 })
 

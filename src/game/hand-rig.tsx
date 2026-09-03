@@ -236,13 +236,13 @@ export function ArticulatedHand({
 /** Wrist joint at the heel (an ellipsoid, squashed like the wrist stub), then
  * the knit CUFF (its own material) and the sleeve running along +Z, WIDENING
  * toward the elbow (cylinder top = +Z after rotateX). Module-shared. */
-const WRIST_BALL_GEO = new SphereGeometry(0.028, 10, 8).scale(0.8, 1, 1)
-const CUFF_GEO = new CylinderGeometry(0.039, 0.037, 0.045, 12).rotateX(Math.PI / 2)
-const SLEEVE_GEO = new CylinderGeometry(0.045, 0.04, 0.3, 12).rotateX(Math.PI / 2)
+const WRIST_BALL_GEO = new SphereGeometry(0.023, 10, 8).scale(0.78, 1, 1)
+const CUFF_GEO = new CylinderGeometry(0.032, 0.03, 0.045, 12).rotateX(Math.PI / 2)
+const SLEEVE_GEO = new CylinderGeometry(0.036, 0.032, 0.3, 12).rotateX(Math.PI / 2)
 export const FOREARM_PARTS = {
-  ball: { z: 0.0, r: 0.028 },
-  cuff: { z: 0.046, len: 0.045, r: 0.039 },
-  sleeve: { z: 0.218, len: 0.3, r0: 0.04, r1: 0.045 },
+  ball: { z: 0.0, r: 0.023 },
+  cuff: { z: 0.046, len: 0.045, r: 0.032 },
+  sleeve: { z: 0.218, len: 0.3, r0: 0.033, r1: 0.036 },
 } as const
 
 /**

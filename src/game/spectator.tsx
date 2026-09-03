@@ -13,6 +13,7 @@ import {
 } from './presence'
 import { RemotePlayers } from './remote-players'
 import { livePlayerNames, sameNames } from './roster-names'
+import { beginEntry } from './mic-gate'
 import { enterGame } from './session'
 import {
   HINT_ATTR,
@@ -25,6 +26,7 @@ import {
 } from './spectator-hint'
 import {
   resumeVoiceOutputs,
+  releaseMic,
   setVoiceLocalEcho,
   startVoiceListen,
   stopVoiceListen,
@@ -155,6 +157,10 @@ function SpectatorHint({ text, event, hidden }: { text: string | null; event: st
   const pillRef = useRef<HTMLButtonElement | null>(null)
   const labelRef = useRef<HTMLSpanElement | null>(null)
   const subRef = useRef<HTMLSpanElement | null>(null)
+  // While the mic gate is asking, its ALLOW/PLAY copy owns the label. Roster
+  // polling may keep changing `text` underneath it; never overwrite the
+  // permission state with another JUMP IN line mid-prompt.
+  const entryLabelRef = useRef<string | null>(null)
   const show = text !== null
 
   useEffect(() => {
@@ -180,9 +186,30 @@ function SpectatorHint({ text, event, hidden }: { text: string | null; event: st
     sub.setAttribute('data-boots-spectator-event', '')
     sub.style.cssText = `display:none;font:500 11px/1.2 ${FONT};letter-spacing:0.06em;opacity:0.72;margin-top:5px;white-space:nowrap`
     pill.append(label, sub)
-    // The click is the user gesture fullscreen and pointer lock require.
+    // The click is also the microphone gesture. The mic gate keeps a browser
+    // permission prompt OUTSIDE enterGame's fullscreen/pointer-lock sequence:
+    // first click asks (when needed), second click enters with the grant.
     pill.onclick = () => {
-      enterGame()
+      beginEntry({
+        setLabel: (next, busy) => {
+          entryLabelRef.current = next
+          label.textContent = next
+          pill.disabled = busy
+          pill.style.cursor = busy ? 'wait' : 'pointer'
+          pill.style.opacity = busy ? '0.72' : '1'
+        },
+        enter: () => {
+          if (enterGame()) return
+          // A vanished canvas/session must not leave the device hot. Restore
+          // the live roster copy so the still-mounted pill remains usable.
+          releaseMic()
+          entryLabelRef.current = null
+          label.textContent = text ?? ''
+          pill.disabled = false
+          pill.style.cursor = 'pointer'
+          pill.style.opacity = '1'
+        },
+      })
     }
     document.body.appendChild(pill)
     pillRef.current = pill
@@ -199,7 +226,7 @@ function SpectatorHint({ text, event, hidden }: { text: string | null; event: st
   useEffect(() => {
     const pill = pillRef.current
     if (!pill) return
-    if (labelRef.current) labelRef.current.textContent = text ?? ''
+    if (labelRef.current) labelRef.current.textContent = entryLabelRef.current ?? text ?? ''
     const sub = subRef.current
     if (sub) {
       sub.textContent = event ?? ''
