@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { Box3, type BufferGeometry, Vector3 } from 'three'
-import { handBounds, HAND_POSES, type HandPoseId } from './hand-pose'
-import { buildHandGeometry, flipWinding, FOREARM_PARTS, HAND_SKIN, HAND_SLEEVE, segmentGeometry } from './hand-rig'
+import { CUFF_HEX, handBounds, HAND_POSES, type HandPoseId } from './hand-pose'
+import { buildHandGeometry, flipWinding, FOREARM_PARTS, HAND_CUFF, HAND_SKIN, HAND_SLEEVE, segmentGeometry } from './hand-rig'
 
 /**
  * THE MERGED HAND GEOMETRY. Cache identity (one geometry per key for the
@@ -135,14 +135,47 @@ describe('segments, materials, forearm', () => {
     expect(g.boundingBox!.max.x).toBeCloseTo(0.0095, 3)
   })
 
-  test('materials are standard (WebGPU-safe) with the shared skin/sleeve colours', () => {
-    expect(HAND_SKIN.type).toBe('MeshStandardMaterial')
-    expect(HAND_SLEEVE.type).toBe('MeshStandardMaterial')
-    expect(`#${HAND_SKIN.color.getHexString()}`).toBe('#efc7b3')
-    expect(`#${HAND_SLEEVE.color.getHexString()}`).toBe('#22242a')
+  test('a profiled segment tapers r → r1, wears its joint sphere at the origin and its tip sphere at −len', () => {
+    const g = segmentGeometry(0.03, 0.008, 0.006, 0.009, 0.006)
+    expect(segmentGeometry(0.03, 0.008, 0.006, 0.009, 0.006)).toBe(g)
+    expect(g).not.toBe(segmentGeometry(0.03, 0.008))
+    g.computeBoundingBox()
+    const bb = g.boundingBox!
+    expect(bb.max.z).toBeCloseTo(0.009, 6) // the joint sphere leads
+    expect(bb.min.z).toBeCloseTo(-0.036, 6) // the tip sphere trails
+    expect(bb.max.x).toBeCloseTo(0.009, 6) // the bulge is the widest point
+    // the cone: radius near the far end is ≤ r1 (sample vertices with z < −0.02 outside the tip sphere's z-range)
+    const pos = g.getAttribute('position')
+    let maxRFar = 0
+    for (let i = 0; i < pos.count; i++) {
+      const z = pos.getZ(i)
+      if (z < -0.022 && z > -0.029) maxRFar = Math.max(maxRFar, Math.hypot(pos.getX(i), pos.getY(i)))
+    }
+    expect(maxRFar).toBeLessThanOrEqual(0.0075)
+    expect(maxRFar).toBeGreaterThan(0.005)
+    // eight radial segments, no capsule: a segment stays under 300 vertices
+    expect(pos.count).toBeLessThan(300)
+    expect(g.getIndex()).not.toBeNull()
   })
 
-  test('forearm parts stack along +Z from the wrist ball without gaps', () => {
+  test('a whole first-person hand stays a small mesh (≤ 3 k vertices, one geometry)', () => {
+    for (const pose of POSES) {
+      const g = buildHandGeometry(pose, 'R', { wrist: true })
+      expect(g.getAttribute('position').count).toBeLessThan(3000)
+    }
+  })
+
+  test('materials are standard (WebGPU-safe) with the shared skin/sleeve colours, the cuff its own', () => {
+    expect(HAND_SKIN.type).toBe('MeshStandardMaterial')
+    expect(HAND_SLEEVE.type).toBe('MeshStandardMaterial')
+    expect(HAND_CUFF.type).toBe('MeshStandardMaterial')
+    expect(`#${HAND_SKIN.color.getHexString()}`).toBe('#efc7b3')
+    expect(`#${HAND_SLEEVE.color.getHexString()}`).toBe('#22242a')
+    expect(`#${HAND_CUFF.color.getHexString()}`).toBe(CUFF_HEX)
+    expect(HAND_CUFF.color.getHex()).not.toBe(HAND_SLEEVE.color.getHex())
+  })
+
+  test('forearm parts stack along +Z from the wrist ball without gaps; the sleeve widens toward the elbow', () => {
     const ballEnd = FOREARM_PARTS.ball.z + FOREARM_PARTS.ball.r
     const cuffStart = FOREARM_PARTS.cuff.z - FOREARM_PARTS.cuff.len / 2
     const cuffEnd = FOREARM_PARTS.cuff.z + FOREARM_PARTS.cuff.len / 2
@@ -150,5 +183,7 @@ describe('segments, materials, forearm', () => {
     expect(cuffStart).toBeLessThanOrEqual(ballEnd + 0.005)
     expect(sleeveStart).toBeLessThanOrEqual(cuffEnd + 0.001)
     expect(FOREARM_PARTS.sleeve.z + FOREARM_PARTS.sleeve.len / 2).toBeLessThan(0.45)
+    expect(FOREARM_PARTS.sleeve.r1).toBeGreaterThan(FOREARM_PARTS.sleeve.r0)
+    expect(FOREARM_PARTS.sleeve.r0).toBeGreaterThan(FOREARM_PARTS.cuff.r) // a hem step where the cuff meets the sleeve
   })
 })

@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import {
   AVATAR_SKIN_HEX,
+  CUFF_HEX,
+  FINGER_TAPER,
+  FINGER_TIP,
   FINGERS,
   fingerSegmentTransforms,
   HAND_POSES,
@@ -9,6 +12,7 @@ import {
   indexChain,
   INDEX_SEGMENTS,
   KNUCKLE,
+  KNUCKLE_BULGE,
   makeSegments,
   mirrorX,
   PALM,
@@ -16,8 +20,11 @@ import {
   segmentEnd,
   SLEEVE_HEX,
   THUMB,
+  THUMB_TAPER,
+  THUMB_TIP,
   TRIGGER_CURL,
   TRIGGER_REST,
+  WRIST,
 } from './hand-pose'
 
 /**
@@ -49,11 +56,59 @@ describe('fingerSegmentTransforms', () => {
       const segs = fingerSegmentTransforms(HAND_POSES[pose], makeSegments())
       expect(segs.length).toBe(SEGMENT_COUNT)
       for (const s of segs) {
-        for (const v of [s.px, s.py, s.pz, s.rx, s.ry, s.rz, s.len, s.r]) expect(Number.isFinite(v)).toBe(true)
+        for (const v of [s.px, s.py, s.pz, s.rx, s.ry, s.rz, s.len, s.r, s.r1, s.joint, s.tip]) expect(Number.isFinite(v)).toBe(true)
         expect(s.len).toBeGreaterThan(0)
         expect(s.r).toBeGreaterThan(0)
       }
     }
+  })
+
+  test('PROFILE: each chain is one cone — r ≥ r1, continuous across joints, a knuckle bulge only at the first joint, a tip only at the last', () => {
+    const segs = fingerSegmentTransforms(HAND_POSES.fist, makeSegments())
+    const chains = [
+      [0, 1, 2],
+      [3, 4, 5],
+      [6, 7, 8],
+      [9, 10, 11],
+      [12, 13],
+    ]
+    for (const chain of chains) {
+      for (let i = 0; i < chain.length; i++) {
+        const s = segs[chain[i]!]!
+        expect(s.r1).toBeLessThan(s.r) // tapers
+        expect(s.r1).toBeGreaterThan(0)
+        if (i === 0) expect(s.joint).toBeCloseTo(s.r * KNUCKLE_BULGE, 12)
+        else {
+          expect(s.joint).toBeCloseTo(s.r, 12)
+          expect(s.r).toBeCloseTo(segs[chain[i - 1]!]!.r1, 12) // continuous
+        }
+        if (i === chain.length - 1) expect(s.tip).toBeCloseTo(s.r1, 12)
+        else expect(s.tip).toBe(0)
+      }
+    }
+    expect(FINGER_TAPER[0]).toBe(1)
+    expect(FINGER_TAPER[1]).toBeLessThan(FINGER_TAPER[0])
+    expect(FINGER_TAPER[2]).toBeLessThan(FINGER_TAPER[1])
+    expect(FINGER_TIP).toBeLessThan(FINGER_TAPER[2])
+    expect(THUMB_TIP).toBeLessThan(THUMB_TAPER[1])
+    expect(KNUCKLE_BULGE).toBeGreaterThan(1)
+    expect(KNUCKLE_BULGE).toBeLessThan(1.25) // a ridge, not a bead
+  })
+
+  test('fingers are slim: every radius ≤ 8.5 mm, neighbours leave a gap at the knuckles, the wrist is an ellipse', () => {
+    for (const f of FINGERS) {
+      expect(f.r).toBeLessThanOrEqual(0.0085)
+      expect(f.r).toBeGreaterThan(0.005)
+    }
+    expect(THUMB.r).toBeLessThanOrEqual(0.0095)
+    for (let i = 1; i < FINGERS.length; i++) {
+      const a = FINGERS[i - 1]!
+      const b = FINGERS[i]!
+      const gap = a.y - b.y - a.r * KNUCKLE_BULGE - b.r * KNUCKLE_BULGE
+      expect(gap, `${a.name}/${b.name} knuckle gap`).toBeGreaterThan(0.0005)
+    }
+    expect(WRIST.sx).toBeGreaterThan(0.5)
+    expect(WRIST.sx).toBeLessThan(0.8)
   })
 
   test('chains are continuous: each segment starts where the previous one ended', () => {
@@ -146,6 +201,9 @@ describe('indexChain', () => {
         expect(acc.ry).toBeCloseTo(ry, 9)
         expect(acc.len).toBe(locals[i]!.len)
         expect(acc.r).toBeCloseTo(locals[i]!.r, 12)
+        expect(acc.r1).toBeCloseTo(locals[i]!.r1, 12)
+        expect(acc.joint).toBeCloseTo(locals[i]!.joint, 12)
+        expect(acc.tip).toBeCloseTo(locals[i]!.tip, 12)
         // next joint origin: this joint's origin + local (0,0,-len) rotated by the accumulated Euler
         const cy = Math.cos(ry)
         const dx = -Math.sin(ry)
@@ -221,8 +279,11 @@ describe('handBounds', () => {
 })
 
 describe('colours', () => {
-  test('skin and sleeve are 6-digit hex', () => {
+  test('skin, sleeve and cuff are 6-digit hex; the cuff is lighter than the sleeve', () => {
     expect(AVATAR_SKIN_HEX).toMatch(/^#[0-9a-f]{6}$/)
     expect(SLEEVE_HEX).toMatch(/^#[0-9a-f]{6}$/)
+    expect(CUFF_HEX).toMatch(/^#[0-9a-f]{6}$/)
+    const lum = (hex: string) => Number.parseInt(hex.slice(1, 3), 16) + Number.parseInt(hex.slice(3, 5), 16) + Number.parseInt(hex.slice(5, 7), 16)
+    expect(lum(CUFF_HEX)).toBeGreaterThan(lum(SLEEVE_HEX) + 60)
   })
 })

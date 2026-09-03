@@ -27,7 +27,7 @@ import {
   WarhammerModel,
 } from './weapon-models'
 import { WEAPONS } from './weapons'
-import { WeaponHands } from './weapon-hands'
+import { driveHands, handSignals, WeaponHands } from './weapon-hands'
 import type { GameWorld } from './world'
 
 /**
@@ -52,47 +52,56 @@ export const VIEWMODEL_NAME = 'boots-viewmodel'
  * fleet feature-detect idiom; the cast is a no-op after the one-liner). */
 export type ToolId = WeaponId | 'paint'
 
+export type VmPose = { pos: [number, number, number]; rot: [number, number, number] }
+
 /**
  * Classic FPS anchor: low-right of screen, barrel converging on the crosshair.
- * Tuned to the weapon-models extents at the game FOV (90-ish vertical): the
- * pistol/knife sit closer so the small models read; the rifle stays at arm's
- * length so its muzzle (model z ~ -0.6) lands right of the crosshair, with the
- * stock running off the bottom-right corner. Every part stays > 0.11 in front
- * of the camera through recoil (+0.07 z) and draw-in, clear of the near plane.
+ * Tuned to the weapon-models extents at the game FOV (92 vertical, so the
+ * frame's bottom edge is 46° down): the pistol/knife sit closer so the small
+ * models read; the rifle stays at arm's length so its muzzle (model z ~ -0.6)
+ * lands right of the crosshair, with the stock running off the bottom-right
+ * corner. The grips ride high enough (≈ 40° down at the wrist) that the hand,
+ * its cuff and a hand's-breadth of sleeve are IN the frame — the round-1
+ * poses put every right wrist at 43–44°, under the edge. Every part stays
+ * > 0.11 in front of the camera through recoil (+0.07 z) and draw-in, clear
+ * of the near plane (hand-grips.test.ts binds to this table).
  */
-const POSES: Record<
-  ToolId,
-  { pos: [number, number, number]; rot: [number, number, number] }
-> = {
-  knife: { pos: [0.3, -0.3, -0.42], rot: [0.05, -0.24, 0.12] },
-  pistol: { pos: [0.3, -0.28, -0.45], rot: [0, -0.07, 0.03] },
-  rifle: { pos: [0.33, -0.3, -0.5], rot: [0.01, -0.09, 0.04] },
-  // The big one rides lower and closer to center — it's huge, most of the
-  // drum should sit at the bottom-right edge with the barrels crossing in.
-  minigun: { pos: [0.22, -0.36, -0.56], rot: [0.01, -0.05, 0.02] },
+export const POSES: Record<ToolId, VmPose> = {
+  knife: { pos: [0.3, -0.235, -0.42], rot: [0.05, -0.24, 0.12] },
+  pistol: { pos: [0.3, -0.23, -0.45], rot: [0, -0.07, 0.03] },
+  rifle: { pos: [0.33, -0.26, -0.5], rot: [0.01, -0.09, 0.04] },
+  // The big one rides low and to the right, SWUNG across the body (rot.y
+  // +0.6, a hip carry: the barrels cross the view and converge just left of
+  // the crosshair) — the ammo box on its near flank sits closer to the eye
+  // than the front grip and hides the support hand until the gun is turned
+  // this far; a touch of roll toward the body (rot.z < 0) shows the rear
+  // grip's fingers under the housing.
+  minigun: { pos: [0.34, -0.28, -0.5], rot: [0.02, 0.6, -0.12] },
   // Warhammer at carry: grip low-right, the model's +Y haft pitched hard
   // forward (rot.x ≈ -1.25) so the huge head rides ahead at chest height
   // like a lance — the swing offsets below rotate the whole pose group.
   hammer: { pos: [0.3, -0.42, -0.42], rot: [-1.25, -0.16, 0.1] },
-  builder: { pos: [0.32, -0.33, -0.46], rot: [0.07, -0.28, 0.14] },
+  builder: { pos: [0.32, -0.265, -0.46], rot: [0.07, -0.28, 0.14] },
   // Sprayer at carry: the little can rides close and slightly rolled in,
   // nozzle converging on the crosshair like the guns.
-  paint: { pos: [0.28, -0.3, -0.4], rot: [0.12, -0.3, 0.1] },
+  paint: { pos: [0.28, -0.27, -0.4], rot: [0.12, -0.3, 0.1] },
 }
 
 /**
  * ADS (right-mouse aim) poses: pistol/rifle only. Centered x=0 so the
- * sights converge on the crosshair, raised just under the eye line, level
- * rotation. viewmodel blends POSES→ADS_POSES with playerRig.ads (0..1,
- * written here at ±12/s); player-feel consumes the same scalar for the
- * FOV 92→60 interp and the look-sensitivity scale, and shooting-side
- * spread scaling hangs off it too (grenade agent's routing edit).
+ * sights converge on the crosshair, level rotation, and RAISED so the sight
+ * line (pistol slide top y 0.077, rifle rear sight y 0.11) sits ~3° under
+ * the crosshair: at ADS the FOV is 60 (player.tsx), the frame's bottom edge
+ * is only 30° down, and the round-1 poses (grip 33° down) put the whole
+ * hand under it. Now the grip is ~23° down: both hands in view, wrists at
+ * the edge — how aiming looks. viewmodel blends POSES→ADS_POSES with
+ * playerRig.ads (0..1, written here at ±12/s); player-feel consumes the same
+ * scalar for the FOV 92→60 interp and the look-sensitivity scale, and
+ * shooting-side spread scaling hangs off it too (grenade agent's routing edit).
  */
-const ADS_POSES: Partial<
-  Record<ToolId, { pos: [number, number, number]; rot: [number, number, number] }>
-> = {
-  pistol: { pos: [0, -0.21, -0.38], rot: [0, 0, 0] },
-  rifle: { pos: [0, -0.235, -0.44], rot: [0, 0, 0] },
+export const ADS_POSES: Partial<Record<ToolId, VmPose>> = {
+  pistol: { pos: [0, -0.11, -0.38], rot: [0, 0, 0] },
+  rifle: { pos: [0, -0.133, -0.44], rot: [0, 0, 0] },
 }
 /** playerRig.ads ramp speed (1/s) — full transition in ~0.08s each way. */
 const ADS_RATE = 12
@@ -236,11 +245,32 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     [],
   )
 
-  useFrame(guardedFrame('viewmodel', (_: RootState, rawDt: number) => {
+  // The hands take their motion from HERE (weapon-hands.tsx `handSignals`):
+  // the exact shot frame, the swap edge, the aim blend and this frame's
+  // recoil/sway values, applied by driveHands() at the end of the frame loop
+  // below. Fallback derivation resumes if the viewmodel unmounts.
+  useEffect(() => {
+    handSignals.external = true
+    return () => {
+      handSignals.external = false
+      handSignals.shot = false
+      handSignals.drawn = false
+      handSignals.held = false
+      handSignals.recoil = 0
+      handSignals.swayX = 0
+      handSignals.swayY = 0
+      handSignals.swayRoll = 0
+    }
+  }, [])
+
+  useFrame(guardedFrame('viewmodel', (root: RootState, rawDt: number) => {
     const session = getSession()
     const rig = rigRef.current
     if (!session || !rig) return
     const dt = clampFrameDt(rawDt)
+    // One-frame hand signals: cleared here, raised below where the events happen.
+    handSignals.shot = false
+    handSignals.drawn = false
 
     rig.position.copy(camera.position)
     rig.quaternion.copy(camera.quaternion)
@@ -373,6 +403,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     if (shown !== prevWeapon.current) {
       prevWeapon.current = shown
       drawT.current = 0
+      handSignals.drawn = true
       // Drawing the sprayer shakes the can awake — same rattle as R.
       if (shown === 'paint') {
         paintShakeT.current = 1
@@ -449,6 +480,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
             // pose it was fired from (presence-interp's `f`). Guns only: a knife
             // swing is not gunfire, and the branch below is where melee lives.
             playerRig.shots++
+            // …and the index finger squeezes on exactly this frame.
+            handSignals.shot = true
             const muzzle = def.id === 'knife' ? MUZZLE_OFFSETS.rifle : MUZZLE_OFFSETS[def.id]
             const flash = flashRef.current
             if (flash) {
@@ -631,6 +664,24 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         baseRZ + bobRoll * steady + swing * 0.3 + sag * 0.07 + shakeRoll,
       )
     }
+
+    // --- Hands: the exact signals, then the drive -------------------------
+    // Same frame as the weapon: this frame's recoil envelope and sway (the
+    // values the pose above just used), the aim blend the pose blended with,
+    // and whether the trigger is held on the shown gun (auto stream, an
+    // unreleased semi shot, a rotary spinning up) so the index stays pulled.
+    handSignals.aim = aim
+    handSignals.recoil = recoil
+    handSignals.swayX = bobX * steady
+    handSignals.swayY = bobY * steady
+    handSignals.swayRoll = bobRoll * steady
+    handSignals.held =
+      firing &&
+      shown === current &&
+      (current === 'pistol' || current === 'rifle' || current === 'minigun') &&
+      !staggered &&
+      !itemGhostActive()
+    driveHands(shown, dt, root.clock.elapsedTime)
   }))
 
   // Mesh pick follows `displayed`, not the store weapon — the armed-ghost

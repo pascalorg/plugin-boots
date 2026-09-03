@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { Euler, Group, Matrix4, Object3D, Quaternion, Vector3 } from 'three'
+import * as feel from './feel'
 import {
   armDirection,
-  bobProfile,
+  AVATAR_SKIN_HEX,
   FALLBACK_HOLD,
   gripQuaternion,
   gripToShoulder,
@@ -16,15 +17,21 @@ import {
   readyBob,
   RECOIL_TIME,
   recoilCurve,
+  recoilEnvelope,
   remoteKickFor,
+  SWAY_COMPLIANCE,
+  swayProfile,
+  TRIGGER_HOLD,
+  TRIGGER_PULL_RATE,
+  TRIGGER_RELEASE_RATE,
   TRIGGER_TIME,
   triggerCurve,
   type WeaponHold,
   WRIST_JOINT,
 } from './hand-grips'
+import * as handPose from './hand-pose'
 import { MODEL_ARMS, solveArm } from './remote-players'
-import type { ToolId } from './viewmodel'
-import * as viewmodel from './viewmodel'
+import { ADS_POSES, POSES, type ToolId, type VmPose } from './viewmodel'
 
 /**
  * THE GRIP CONTRACT. `gripQuaternion` must be a proper rotation that puts the
@@ -241,51 +248,38 @@ describe('gripToShoulder', () => {
   })
 })
 
-describe('motion curves', () => {
-  test('recoilCurve: 0.55 on the shot frame, 1 at the peak, ~0 at the end, decaying envelope', () => {
-    expect(recoilCurve(0)).toBeCloseTo(0.55, 12)
-    expect(recoilCurve(0.1)).toBeCloseTo(1, 12)
-    expect(Math.abs(recoilCurve(1))).toBeLessThan(0.01)
-    let prevEnv = Number.POSITIVE_INFINITY
-    let overshoot = 0
-    for (let t = 0.1; t <= 1; t += 0.01) {
-      const u = (t - 0.1) / 0.9
-      const env = Math.exp(-6 * u)
-      expect(Math.abs(recoilCurve(t))).toBeLessThanOrEqual(env + 1e-12)
-      expect(env).toBeLessThanOrEqual(prevEnv)
-      prevEnv = env
-      overshoot = Math.min(overshoot, recoilCurve(t))
-    }
-    expect(overshoot).toBeLessThan(-0.03) // a real return past centre …
-    expect(overshoot).toBeGreaterThan(-0.12) // … but not a second kick
-    expect(RECOIL_TIME).toBeGreaterThan(0.1)
+describe('motion curves — feel.ts is the one source', () => {
+  test('recoil: RECOIL_TIME is FEEL.RECOIL_TIME and recoilEnvelope/recoilCurve ARE feel.recoilEnvelope', () => {
+    expect(RECOIL_TIME).toBe(feel.FEEL.RECOIL_TIME)
+    expect(recoilEnvelope).toBe(feel.recoilEnvelope)
+    expect(recoilCurve).toBe(feel.recoilEnvelope)
+    expect(recoilEnvelope(0)).toBe(1) // the kick reads on the shot frame
+    expect(recoilEnvelope(1)).toBe(0)
+    expect(recoilEnvelope(2)).toBe(0)
   })
 
-  test('triggerCurve: 0 → 1 at 0.04 s → 0 at TRIGGER_TIME (normalised input)', () => {
-    expect(triggerCurve(0)).toBe(0)
-    expect(triggerCurve(0.04 / TRIGGER_TIME)).toBeCloseTo(1, 9)
-    expect(triggerCurve(1)).toBeCloseTo(0, 9)
+  test('sway: swayProfile IS feel.swayProfile; the skin constant is the shared one', () => {
+    expect(swayProfile).toBe(feel.swayProfile)
+    expect(AVATAR_SKIN_HEX).toBe(handPose.AVATAR_SKIN_HEX)
+    expect(SWAY_COMPLIANCE).toBeGreaterThan(0)
+    expect(SWAY_COMPLIANCE).toBeLessThan(0.5) // the hand still follows the gun
+  })
+
+  test('triggerCurve: 1 on the shot frame and through TRIGGER_HOLD, a smooth monotone release to exactly 0 at TRIGGER_TIME', () => {
+    expect(triggerCurve(0)).toBe(1)
+    expect(triggerCurve(TRIGGER_HOLD / TRIGGER_TIME)).toBe(1)
+    expect(triggerCurve(1)).toBe(0)
     expect(triggerCurve(2)).toBe(0)
-    expect(triggerCurve(0.02 / TRIGGER_TIME)).toBeCloseTo(0.5, 9)
-  })
-
-  test('bobProfile: zero at rest, monotone non-decreasing, amp ≤ 0.03, run > walk', () => {
-    const o = { amp: 0, lateral: 0, roll: 0 }
-    bobProfile(0, o)
-    expect(o).toEqual({ amp: 0, lateral: 0, roll: 0 })
-    let prev = { amp: 0, lateral: 0, roll: 0 }
-    for (let s = 0; s <= 1.0001; s += 0.02) {
-      bobProfile(s, o)
-      expect(o.amp).toBeGreaterThanOrEqual(prev.amp)
-      expect(o.lateral).toBeGreaterThanOrEqual(prev.lateral)
-      expect(o.roll).toBeGreaterThanOrEqual(prev.roll)
-      expect(o.amp).toBeLessThanOrEqual(0.03)
-      prev = { ...o }
+    let prev = 1
+    for (let t = 0; t <= 1; t += 0.01) {
+      const v = triggerCurve(t)
+      expect(v).toBeLessThanOrEqual(prev + 1e-12)
+      expect(v).toBeGreaterThanOrEqual(0)
+      prev = v
     }
-    const walk = bobProfile(0.46, { amp: 0, lateral: 0, roll: 0 })
-    const run = bobProfile(1, { amp: 0, lateral: 0, roll: 0 })
-    expect(run.amp).toBeGreaterThan(walk.amp * 1.5)
-    expect(run.amp).toBeCloseTo(0.022, 6)
+    const mid = (TRIGGER_HOLD + (TRIGGER_TIME - TRIGGER_HOLD) / 2) / TRIGGER_TIME
+    expect(triggerCurve(mid)).toBeCloseTo(0.5, 9)
+    expect(TRIGGER_PULL_RATE).toBeGreaterThan(TRIGGER_RELEASE_RATE) // pulls snap, releases ease
   })
 
   test('readyBob is a single dip; remoteKickFor is bounded with minigun < pistol', () => {
@@ -301,28 +295,8 @@ describe('motion curves', () => {
   })
 })
 
-/**
- * Viewmodel POSES / ADS_POSES. Bound to the real export when viewmodel.tsx
- * exports them (feel lane, round 2); until then this copy of its table keeps
- * the near-plane test honest — update it if the poses move.
- */
-type Pose = { pos: [number, number, number]; rot: [number, number, number] }
-const POSES_COPY: Record<ToolId, Pose> = {
-  knife: { pos: [0.3, -0.3, -0.42], rot: [0.05, -0.24, 0.12] },
-  pistol: { pos: [0.3, -0.28, -0.45], rot: [0, -0.07, 0.03] },
-  rifle: { pos: [0.33, -0.3, -0.5], rot: [0.01, -0.09, 0.04] },
-  minigun: { pos: [0.22, -0.36, -0.56], rot: [0.01, -0.05, 0.02] },
-  hammer: { pos: [0.3, -0.42, -0.42], rot: [-1.25, -0.16, 0.1] },
-  builder: { pos: [0.32, -0.33, -0.46], rot: [0.07, -0.28, 0.14] },
-  paint: { pos: [0.28, -0.3, -0.4], rot: [0.12, -0.3, 0.1] },
-}
-const ADS_COPY: Partial<Record<ToolId, Pose>> = {
-  pistol: { pos: [0, -0.21, -0.38], rot: [0, 0, 0] },
-  rifle: { pos: [0, -0.235, -0.44], rot: [0, 0, 0] },
-}
-const vm = viewmodel as unknown as { POSES?: Record<ToolId, Pose>; ADS_POSES?: Partial<Record<ToolId, Pose>> }
-const POSES = vm.POSES ?? POSES_COPY
-const ADS_POSES = vm.ADS_POSES ?? ADS_COPY
+/** Viewmodel POSES / ADS_POSES — the REAL exported tables (round 2). */
+type Pose = VmPose
 
 describe('near plane (frustum-aware)', () => {
   const NEAR = 0.1
@@ -379,5 +353,41 @@ describe('near plane (frustum-aware)', () => {
       expect(Math.abs(y) / -z, `${w} right palm y`).toBeLessThan(TAN_HALF * 1.05)
       expect(Math.abs(x) / -z, `${w} right palm x`).toBeLessThan(TAN_HALF * 1.8)
     }
+  })
+
+  test('the right WRIST (heel) is inside the frame at carry with room for the cuff, every weapon but the hammer', () => {
+    // The heel is sample 1 (palm 0, heel 1, then the sleeve). The frame's
+    // bottom edge is 46° down; the cuff (4 cm at ~0.35 m ≈ 6.5°) needs the
+    // heel at ≤ 41° or it hangs under the frame — the round-1 look.
+    const HEEL_MAX = Math.tan((41 * Math.PI) / 180)
+    for (const w of WEAPONS) {
+      if (w === 'hammer') continue // the lance carry: heels point down by design
+      const pts: number[] = []
+      handPartsInCamera(POSES[w].pos, POSES[w].rot, HAND_GRIPS[w], 'R', { recoilZ: 0, drawY: 0, drawPitch: 0, hamPitch: 0 }, pts)
+      const [x, y, z] = [pts[3]!, pts[4]!, pts[5]!]
+      expect(z).toBeLessThan(-0.2)
+      expect(Math.abs(y) / -z, `${w} right heel y/z = ${(Math.abs(y) / -z).toFixed(3)}`).toBeLessThan(HEEL_MAX)
+      expect(Math.abs(x) / -z, `${w} right heel x`).toBeLessThan(TAN_HALF * 1.6)
+    }
+  })
+
+  test('the right sleeve heads screen-right and down on every one-handed and gun carry (toward the shoulder side)', () => {
+    const d: [number, number, number] = [0, 0, 0]
+    for (const w of WEAPONS) {
+      if (w === 'hammer') continue
+      armDirection(HAND_GRIPS[w].right.arm, d)
+      expect(d[0], `${w} right arm heads +X`).toBeGreaterThan(0.2)
+      expect(d[1], `${w} right arm heads down`).toBeLessThan(-0.2)
+    }
+    for (const w of ['pistol', 'rifle', 'minigun'] as ToolId[]) {
+      armDirection(HAND_GRIPS[w].left!.arm, d)
+      expect(d[0], `${w} left arm heads −X`).toBeLessThan(-0.2)
+    }
+  })
+
+  test('the minigun support hand sits on the lower half of the front grip, under the drum (y < −0.045)', () => {
+    const g = HAND_GRIPS.minigun.left!
+    expect(g.position[1]).toBeLessThan(-0.045)
+    expect(g.position[1]).toBeGreaterThan(-0.08) // still on the 0.11 m grip
   })
 })

@@ -3,7 +3,6 @@
 import type { RefObject } from 'react'
 import {
   type BufferGeometry,
-  CapsuleGeometry,
   CylinderGeometry,
   Euler,
   type Group,
@@ -17,6 +16,7 @@ import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeom
 import { mergeGeometries, mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import {
   AVATAR_SKIN_HEX,
+  CUFF_HEX,
   fingerSegmentTransforms,
   HAND_POSES,
   type HandPoseId,
@@ -44,8 +44,10 @@ import type { ArmDir, HandSide } from './hand-grips'
  * No negative-scale objects ever reach the scene graph.
  */
 
-export const HAND_SKIN = new MeshStandardMaterial({ color: AVATAR_SKIN_HEX, roughness: 0.5 })
+export const HAND_SKIN = new MeshStandardMaterial({ color: AVATAR_SKIN_HEX, roughness: 0.55 })
 export const HAND_SLEEVE = new MeshStandardMaterial({ color: SLEEVE_HEX, roughness: 0.7 })
+/** The knit cuff: its own colour so the wrist reads against the sleeve. */
+export const HAND_CUFF = new MeshStandardMaterial({ color: CUFF_HEX, roughness: 0.9 })
 
 const _m = new Matrix4()
 const _q = new Quaternion()
@@ -53,20 +55,39 @@ const _e = new Euler()
 const _p = new Vector3()
 const _one = new Vector3(1, 1, 1)
 
-/** A finger/thumb segment: a capsule along −Z from the joint (its origin) to −len. */
+/**
+ * A finger/thumb segment along −Z from the joint (its origin) to −len: a cone
+ * from `r` at the joint to `r1` at the far end, a sphere of radius `joint` AT
+ * the origin (the knuckle, or a smooth bend that stays smooth however the next
+ * segment turns) and one of radius `tip` at the far end (a rounded fingertip).
+ * Zeros leave the spheres out. One sphere per joint — not a capsule per
+ * segment, whose two hemispheres met at every bend as a double bead and made
+ * the round-1 hand read as a bunch of grapes. Eight radial segments: a whole
+ * hand is ≈ 2 k vertices.
+ */
 const segmentCache = new Map<string, BufferGeometry>()
-export function segmentGeometry(len: number, r: number): BufferGeometry {
-  const key = `${len}|${r}`
+export function segmentGeometry(len: number, r: number, r1 = r, joint = 0, tip = 0): BufferGeometry {
+  const key = `${len}|${r}|${r1}|${joint}|${tip}`
   let g = segmentCache.get(key)
   if (!g) {
-    g = new CapsuleGeometry(r, Math.max(0.001, len - 2 * r), 2, 6).rotateX(Math.PI / 2).translate(0, 0, -len / 2)
+    const L = Math.max(0.001, len)
+    const parts: BufferGeometry[] = [new CylinderGeometry(r, r1, L, 8, 1).rotateX(Math.PI / 2).translate(0, 0, -L / 2)]
+    if (joint > 0) parts.push(new SphereGeometry(joint, 8, 6))
+    if (tip > 0) parts.push(new SphereGeometry(tip, 8, 6).translate(0, 0, -L))
+    if (parts.length === 1) g = parts[0] as BufferGeometry
+    else {
+      const merged = mergeGeometries(parts, false)
+      if (!merged) throw new Error('hand-rig: segment merge failed')
+      for (const p of parts) p.dispose()
+      g = merged
+    }
     segmentCache.set(key, g)
   }
   return g
 }
 
 function placedSegment(seg: SegmentXform): BufferGeometry {
-  const g = segmentGeometry(seg.len, seg.r).clone()
+  const g = segmentGeometry(seg.len, seg.r, seg.r1, seg.joint, seg.tip).clone()
   _p.set(seg.px, seg.py, seg.pz)
   _q.setFromEuler(_e.set(seg.rx, seg.ry, seg.rz, 'XYZ'))
   _m.compose(_p, _q, _one)
@@ -130,8 +151,10 @@ export function buildHandGeometry(pose: HandPoseId, side: HandSide, opts: HandGe
   palm.translate(PALM.x + PALM.t / 2, 0, 0)
   parts.push(palm)
   if (wrist) {
-    const w = new CylinderGeometry(WRIST.r0, WRIST.r1, WRIST.len, 10)
+    // An ellipse across the hand's thickness (x), not a ball behind a slab.
+    const w = new CylinderGeometry(WRIST.r0, WRIST.r1, WRIST.len, 12)
     w.rotateX(Math.PI / 2)
+    w.scale(WRIST.sx, 1, 1)
     w.translate(WRIST.x, 0, WRIST.z)
     parts.push(w)
   }
@@ -189,9 +212,9 @@ export function ArticulatedHand({
   const rest = buildHandGeometry(pose, side, { articulatedIndex: true, wrist: true })
   const [j0, j1, j2] = indexChain(HAND_POSES[pose])
   const s = side === 'L' ? -1 : 1
-  const seg0 = segmentGeometry(j0.len, j0.r)
-  const seg1 = segmentGeometry(j1.len, j1.r)
-  const seg2 = segmentGeometry(j2.len, j2.r)
+  const seg0 = segmentGeometry(j0.len, j0.r, j0.r1, j0.joint, j0.tip)
+  const seg1 = segmentGeometry(j1.len, j1.r, j1.r1, j1.joint, j1.tip)
+  const seg2 = segmentGeometry(j2.len, j2.r, j2.r1, j2.joint, j2.tip)
   return (
     <>
       <mesh geometry={rest} material={HAND_SKIN} />
@@ -210,15 +233,16 @@ export function ArticulatedHand({
 
 // ── First-person forearm ─────────────────────────────────────────────────────
 
-/** Wrist ball at the joint, then the jacket cuff and sleeve running along +Z
- * (rotateX at build so the cylinders' axes are Z). Module-shared. */
-const WRIST_BALL_GEO = new SphereGeometry(0.031, 10, 8)
-const CUFF_GEO = new CylinderGeometry(0.04, 0.04, 0.05, 12).rotateX(Math.PI / 2)
-const SLEEVE_GEO = new CylinderGeometry(0.037, 0.046, 0.3, 10).rotateX(Math.PI / 2)
+/** Wrist joint at the heel (an ellipsoid, squashed like the wrist stub), then
+ * the knit CUFF (its own material) and the sleeve running along +Z, WIDENING
+ * toward the elbow (cylinder top = +Z after rotateX). Module-shared. */
+const WRIST_BALL_GEO = new SphereGeometry(0.028, 10, 8).scale(0.8, 1, 1)
+const CUFF_GEO = new CylinderGeometry(0.039, 0.037, 0.045, 12).rotateX(Math.PI / 2)
+const SLEEVE_GEO = new CylinderGeometry(0.045, 0.04, 0.3, 12).rotateX(Math.PI / 2)
 export const FOREARM_PARTS = {
-  ball: { z: 0.0, r: 0.031 },
-  cuff: { z: 0.06, len: 0.05, r: 0.04 },
-  sleeve: { z: 0.235, len: 0.3, r0: 0.037, r1: 0.046 },
+  ball: { z: 0.0, r: 0.028 },
+  cuff: { z: 0.046, len: 0.045, r: 0.039 },
+  sleeve: { z: 0.218, len: 0.3, r0: 0.04, r1: 0.045 },
 } as const
 
 /**
@@ -231,7 +255,7 @@ export function Forearm({ arm, position }: { arm: ArmDir; position: readonly [nu
   return (
     <group position={[position[0], position[1], position[2]]} rotation={[arm.pitch, arm.yaw, 0]}>
       <mesh geometry={WRIST_BALL_GEO} material={HAND_SKIN} position={[0, 0, FOREARM_PARTS.ball.z]} />
-      <mesh geometry={CUFF_GEO} material={HAND_SLEEVE} position={[0, 0, FOREARM_PARTS.cuff.z]} />
+      <mesh geometry={CUFF_GEO} material={HAND_CUFF} position={[0, 0, FOREARM_PARTS.cuff.z]} />
       <mesh geometry={SLEEVE_GEO} material={HAND_SLEEVE} position={[0, 0, FOREARM_PARTS.sleeve.z]} />
     </group>
   )

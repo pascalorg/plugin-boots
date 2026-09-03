@@ -1,6 +1,11 @@
 import { Euler, Matrix4, Quaternion, Vector3 } from 'three'
+import { FEEL, recoilEnvelope, swayProfile } from './feel'
 import { type HandPoseId, WRIST } from './hand-pose'
 import type { ToolId } from './viewmodel'
+
+/** The one skin / sleeve pair, re-exported so a rig that only knows the grip
+ * table (the avatar's HeldWeapon) can colour its hands to match. */
+export { AVATAR_SKIN_HEX, SLEEVE_HEX } from './hand-pose'
 
 /**
  * HOW EACH WEAPON IS HELD — the one grip table both rigs share, plus the
@@ -62,7 +67,7 @@ export const HAND_GRIPS: Record<ToolId, WeaponHold> = {
       up: norm([0, -0.12, 0.993]),
       palm: [-1, 0, 0],
       pose: 'fist',
-      arm: { pitch: 0.9, yaw: 0.25 },
+      arm: { pitch: 0.85, yaw: 0.45 },
     },
     left: null,
     trigger: false,
@@ -70,27 +75,29 @@ export const HAND_GRIPS: Record<ToolId, WeaponHold> = {
   // Pistol: right high on the raked grip, index on the trigger; left cups the
   // right hand's fingers from the left, a touch lower.
   pistol: {
-    right: { position: [0, -0.04, 0.028], up: rakedUp(0.32), palm: [-1, 0, 0], pose: 'trigger', arm: { pitch: 0.5, yaw: -0.2 } },
-    left: { position: [-0.034, -0.058, 0.03], up: rakedUp(0.32), palm: [1, 0, 0], pose: 'wrap', arm: { pitch: 0.55, yaw: -0.55 } },
+    right: { position: [0, -0.04, 0.028], up: rakedUp(0.32), palm: [-1, 0, 0], pose: 'trigger', arm: { pitch: 0.6, yaw: 0.5 } },
+    left: { position: [-0.034, -0.058, 0.03], up: rakedUp(0.32), palm: [1, 0, 0], pose: 'wrap', arm: { pitch: 0.6, yaw: -0.55 } },
     trigger: true,
   },
   // Rifle: right on the pistol grip; left under the handguard, palm up,
   // fingers over its right flank, the hand angled so the wrist bends less.
   rifle: {
-    right: { position: [0, -0.045, 0.02], up: rakedUp(0.34), palm: [-1, 0, 0], pose: 'trigger', arm: { pitch: 0.55, yaw: -0.2 } },
+    right: { position: [0, -0.045, 0.02], up: rakedUp(0.34), palm: [-1, 0, 0], pose: 'trigger', arm: { pitch: 0.6, yaw: 0.5 } },
     left: {
       position: [0, 0.032, -0.29],
       up: norm([-0.35, 0, -1]),
       palm: [0, 1, 0],
       pose: 'wrap',
-      arm: { pitch: 0.7, yaw: -0.6 },
+      arm: { pitch: 0.95, yaw: -0.5 },
     },
     trigger: true,
   },
-  // Minigun: right on the rear grip, left on the vertical front grip.
+  // Minigun: right on the rear grip, left LOW on the vertical front grip —
+  // the drum (r 0.095 at y 0.07) swallows the grip's top 2.5 cm, so the hand
+  // sits at the grip's lower half where the camera sees it past the drum.
   minigun: {
-    right: { position: [0, -0.05, 0.02], up: rakedUp(0.34), palm: [-1, 0, 0], pose: 'trigger', arm: { pitch: 0.5, yaw: -0.15 } },
-    left: { position: [0, -0.04, -0.2], up: rakedUp(-0.12), palm: [1, 0, 0], pose: 'wrap', arm: { pitch: 0.4, yaw: -0.5 } },
+    right: { position: [0, -0.05, 0.02], up: rakedUp(0.34), palm: [-1, 0, 0], pose: 'trigger', arm: { pitch: 0.6, yaw: 0.5 } },
+    left: { position: [0, -0.06, -0.198], up: rakedUp(-0.12), palm: [1, 0, 0], pose: 'wrap', arm: { pitch: 0.55, yaw: -0.55 } },
     trigger: true,
   },
   // Warhammer: two hands stacked on the haft (+Y). The carry pose pitches the
@@ -105,14 +112,14 @@ export const HAND_GRIPS: Record<ToolId, WeaponHold> = {
   },
   // Builder claw hammer: one fist on the rubber sleeve, handle vertical.
   builder: {
-    right: { position: [0, -0.06, 0], up: [0, 1, 0], palm: [-1, 0, 0], pose: 'fist', arm: { pitch: 0.55, yaw: -0.2 } },
+    right: { position: [0, -0.06, 0], up: [0, 1, 0], palm: [-1, 0, 0], pose: 'fist', arm: { pitch: 0.6, yaw: 0.5 } },
     left: null,
     trigger: false,
   },
   // Spray can: cupped from the right, palm on the can's flank (r 0.042); the
   // existing press lean (viewmodel) stays the nozzle cue.
   paint: {
-    right: { position: [0.028, 0, 0], up: [0, 1, 0], palm: [-1, 0, 0], pose: 'can', arm: { pitch: 0.5, yaw: -0.2 } },
+    right: { position: [0.028, 0, 0], up: [0, 1, 0], palm: [-1, 0, 0], pose: 'can', arm: { pitch: 0.6, yaw: 0.5 } },
     left: null,
     trigger: false,
   },
@@ -120,7 +127,7 @@ export const HAND_GRIPS: Record<ToolId, WeaponHold> = {
 
 /** What an unknown wire id gets: a fist at the origin, one hand, no trigger. */
 export const FALLBACK_HOLD: WeaponHold = {
-  right: { position: [0, 0, 0], up: [0, 1, 0], palm: [-1, 0, 0], pose: 'fist', arm: { pitch: 0.55, yaw: -0.2 } },
+  right: { position: [0, 0, 0], up: [0, 1, 0], palm: [-1, 0, 0], pose: 'fist', arm: { pitch: 0.6, yaw: 0.5 } },
   left: null,
   trigger: false,
 }
@@ -256,51 +263,41 @@ export function gripToShoulder(
 
 // ── Motion curves ────────────────────────────────────────────────────────────
 
-/** A shot's kick-and-return, seconds. */
-export const RECOIL_TIME = 0.16
 /**
- * Recoil envelope over t ∈ [0, 1] of RECOIL_TIME: reads on the shot frame
- * (0.55), peaks at t = 0.1, then a damped return with a small overshoot
- * (−7 % around u ≈ 0.39) and |v| < 0.003 at the end. Multiply by the pose
- * gains (viewmodel: +0.07 z, +0.14 pitch).
+ * ONE recoil, ONE sway: feel.ts owns them (recoilEnvelope over
+ * FEEL.RECOIL_TIME, swayProfile over the eased speed). The viewmodel evaluates
+ * both once a frame and hands the values to the hands through
+ * weapon-hands' `handSignals`; the hands only run the envelope themselves when
+ * nothing drives them. Re-exported here so the grip table stays the one import
+ * a hand rig needs.
  */
-export function recoilCurve(t: number): number {
-  if (t <= 0) return 0.55
-  if (t < 0.1) return 0.55 + 4.5 * t
-  if (t >= 1) return Math.exp(-6) * Math.cos(6)
-  const u = (t - 0.1) / 0.9
-  return Math.exp(-6 * u) * Math.cos(6 * u)
-}
+export const RECOIL_TIME = FEEL.RECOIL_TIME
+export { recoilEnvelope, swayProfile }
+/** @deprecated round-1 name for feel.recoilEnvelope (1 on the shot frame → 0). */
+export const recoilCurve = recoilEnvelope
 
-/** The index squeeze, seconds: a snap to full pull, then release. */
+/** The index squeeze after a shot, seconds: the SHOT FRAME is the pull. */
 export const TRIGGER_TIME = 0.14
-/** 0 → 1 at 0.04/0.14 of the way, → 0 at the end. */
+/** 1 (fully pulled) from the shot frame through the first 0.03 s, then a
+ * smooth release to exactly 0 at TRIGGER_TIME. The bang happens at full pull,
+ * so nothing here animates a pull AFTER the shot it caused. */
+export const TRIGGER_HOLD = 0.03
 export function triggerCurve(t: number): number {
-  if (t <= 0) return 0
+  if (t <= 0) return 1
+  if (t >= 1) return 0
   const s = t * TRIGGER_TIME
-  if (s < 0.04) return s / 0.04
-  return Math.max(0, 1 - (s - 0.04) / 0.1)
+  if (s <= TRIGGER_HOLD) return 1
+  const u = (s - TRIGGER_HOLD) / (TRIGGER_TIME - TRIGGER_HOLD)
+  return 1 - u * u * (3 - 2 * u)
 }
+/** A HELD trigger (auto stream, a semi shot not yet released, a spinning-up
+ * rotary) keeps the index pulled: ease-in / ease-out rates (1/s). */
+export const TRIGGER_PULL_RATE = 40
+export const TRIGGER_RELEASE_RATE = 12
 
-export type BobProfile = { amp: number; lateral: number; roll: number }
-const smoothstep = (a: number, b: number, x: number): number => {
-  const t = Math.min(1, Math.max(0, (x - a) / (b - a)))
-  return t * t * (3 - 2 * t)
-}
-/**
- * Walk/run sway amplitudes from the eased speed fraction `s` (viewmodel's
- * bobAmp.current, 0..1 of MOVE.runSpeed — already speed-tracked, never
- * multiply by speedN again). Walk (0.46) ≈ today's feel; run (1) rolls
- * visibly larger: 0.022 / 0.016 / 0.016.
- */
-export function bobProfile(s: number, out: BobProfile): BobProfile {
-  const c = Math.min(1, Math.max(0, s))
-  const ss = smoothstep(0.5, 1, c)
-  out.amp = 0.012 * c + 0.01 * ss
-  out.lateral = 0.009 * c + 0.007 * ss
-  out.roll = 0.008 * c + 0.008 * ss
-  return out
-}
+/** The share of the weapon's sway (feel.swayProfile, weapon space) the SUPPORT
+ * hand does NOT follow — a soft grip lets the gun move a little inside it. */
+export const SWAY_COMPLIANCE = 0.25
 
 /** The support hand's settle after a weapon swap, seconds. */
 export const READY_TIME = 0.32

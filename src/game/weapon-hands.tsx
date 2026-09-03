@@ -9,12 +9,16 @@ import {
   HAND_GRIPS,
   type HandGrip,
   heelPoint,
+  type WeaponHold,
   READY_TIME,
   readyBob,
   RECOIL_TIME,
-  recoilCurve,
+  recoilEnvelope,
   SUPPORT_LAG,
+  SWAY_COMPLIANCE,
   TRIGGER_ADS_TIGHTEN,
+  TRIGGER_PULL_RATE,
+  TRIGGER_RELEASE_RATE,
   TRIGGER_TIME,
   triggerCurve,
 } from './hand-grips'
@@ -41,13 +45,17 @@ import type { ToolId } from './viewmodel'
  * module tables keyed by weapon (only ONE Viewmodel ever mounts — the depot
  * mirror hides it by name rather than mounting a second).
  *
- * MOTION SIGNALS. Until the viewmodel feeds `handSignals` (round 2: it owns
- * recoilT/aim/draw and can write exact values), the hands derive their own
- * from playerRig: a shot is `playerRig.shots` ticking (the monotone round
- * counter the trigger loop bumps for every round that leaves a barrel — the
- * same one the wire carries), aim is `playerRig.ads`, a draw is the parent
- * group turning visible. Set `handSignals.external = true` and write the
- * fields each frame BEFORE this useFrame to take over.
+ * MOTION SIGNALS. The viewmodel owns the exact values — the frame a round
+ * leaves the barrel, the swap edge, the aim blend, THIS frame's recoil
+ * envelope and sway (feel.ts, evaluated once) — so it sets
+ * `handSignals.external = true` on mount, writes the fields every frame and
+ * calls `driveHands()` at the END of its own frame. That call is the point:
+ * R3F subscribes useFrame in a layout effect, children first, so a useFrame
+ * here would run BEFORE the viewmodel's and read last frame's signals. The
+ * component's own useFrame is the fallback for a host with no viewmodel: it
+ * derives a shot from `playerRig.shots` ticking (the monotone round counter
+ * the wire carries), aim from `playerRig.ads`, a draw from the parent group
+ * turning visible, and runs the recoil envelope on its own clock.
  */
 
 export type HandsRefs = {
@@ -82,6 +90,17 @@ export const handSignals = {
   aim: 0,
   /** Set true for one frame when the shown weapon changes. */
   drawn: false,
+  /** The trigger is held (an auto stream, a semi shot not yet released, a
+   * rotary spinning up): the index stays pulled. */
+  held: false,
+  /** The viewmodel's recoil envelope THIS frame (feel.recoilEnvelope: 1 on the
+   * shot frame → 0), so the support hand's lag is the gun's own kick. */
+  recoil: 0,
+  /** The viewmodel's weapon sway this frame (m, m, rad — feel.swayProfile on
+   * the shared bob phase): the support hand lags SWAY_COMPLIANCE of it. */
+  swayX: 0,
+  swayY: 0,
+  swayRoll: 0,
 }
 
 export type HandMotionState = {
@@ -90,6 +109,8 @@ export type HandMotionState = {
   readyT: number
   prevShots: number
   prevShown: boolean
+  /** Eased 0..1 held-trigger pull. */
+  held: number
   /** Last applied values, for QA. */
   squeeze: number
   recoil: number
@@ -107,6 +128,7 @@ function makeMotion(): HandMotionState {
     readyT: 1,
     prevShots: 0,
     prevShown: false,
+    held: 0,
     squeeze: 0,
     recoil: 0,
     ready: 0,
@@ -124,23 +146,43 @@ const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v)
 
 /**
  * Advance one hand's motion clocks. Pure over `st`; returns nothing, writes
- * st.squeeze / st.recoil / st.ready / st.aim for the appliers. `shot` and
- * `drawn` restart the trigger+recoil and the ready dip.
+ * st.squeeze / st.recoil / st.ready / st.aim for the appliers. The clocks
+ * advance FIRST and a `shot` then rewinds them, so the shot frame itself reads
+ * the pull (1) and the kick (1) — the viewmodel's own order. `drawn` starts
+ * the ready dip and parks the shot clocks (a fresh draw starts clean).
+ * `recoil`, when given, is the viewmodel's envelope for this frame and
+ * replaces the local clock; `held` keeps the index pulled.
  */
-export function stepHandMotion(st: HandMotionState, dt: number, shot: boolean, drawn: boolean, aim: number): void {
+export function stepHandMotion(
+  st: HandMotionState,
+  dt: number,
+  shot: boolean,
+  drawn: boolean,
+  aim: number,
+  recoil?: number,
+  held = false,
+): void {
+  st.triggerT = Math.min(1, st.triggerT + dt / TRIGGER_TIME)
+  st.recoilT = Math.min(1, st.recoilT + dt / RECOIL_TIME)
+  st.readyT = Math.min(1, st.readyT + dt / READY_TIME)
+  if (drawn) {
+    st.readyT = 0
+    st.triggerT = 1
+    st.recoilT = 1
+    st.held = 0
+  }
   if (shot) {
     st.triggerT = 0
     st.recoilT = 0
     st.peakRecoil = 0
     st.peakSqueeze = 0
   }
-  if (drawn) st.readyT = 0
-  st.triggerT = Math.min(1, st.triggerT + dt / TRIGGER_TIME)
-  st.recoilT = Math.min(1, st.recoilT + dt / RECOIL_TIME)
-  st.readyT = Math.min(1, st.readyT + dt / READY_TIME)
   st.aim = clamp01(aim)
-  st.squeeze = st.triggerT >= 1 ? 0 : triggerCurve(st.triggerT)
-  st.recoil = st.recoilT >= 1 ? 0 : recoilCurve(st.recoilT)
+  const pulse = st.triggerT >= 1 ? 0 : triggerCurve(st.triggerT)
+  st.held += ((held ? 1 : 0) - st.held) * Math.min(1, dt * (held ? TRIGGER_PULL_RATE : TRIGGER_RELEASE_RATE))
+  if (!held && st.held < 1e-3) st.held = 0
+  st.squeeze = pulse > st.held ? pulse : st.held
+  st.recoil = recoil !== undefined ? recoil : st.recoilT >= 1 ? 0 : recoilEnvelope(st.recoilT)
   st.ready = st.readyT >= 1 ? 0 : readyBob(st.readyT)
   if (st.recoil > st.peakRecoil) st.peakRecoil = st.recoil
   if (st.squeeze > st.peakSqueeze) st.peakSqueeze = st.squeeze
@@ -172,6 +214,59 @@ export function idleDrift(t: number, aim: number): number {
   return 0.04 * Math.sin(t * 1.6 + 1) * (1 - 0.75 * aim)
 }
 
+/**
+ * Write one weapon's motion state onto its scene objects: the support hand's
+ * table position plus the ready dip, the recoil lag and its sway compliance
+ * (it does NOT follow SWAY_COMPLIANCE of the gun's sway, weapon space); the
+ * three index joints. No allocation. Missing refs (not mounted) are skipped.
+ */
+export function applyHandMotion(
+  hold: WeaponHold,
+  refs: HandsRefs,
+  st: HandMotionState,
+  elapsed: number,
+  swayX: number,
+  swayY: number,
+): void {
+  const left = refs.left.current
+  if (left && hold.left) {
+    supportOffset(st.recoil, st.ready, st.aim, _off)
+    const p = hold.left.position
+    left.position.set(
+      p[0] + _off[0] - swayX * SWAY_COMPLIANCE,
+      p[1] + _off[1] - swayY * SWAY_COMPLIANCE,
+      p[2] + _off[2],
+    )
+  }
+  if (hold.trigger) {
+    triggerAngles(st.squeeze, st.aim, idleDrift(elapsed, st.aim), _angles)
+    for (let i = 0; i < 3; i++) {
+      const seg = refs.trigger[i]?.current
+      if (seg) seg.rotation.y = _angles[i] as number
+    }
+  }
+}
+
+/**
+ * THE external drive: advance and apply the SHOWN weapon's hands from
+ * `handSignals`. The viewmodel calls this at the end of its frame (after it
+ * has evaluated recoil/sway/aim and bumped `shots`), so the hands see this
+ * frame's values, never last frame's. Weapons not shown are left parked; the
+ * `drawn` edge cleans their clocks when they come back.
+ */
+export function driveHands(weapon: ToolId, dt: number, elapsed: number): void {
+  const hold = HAND_GRIPS[weapon] ?? HAND_GRIPS.knife
+  const refs = HAND_REFS[weapon] ?? HAND_REFS.knife
+  const st = MOTION[weapon] ?? MOTION.knife
+  stepHandMotion(st, dt, handSignals.shot, handSignals.drawn, handSignals.aim, handSignals.recoil, handSignals.held)
+  applyHandMotion(hold, refs, st, elapsed, handSignals.swayX, handSignals.swayY)
+}
+
+/** The motion state of one weapon's hands (QA / tests). */
+export function handMotionOf(weapon: ToolId): HandMotionState {
+  return MOTION[weapon] ?? MOTION.knife
+}
+
 // ── QA handle ────────────────────────────────────────────────────────────────
 let mounted = 0
 function installQa(): void {
@@ -185,12 +280,15 @@ function installQa(): void {
       shown,
       recoil: st.recoil,
       trigger: st.squeeze,
+      held: st.held,
       ready: st.ready,
       aim: st.aim,
       triggerT: st.triggerT,
       peakRecoil: st.peakRecoil,
       peakTrigger: st.peakSqueeze,
       external: handSignals.external,
+      source: handSignals.external ? 'viewmodel' : 'derived',
+      sway: [handSignals.swayX, handSignals.swayY, handSignals.swayRoll],
       triggerAngles: h.trigger.map((r) => r.current?.rotation.y ?? null),
       leftPos: l ? [l.position.x, l.position.y, l.position.z] : null,
       rightMounted: !!h.right.current,
@@ -238,26 +336,20 @@ export function WeaponHands({ weapon }: { weapon: ToolId }) {
     return uninstallQa
   }, [])
 
+  // FALLBACK drive only (see the header): when the viewmodel drives the hands
+  // it calls driveHands() itself at the end of its frame and this returns.
   useFrame((state, dt) => {
+    if (handSignals.external) return
     const right = refs.right.current
     if (!right) return
     const shown = right.parent ? right.parent.visible : true
-    let shot: boolean
-    let drawn: boolean
-    let aim: number
-    if (handSignals.external) {
-      shot = handSignals.shot
-      drawn = handSignals.drawn
-      aim = handSignals.aim
-    } else {
-      const n = (playerRig as { shots?: number }).shots ?? 0
-      shot = shown && n !== st.prevShots
-      st.prevShots = n
-      drawn = shown && !st.prevShown
-      st.prevShown = shown
-      const a = (playerRig as { ads?: number }).ads
-      aim = typeof a === 'number' ? a : 0
-    }
+    const n = (playerRig as { shots?: number }).shots ?? 0
+    const shot = shown && n !== st.prevShots
+    st.prevShots = n
+    const drawn = shown && !st.prevShown
+    st.prevShown = shown
+    const a = (playerRig as { ads?: number }).ads
+    const aim = typeof a === 'number' ? a : 0
     if (!shown) {
       // Hidden hands keep their clocks parked so the next draw starts clean.
       st.triggerT = 1
@@ -265,19 +357,7 @@ export function WeaponHands({ weapon }: { weapon: ToolId }) {
       return
     }
     stepHandMotion(st, Math.min(dt, 1 / 30), shot, drawn, aim)
-    const left = refs.left.current
-    if (left && hold.left) {
-      supportOffset(st.recoil, st.ready, st.aim, _off)
-      const p = hold.left.position
-      left.position.set(p[0] + _off[0], p[1] + _off[1], p[2] + _off[2])
-    }
-    if (hold.trigger) {
-      triggerAngles(st.squeeze, st.aim, idleDrift(state.clock.elapsedTime, st.aim), _angles)
-      for (let i = 0; i < 3; i++) {
-        const seg = refs.trigger[i]?.current
-        if (seg) seg.rotation.y = _angles[i] as number
-      }
-    }
+    applyHandMotion(hold, refs, st, state.clock.elapsedTime, 0, 0)
   })
 
   return (

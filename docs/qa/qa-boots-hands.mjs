@@ -6,16 +6,20 @@
  *   node docs/qa/qa-boots-hands.mjs rifle,pistol    a subset
  *
  * Per weapon: give + select it, wait for the swap to settle (the support hand's
- * ready dip has finished), screenshot /tmp/boots-hands-fp-<w>.png. For guns:
- * ADS (right button) → -ads.png; FIRE (left button held, polled every 40 ms) →
- * -fire.png at the first sample with the index squeezed, asserting peak
- * recoil > 0.3 and peak trigger > 0.5 while the button is down (the handle
- * keeps per-shot peaks because a slow poll misses the 0.1 s recoil peak). Headless runs
- * at ~3 fps with dt capped 1/30, so nothing here waits a fixed time for a
- * motion — it polls the `__bootsHands()` handle (weapon-hands.tsx).
+ * ready dip has finished), screenshot /tmp/boots-hands-fp-<w>.png plus a
+ * -crop.png of the lower-right two thirds (the hands, at native pixels — LOOK
+ * at these). For guns: ADS (right button) → -ads.png; FIRE (left button held,
+ * polled every 40 ms) → -fire.png at the first sample with the index squeezed,
+ * asserting peak recoil > 0.3, peak trigger > 0.5 and a held pull > 0.9 while
+ * the button is down (the handle keeps per-shot peaks because a slow poll
+ * misses a frame). The hands must report `external` (driven by the viewmodel
+ * — same-frame shot/recoil/aim), or the run fails. Headless runs at ~3 fps
+ * with dt capped 1/30, so nothing here waits a fixed time for a motion — it
+ * polls the `__bootsHands()` handle (weapon-hands.tsx).
  *
  * Knobs: HEADFUL=1 · SHOT_PREFIX=/tmp/boots-hands · SCENE · BASE · PITCH (rad,
- * default −0.35: look a little down so the floor is the backdrop) · PE_ROOT.
+ * default −0.35: look a little down so the floor is the backdrop) · PE_ROOT ·
+ * CROP=x,y,w,h (default 420,330,860,570).
  * ONE automation browser at a time on this machine: /tmp/boots-browser.lock.
  */
 import fs from 'node:fs'
@@ -32,6 +36,10 @@ const BASE = process.env.BASE ?? 'http://localhost:3002'
 const PREFIX = process.env.SHOT_PREFIX ?? '/tmp/boots-hands'
 const HEADFUL = process.env.HEADFUL === '1'
 const PITCH = Number(process.env.PITCH ?? -0.35)
+const CROP = (() => {
+  const [x, y, width, height] = (process.env.CROP ?? '420,330,860,570').split(',').map(Number)
+  return { x, y, width, height }
+})()
 const LOCK = '/tmp/boots-browser.lock'
 const ALL = ['knife', 'pistol', 'rifle', 'minigun', 'hammer', 'builder', 'paint']
 const WEAPONS = process.argv[2] ? process.argv[2].split(',') : ALL
@@ -128,7 +136,16 @@ async function poll(page, fn, arg, { every = 60, timeout = 8000 } = {}) {
 }
 
 let inGame = false
-const summary = { ok: false, weapons: {}, failures: [], screenshots: [], consoleErrors: [], pageErrors: [], navigations: [] }
+const summary = { ok: false, external: null, weapons: {}, failures: [], screenshots: [], consoleErrors: [], pageErrors: [], navigations: [] }
+
+/** Full frame + a native-pixel crop of the hands region. */
+async function shoot(page, base) {
+  await page.screenshot({ path: `${base}.png` })
+  summary.screenshots.push(`${base}.png`)
+  await page.screenshot({ path: `${base}-crop.png`, clip: CROP })
+  summary.screenshots.push(`${base}-crop.png`)
+  return `${base}.png`
+}
 const NOISE = /pointer lock|PointerLock|favicon|Permissions policy|autoplay|DevTools|ERR_ABORTED/i
 
 async function main() {
@@ -182,6 +199,10 @@ async function main() {
     globalThis.__boots.teleport(x, z, st?.yaw ?? 0, pitch)
   }, PITCH)
   await page.mouse.move(640, 450)
+  // The hands must be driven by the viewmodel (exact same-frame signals).
+  const first = await page.evaluate(() => globalThis.__bootsHands())
+  summary.external = first?.external ?? null
+  if (first?.external !== true) summary.failures.push(`hands not driven by the viewmodel (source ${first?.source ?? 'n/a'})`)
 
   for (const w of WEAPONS) {
     const rec = { shown: false, settled: false, shots: {} }
@@ -209,9 +230,7 @@ async function main() {
     )
     rec.settled = !!settled
     await sleep(250)
-    const shot = `${PREFIX}-fp-${w}.png`
-    await page.screenshot({ path: shot })
-    summary.screenshots.push(shot)
+    const shot = await shoot(page, `${PREFIX}-fp-${w}`)
     log(`${w}: carry shot → ${shot}`)
 
     if (!GUNS.has(w)) continue
@@ -223,9 +242,7 @@ async function main() {
       })
       rec.ads = aimed ? { aim: aimed.aim, triggerAngles: aimed.triggerAngles } : null
       await sleep(200)
-      const adsShot = `${PREFIX}-fp-${w}-ads.png`
-      await page.screenshot({ path: adsShot })
-      summary.screenshots.push(adsShot)
+      const adsShot = await shoot(page, `${PREFIX}-fp-${w}-ads`)
       await page.mouse.up({ button: 'right' })
       await poll(page, () => (globalThis.__bootsHands().aim < 0.1 ? true : null), null, { timeout: 4000 })
       log(`${w}: ads shot → ${adsShot} (aim ${aimed?.aim ?? 'n/a'})`)
@@ -234,6 +251,7 @@ async function main() {
     await page.mouse.down()
     let maxRecoil = 0
     let maxTrigger = 0
+    let maxHeld = 0
     let fireShot = null
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {
@@ -241,22 +259,21 @@ async function main() {
       if (h) {
         maxRecoil = Math.max(maxRecoil, h.recoil, h.peakRecoil ?? 0)
         maxTrigger = Math.max(maxTrigger, h.trigger, h.peakTrigger ?? 0)
-        if (!fireShot && h.trigger > 0.3) {
-          fireShot = `${PREFIX}-fp-${w}-fire.png`
-          await page.screenshot({ path: fireShot })
-          summary.screenshots.push(fireShot)
-        }
+        maxHeld = Math.max(maxHeld, h.held ?? 0)
+        if (!fireShot && h.trigger > 0.3) fireShot = await shoot(page, `${PREFIX}-fp-${w}-fire`)
       }
-      if (fireShot && maxRecoil > 0.3 && maxTrigger > 0.5) break
+      if (fireShot && maxRecoil > 0.3 && maxTrigger > 0.5 && maxHeld > 0.9) break
       await sleep(40)
     }
     await page.mouse.up()
-    rec.shots = { maxRecoil: +maxRecoil.toFixed(3), maxTrigger: +maxTrigger.toFixed(3), fireShot }
-    // Headless caps dt at 1/30 and runs ~3 fps: the first sample after a shot
-    // is recoilCurve(0.21) ≈ 0.36, the peak (1.0 at t = 0.1) falls between frames.
+    rec.shots = { maxRecoil: +maxRecoil.toFixed(3), maxTrigger: +maxTrigger.toFixed(3), maxHeld: +maxHeld.toFixed(3), fireShot }
+    // The shot frame reads recoil 1 / trigger 1 (feel.recoilEnvelope(0),
+    // triggerCurve(0)); the peaks survive a slow poll. `held` is the eased
+    // pull that stays while the button is down (spin-up included).
     if (!(maxRecoil > 0.3)) summary.failures.push(`${w}: max recoil ${maxRecoil.toFixed(2)} ≤ 0.3 while firing`)
     if (!(maxTrigger > 0.5)) summary.failures.push(`${w}: max trigger ${maxTrigger.toFixed(2)} ≤ 0.5 while firing`)
-    log(`${w}: fire → recoil ${maxRecoil.toFixed(2)} trigger ${maxTrigger.toFixed(2)} ${fireShot ?? '(no squeeze frame caught)'}`)
+    if (!(maxHeld > 0.9)) summary.failures.push(`${w}: held pull ${maxHeld.toFixed(2)} ≤ 0.9 with the button down`)
+    log(`${w}: fire → recoil ${maxRecoil.toFixed(2)} trigger ${maxTrigger.toFixed(2)} held ${maxHeld.toFixed(2)} ${fireShot ?? '(no squeeze frame caught)'}`)
     // Let the clip/shots settle before the next weapon.
     await poll(page, () => (globalThis.__bootsHands().recoil === 0 ? true : null), null, { timeout: 3000 })
   }
