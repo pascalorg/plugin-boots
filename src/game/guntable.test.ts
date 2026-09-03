@@ -5,6 +5,7 @@ import {
   armoryStationPosition,
   breakerEngageable,
   breakerPosition,
+  convoyCanOccupy,
   buildStationPosition,
   DEPOT_NODE_ID,
   DEPOT_NODE_TYPE,
@@ -232,6 +233,40 @@ describe('spawn depot layout', () => {
       // Static sanity (yaw-independent): the depot anchors BEHIND spawn.
       expect(DEPOT_OFFSET[1]).toBeLessThan(0)
     }
+  })
+})
+
+describe('Cybertruck convoy collision envelope', () => {
+  const box = (
+    nodeId: string,
+    nodeType: string,
+    size: [number, number, number],
+    center: [number, number, number],
+  ): ColliderEntry => {
+    const mesh = new Mesh(new BoxGeometry(...size))
+    mesh.position.set(...center)
+    mesh.updateMatrixWorld(true)
+    mesh.geometry.computeBoundingBox()
+    return {
+      mesh,
+      bvh: bvhFor(mesh),
+      inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+      worldBox: mesh.geometry.boundingBox!.clone().applyMatrix4(mesh.matrixWorld),
+      root: mesh,
+      nodeId,
+      nodeType,
+    }
+  }
+
+  test('the truck cannot push its nose through a wall', () => {
+    const wall = box('wall-a', 'wall', [0.2, 2.6, 4], [-9.3, 1.3, 0])
+    expect(convoyCanOccupy([wall], 0, 0, 0, 0)).toBe(false)
+  })
+
+  test('ground and the convoy itself never deadlock movement', () => {
+    const ground = box('site-a', 'site', [100, 0.2, 100], [0, 0, 0])
+    const own = box(DEPOT_NODE_ID, DEPOT_NODE_TYPE, [6, 3, 2.5], [0, 1.5, 0])
+    expect(convoyCanOccupy([ground, own], 0, 0, 0, 0)).toBe(true)
   })
 })
 

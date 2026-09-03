@@ -30,6 +30,7 @@ import { groundSurfaceY, lotFloorY } from './ground'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
 import { exitGame, getSession } from './session'
+import { vehicleRig } from './vehicle-state'
 import { type GameWorld, settleSpawnFeet } from './world'
 
 /**
@@ -525,6 +526,32 @@ export function Player({ world }: { world: GameWorld }) {
     playerRig.yawVelocity += (-dx * sens * invDt - playerRig.yawVelocity) * smooth
     playerRig.pitchVelocity += ((playerRig.pitch - prevPitch) * invDt - playerRig.pitchVelocity) * smooth
     playerRig.recoil = Math.max(0, playerRig.recoil - dt * 6 * playerRig.recoil - dt * 0.02)
+
+    // The convoy controller runs at priority -2 and writes the live cab seat
+    // before Player's default-priority frame. While driving, the vehicle owns
+    // translation and WASD; mouse look remains free so the cab is genuinely
+    // first-person instead of welding the camera to the windscreen.
+    if (vehicleRig.driving) {
+      feet.current.set(vehicleRig.seatX, vehicleRig.seatY, vehicleRig.seatZ)
+      vel.current.set(0, 0, 0)
+      groundNormal.current.set(0, 1, 0)
+      playerRig.grounded = true
+      playerRig.speed = Math.abs(vehicleRig.speed)
+      playerRig.bobPhase = feel.bobPhase
+      playerRig.bobAmp = 0
+      playerRig.landDip = 0
+      playerRig.position.set(feet.current.x, feet.current.y + EYE_HEIGHT, feet.current.z)
+      prevGrounded.current = true
+      if (camera.fov !== GAME_FOV) {
+        camera.fov += (GAME_FOV - camera.fov) * Math.min(1, dt * 8)
+        if (Math.abs(camera.fov - GAME_FOV) < 0.1) camera.fov = GAME_FOV
+        camera.updateProjectionMatrix()
+      }
+      camera.position.copy(playerRig.position)
+      camera.rotation.order = 'YXZ'
+      camera.rotation.set(playerRig.pitch, playerRig.yaw, 0)
+      return
+    }
 
     // Wish direction (camera-relative on XZ).
     const keys = input.state.keys

@@ -1,0 +1,141 @@
+/**
+ * Shared runtime state for the depot convoy.  The rendered controller owns
+ * the pose; Player and Viewmodel only read the tiny driver contract below,
+ * which keeps the vehicle out of either system's React state.
+ */
+
+export const VEHICLE_KIND = 'boots/vehicle' as const
+
+export type VehicleFrame = {
+  x: number
+  y: number
+  z: number
+  yaw: number
+  speed: number
+  occupied: boolean
+}
+
+export type ConvoyPose = VehicleFrame & {
+  ready: boolean
+  targetX: number
+  targetY: number
+  targetZ: number
+  targetYaw: number
+  remoteDriver: string | null
+  remoteAt: number
+}
+
+export const convoyPose: ConvoyPose = {
+  ready: false,
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  speed: 0,
+  occupied: false,
+  targetX: 0,
+  targetY: 0,
+  targetZ: 0,
+  targetYaw: 0,
+  remoteDriver: null,
+  remoteAt: 0,
+}
+
+/** The seat position Player follows while this browser is driving. */
+export const vehicleRig = {
+  driving: false,
+  seatX: 0,
+  seatY: 0,
+  seatZ: 0,
+  speed: 0,
+}
+
+export function resetConvoyPose(x: number, y: number, z: number, yaw: number): void {
+  convoyPose.ready = true
+  convoyPose.x = convoyPose.targetX = x
+  convoyPose.y = convoyPose.targetY = y
+  convoyPose.z = convoyPose.targetZ = z
+  convoyPose.yaw = convoyPose.targetYaw = yaw
+  convoyPose.speed = 0
+  convoyPose.occupied = false
+  convoyPose.remoteDriver = null
+  convoyPose.remoteAt = 0
+  vehicleRig.driving = false
+  vehicleRig.speed = 0
+}
+
+export function clearConvoyPose(): void {
+  convoyPose.ready = false
+  convoyPose.occupied = false
+  convoyPose.remoteDriver = null
+  convoyPose.remoteAt = 0
+  vehicleRig.driving = false
+  vehicleRig.speed = 0
+}
+
+export function readVehicleFrame(data: unknown): VehicleFrame | null {
+  if (!data || typeof data !== 'object') return null
+  const f = data as Record<string, unknown>
+  if (
+    typeof f.x !== 'number' ||
+    typeof f.y !== 'number' ||
+    typeof f.z !== 'number' ||
+    typeof f.yaw !== 'number' ||
+    typeof f.speed !== 'number' ||
+    typeof f.occupied !== 'boolean' ||
+    !Number.isFinite(f.x) ||
+    !Number.isFinite(f.y) ||
+    !Number.isFinite(f.z) ||
+    !Number.isFinite(f.yaw) ||
+    !Number.isFinite(f.speed)
+  ) {
+    return null
+  }
+  // A malformed peer must not teleport the convoy to infinity or inject a
+  // speed that makes interpolation/camera code unstable.
+  if (Math.abs(f.x) > 1_000_000 || Math.abs(f.y) > 100_000 || Math.abs(f.z) > 1_000_000) {
+    return null
+  }
+  return {
+    x: f.x,
+    y: f.y,
+    z: f.z,
+    yaw: wrapVehicleYaw(f.yaw),
+    speed: Math.max(-20, Math.min(30, f.speed)),
+    occupied: f.occupied,
+  }
+}
+
+export function wrapVehicleYaw(yaw: number): number {
+  const twoPi = Math.PI * 2
+  let out = yaw % twoPi
+  if (out > Math.PI) out -= twoPi
+  if (out <= -Math.PI) out += twoPi
+  return out
+}
+
+export function shortestYawDelta(from: number, to: number): number {
+  return wrapVehicleYaw(to - from)
+}
+
+export function convoyLocalToWorld(
+  lx: number,
+  lz: number,
+  pose: Pick<ConvoyPose, 'x' | 'z' | 'yaw'> = convoyPose,
+): { x: number; z: number } {
+  const cos = Math.cos(pose.yaw)
+  const sin = Math.sin(pose.yaw)
+  return { x: pose.x + lx * cos + lz * sin, z: pose.z - lx * sin + lz * cos }
+}
+
+export function convoyWorldToLocal(
+  x: number,
+  z: number,
+  pose: Pick<ConvoyPose, 'x' | 'z' | 'yaw'> = convoyPose,
+): { x: number; z: number } {
+  const cos = Math.cos(pose.yaw)
+  const sin = Math.sin(pose.yaw)
+  const dx = x - pose.x
+  const dz = z - pose.z
+  return { x: dx * cos - dz * sin, z: dx * sin + dz * cos }
+}

@@ -22,7 +22,7 @@ import {
   restoreOperableTarget,
   useDestruction,
 } from './destruction'
-import { armoryStationPosition } from './guntable'
+import { ARMORY_STATION_LOCAL, armoryStationPosition, liveDepotLocalToWorld } from './guntable'
 import { takeAction } from './input'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
@@ -1024,6 +1024,12 @@ export function Interact({ world }: { world: GameWorld }) {
     const owned = useBoots.getState().owned
     for (const table of tablesRef.current) {
       if (owned.includes(table.weapon)) continue
+      liveDepotLocalToWorld(
+        world,
+        ARMORY_STATION_LOCAL[0],
+        ARMORY_STATION_LOCAL[1],
+        table.position,
+      )
       const d = Math.hypot(
         playerRig.position.x - table.position.x,
         playerRig.position.z - table.position.z,

@@ -124,6 +124,9 @@ export const FRAME_KINDS = [
   // A new peer on an old pin drops this unknown kind silently, so PvP simply
   // doesn't occur across mismatched pins — nothing breaks.
   'boots/pvp-hit',
+  // The one shared depot convoy pose. Only its current driver publishes;
+  // late joiners recover the resting pose through the state-snapshot lane.
+  'boots/vehicle',
   // voice.ts → SIGNALLING ONLY. The audio itself never touches this bus: an
   // 8 000-byte JSON frame under latest-value coalescing would drop the middle
   // of every sentence. What travels here is one WebRTC description per peer

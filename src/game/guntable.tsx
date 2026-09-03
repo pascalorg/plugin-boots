@@ -14,11 +14,37 @@ import {
 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { CyberTruckModel } from './cyber-truck'
 import { DepotMirror } from './depot-mirror'
 import { armWaves, disarmWaves, waveState } from './enemies-state'
+import { takeAction } from './input'
 import { clearScatterInRadius } from './nature'
-import { playerRig } from './player'
+import {
+  getParticipants,
+  localSessionId,
+  onFrame,
+  onStateRequest,
+  onStateSnapshot,
+  publishFrame,
+  registerFrameKind,
+  requestState,
+  sendStateSnapshot,
+  shouldAnswerStateRequest,
+} from './net'
+import { playerDebug, playerRig } from './player'
 import { getSession } from './session'
+import {
+  clearConvoyPose,
+  convoyLocalToWorld,
+  convoyPose,
+  convoyWorldToLocal,
+  readVehicleFrame,
+  resetConvoyPose,
+  shortestYawDelta,
+  VEHICLE_KIND,
+  vehicleRig,
+  type VehicleFrame,
+} from './vehicle-state'
 import * as weaponModels from './weapon-models'
 import { HammerModel, MinigunModel, PistolModel, RifleModel } from './weapon-models'
 import { bvhFor, type ColliderEntry, type GameWorld, spawnGroundY } from './world'
@@ -166,6 +192,25 @@ export function worldToDepotLocal(world: GameWorld, px: number, pz: number): [nu
   return [dx * cos - dz * sin, dx * sin + dz * cos]
 }
 
+/** Runtime transform for systems that must follow the movable trailer. The
+ * exported static helpers above remain the deterministic initial-layout API. */
+export function liveDepotLocalToWorld(
+  world: GameWorld,
+  lx: number,
+  lz: number,
+  out = new Vector3(),
+): Vector3 {
+  if (!convoyPose.ready) return out.copy(depotLocalToWorld(world, lx, lz))
+  const p = convoyLocalToWorld(lx, lz)
+  return out.set(p.x, convoyPose.y, p.z)
+}
+
+export function liveWorldToDepotLocal(world: GameWorld, px: number, pz: number): [number, number] {
+  if (!convoyPose.ready) return worldToDepotLocal(world, px, pz)
+  const p = convoyWorldToLocal(px, pz)
+  return [p.x, p.z]
+}
+
 /** BUILD station (left bay): E gives the builder only — the peaceful entry. */
 export function buildStationPosition(world: GameWorld): Vector3 {
   return depotLocalToWorld(world, BUILD_STATION_LOCAL[0], BUILD_STATION_LOCAL[1])
@@ -285,6 +330,97 @@ export const DEPOT_NODE_ID = '__boots-depot'
  * the QA P6R1 lane where hits only spark. Exported for the armor pin. */
 export const DEPOT_NODE_TYPE = 'fixture'
 
+/** Trailer-local placement. The truck sits beyond the quiet -X end so the
+ * breaker on +X remains usable; its model points down -Z, hence the +π/2 turn. */
+export const TRUCK_LOCAL_X = -6
+export const TRUCK_LOCAL_Z = 0
+export const TRUCK_LOCAL_YAW = Math.PI / 2
+export const DRIVER_DOOR_LOCAL: readonly [number, number] = [-5.7, 1.45]
+export const DRIVER_SEAT_LOCAL: readonly [number, number] = [-5.72, 0.45]
+export const DRIVER_EXIT_LOCAL: readonly [number, number] = [-5.7, 1.65]
+export const VEHICLE_ENTER_RANGE = 2.25
+
+const VEHICLE_MAX_FORWARD = 10
+const VEHICLE_MAX_REVERSE = 4
+const VEHICLE_ACCEL = 7
+const VEHICLE_BRAKE = 10
+const VEHICLE_COAST = 4
+const VEHICLE_STEER_RATE = 0.78
+const VEHICLE_PUBLISH_HZ = 10
+const REMOTE_DRIVER_TIMEOUT_MS = 1800
+
+const DRIVE_SAMPLES: ReadonlyArray<readonly [number, number, number]> = [
+  [-8.45, 0, 0.9],
+  [-7.3, 0, 1.05],
+  [-5.5, 0, 1.05],
+  [-3.8, 0, 1.1],
+  [-2.1, 0, 1.3],
+  [0, 0, 1.3],
+  [2.1, 0, 1.3],
+]
+
+const DRIVE_OVER_TYPES = new Set(['site'])
+
+/** Broad, conservative convoy sweep. Ground-like surfaces below axle height
+ * are driveable; walls, furniture and other vertical solids block before the
+ * rendered truck or trailer can cross them. */
+export function convoyCanOccupy(
+  colliders: readonly ColliderEntry[],
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+): boolean {
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  for (const collider of colliders) {
+    if (collider.disabled || collider.nodeId === DEPOT_NODE_ID) continue
+    if (DRIVE_OVER_TYPES.has(collider.nodeType)) continue
+    const box = collider.worldBox
+    // Floors, slabs and low curbs are under the chassis; roofs/ceilings well
+    // overhead do not stop a vehicle driving beneath them.
+    if (box.max.y <= y + 0.34 || box.min.y >= y + 1.9) continue
+    for (const [lx, lz, radius] of DRIVE_SAMPLES) {
+      const px = x + lx * cos + lz * sin
+      const pz = z - lx * sin + lz * cos
+      const dx = px < box.min.x ? box.min.x - px : px > box.max.x ? px - box.max.x : 0
+      const dz = pz < box.min.z ? box.min.z - pz : pz > box.max.z ? pz - box.max.z : 0
+      if (dx * dx + dz * dz < radius * radius) return false
+    }
+  }
+  return true
+}
+
+function convoyGroundY(world: GameWorld, x: number, z: number, yaw: number): number {
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  let best = Number.NEGATIVE_INFINITY
+  // Trailer center/end + truck axles: enough to keep the rigid convoy above
+  // sculpted yards without paying seven ground BVH probes every frame.
+  for (const lx of [-7.7, -4.3, -2.4, 0, 2.4]) {
+    const px = x + lx * cos
+    const pz = z - lx * sin
+    best = Math.max(best, spawnGroundY(world.colliders, px, pz))
+  }
+  return Number.isFinite(best) ? best : 0
+}
+
+function refreshConvoyColliders(world: GameWorld): void {
+  for (const entry of world.colliders) {
+    if (entry.disabled || entry.nodeId !== DEPOT_NODE_ID) continue
+    const mesh = entry.mesh
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+    entry.inverse.copy(mesh.matrixWorld).invert()
+    entry.worldBox.copy(mesh.geometry.boundingBox!).applyMatrix4(mesh.matrixWorld)
+  }
+}
+
+function approach(value: number, target: number, amount: number): number {
+  if (value < target) return Math.min(target, value + amount)
+  if (value > target) return Math.max(target, value - amount)
+  return value
+}
+
 /** Kept export name — game-root mounts <GunTable/>; it now builds the
  * armored spawn depot in place of the loose tables. */
 export function GunTable({ world }: { world: GameWorld }) {
@@ -343,11 +479,233 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   const groundY = useMemo(() => depotSeatY(world), [world])
   const armoryAt = useMemo(() => armoryStationPosition(world), [world])
   const geared = useBoots((s) => s.owned.includes('rifle'))
+  const rootRef = useRef<Group>(null)
+  const vehiclePrompt = useRef<string | null>(null)
+  const publishClock = useRef(0)
   const solidRefs = useRef<(Mesh | null)[]>([])
   useFixtureColliders(world, solidRefs)
   const solid = (i: number) => (mesh: Mesh | null) => {
     solidRefs.current[i] = mesh
   }
+
+  useEffect(() => {
+    const initialYaw = depotWorldYaw(world)
+    resetConvoyPose(center.x, groundY, center.z, initialYaw)
+    registerFrameKind(VEHICLE_KIND, readVehicleFrame)
+
+    const accept = (frame: VehicleFrame, sender: string | null, now: number) => {
+      const mine = localSessionId()
+      if (sender && mine && sender === mine) return
+      // Simultaneous entry is resolved identically everywhere: the lower
+      // host-stamped session id keeps the wheel.
+      if (vehicleRig.driving && frame.occupied && sender && mine && sender < mine) {
+        vehicleRig.driving = false
+      } else if (vehicleRig.driving) {
+        return
+      }
+      if (frame.occupied) {
+        if (
+          convoyPose.remoteDriver &&
+          now - convoyPose.remoteAt < REMOTE_DRIVER_TIMEOUT_MS &&
+          sender &&
+          convoyPose.remoteDriver < sender
+        ) {
+          return
+        }
+        convoyPose.remoteDriver = sender
+        convoyPose.remoteAt = now
+      } else if (!sender || convoyPose.remoteDriver === sender) {
+        convoyPose.remoteDriver = null
+        convoyPose.remoteAt = 0
+      }
+      convoyPose.targetX = frame.x
+      convoyPose.targetY = frame.y
+      convoyPose.targetZ = frame.z
+      convoyPose.targetYaw = frame.yaw
+      convoyPose.speed = frame.speed
+      convoyPose.occupied = frame.occupied
+    }
+
+    const offFrame = onFrame<VehicleFrame>(VEHICLE_KIND, (msg) => {
+      accept(msg.data, msg.sessionId, Date.now())
+    })
+    const offSnapshot = onStateSnapshot(VEHICLE_KIND, ({ state }) => {
+      const frame = readVehicleFrame(state)
+      if (frame && !vehicleRig.driving && !convoyPose.remoteDriver) {
+        // A snapshot establishes a resting location; a live driver stream,
+        // if present, supersedes it on the next frame.
+        accept({ ...frame, occupied: false }, null, Date.now())
+        convoyPose.x = convoyPose.targetX
+        convoyPose.y = convoyPose.targetY
+        convoyPose.z = convoyPose.targetZ
+        convoyPose.yaw = convoyPose.targetYaw
+      }
+    })
+    const offRequest = onStateRequest(({ of, from }) => {
+      const mine = localSessionId()
+      if (of !== VEHICLE_KIND || !mine) return
+      if (!shouldAnswerStateRequest(mine, from, getParticipants())) return
+      sendStateSnapshot(VEHICLE_KIND, from, {
+        x: convoyPose.x,
+        y: convoyPose.y,
+        z: convoyPose.z,
+        yaw: convoyPose.yaw,
+        speed: convoyPose.speed,
+        occupied: false,
+      } satisfies VehicleFrame)
+    })
+    requestState(VEHICLE_KIND)
+
+    return () => {
+      if (vehicleRig.driving) {
+        publishFrame(VEHICLE_KIND, {
+          x: convoyPose.x,
+          y: convoyPose.y,
+          z: convoyPose.z,
+          yaw: convoyPose.yaw,
+          speed: 0,
+          occupied: false,
+        } satisfies VehicleFrame)
+      }
+      offFrame()
+      offSnapshot()
+      offRequest()
+      getSession()?.hud.prompt(null, 'vehicle')
+      clearConvoyPose()
+    }
+  }, [center.x, center.z, groundY, world])
+
+  // Priority -2: claim E before doors (-1) and move the root before Player
+  // follows the cab at priority 0. Remote poses ease between 10 Hz packets;
+  // the local driver remains exact and publishes latest-value frames.
+  useFrame((_, rawDt) => {
+    const root = rootRef.current
+    const session = getSession()
+    if (!root || !session || !convoyPose.ready) return
+    const dt = Math.min(rawDt, 1 / 30)
+    const now = Date.now()
+
+    if (
+      convoyPose.remoteDriver &&
+      now - convoyPose.remoteAt > REMOTE_DRIVER_TIMEOUT_MS
+    ) {
+      convoyPose.remoteDriver = null
+      convoyPose.occupied = false
+      convoyPose.speed = 0
+    }
+
+    const door = convoyLocalToWorld(DRIVER_DOOR_LOCAL[0], DRIVER_DOOR_LOCAL[1])
+    const nearDoor =
+      Math.hypot(playerRig.position.x - door.x, playerRig.position.z - door.z) <=
+      VEHICLE_ENTER_RANGE
+    const remotelyOccupied = convoyPose.remoteDriver !== null
+
+    if (vehicleRig.driving) {
+      if (takeAction(session.input.state.actions, 'KeyE')) {
+        vehicleRig.driving = false
+        vehicleRig.speed = 0
+        convoyPose.occupied = false
+        convoyPose.speed = 0
+        const exit = convoyLocalToWorld(DRIVER_EXIT_LOCAL[0], DRIVER_EXIT_LOCAL[1])
+        playerDebug.teleport?.(
+          exit.x,
+          exit.z,
+          convoyPose.yaw + Math.PI / 2,
+          playerRig.pitch,
+          spawnGroundY(world.colliders, exit.x, exit.z),
+        )
+        publishFrame(VEHICLE_KIND, {
+          x: convoyPose.x,
+          y: convoyPose.y,
+          z: convoyPose.z,
+          yaw: convoyPose.yaw,
+          speed: 0,
+          occupied: false,
+        } satisfies VehicleFrame)
+      } else {
+        const keys = session.input.state.keys
+        const throttle = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0)
+        const target =
+          throttle > 0 ? VEHICLE_MAX_FORWARD : throttle < 0 ? -VEHICLE_MAX_REVERSE : 0
+        const rate = throttle === 0 ? VEHICLE_COAST : Math.sign(target) === Math.sign(convoyPose.speed) || convoyPose.speed === 0
+          ? VEHICLE_ACCEL
+          : VEHICLE_BRAKE
+        convoyPose.speed = approach(convoyPose.speed, target, rate * dt)
+
+        const steer = (keys.has('KeyA') ? 1 : 0) - (keys.has('KeyD') ? 1 : 0)
+        const oldYaw = convoyPose.yaw
+        if (steer !== 0 && Math.abs(convoyPose.speed) > 0.08) {
+          const direction = convoyPose.speed >= 0 ? 1 : -1
+          const speedScale = Math.min(1, Math.abs(convoyPose.speed) / 3)
+          convoyPose.yaw += steer * direction * VEHICLE_STEER_RATE * speedScale * dt
+        }
+        const nx = convoyPose.x - Math.cos(convoyPose.yaw) * convoyPose.speed * dt
+        const nz = convoyPose.z + Math.sin(convoyPose.yaw) * convoyPose.speed * dt
+        const ny = convoyGroundY(world, nx, nz, convoyPose.yaw)
+        if (convoyCanOccupy(world.colliders, nx, ny, nz, convoyPose.yaw)) {
+          convoyPose.x = convoyPose.targetX = nx
+          convoyPose.y = convoyPose.targetY = ny
+          convoyPose.z = convoyPose.targetZ = nz
+          convoyPose.targetYaw = convoyPose.yaw
+        } else {
+          convoyPose.yaw = convoyPose.targetYaw = oldYaw
+          convoyPose.speed = 0
+        }
+
+        publishClock.current += dt
+        if (publishClock.current >= 1 / VEHICLE_PUBLISH_HZ) {
+          publishClock.current = 0
+          publishFrame(VEHICLE_KIND, {
+            x: convoyPose.x,
+            y: convoyPose.y,
+            z: convoyPose.z,
+            yaw: convoyPose.yaw,
+            speed: convoyPose.speed,
+            occupied: true,
+          } satisfies VehicleFrame)
+        }
+      }
+    } else {
+      if (nearDoor && !remotelyOccupied && takeAction(session.input.state.actions, 'KeyE')) {
+        vehicleRig.driving = true
+        convoyPose.occupied = true
+        convoyPose.speed = 0
+        convoyPose.remoteDriver = null
+        publishClock.current = 1 / VEHICLE_PUBLISH_HZ
+        playerRig.yaw = convoyPose.yaw + Math.PI / 2
+        playerRig.pitch = 0
+      } else {
+        const k = 1 - Math.exp(-14 * dt)
+        convoyPose.x += (convoyPose.targetX - convoyPose.x) * k
+        convoyPose.y += (convoyPose.targetY - convoyPose.y) * k
+        convoyPose.z += (convoyPose.targetZ - convoyPose.z) * k
+        convoyPose.yaw += shortestYawDelta(convoyPose.yaw, convoyPose.targetYaw) * k
+      }
+    }
+
+    root.position.set(convoyPose.x, convoyPose.y, convoyPose.z)
+    root.rotation.y = convoyPose.yaw
+    root.updateWorldMatrix(true, true)
+    refreshConvoyColliders(world)
+
+    const seat = convoyLocalToWorld(DRIVER_SEAT_LOCAL[0], DRIVER_SEAT_LOCAL[1])
+    vehicleRig.seatX = seat.x
+    vehicleRig.seatY = convoyPose.y + 0.08
+    vehicleRig.seatZ = seat.z
+    vehicleRig.speed = convoyPose.speed
+
+    const prompt = vehicleRig.driving
+      ? 'W/S — throttle · A/D — steer · E — exit Cybertruck'
+      : nearDoor
+        ? remotelyOccupied
+          ? 'Cybertruck occupied'
+          : 'Press E — drive Cybertruck'
+        : null
+    if (prompt !== vehiclePrompt.current) {
+      vehiclePrompt.current = prompt
+      session.hud.prompt(prompt, 'vehicle')
+    }
+  }, -2)
 
   // Grass must not grow through the deck: zero-scale the nature scatter
   // under the footprint (three circles tile the 6 × 2.5 box). Nature
@@ -362,17 +720,40 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     sweepFrame.current = frame + 1
     if (frame !== 10 && frame !== 120) return
     for (const lx of [-2, 0, 2]) {
-      const p = depotLocalToWorld(world, lx, 0)
+      const p = liveDepotLocalToWorld(world, lx, 0)
       clearScatterInRadius(p.x, p.z, 1.75)
     }
+    const truck = liveDepotLocalToWorld(world, TRUCK_LOCAL_X, TRUCK_LOCAL_Z)
+    clearScatterInRadius(truck.x, truck.z, 1.5)
   })
 
   return (
     <group
+      ref={rootRef}
       position={[center.x, groundY, center.z]}
       rotation={[0, depotWorldYaw(world), 0]}
       userData={{ __boots: true }}
     >
+      {/* The depot is now the truck's cargo trailer: four low-poly wheels,
+          axles and a short drawbar to the pickup's rear hitch. */}
+      <TrailerRunningGear />
+      <mesh position={[-3.2, 0.42, 0]} rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[0.07, 0.07, 0.55, 8]} />
+        <meshStandardMaterial color={CASTING} metalness={0.55} roughness={0.5} />
+      </mesh>
+      <group position={[TRUCK_LOCAL_X, 0, TRUCK_LOCAL_Z]} rotation={[0, TRUCK_LOCAL_YAW, 0]}>
+        <CyberTruckModel />
+      </group>
+      {/* Simple hidden hulls keep collision cheap; the detailed procedural
+          body remains visual and low-poly. */}
+      <mesh visible={false} position={[-6, 0.85, 0]} ref={solid(10)}>
+        <boxGeometry args={[5.65, 1.35, 1.95]} />
+        <meshBasicMaterial />
+      </mesh>
+      <mesh visible={false} position={[-5.72, 1.5, 0]} ref={solid(11)}>
+        <boxGeometry args={[2.0, 0.75, 1.8]} />
+        <meshBasicMaterial />
+      </mesh>
       {/* ── the armored shell (all colliders) ─────────────────────────── */}
       {/* floor plate — the interior deck the player steps onto */}
       <mesh castShadow receiveShadow position={[0, 0.06, 0]} ref={solid(0)}>
@@ -494,6 +875,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
 
       {/* ── ARMORY RACK (center bay): the full loadout ─────────────────── */}
       <StationLogic
+        world={world}
         at={armoryAt}
         nodeId="__boots-depot-armory"
         taken={geared}
@@ -576,6 +958,42 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   )
 }
 
+const TRAILER_WHEELS: ReadonlyArray<readonly [number, number]> = [
+  [-2.05, -1.28],
+  [-2.05, 1.28],
+  [1.85, -1.28],
+  [1.85, 1.28],
+]
+
+function TrailerRunningGear() {
+  return (
+    <group>
+      {[-2.05, 1.85].map((x) => (
+        <mesh key={`axle:${x}`} position={[x, 0.38, 0]} rotation={[Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[0.075, 0.075, 2.62, 8]} />
+          <meshStandardMaterial color={CASTING} metalness={0.55} roughness={0.55} />
+        </mesh>
+      ))}
+      {TRAILER_WHEELS.map(([x, z]) => (
+        <group key={`wheel:${x}:${z}`} position={[x, 0.38, z]} rotation={[Math.PI / 2, 0, 0]}>
+          <mesh>
+            <cylinderGeometry args={[0.38, 0.38, 0.24, 12]} />
+            <meshStandardMaterial color="#15171a" roughness={0.95} />
+          </mesh>
+          <mesh position={[0, Math.sign(z) * 0.125, 0]}>
+            <cylinderGeometry args={[0.16, 0.16, 0.025, 10]} />
+            <meshStandardMaterial color={CASTING} metalness={0.55} roughness={0.4} />
+          </mesh>
+        </group>
+      ))}
+      <mesh position={[0, 0.3, 0]}>
+        <boxGeometry args={[5.7, 0.16, 1.65]} />
+        <meshStandardMaterial color={CASTING} metalness={0.45} roughness={0.62} />
+      </mesh>
+    </group>
+  )
+}
+
 /** Turntable speed for the minigun showcase (rad/s) — slow and steady. */
 const SHOWCASE_SPIN = 0.45
 
@@ -652,7 +1070,8 @@ function BreakerPanel({ world }: { world: GameWorld }) {
   // claimable for as long as the session runs; the engageable gate (not
   // arbitration) is what keeps stray presses out.
   useEffect(() => {
-    grabTables.set(BREAKER_NODE_ID, { x: at.x, z: at.z, taken: false })
+    const entry = { x: at.x, z: at.z, taken: false }
+    grabTables.set(BREAKER_NODE_ID, entry)
     return () => {
       grabTables.delete(BREAKER_NODE_ID)
     }
@@ -670,11 +1089,24 @@ function BreakerPanel({ world }: { world: GameWorld }) {
 
     const session = getSession()
     if (!session) return
+    liveDepotLocalToWorld(world, BREAKER_LOCAL[0], BREAKER_LOCAL[1], at)
+    const entry = grabTables.get(BREAKER_NODE_ID)
+    if (entry) {
+      entry.x = at.x
+      entry.z = at.z
+    }
     camera.getWorldDirection(_look)
+    const [playerLocalX] = liveWorldToDepotLocal(world, playerRig.position.x, playerRig.position.z)
     const near =
       nearestGrabbable(playerRig.position.x, playerRig.position.z, grabTables) ===
         BREAKER_NODE_ID &&
-      breakerEngageable(world, at, playerRig.position.x, playerRig.position.z, _look.x, _look.z)
+      playerLocalX > DEPOT_SIZE[0] / 2 &&
+      (() => {
+        const tx = at.x - playerRig.position.x
+        const tz = at.z - playerRig.position.z
+        const len = Math.hypot(tx, tz) * Math.hypot(_look.x, _look.z)
+        return len > 1e-6 && (tx * _look.x + tz * _look.z) / len > BREAKER_FACING_DOT
+      })()
     // The verb tracks the handle: the prompt itself says which way the
     // next throw goes (and flips in place right after a toggle).
     const want = near
@@ -1083,6 +1515,7 @@ function useFixtureColliders(world: GameWorld, solidRefs: { current: (Mesh | nul
  * fixture, one pickup per press edge, sfx.pickup on grant.
  */
 function StationLogic({
+  world,
   at,
   nodeId,
   taken,
@@ -1090,6 +1523,7 @@ function StationLogic({
   promptOwner,
   onPickup,
 }: {
+  world: GameWorld
   at: Vector3
   nodeId: string
   /** True once this station's gear is owned: prompt off, arbitration
@@ -1106,7 +1540,8 @@ function StationLogic({
   // on the station nearestGrabbable elects, so overlapping discs never
   // serve one E press twice.
   useEffect(() => {
-    grabTables.set(nodeId, { x: at.x, z: at.z, taken })
+    const entry = { x: at.x, z: at.z, taken }
+    grabTables.set(nodeId, entry)
     return () => {
       grabTables.delete(nodeId)
     }
@@ -1115,6 +1550,17 @@ function StationLogic({
   useFrame(() => {
     const session = getSession()
     if (!session) return
+
+    // `at` is a stable scratch Vector3 owned by SpawnDepot. Mutating it and
+    // the arbitration record makes the station ride the trailer without a
+    // React render on every metre travelled.
+    liveDepotLocalToWorld(world, ARMORY_STATION_LOCAL[0], ARMORY_STATION_LOCAL[1], at)
+    const entry = grabTables.get(nodeId)
+    if (entry) {
+      entry.x = at.x
+      entry.z = at.z
+      entry.taken = taken
+    }
 
     const near =
       !taken &&

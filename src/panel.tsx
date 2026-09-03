@@ -886,7 +886,7 @@ export default function BootsPanel() {
           Controls
         </p>
         <p>WASD move · Space jump · Shift walk</p>
-        <p>Mouse shoot · E gear up at the depot (behind you at spawn)</p>
+        <p>Mouse shoot · E gear up · E enters/exits the Cybertruck · WASD drives</p>
         <p>
           Peaceful for as long as you like — grab guns, build, nothing comes. Face the breaker on
           the depot's end wall from outside and press E: the countdown starts and the machines come

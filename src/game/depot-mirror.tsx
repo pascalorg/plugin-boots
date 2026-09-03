@@ -19,7 +19,7 @@ import {
 } from 'three'
 import { useBoots } from '../store'
 import { EYE_HEIGHT } from './collision'
-import { DEPOT_NODE_ID, DEPOT_NODE_TYPE, depotWorldYaw, worldToDepotLocal } from './guntable'
+import { DEPOT_NODE_ID, DEPOT_NODE_TYPE } from './guntable'
 import { clampFrameDt } from './feel'
 import { leftGripFor } from './hand-grips'
 import { aimMirrorCamera, flipPaneUv, MirrorCamera, type MirrorPane, paneInView } from './mirror-view'
@@ -239,10 +239,6 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     localPaletteIndex,
     localPaletteIndex,
   )
-  // The depot's yaw is fixed once the lot loads: the player's heading has to
-  // come into this frame before the rig can wear it.
-  const yawOffset = useMemo(() => depotWorldYaw(world), [world])
-
   // GPU-side gear, one set per mount: the target the pass renders into, the
   // pane's geometry with its UVs turned for a render target seen in a mirror,
   // the two faces of the glass (live reflection / idle steel-grey), and the
@@ -323,8 +319,11 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     const warmPass = warm.current === 1
     if (warmPass) warm.current = 2
 
-    const [lx, lz] = worldToDepotLocal(world, playerRig.position.x, playerRig.position.z)
-    const engaged = mirrorEngaged(lx, lz) && paneInView(camera, pane)
+    // The depot can move now. Measure engagement in the rendered parent's
+    // live frame instead of re-deriving the old spawn transform.
+    _local.copy(playerRig.position)
+    parent.worldToLocal(_local)
+    const engaged = mirrorEngaged(_local.x, _local.z) && paneInView(camera, pane)
     const face = engaged ? gear.live : gear.idle
     if (pane.material !== face) pane.material = face
     mirrorDebug.engaged = engaged
@@ -340,7 +339,8 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     // goes out on the wire, so plant the feet exactly as remote-players does.
     _local.copy(playerRig.position)
     parent.worldToLocal(_local)
-    const localYaw = playerRig.yaw - yawOffset
+    const e = parent.matrixWorld.elements
+    const localYaw = playerRig.yaw - Math.atan2(e[8], e[10])
     // The motion layer, off our own eye in the depot frame: body yaw lags the
     // view, landings are judged on the fall, shots kick. The vertical speed is
     // the eye's finite difference (the wire's `vy` is the same thing, sampled),

@@ -286,6 +286,8 @@ describe('envelope codec — readEnvelope', () => {
       // PvP: a per-victim monotone hit counter (like the gunfire field on
       // 'pose'); unknown to old pins, which drop it, so PvP just doesn't occur.
       'boots/pvp-hit',
+      // Shared Cybertruck + depot-trailer pose.
+      'boots/vehicle',
       // Voice SIGNALLING only — one WebRTC description per peer per epoch. The
       // speech itself never enters this bus (see voice-policy.ts).
       'boots/voice',

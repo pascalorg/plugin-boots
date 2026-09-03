@@ -17,6 +17,7 @@ import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { fire } from './shooting'
+import { vehicleRig } from './vehicle-state'
 import {
   HammerModel,
   KnifeModel,
@@ -274,6 +275,28 @@ export function Viewmodel({ world }: { world: GameWorld }) {
 
     rig.position.copy(camera.position)
     rig.quaternion.copy(camera.quaternion)
+
+    // Driving owns both hands. Keep the first-person weapon out of the cab,
+    // stop any rotary loop, and drain non-vehicle one-shots so a key tapped
+    // behind the wheel cannot fire after the player exits.
+    if (vehicleRig.driving) {
+      rig.visible = false
+      session.input.consumeActions()
+      session.input.state.firing = false
+      session.input.state.altFiring = false
+      handSignals.held = false
+      playerRig.ads = 0
+      if (spinSfx.current) {
+        spinSfx.current.stop()
+        spinSfx.current = null
+      }
+      if (spinDragging.current) {
+        playerRig.speedScale = 1
+        spinDragging.current = false
+      }
+      return
+    }
+    rig.visible = true
 
     // Discrete actions: weapon slots, wheel cycling, build controls.
     const state = useBoots.getState()
