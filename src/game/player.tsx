@@ -279,7 +279,7 @@ export function damagePlayer(amount: number, fromDir?: { x: number; z: number })
 
   // Directional edge flash: the HUD lights the screen edge(s) facing the hit.
   getSession()?.hud.damageFlash(angle)
-  sfx.damage()
+  sfx.damage(amount) // a bigger hit is a sharper hurt (audio.ts hurtMix)
 
   if (s.staggered) return // mercy window: pushed around, but no hp loss
   const next = Math.max(0, s.health - amount)
@@ -617,7 +617,8 @@ export function Player({ world }: { world: GameWorld }) {
       // Touchdown: the camera dips from a curb (−3 m/s, feel.ts), the thump
       // only voices for a real drop (−4 m/s: a 0.5 m ledge, a jump).
       triggerLanding(feel, fallSpeed)
-      if (fallSpeed < -FEEL.LAND_SFX_FALL) sfx.land()
+      // The thump carries the dip's depth: a heavier landing lands lower/louder.
+      if (fallSpeed < -FEEL.LAND_SFX_FALL) sfx.land(feel.landDepth / FEEL.LAND_DIP_MAX)
     }
     prevGrounded.current = grounded
 
@@ -628,7 +629,8 @@ export function Player({ world }: { world: GameWorld }) {
     // jump at run speed.
     const speed = Math.hypot(vel.current.x, vel.current.z)
     playerRig.speed = speed
-    if (advanceBob(feel, speed, grounded, MOVE.runSpeed, dt)) sfx.footstep()
+    // The step carries its pace: a walk is softer than a run.
+    if (advanceBob(feel, speed, grounded, MOVE.runSpeed, dt)) sfx.footstep(speed / MOVE.runSpeed)
     const dip = landDip(feel, dt)
     const bY = bobY(feel)
     const bX = bobX(feel)

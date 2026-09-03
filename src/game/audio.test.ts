@@ -1,20 +1,43 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  audioDebug,
+  footstepMix,
   heartbeatBpm,
+  HURT_DEFAULT_DMG,
+  HURT_FULL_DMG,
+  hurtMix,
+  LAND_DEFAULT_DEPTH,
+  LAND_SUB_DEPTH,
+  landMix,
   lowHpSeverity,
+  PAN_MONO_COMP,
   REMOTE_SHOT_MAX_M,
   REMOTE_SHOT_VOICE_CAP,
   REMOTE_SHOT_WINDOW_MS,
+  REMOTE_STEP_LEVEL_0,
+  REMOTE_STEP_MAX_M,
+  REMOTE_STEP_VOICE_CAP,
+  REMOTE_STEP_WINDOW_MS,
   remoteShotMix,
   remoteShotVoiceGate,
+  remoteStepAttenuation,
+  remoteStepCutoffHz,
+  remoteStepLevel,
+  remoteStepMix,
+  remoteStepVoiceGate,
   resetRemoteShotVoiceGate,
+  resetRemoteStepVoiceGate,
   resetSnapVoiceGate,
   sfx,
   SNAP_VOICE_CAP,
   SNAP_WINDOW_MS,
   snapVoiceGate,
+  SPATIAL_PAN_MAX,
+  spatialPan,
   SPEED_OF_SOUND_MS,
 } from './audio'
+import { FEEL } from './feel'
+import { MOVE } from './movement'
 
 /**
  * Headless contract tests — bun test has no `window`, so ensureContext()
@@ -239,6 +262,267 @@ describe('sfx.remoteShot (silent no-op headless)', () => {
       sfx.remoteShot('rifle', Number.NaN)
       for (let i = 0; i < 60; i++) sfx.remoteShot('minigun', 8, 0) // flood the gate
     }).not.toThrow()
+    resetRemoteShotVoiceGate()
+  })
+})
+
+// ── 2026-09-02 audio lane: the shared distance rig, steps, intensities ──────
+
+describe('spatialPan — the one pan law for every placed sound', () => {
+  test('scales to ±SPATIAL_PAN_MAX, clamps, and is centre for junk', () => {
+    expect(spatialPan(0)).toBe(0)
+    expect(spatialPan(0.5)).toBeCloseTo(0.5 * SPATIAL_PAN_MAX, 12)
+    expect(spatialPan(1)).toBe(SPATIAL_PAN_MAX)
+    expect(spatialPan(-1)).toBe(-SPATIAL_PAN_MAX)
+    expect(spatialPan(7)).toBe(SPATIAL_PAN_MAX) // an un-normalized bearing never leaves one ear
+    expect(spatialPan(-7)).toBe(-SPATIAL_PAN_MAX)
+    // A source AT the listener (0/0) must not reach an AudioParam as NaN — that throws.
+    expect(spatialPan(Number.NaN)).toBe(0)
+    expect(spatialPan(Number.POSITIVE_INFINITY)).toBe(0)
+  })
+
+  test('PAN_MONO_COMP undoes the centred panner\'s mono loss and is equal-power at any pan', () => {
+    // A mono source through a StereoPanner: L = cos(x·π/2), R = sin(x·π/2), x = (pan + 1) / 2.
+    // Wired straight into the stereo master it is copied to both ears at unity — power 2.
+    for (const pan of [0, 0.3, -0.5, SPATIAL_PAN_MAX, -SPATIAL_PAN_MAX]) {
+      const x = ((pan + 1) / 2) * (Math.PI / 2)
+      const l = Math.cos(x) * PAN_MONO_COMP
+      const r = Math.sin(x) * PAN_MONO_COMP
+      expect(l * l + r * r).toBeCloseTo(2, 12)
+    }
+    // Centre: exactly the loudness the straight connection had (botTell's by-ear tuning).
+    expect(Math.cos(Math.PI / 4) * PAN_MONO_COMP).toBeCloseTo(1, 12)
+  })
+})
+
+describe('remoteStepMix — the quiet law, same shape as remote gunfire', () => {
+  afterEach(() => resetRemoteStepVoiceGate())
+
+  test('level = LEVEL_0 × attenuation; quadratic, monotone, exactly 0 at and past 22 m', () => {
+    expect(remoteStepMix(0).level).toBe(REMOTE_STEP_LEVEL_0)
+    expect(remoteStepMix(0).attenuation).toBe(1)
+    expect(remoteStepLevel(-3)).toBe(REMOTE_STEP_LEVEL_0)
+    let previous = Number.POSITIVE_INFINITY
+    for (let d = 0; d <= 30; d += 0.25) {
+      const m = remoteStepMix(d)
+      expect(m.level).toBeCloseTo(REMOTE_STEP_LEVEL_0 * m.attenuation, 12)
+      expect(m.level).toBeLessThanOrEqual(previous)
+      expect(m.attenuation).toBeGreaterThanOrEqual(0)
+      expect(m.attenuation).toBeLessThanOrEqual(1)
+      previous = m.level
+    }
+    expect(remoteStepAttenuation(REMOTE_STEP_MAX_M)).toBe(0)
+    expect(remoteStepMix(REMOTE_STEP_MAX_M + 10).level).toBe(0)
+    expect(remoteStepMix(REMOTE_STEP_MAX_M / 2).level).toBeCloseTo(REMOTE_STEP_LEVEL_0 / 4, 9)
+  })
+
+  test('air cutoff falls with distance and floors; delay is d/343 s capped at 0.1', () => {
+    expect(remoteStepCutoffHz(0)).toBe(2400)
+    expect(remoteStepCutoffHz(10)).toBe(1600)
+    expect(remoteStepCutoffHz(100)).toBe(600)
+    expect(remoteStepMix(0).delayS).toBe(0)
+    expect(remoteStepMix(10).delayS).toBeCloseTo(10 / SPEED_OF_SOUND_MS, 12)
+    expect(remoteStepMix(20).delayS).toBeCloseTo(20 / SPEED_OF_SOUND_MS, 12)
+    expect(remoteStepMix(60).delayS).toBe(0.1)
+  })
+
+  test('a peer at 3 m steps about as loud as their gun would (the laws agree near)', () => {
+    // Both laws normalized to their own point-blank level: within 10 % at 3 m,
+    // so a shooter's steps and shots read as coming from the same body.
+    const step = remoteStepMix(3).attenuation
+    const shot = remoteShotMix(3).level
+    expect(Math.abs(step - shot)).toBeLessThan(0.1)
+  })
+
+  test(`governor: ${REMOTE_STEP_VOICE_CAP} steps per ${REMOTE_STEP_WINDOW_MS} ms, then a fresh window`, () => {
+    for (let i = 0; i < REMOTE_STEP_VOICE_CAP; i++) expect(remoteStepVoiceGate(5000)).toBe('voice')
+    expect(remoteStepVoiceGate(5000 + REMOTE_STEP_WINDOW_MS)).toBe('skip')
+    expect(remoteStepVoiceGate(5000 + REMOTE_STEP_WINDOW_MS + 1)).toBe('voice')
+  })
+
+  test('sfx.remoteFootstep is a silent no-op headless (any distance, pan, intensity)', () => {
+    expect(() => sfx.remoteFootstep(3, 0.2)).not.toThrow()
+    expect(() => sfx.remoteFootstep(0, -2, 0.3)).not.toThrow()
+    expect(() => sfx.remoteFootstep(100, Number.NaN)).not.toThrow()
+    expect(() => sfx.botTell('dog', 4, 0.5)).not.toThrow()
+  })
+})
+
+describe('footstepMix — a walk is softer and duller than a run', () => {
+  test('pace 1 is the pre-intensity voice; monotone in gain and brightness', () => {
+    expect(footstepMix().gain).toBeCloseTo(0.16, 12)
+    expect(footstepMix().freq).toBe(380)
+    let g = -1
+    let f = -1
+    for (let p = 0; p <= 1; p += 0.1) {
+      const m = footstepMix(p)
+      expect(m.gain).toBeGreaterThan(g)
+      expect(m.freq).toBeGreaterThan(f)
+      g = m.gain
+      f = m.freq
+    }
+    // A walk is quieter but still a step, not a whisper (≥ half the run's gain).
+    expect(footstepMix(0).gain).toBeGreaterThanOrEqual(0.16 * 0.5)
+  })
+
+  test('clamps and tolerates junk', () => {
+    expect(footstepMix(4)).toEqual(footstepMix(1))
+    expect(footstepMix(-1)).toEqual(footstepMix(0))
+    expect(footstepMix(Number.NaN)).toEqual(footstepMix(1))
+    expect(() => sfx.footstep(0.4)).not.toThrow()
+  })
+})
+
+describe('landMix — a heavier landing thumps lower and louder', () => {
+  /** What player.tsx sends for a landing at `fallSpeed` m/s: feel.landDepth / LAND_DIP_MAX. */
+  const liveDepth = (fallSpeed: number) =>
+    Math.min(FEEL.LAND_DIP_MAX, Math.max(FEEL.LAND_DIP_MIN, fallSpeed * FEEL.LAND_DIP_PER_MS)) / FEEL.LAND_DIP_MAX
+
+  test('the default depth IS the standing jump the game sends, and reproduces the old thump exactly', () => {
+    // A jump leaves at MOVE.jumpSpeed and lands at the same speed; the default is
+    // derived from that, not pinned — a pinned 0.5 was a depth no jump ever produced.
+    expect(LAND_DEFAULT_DEPTH).toBeCloseTo(liveDepth(MOVE.jumpSpeed), 12)
+    expect(LAND_DEFAULT_DEPTH).toBeGreaterThan(0.6)
+    expect(LAND_DEFAULT_DEPTH).toBeLessThan(0.7)
+    const m = landMix()
+    expect(m.thumpHz).toBeCloseTo(95, 12)
+    expect(m.thumpS).toBeCloseTo(0.1, 12)
+    expect(m.thumpGain).toBeCloseTo(0.3, 12)
+    expect(m.burstGain).toBeCloseTo(0.2, 12)
+    expect(m.subGain).toBe(0)
+    expect(landMix(LAND_DEFAULT_DEPTH)).toEqual(m)
+    expect(landMix(liveDepth(MOVE.jumpSpeed))).toEqual(m)
+  })
+
+  test('live range: the softest voiced landing is softer than a jump, and no jump reaches the sub-thump', () => {
+    const ledge = landMix(liveDepth(FEEL.LAND_SFX_FALL)) // the 4 m/s threshold that voices at all
+    const jump = landMix(LAND_DEFAULT_DEPTH)
+    expect(ledge.thumpGain).toBeLessThan(jump.thumpGain)
+    expect(ledge.thumpHz).toBeGreaterThan(jump.thumpHz)
+    expect(ledge.thumpS).toBeLessThan(jump.thumpS)
+    expect(ledge.subGain).toBe(0)
+    // Even a jump that fell one whole max-dt frame further stays under the sub-thump.
+    const lateFrame = liveDepth(MOVE.jumpSpeed + MOVE.gravity * FEEL.DT_MAX)
+    expect(lateFrame).toBeLessThan(LAND_SUB_DEPTH)
+    expect(landMix(lateFrame).subGain).toBe(0)
+    // A real drop does get it, in full at the dip ceiling.
+    expect(landMix(1).subGain).toBeCloseTo(0.3, 12)
+  })
+
+  test('deeper → lower pitch, more gain, longer, and a sub-thump only past LAND_SUB_DEPTH', () => {
+    let hz = Number.POSITIVE_INFINITY
+    let gain = -1
+    let s = -1
+    for (let k = 0; k <= 20; k++) {
+      const d = k / 20
+      const m = landMix(d)
+      expect(m.thumpHz).toBeLessThan(hz)
+      expect(m.thumpGain).toBeGreaterThan(gain)
+      expect(m.thumpS).toBeGreaterThan(s)
+      hz = m.thumpHz
+      gain = m.thumpGain
+      s = m.thumpS
+      if (d <= LAND_SUB_DEPTH) expect(m.subGain).toBe(0)
+      else expect(m.subGain).toBeGreaterThan(0)
+    }
+    // The heaviest thump still sits well under the limiter's flood level.
+    expect(landMix(1).thumpGain + landMix(1).subGain).toBeLessThan(0.8)
+  })
+
+  test('clamps and tolerates junk', () => {
+    expect(landMix(3)).toEqual(landMix(1))
+    expect(landMix(-2)).toEqual(landMix(0))
+    expect(landMix(Number.NaN)).toEqual(landMix())
+    expect(() => sfx.land(1)).not.toThrow()
+    expect(() => sfx.land()).not.toThrow()
+  })
+})
+
+describe('hurtMix — a bigger hit is a sharper hurt', () => {
+  test('the default amount (a droid swing) reproduces the old voice: 140 Hz sawtooth, 0.12 s, 0.4, no crack', () => {
+    const m = hurtMix()
+    expect(m.thumpHz).toBeCloseTo(140, 12)
+    expect(m.thumpS).toBeCloseTo(0.12, 12)
+    expect(m.thumpGain).toBeCloseTo(0.4, 12)
+    expect(m.crackGain).toBe(0)
+    expect(hurtMix(HURT_DEFAULT_DMG)).toEqual(m)
+  })
+
+  test('a PvP round (10) has no crack; a grenade at your feet (≥ 40) is the sharpest', () => {
+    expect(hurtMix(10).crackGain).toBe(0)
+    expect(hurtMix(10).thumpHz).toBeLessThan(hurtMix().thumpHz)
+    const full = hurtMix(HURT_FULL_DMG)
+    expect(full.crackGain).toBeCloseTo(0.4, 12)
+    expect(full.thumpHz).toBe(175)
+    expect(hurtMix(90)).toEqual(full) // capped
+    let hz = -1
+    let gain = -1
+    let s = Number.POSITIVE_INFINITY
+    let crack = -1
+    for (let a = 0; a <= HURT_FULL_DMG; a += 4) {
+      const m = hurtMix(a)
+      expect(m.thumpHz).toBeGreaterThan(hz) // sharper = higher
+      expect(m.thumpGain).toBeGreaterThan(gain) // louder
+      expect(m.thumpS).toBeLessThan(s) // shorter
+      expect(m.crackGain).toBeGreaterThanOrEqual(crack)
+      hz = m.thumpHz
+      gain = m.thumpGain
+      s = m.thumpS
+      crack = m.crackGain
+    }
+  })
+
+  test('junk amounts fall back to the default; the voice never throws headless', () => {
+    expect(hurtMix(Number.NaN)).toEqual(hurtMix())
+    expect(hurtMix(-5)).toEqual(hurtMix(0))
+    expect(() => sfx.damage(50)).not.toThrow()
+    expect(() => sfx.damage()).not.toThrow()
+  })
+})
+
+describe('audioDebug — the headless-QA read of the mix', () => {
+  test('without WebAudio: no context, no master chain, muffle open, plain counters', () => {
+    const d = audioDebug()
+    expect(d.hasWebAudio).toBe(false)
+    expect(d.state).toBe('none')
+    expect(d.masterChain).toBe(false)
+    expect(d.muffleHz).toBe(19000)
+    expect(typeof d.voiced.remoteSteps).toBe('number')
+    expect(typeof d.voiced.remoteShots).toBe('number')
+    // A fresh copy each call — never the live counter object.
+    expect(audioDebug().voiced).not.toBe(d.voiced)
+  })
+
+  test('headless, a remote step over range or over the governor is counted as skipped, never voiced', () => {
+    resetRemoteStepVoiceGate()
+    const before = audioDebug().voiced
+    sfx.remoteFootstep(REMOTE_STEP_MAX_M + 8, 0) // out of range: a skip, not "never called"
+    sfx.remoteFootstep(REMOTE_STEP_MAX_M, 0.5) // exactly at the cutoff is silence too
+    for (let i = 0; i < REMOTE_STEP_VOICE_CAP + 3; i++) sfx.remoteFootstep(2, 0) // 3 over the governor
+    const after = audioDebug().voiced
+    expect(after.remoteSteps).toBe(before.remoteSteps) // no context → nothing voiced
+    expect(after.remoteStepsSkipped - before.remoteStepsSkipped).toBe(2 + 3)
+    resetRemoteStepVoiceGate()
+  })
+
+  test('remote shots and bot tells out of range are skips too; local voices count nothing without WebAudio', () => {
+    resetRemoteShotVoiceGate()
+    const before = audioDebug().voiced
+    sfx.remoteShot('rifle', REMOTE_SHOT_MAX_M + 10)
+    sfx.botTell('droid', REMOTE_SHOT_MAX_M + 10)
+    sfx.botTell('dog', 4) // in range but no context: neither voiced nor skipped
+    sfx.footstep(1)
+    sfx.land()
+    sfx.damage(25)
+    const after = audioDebug().voiced
+    expect(after.remoteShotsSkipped - before.remoteShotsSkipped).toBe(1)
+    expect(after.botTellsSkipped - before.botTellsSkipped).toBe(1)
+    expect(after.remoteShots).toBe(before.remoteShots)
+    expect(after.botTells).toBe(before.botTells)
+    // "Voiced" = a graph actually built into the master chain — none exists headless.
+    expect(after.footsteps).toBe(before.footsteps)
+    expect(after.lands).toBe(before.lands)
+    expect(after.hurts).toBe(before.hurts)
     resetRemoteShotVoiceGate()
   })
 })

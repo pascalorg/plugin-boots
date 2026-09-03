@@ -73,6 +73,23 @@
  * remoteShotVoiceGate() caps voices per rolling window, so a lobby full of
  * miniguns costs a bounded amount. pistolShot/rifleShot stay the LOCAL guns —
  * dry and undelayed, because your own muzzle is at your ear.
+ * sfx.remoteFootstep(distance, pan, intensity) — another player's (or a bot's)
+ * planted foot: remoteStepMix() is its own, quieter law (gone by 22 m) with
+ * remoteStepVoiceGate() as its governor. Shots, steps and bot tells all voice
+ * INTO one spatialRig (gain → air lowpass → stereo pan → master), so every
+ * sound with a place in the world sits under the same compressor and the
+ * same concussion muffle as your own guns.
+ *
+ * Intensities (2026-09-02): sfx.footstep(pace), sfx.land(depth) and
+ * sfx.damage(amount) take an optional weight — footstepMix/landMix/hurtMix
+ * are the pure laws (a walk is softer than a run, a heavy landing thumps
+ * lower and louder, a big hit is a sharper, shorter hurt with a crack on
+ * top). Each default reproduces the pre-intensity voice exactly.
+ *
+ * audioDebug() (also globalThis.__bootsAudio in a browser): context state,
+ * whether the master chain exists, the muffle cutoff, and how many voices of
+ * each spatial kind were voiced or skipped — the headless-QA proof that a
+ * peer's steps actually reached the mix.
  *
  * Phase-6 char-feel: charSnap(depth) — depth = prior snaps on the SAME
  * tree; each successive snap sits ~9% lower with a deeper, longer thunk
@@ -83,6 +100,9 @@
  * ~0.045; start idempotent while running (works again after stop), stop
  * idempotent; ALWAYS returns a handle (silent no-op without WebAudio).
  */
+
+import { FEEL } from './feel'
+import { MOVE } from './movement'
 
 /** Health at/below which the low-HP heartbeat (audio + HUD pulse) engages. */
 export const HEARTBEAT_HP = 45
@@ -127,12 +147,63 @@ let master: DynamicsCompressorNode | null = null
 let muffleFilter: BiquadFilterNode | null = null
 let noiseBuffer: AudioBuffer | null = null
 
+/**
+ * Voice counters — plain numbers on one long-lived object (an increment in a
+ * hot path, never an allocation). A kind's plain counter counts graphs
+ * actually built into the master chain (a call without WebAudio counts as
+ * nothing); its `Skipped` twin counts calls dropped before any graph — out of
+ * range or over the kind's governor — so a QA read can tell "never called"
+ * from "called, inaudible". Read through audioDebug(); QA harnesses read
+ * globalThis.__bootsAudio.
+ */
+const voiceStats = {
+  remoteShots: 0,
+  remoteShotsSkipped: 0,
+  remoteSteps: 0,
+  remoteStepsSkipped: 0,
+  botTells: 0,
+  botTellsSkipped: 0,
+  footsteps: 0,
+  lands: 0,
+  hurts: 0,
+}
+
+/** Plain snapshot of the audio layer's health — see audioDebug(). */
+export type AudioDebug = {
+  /** WebAudio exists in this runtime (false headless / in bun test). */
+  hasWebAudio: boolean
+  state: 'none' | 'suspended' | 'running' | 'closed' | 'interrupted'
+  sampleRate: number
+  /** compressor → muffle → gain → destination is built and connected. */
+  masterChain: boolean
+  /** Current concussion-muffle cutoff (Hz); MUFFLE_OPEN_HZ when clear. */
+  muffleHz: number
+  voiced: typeof voiceStats
+}
+
+/**
+ * Read-only snapshot of the mix's health (fresh plain object — not a hot-path
+ * call). Never builds the context: reading must not resume audio.
+ */
+export function audioDebug(): AudioDebug {
+  return {
+    hasWebAudio: ctx !== null,
+    state: ctx ? (ctx.state as AudioDebug['state']) : 'none',
+    sampleRate: ctx ? ctx.sampleRate : 0,
+    masterChain: master !== null && muffleFilter !== null,
+    muffleHz: muffleFilter ? muffleFilter.frequency.value : MUFFLE_OPEN_HZ,
+    voiced: { ...voiceStats },
+  }
+}
+
 function ensureContext(): AudioContext | null {
   if (typeof window === 'undefined') return null
   if (!ctx) {
     const Ctor = window.AudioContext ?? (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!Ctor) return null
     ctx = new Ctor()
+    // QA seam (read-only): the harnesses prove the graph exists headless.
+    ;(globalThis as Record<string, unknown>).__bootsAudio = audioDebug
     master = ctx.createDynamicsCompressor()
     master.threshold.value = -18
     master.ratio.value = 12
@@ -291,6 +362,228 @@ export function resetRemoteShotVoiceGate(): void {
 
 /** Weapon classes a remote shot can be voiced as (unknown ids read as rifle). */
 export type RemoteShotKind = 'pistol' | 'rifle' | 'minigun'
+
+// ── The distance rig: one chain for everything heard from somewhere ─────────
+
+/** A sound never arrives from strictly one ear: pans are softened to ±this. */
+export const SPATIAL_PAN_MAX = 0.8
+
+/**
+ * Listener-relative left/right (−1..1, the caller projects the source onto the
+ * camera's right axis) → StereoPanner value: scaled and clamped to
+ * ±SPATIAL_PAN_MAX. Non-finite input (a source AT the listener divided by a
+ * zero distance) is centre — an AudioParam rejects NaN with a throw, which in
+ * a frame loop is a session crash.
+ */
+export function spatialPan(pan: number): number {
+  if (!Number.isFinite(pan)) return 0
+  const p = pan * SPATIAL_PAN_MAX
+  return p < -SPATIAL_PAN_MAX ? -SPATIAL_PAN_MAX : p > SPATIAL_PAN_MAX ? SPATIAL_PAN_MAX : p
+}
+
+/**
+ * gain → lowpass ("air") → stereo pan → `out` (the master compressor). Every
+ * sound that comes from a place in the world — a peer's shot, a peer's step, a
+ * bot's tell — is voiced INTO the node this returns, so all of them sit under
+ * the master compressor and the concussion muffle exactly like the local
+ * guns: a remote step must not stay crisp while a grenade has your own ears
+ * ringing. Fire-and-forget: once the sources feeding it stop, the chain is
+ * garbage like every other voice here. The StereoPanner is universal on the
+ * browsers this ships to, but the graph must still build without it (older
+ * WebKit, test doubles).
+ */
+/**
+ * A mono voice through a StereoPanner at centre comes out cos(π/4) ≈ 0.707
+ * per ear — 3 dB under the same voice wired straight into the stereo master,
+ * whose up-mix copies it to both ears at unity. Every source in this file is
+ * mono (oscillators, the 1-channel noise buffer), so a rig that REPLACES a
+ * straight-to-master connection multiplies its level by this: equal power at
+ * every pan, and pan 0 is exactly the loudness it had before the panner.
+ * remoteShot was tuned by ear WITH its panner from day one and does not
+ * take it.
+ */
+export const PAN_MONO_COMP = Math.SQRT2
+
+function spatialRig(
+  c: AudioContext,
+  out: AudioNode,
+  level: number,
+  cutoffHz: number,
+  pan: number,
+  panComp = 1,
+): AudioNode {
+  const panner = typeof c.createStereoPanner === 'function' ? c.createStereoPanner() : null
+  const gain = c.createGain()
+  // The compensation is for the panner's centre loss — without a panner the
+  // straight connection is already at unity.
+  gain.gain.value = panner ? level * panComp : level
+  const air = c.createBiquadFilter()
+  air.type = 'lowpass'
+  air.frequency.value = cutoffHz
+  air.Q.value = 0.7
+  gain.connect(air)
+  if (panner) {
+    panner.pan.value = spatialPan(pan)
+    air.connect(panner)
+    panner.connect(out)
+  } else {
+    air.connect(out)
+  }
+  return gain
+}
+
+// ── Footsteps at a distance: the quiet law (pure, tested) ───────────────────
+
+/** Past this range (m) a footstep is not voiced at all — steps are quiet things. */
+export const REMOTE_STEP_MAX_M = 22
+/** The local footstep's own gain — and a remote step's level at zero distance,
+ * so a peer standing on your toes steps exactly as loud as you do, through the
+ * same master chain. */
+const FOOTSTEP_GAIN = 0.16
+export const REMOTE_STEP_LEVEL_0 = FOOTSTEP_GAIN
+/** Step voice governor: at most this many steps per rolling window, so a crowd
+ * marching past never builds a hundred filter chains (or starves gunfire). */
+export const REMOTE_STEP_WINDOW_MS = 250
+export const REMOTE_STEP_VOICE_CAP = 16
+
+/** What one distant footstep sounds like from `distance` metres away. */
+export type RemoteStepMix = {
+  /** Absolute level 0..REMOTE_STEP_LEVEL_0 — 0 means "do not voice this". */
+  level: number
+  /** The distance window 0..1 the rig's gain sits at (level / LEVEL_0). */
+  attenuation: number
+  /** Lowpass cutoff (Hz): the air eats the click first. */
+  cutoffHz: number
+  /** Propagation delay (s): a far step lands a beat after the foot does. */
+  delayS: number
+}
+
+/** Level 0..REMOTE_STEP_LEVEL_0 for a step `distance` metres away: a quadratic
+ * roll-off to exactly 0 at REMOTE_STEP_MAX_M (monotone, pinned). */
+export function remoteStepLevel(distance: number): number {
+  return REMOTE_STEP_LEVEL_0 * remoteStepAttenuation(distance)
+}
+
+/** The 0..1 window behind remoteStepLevel. */
+export function remoteStepAttenuation(distance: number): number {
+  const d = distance > 0 ? distance : 0
+  if (d >= REMOTE_STEP_MAX_M) return 0
+  const w = 1 - d / REMOTE_STEP_MAX_M
+  return w * w
+}
+
+/** Lowpass cutoff (Hz) for a step at this distance, floored at 600. */
+export function remoteStepCutoffHz(distance: number): number {
+  const d = distance > 0 ? distance : 0
+  const hz = 2400 - 80 * d
+  return hz < 600 ? 600 : hz
+}
+
+/** THE distance law for other people's footsteps — same shape as remoteShotMix
+ * (level, air, delay move together), on a much shorter range. */
+export function remoteStepMix(distance: number): RemoteStepMix {
+  const d = distance > 0 ? distance : 0
+  const attenuation = remoteStepAttenuation(d)
+  return {
+    level: REMOTE_STEP_LEVEL_0 * attenuation,
+    attenuation,
+    cutoffHz: remoteStepCutoffHz(d),
+    delayS: Math.min(0.1, d / SPEED_OF_SOUND_MS),
+  }
+}
+
+let remoteStepWindowStart = Number.NEGATIVE_INFINITY
+let remoteStepWindowCount = 0
+
+export function remoteStepVoiceGate(nowMs: number): 'voice' | 'skip' {
+  if (nowMs - remoteStepWindowStart > REMOTE_STEP_WINDOW_MS) {
+    remoteStepWindowStart = nowMs
+    remoteStepWindowCount = 0
+  }
+  remoteStepWindowCount++
+  return remoteStepWindowCount <= REMOTE_STEP_VOICE_CAP ? 'voice' : 'skip'
+}
+
+/** Test hook — clears the rolling window (module state outlives a test file). */
+export function resetRemoteStepVoiceGate(): void {
+  remoteStepWindowStart = Number.NEGATIVE_INFINITY
+  remoteStepWindowCount = 0
+}
+
+// ── Intensity laws for the body's own sounds (pure, tested) ─────────────────
+
+/** 0..1 clamp; non-finite reads as the caller's default. */
+function unit(v: number, fallback: number): number {
+  if (!Number.isFinite(v)) return fallback
+  return v < 0 ? 0 : v > 1 ? 1 : v
+}
+
+/** Own footstep for a stride `pace` 0..1 (speed / run speed): a walk is softer
+ * and a touch duller than a run. pace 1 is the pre-intensity voice. */
+export function footstepMix(pace = 1): { gain: number; freq: number } {
+  const i = unit(pace, 1)
+  return { gain: FOOTSTEP_GAIN * (0.55 + 0.45 * i), freq: 320 + 60 * i }
+}
+
+/**
+ * Landing depth 0..1 (feel.landDepth / LAND_DIP_MAX — what player.tsx sends)
+ * of a jump from standing height: the landing the pre-intensity thump was
+ * tuned on. Derived, not pinned: the player leaves the ground at
+ * MOVE.jumpSpeed and comes back at the same speed, and feel.ts turns that
+ * into a dip of LAND_DIP_PER_MS metres per m/s (≈ 0.65 with tonight's
+ * tuning). The softest landing that voices at all (FEEL.LAND_SFX_FALL, a
+ * 0.5 m ledge) sits just under this, so the live range is roughly [0.48, 1].
+ */
+export const LAND_DEFAULT_DEPTH = Math.min(1, (MOVE.jumpSpeed * FEEL.LAND_DIP_PER_MS) / FEEL.LAND_DIP_MAX)
+
+/** Depth past which a sub-thump grows in under the landing: a real drop
+ * (≈ 6.3 m/s — past any jump, even one that fell a whole extra frame). */
+export const LAND_SUB_DEPTH = 0.75
+
+/** Landing thump for a `depth` 0..1: heavier lands lower, louder and longer,
+ * and past LAND_SUB_DEPTH a sub-thump grows in underneath. LAND_DEFAULT_DEPTH
+ * (a standing jump) is the old voice exactly: 95 Hz, 0.1 s, 0.3 / 0.2. */
+export function landMix(depth = LAND_DEFAULT_DEPTH): {
+  thumpHz: number
+  thumpGain: number
+  thumpS: number
+  burstGain: number
+  subGain: number
+} {
+  const i = unit(depth, LAND_DEFAULT_DEPTH)
+  const x = i - LAND_DEFAULT_DEPTH // signed distance from the standing jump
+  const sub = i > LAND_SUB_DEPTH ? (i - LAND_SUB_DEPTH) / (1 - LAND_SUB_DEPTH) : 0
+  return {
+    thumpHz: 95 - 30 * x,
+    thumpGain: 0.3 + 0.2 * x,
+    thumpS: 0.1 + 0.04 * x,
+    burstGain: 0.2 + 0.12 * x,
+    subGain: 0.3 * sub,
+  }
+}
+
+/** Damage (hp) that reads as a full-weight hit: a grenade at your feet. */
+export const HURT_FULL_DMG = 40
+/** The hit the pre-intensity hurt voice was tuned on: a droid's swing. */
+export const HURT_DEFAULT_DMG = 12
+
+/** Hurt voice for `amount` hp: a bigger hit is sharper — higher, shorter,
+ * louder, with a noise crack on top that only appears above a PvP round. */
+export function hurtMix(amount = HURT_DEFAULT_DMG): {
+  thumpHz: number
+  thumpGain: number
+  thumpS: number
+  crackGain: number
+} {
+  const i = unit(amount / HURT_FULL_DMG, HURT_DEFAULT_DMG / HURT_FULL_DMG)
+  const crack = i > 0.3 ? (i - 0.3) / 0.7 : 0
+  return {
+    thumpHz: 125 + 50 * i,
+    thumpGain: 0.325 + 0.25 * i,
+    thumpS: 0.135 - 0.05 * i,
+    crackGain: 0.4 * crack,
+  }
+}
 
 type BurstOpts = {
   duration: number
@@ -530,29 +823,18 @@ export const sfx = {
     // Under ~0.4% of full scale is below the noise floor of everything else in
     // the mix — spend nothing on it (and skip the gate, so an inaudible shot
     // never uses up an audible peer's slot in the window).
-    if (mix.level <= 0.004) return
-    if (remoteShotVoiceGate(performance.now()) === 'skip') return
+    if (mix.level <= 0.004) {
+      voiceStats.remoteShotsSkipped++
+      return
+    }
+    if (remoteShotVoiceGate(performance.now()) === 'skip') {
+      voiceStats.remoteShotsSkipped++
+      return
+    }
     const c = ensureContext()
     if (!c || !master) return
-
-    const level = c.createGain()
-    level.gain.value = mix.level
-    const air = c.createBiquadFilter()
-    air.type = 'lowpass'
-    air.frequency.value = mix.cutoffHz
-    air.Q.value = 0.7
-    level.connect(air)
-    // StereoPannerNode is universal on the browsers this ships to, but the
-    // graph must still build without it (older WebKit, test doubles).
-    const panner = typeof c.createStereoPanner === 'function' ? c.createStereoPanner() : null
-    if (panner) {
-      panner.pan.value = Math.max(-0.8, Math.min(0.8, pan * 0.8))
-      air.connect(panner)
-      panner.connect(master)
-    } else {
-      air.connect(master)
-    }
-    const dest: AudioNode = level
+    voiceStats.remoteShots++
+    const dest = spatialRig(c, master, mix.level, mix.cutoffHz, pan)
 
     const v = rr()
     const t = mix.delayS + (offsetS > 0 ? Math.min(0.25, offsetS) : 0)
@@ -828,22 +1110,79 @@ export const sfx = {
     burst({ duration: 0.25, gain: 0.3, filterType: 'highpass', freq: 3000 })
   },
 
-  footstep(): void {
+  /** Your own heel strike. `pace` 0..1 = speed / run speed (player.tsx): a
+   * walk is softer and duller than a run (footstepMix). */
+  footstep(pace = 1): void {
+    const c = ensureContext()
+    if (!c || !master) return
+    const m = footstepMix(pace)
+    voiceStats.footsteps++
     burst({
       duration: 0.055,
-      gain: 0.16 + Math.random() * 0.05,
-      freq: 380 + Math.random() * 240,
+      gain: m.gain * (1 + Math.random() * 0.3),
+      freq: m.freq + Math.random() * 240,
       q: 0.9,
     })
+  },
+
+  /**
+   * SOMEBODY ELSE'S FOOTSTEP — a peer's (remote-players.tsx counts the gait
+   * phase's k·π crossings, exactly the drawn plants) or a bot's — heard from
+   * `distance` metres, `pan` −1..1 along the listener's right axis. The same
+   * timbre as your own step, through the spatialRig at remoteStepMix's window,
+   * air cutoff and speed-of-sound delay, so it lands under the master
+   * compressor and the concussion muffle like everything else with a place in
+   * the world. `intensity` is the stepper's pace (footstepMix). Beyond
+   * REMOTE_STEP_MAX_M, over the per-window governor, or without WebAudio:
+   * silent no-op.
+   */
+  remoteFootstep(distance: number, pan = 0, intensity = 1): void {
+    const mix = remoteStepMix(distance)
+    // Under ~0.4% of full scale is under everything else in the mix — spend
+    // nothing on it, and do not let it use up an audible step's slot.
+    if (mix.level <= 0.004) {
+      voiceStats.remoteStepsSkipped++
+      return
+    }
+    if (remoteStepVoiceGate(performance.now()) === 'skip') {
+      voiceStats.remoteStepsSkipped++
+      return
+    }
+    const c = ensureContext()
+    if (!c || !master) return
+    voiceStats.remoteSteps++
+    // PAN_MONO_COMP: a peer on your toes steps exactly as loud as you do —
+    // the rig's centred panner would otherwise take 3 dB off the same burst.
+    const dest = spatialRig(c, master, mix.attenuation, mix.cutoffHz, pan, PAN_MONO_COMP)
+    const m = footstepMix(intensity)
+    burst(
+      {
+        duration: 0.055,
+        gain: m.gain * (1 + Math.random() * 0.3),
+        freq: m.freq + Math.random() * 240,
+        q: 0.9,
+        dest,
+      },
+      mix.delayS,
+    )
   },
 
   jump(): void {
     burst({ duration: 0.07, gain: 0.14, freq: 500, q: 1 })
   },
 
-  land(): void {
-    thump(95, 0.1, 0.3)
-    burst({ duration: 0.07, gain: 0.2, freq: 300, q: 0.8 })
+  /** Touchdown. `depth` 0..1 = feel.landDepth / LAND_DIP_MAX (player.tsx): a
+   * heavier landing thumps lower and louder, with a sub-thump underneath past
+   * LAND_SUB_DEPTH (landMix). The default is a jump from standing height —
+   * the old voice exactly. */
+  land(depth = LAND_DEFAULT_DEPTH): void {
+    const c = ensureContext()
+    if (!c || !master) return
+    const m = landMix(depth)
+    voiceStats.lands++
+    thump(m.thumpHz, m.thumpS, m.thumpGain)
+    burst({ duration: 0.07, gain: m.burstGain, freq: 300, q: 0.8 })
+    if (m.subGain > 0.001) thump(55, 0.16, m.subGain, 0.01)
   },
 
   pickup(): void {
@@ -951,20 +1290,25 @@ export const sfx = {
    * the dive. Rides the same distance law as remote gunfire so a swing behind
    * you across the yard is a whisper and one at your back is not.
    */
-  botTell(kind: 'droid' | 'dog' | 'drone', distance: number): void {
+  botTell(kind: 'droid' | 'dog' | 'drone', distance: number, pan = 0): void {
     const mix = remoteShotMix(distance)
-    if (mix.level <= 0.004) return
+    if (mix.level <= 0.004) {
+      voiceStats.botTellsSkipped++
+      return
+    }
     const c = ensureContext()
     if (!c || !master) return
-    const level = c.createGain()
-    level.gain.value = Math.min(1, mix.level * 1.4)
-    const air = c.createBiquadFilter()
-    air.type = 'lowpass'
-    air.frequency.value = Math.max(1400, mix.cutoffHz)
-    air.Q.value = 0.7
-    level.connect(air)
-    air.connect(master)
-    const dest: AudioNode = level
+    voiceStats.botTells++
+    // PAN_MONO_COMP: this rig replaced a straight gain → air → master chain
+    // tuned by ear; the centred panner alone would sit 3 dB under it.
+    const dest = spatialRig(
+      c,
+      master,
+      Math.min(1, mix.level * 1.4),
+      Math.max(1400, mix.cutoffHz),
+      pan,
+      PAN_MONO_COMP,
+    )
     const v = rr()
     if (kind === 'dog') {
       thump(70 * v, 0.36, 0.5, 0, 'sawtooth', dest)
@@ -1451,7 +1795,15 @@ export const sfx = {
     burst({ duration: 0.2, gain: 0.3, filterType: 'highpass', freq: 1500 }, 0.02)
   },
 
-  damage(): void {
-    thump(140, 0.12, 0.4, 0, 'sawtooth')
+  /** Being hit for `amount` hp (player.tsx damagePlayer): a bigger hit is a
+   * sharper hurt — higher, shorter, louder, with a noise crack on top above a
+   * PvP round (hurtMix). The default is a droid's swing, the old voice. */
+  damage(amount = HURT_DEFAULT_DMG): void {
+    const c = ensureContext()
+    if (!c || !master) return
+    const m = hurtMix(amount)
+    voiceStats.hurts++
+    thump(m.thumpHz, m.thumpS, m.thumpGain, 0, 'sawtooth')
+    if (m.crackGain > 0.001) burst({ duration: 0.04, gain: m.crackGain, filterType: 'highpass', freq: 1800 })
   },
 }

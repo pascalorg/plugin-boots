@@ -11,6 +11,7 @@ import {
   remoteStepVoiceGate,
   resetRemoteStepVoiceGate,
 } from './remote-footsteps'
+import * as audio from './audio'
 
 /**
  * Remote footsteps, the pure half: the distance law, the plant counter that
@@ -83,5 +84,22 @@ describe('remoteFootstep — headless', () => {
     expect(() => remoteFootstep(3, 0.2)).not.toThrow()
     expect(() => remoteFootstep(0, -2)).not.toThrow()
     expect(() => remoteFootstep(100, 0)).not.toThrow()
+    expect(() => remoteFootstep(3, 0.2, 0.5)).not.toThrow()
+  })
+
+  test('the law and the governor ARE audio.ts\'s (one source of truth, master-routed)', () => {
+    expect(remoteStepLevel).toBe(audio.remoteStepLevel)
+    expect(remoteStepCutoffHz).toBe(audio.remoteStepCutoffHz)
+    expect(remoteStepVoiceGate).toBe(audio.remoteStepVoiceGate)
+    expect(REMOTE_STEP_MAX_M).toBe(audio.REMOTE_STEP_MAX_M)
+    expect(REMOTE_STEP_LEVEL_0).toBe(audio.REMOTE_STEP_LEVEL_0)
+    expect(remoteStepLevel(5)).toBe(audio.remoteStepMix(5).level)
+  })
+
+  test('delegates to sfx.remoteFootstep: over the governor it is counted as skipped', () => {
+    resetRemoteStepVoiceGate()
+    const before = audio.audioDebug().voiced.remoteStepsSkipped
+    for (let i = 0; i < REMOTE_STEP_VOICE_CAP + 2; i++) remoteFootstep(1, 0)
+    expect(audio.audioDebug().voiced.remoteStepsSkipped - before).toBe(2)
   })
 })
