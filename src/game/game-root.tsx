@@ -36,6 +36,7 @@ import {
 import { clearDust, dustDebug, DustSystem, setDustFloorProbe } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
+import { frameOk, reportFrameCrash } from './frame-guard'
 import { PlacedFittings } from './fittings'
 import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
 import { Grenades } from './grenade'
@@ -53,10 +54,12 @@ import { localDisplayName } from './nickname'
 import { startWorldSync, stopWorldSync, worldSyncDebug,
   onGridRefused,
 } from './net-world'
+import { untilNet } from './net-retry'
 import { PerfMonitor, perfReset, perfSections, perfSnapshot } from './perf-monitor'
 import { mirrorDebug } from './depot-mirror'
 import { Player, playerDebug, playerRig } from './player'
 import {
+  getRemotes,
   type LocalPose,
   onPresenceEvent,
   presenceDebug,
@@ -65,7 +68,8 @@ import {
 } from './presence'
 import { startPvpSync, stopPvpSync } from './pvp-damage'
 import { localPaletteIndex, RemotePlayers } from './remote-players'
-import { getSession, hideForGame, getSessionSerial } from './session'
+import { livePlayerNames } from './roster-names'
+import { exitGame, getSession, hideForGame, getSessionSerial } from './session'
 import { sharedBuildDebug } from './shared-build'
 import { ShellLayer, shellCensus } from './shell-layer'
 import { aimDirection, fire } from './shooting'
@@ -151,8 +155,16 @@ function ResurrectionSweep() {
  * clock epoch from where the limiter left it (capped dt so the first
  * sample never spikes). The limiter's other duty — pixel-ratio/size sync —
  * is replicated on size/dpr changes (fullscreen enters right after mount).
- * On exit everything restores; the limiter resumes its own saved clock
- * (one stale-dt frame in the editor, clamped by consumers).
+ * On exit everything restores. The limiter resumes from ITS OWN stale clock
+ * (createFrameClock(nextFrameTimeRef) — the time it paused at), while this
+ * booster has advanced R3F's clock by the whole session: left alone, the
+ * first resumed frame would carry dt = −(session length) to every editor-
+ * phase subscriber (host systems, a spectator's RemotePlayers). So the
+ * cleanup REWINDS clock.elapsedTime to the epoch captured at mount, and the
+ * first resumed frame carries a small positive dt instead. `advance` is
+ * guarded (frame-guard.ts): three consecutive throws inside R3F's update
+ * end the session instead of freezing fullscreen with the inputs swallowed.
+ * Old hosts without the renderPaused flag keep their limiter untouched.
  */
 export function FrameBooster() {
   const advance = useThree((s) => s.advance)
@@ -170,24 +182,47 @@ export function FrameBooster() {
     // transaction in panel.tsx); the live host store has carried it since
     // the gallery-cover feature.
     const viewerStore = useViewer as unknown as {
-      getState: () => { renderPaused?: boolean }
+      getState: () => { renderPaused?: boolean; setRenderPaused?: unknown }
       setState: (partial: { renderPaused: boolean }) => void
+    }
+    // Version gate on the SETTER (stable): `'renderPaused' in state` would be
+    // polluted by our own cleanup write. A host without the flag keeps its
+    // 50 fps limiter — pausing nothing and driving a second rAF would double
+    // every frame.
+    if (typeof viewerStore.getState().setRenderPaused !== 'function') {
+      console.info('[boots] host has no renderPaused flag — keeping its frame limiter')
+      return
     }
     const prevPaused = viewerStore.getState().renderPaused ?? false
     viewerStore.setState({ renderPaused: true })
-    let frameTime = clock.elapsedTime
+    // The limiter's last frame time — where it will resume from on exit.
+    const epoch = clock.elapsedTime
+    let frameTime = epoch
     let lastNow = 0
     let raf = 0
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick)
+      // rAF timestamps are monotonic: no Math.max(0, …) needed here.
       const dt = lastNow > 0 ? Math.min((now - lastNow) / 1000, 0.05) : 1 / 120
       lastNow = now
       frameTime += dt
-      advance(frameTime)
+      try {
+        advance(frameTime)
+        frameOk('advance')
+      } catch (e) {
+        // A throwing subscriber inside R3F's update: strike it; three in a row
+        // end the session (a no-op under the spectator's booster: no session).
+        if (reportFrameCrash('advance', e)) exitGame()
+      }
     }
     raf = requestAnimationFrame(tick)
     return () => {
       cancelAnimationFrame(raf)
+      // Rewind R3F's clock to the epoch BEFORE un-pausing: the limiter's
+      // resumed createFrameClock(nextFrameTimeRef) then yields a first delta
+      // of ≈ +20–40 ms instead of −(session length).
+      clock.elapsedTime = epoch
+      clock.oldTime = epoch
       viewerStore.setState({ renderPaused: prevPaused })
     }
   }, [advance, clock])
@@ -732,35 +767,65 @@ function ActiveGame() {
   // with the session already over. Join/leave events feed muted HUD toasts.
   useEffect(() => {
     const serial = getSessionSerial()
-    startPresence(sampleLocalPose) // feature-detected: no bus → no-op
-    // The shared world rides the same transport: avatars are one kind of frame,
-    // builds and destruction are another. Also feature-detected, also
-    // idempotent, and it refuses to start if the host cannot name us with an id
-    // we could author records under. exitGame owns the stop, before
-    // stopPresence closes the transport.
-    startWorldSync()
-    // PvP hit damage rides the same transport (a per-victim counter). Game
-    // phase only; inert without a bus or with an empty roster.
-    startPvpSync()
-    // Voice rides the same transport for SIGNALLING only (the speech goes
-    // peer-to-peer). Feature-detected the same way, and it needs the eye
-    // position for the proximity mix — playerRig, not the pose sampler, because
-    // that one mutates a shared scratch object.
-    startVoice({
-      getLocalPosition: () => [playerRig.position.x, playerRig.position.y, playerRig.position.z],
-    })
-    // Turn the mic on ONLY if this browser already granted it. Prompting here
-    // would put a permission dialog in front of someone who just dropped into a
-    // firefight, and a dialog answered by reflex is denied for good; the HUD
-    // offers the key instead. Second session onward this is seamless.
-    void enableMicIfAlreadyPermitted()
+    // The in-game ROSTER chip with names (hud.presenceChip(count, names)) —
+    // driven on every join/leave edge and once at bind, so peers who were
+    // already in the registry (a spectator dropping in adopts them without a
+    // join event) are listed too. Feature-detected like every cross-module hud
+    // call; the label rule is the one the toasts and the spectator pill use.
+    const driveRosterChip = () => {
+      const hud = getSession()?.hud as unknown as
+        | { presenceChip?: (count: number, names?: readonly string[]) => void }
+        | undefined
+      if (!hud?.presenceChip) return
+      const names = livePlayerNames(getRemotes())
+      hud.presenceChip(names.length, names)
+    }
+    // BIND RETRY (see-each-other, 2026-09-02). The host installs the collab bus
+    // asynchronously — after realtime auth — while this effect runs as soon as
+    // the scene is ready, so a fast Jump In used to find no bus, startPresence
+    // returned false, and nothing ever tried again: a whole SOLO session with
+    // no avatars, builds, PvP or voice. untilNet re-runs the bind every second
+    // until the bus is there (with a bus at mount it is exactly one pass), then
+    // (re)runs the other idempotent, feature-detected starts on the transport
+    // that now exists.
+    const cancelRetry = untilNet(
+      () => startPresence(sampleLocalPose), // feature-detected: no bus → false, retry
+      () => {
+        // The shared world rides the same transport: avatars are one kind of frame,
+        // builds and destruction are another. Also feature-detected, also
+        // idempotent, and it refuses to start if the host cannot name us with an id
+        // we could author records under. exitGame owns the stop, before
+        // stopPresence closes the transport.
+        startWorldSync()
+        // PvP hit damage rides the same transport (a per-victim counter). Game
+        // phase only; inert without a bus or with an empty roster.
+        startPvpSync()
+        // Voice rides the same transport for SIGNALLING only (the speech goes
+        // peer-to-peer). Feature-detected the same way, and it needs the eye
+        // position for the proximity mix — playerRig, not the pose sampler, because
+        // that one mutates a shared scratch object.
+        startVoice({
+          getLocalPosition: () => [playerRig.position.x, playerRig.position.y, playerRig.position.z],
+        })
+        // Turn the mic on ONLY if this browser already granted it. Prompting here
+        // would put a permission dialog in front of someone who just dropped into a
+        // firefight, and a dialog answered by reflex is denied for good; the HUD
+        // offers the key instead. Second session onward this is seamless. Armed
+        // only once a transport exists: with no bus there is nobody to talk to,
+        // and a stream acquired while voice is inactive would outlive stopVoice.
+        void enableMicIfAlreadyPermitted()
+        driveRosterChip()
+      },
+    )
     const offEvents = onPresenceEvent((event) => {
       const hud = getSession()?.hud as unknown as
         | { presenceToast?: (text: string) => void }
         | undefined
       hud?.presenceToast?.(`${event.name} ${event.type === 'join' ? 'joined' : 'left'}`)
+      driveRosterChip()
     })
     return () => {
+      cancelRetry()
       offEvents()
       // Same-session remounts keep the adapter alive; a stale unmount
       // (session ended or a new one started) must not stop the new one.

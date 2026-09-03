@@ -280,11 +280,26 @@ export class GameInput {
   }
 
   requestLock(): void {
+    // RAW mouse: `unadjustedMovement` disables the OS pointer acceleration so
+    // a flick is linear and repeatable. Chromium honors it; Safari ignores the
+    // dict; Firefox may reject with NotSupportedError — then re-request plain.
     // Some browsers return a promise that rejects (e.g. WrongDocumentError
     // right after fullscreen churn), others return undefined — swallow both.
     try {
-      const result = this.canvas?.requestPointerLock?.() as unknown
-      if (result instanceof Promise) result.catch(() => {})
+      const result = this.canvas?.requestPointerLock?.({
+        unadjustedMovement: true,
+      } as PointerLockOptions) as unknown
+      if (result instanceof Promise) {
+        result.catch((e: unknown) => {
+          if ((e as { name?: string } | null)?.name !== 'NotSupportedError') return
+          try {
+            const plain = this.canvas?.requestPointerLock?.() as unknown
+            if (plain instanceof Promise) plain.catch(() => {})
+          } catch {
+            // ignore — relock-on-click will retry
+          }
+        })
+      }
     } catch {
       // ignore — relock-on-click will retry
     }

@@ -1,16 +1,17 @@
 'use client'
 
-import { useFrame, useThree } from '@react-three/fiber'
+import { type RootState, useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import type { Group, Mesh, Object3D } from 'three'
 import type { WeaponId } from '../store'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { builderDebug, nextBuildSelection } from './builder'
+import { clampFrameDt, FEEL, recoilEnvelope, swayProfile } from './feel'
+import { guardedFrame } from './frame-guard'
 import { throwGrenade } from './grenade'
 import { isItemMenuOpen } from './inventory'
 import { itemGhostActive, useItems } from './item-place'
-import { MOVE } from './movement'
 import { cyclePaintColor, paintDebug, SprayerModel } from './paint'
 import { perfEvent } from './perf-monitor'
 import { playerRig } from './player'
@@ -104,7 +105,11 @@ type RigFeel = typeof playerRig & { ads?: number; shake?: (power: number) => voi
 const rigFeel = playerRig as RigFeel
 
 const DRAW_TIME = 0.14
-const DIP_TIME = 0.3
+/** The weapon dips 60 % of the camera's landing dip (playerRig.landDip) so
+ * the arms read as sinking WITH the body, not as a separate bounce. */
+const VM_LAND_SCALE = 0.6
+/** Reused sway-profile output (feel.swayProfile writes it every frame). */
+const _sway = { x: 0, y: 0, roll: 0 }
 /** Barrel cluster speed at full spin (rad/s) and spin-down time (s). */
 const BARREL_SPIN_RATE = 28
 const SPIN_DOWN_TIME = 0.9
@@ -192,15 +197,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
   const prevWeapon = useRef(weapon)
   const drawT = useRef(0)
   const breathT = useRef(0)
-  const bobPhase = useRef(0)
-  const bobAmp = useRef(0)
   const lagYaw = useRef(0)
   const lagPitch = useRef(0)
-  const prevGrounded = useRef(true)
-  const prevCamY = useRef(0)
-  const fallVel = useRef(0)
-  const dipT = useRef(1)
-  const dipDepth = useRef(0)
   /** 0→1 while staggered: weapon droops (down + muzzle-down), firing blocked. */
   const droop = useRef(0)
   const prevStaggered = useRef(false)
@@ -238,11 +236,11 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     [],
   )
 
-  useFrame((_, rawDt) => {
+  useFrame(guardedFrame('viewmodel', (_: RootState, rawDt: number) => {
     const session = getSession()
     const rig = rigRef.current
     if (!session || !rig) return
-    const dt = Math.min(rawDt, 1 / 30)
+    const dt = clampFrameDt(rawDt)
 
     rig.position.copy(camera.position)
     rig.quaternion.copy(camera.quaternion)
@@ -328,7 +326,8 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       }
     }
     swingT.current = Math.min(1, swingT.current + dt * 5.2)
-    recoilT.current = Math.min(1, recoilT.current + dt * 9)
+    // Recoil runs on feel.recoilEnvelope: instant kick, fast return, small settle.
+    recoilT.current = Math.min(1, recoilT.current + dt / FEEL.RECOIL_TIME)
     flashT.current -= dt
     if (flashRef.current) flashRef.current.visible = flashT.current > 0
 
@@ -511,7 +510,6 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     // armed the builder's carry pose frames the claw hammer, whatever gun
     // logic still holds underneath.
     const pose = POSES[shown]
-    const invDt = dt > 1e-5 ? 1 / dt : 0
 
     // Draw-in: rise from below with a muzzle-down tilt, ease-out cubic.
     // (clamp keeps the cubic sane for the get-up hold's negative drawT)
@@ -523,14 +521,16 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     const breatheY = Math.sin(breathT.current * 1.6) * 0.0028
     const breatheX = Math.sin(breathT.current * 0.9) * 0.0014
 
-    // Run cadence bob: accumulated phase driven by actual travel speed.
-    const speedN = clamp(playerRig.speed / MOVE.runSpeed, 0, 1)
-    const bobTarget = playerRig.grounded && playerRig.speed > 0.5 ? speedN : 0
-    if (bobTarget > 0) bobPhase.current += playerRig.speed * dt * 1.9
-    bobAmp.current += (bobTarget - bobAmp.current) * Math.min(1, dt * 8)
-    const bobY = -Math.abs(Math.sin(bobPhase.current)) * 0.016 * bobAmp.current
-    const bobX = Math.sin(bobPhase.current) * 0.012 * bobAmp.current
-    const bobRoll = Math.sin(bobPhase.current) * 0.01 * bobAmp.current
+    // Run cadence sway on the SHARED bob phase (playerRig.bobPhase/bobAmp —
+    // Player runs first: game-root.tsx mount order + R3F's stable priority
+    // sort, so these are this frame's values): weapon and head are phase-
+    // locked, and the amplitude SHAPE follows speed (feel.swayProfile: a
+    // lateral, rolling figure-8 at walking pace, vertical-heavy at a run).
+    swayProfile(playerRig.bobAmp, _sway)
+    const bobSin = Math.sin(playerRig.bobPhase)
+    const bobY = -Math.abs(bobSin) * _sway.y
+    const bobX = bobSin * _sway.x
+    const bobRoll = bobSin * _sway.roll
 
     // Look-lag: the weapon trails mouse motion through a spring. Reads the
     // rig's look velocities (rad/s, mouse-driven so teleports don't spike,
@@ -542,24 +542,14 @@ export function Viewmodel({ world }: { world: GameWorld }) {
     lagPitch.current +=
       (clamp(-playerRig.pitchVelocity * 0.018, -0.055, 0.055) - lagPitch.current) * lagK
 
-    // Landing dip: track fall speed from camera height, dip on touchdown.
-    const velY = (camera.position.y - prevCamY.current) * invDt
-    prevCamY.current = camera.position.y
-    if (!playerRig.grounded) fallVel.current = Math.min(fallVel.current, velY)
-    if (playerRig.grounded && !prevGrounded.current) {
-      if (fallVel.current < -3) {
-        dipT.current = 0
-        dipDepth.current = clamp(-fallVel.current * 0.008, 0.02, 0.06)
-      }
-      fallVel.current = 0
-    }
-    prevGrounded.current = playerRig.grounded
-    dipT.current = Math.min(1, dipT.current + dt / DIP_TIME)
-    const dip = Math.sin(Math.PI * dipT.current) * dipDepth.current
+    // Landing dip: the camera's own dip (feel.ts, published by Player), scaled
+    // — no more camera-height derivative, which the camera dip itself would
+    // have tripped as a fresh "fall" on every landing.
+    const dip = playerRig.landDip * VM_LAND_SCALE
 
-    // Swing / recoil springs.
+    // Swing spring / recoil kick + return curve.
     const swing = 1 - swingT.current
-    const recoil = 1 - recoilT.current
+    const recoil = recoilEnvelope(recoilT.current)
 
     // Rotary rumble: tiny high-frequency shake scaling with barrel spin,
     // hotter while the trigger is held. Exactly zero when the barrels rest.
@@ -641,7 +631,7 @@ export function Viewmodel({ world }: { world: GameWorld }) {
         baseRZ + bobRoll * steady + swing * 0.3 + sag * 0.07 + shakeRoll,
       )
     }
-  })
+  }))
 
   // Mesh pick follows `displayed`, not the store weapon — the armed-ghost
   // override swaps the visual to the builder's claw hammer, nothing else.

@@ -1,16 +1,35 @@
 'use client'
 
-import { useFrame, useThree } from '@react-three/fiber'
+import { type RootState, useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
 import { type PerspectiveCamera, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT, moveCapsule, PLAYER_CAPSULE } from './collision'
 import { collideVoxelWalls } from './destruction'
+import {
+  addShake,
+  advanceBob,
+  advanceRoll,
+  bobX,
+  bobY,
+  clampFrameDt,
+  createFeelState,
+  decayHurt,
+  FEEL,
+  type FeelState,
+  hurtKick,
+  landDip,
+  resetFeelState,
+  shakeOffsets,
+  smoothEyeY,
+  triggerLanding,
+} from './feel'
+import { guardedFrame, setFrameCrashHandler } from './frame-guard'
 import { groundSurfaceY, lotFloorY } from './ground'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
-import { getSession } from './session'
+import { exitGame, getSession } from './session'
 import { type GameWorld, settleSpawnFeet } from './world'
 
 /**
@@ -56,10 +75,20 @@ import { type GameWorld, settleSpawnFeet } from './world'
  *
  * `playerRig.shake(power)` — camera-shake impulse (explosions, heavy hits;
  *   arsenal/grenade call it). Impulses ACCUMULATE into a power pool (capped
- *   at 4) that decays ~6/s; each frame a random pitch/yaw offset of
- *   ±0.012 rad × power is applied ON TOP of the camera rotation write only —
- *   playerRig.yaw/pitch state is never touched, so look input, viewmodel
- *   sway and the mouse feel stay clean. Safe to call from anywhere.
+ *   at 4) that drives a DAMPED 13 Hz OSCILLATOR (feel.ts: closed form in the
+ *   time since the impulse, so 60 and 120 Hz displays see the same motion —
+ *   not per-frame noise), ±0.012 rad × power, applied ON TOP of the camera
+ *   rotation write only — playerRig.yaw/pitch state is never touched, so look
+ *   input, viewmodel sway and the mouse feel stay clean. Safe to call from
+ *   anywhere. damagePlayer adds a HURT KICK on top: a head-knock AWAY from
+ *   the blow (roll) + a snap back (pitch) that agree with the HUD edge flash.
+ *
+ * TRUTH vs COSMETICS: `playerRig.position` is the TRUE eye (feet +
+ *   EYE_HEIGHT, no bob/dip/lag) — the wire, builder, item-place, enemies and
+ *   the aim ray all read it. Head bob, the landing dip, step-offset smoothing,
+ *   strafe lean, shake and the hurt kick live on `camera.position/rotation`
+ *   ONLY (feel.ts), so a remote avatar never inherits our bob and nothing
+ *   placed from the eye ever sinks with a landing.
  *
  * REGEN: 4s after the last damage, health climbs +12/s to 100. Store writes
  * are throttled to ~4/s (fractional hp pools locally) to avoid re-render
@@ -73,16 +102,7 @@ const SENSITIVITY = 0.0021
 const GAME_FOV = 92
 /** Full aim-down-sights FOV; playerRig.ads lerps GAME_FOV→ADS_FOV. */
 const ADS_FOV = 60
-const FOOTSTEP_STRIDE = 2.3
 const MAX_PITCH = Math.PI / 2 - 0.02
-
-// --- Camera shake (playerRig.shake) -----------------------------------------
-/** Rad of random pitch/yaw offset per unit of shake power. */
-const SHAKE_AMP = 0.012
-/** Exponential decay rate (/s) of the accumulated shake power. */
-const SHAKE_DECAY = 6
-/** Impulse cap — even stacked explosions top out at ≈ ±0.048 rad of jitter. */
-const SHAKE_MAX = 4
 
 const REGEN_DELAY = 4 // s after last damage before regen kicks in
 const REGEN_RATE = 12 // hp/s
@@ -129,12 +149,23 @@ export function getUpPitch(u: number): number {
 
 /** Shared with the viewmodel/shooting: where the player is looking from. */
 export const playerRig = {
+  /** The TRUE eye = feet + EYE_HEIGHT, no bob/dip/lag — the wire, builder,
+   * item-place, enemies and the aim ray all read it; cosmetics live on
+   * camera.position only (see the API block). */
   position: new Vector3(),
   yaw: 0,
   pitch: 0,
   /** Horizontal speed, for bob/spread. */
   speed: 0,
   grounded: true,
+  /** Head-bob phase (rad, |sin| humps, heel strike at the low point) and its
+   * eased 0..1 amplitude — written by Player each frame, read by Viewmodel so
+   * weapon and head bob share ONE phase. Player subscribes first (game-root
+   * mount order + R3F's stable priority sort), so these are this frame's. */
+  bobPhase: 0,
+  bobAmp: 0,
+  /** This frame's camera landing dip (m, ≥ 0) — read by Viewmodel (60 %). */
+  landDip: 0,
   /** Camera recoil impulse (pitch radians), decays in the frame loop. */
   recoil: 0,
   /** Look velocity (rad/s), ~10 Hz smoothed — viewmodel sway reads these. */
@@ -170,11 +201,11 @@ export const playerRig = {
     if (!(power > 0)) return
     launchAccum = Math.max(launchAccum, Math.min(power, 9))
   },
-  /** Camera-shake impulse (see the API block): accumulates power (cap 4),
-   * decays ~6/s, applied as a random rotation OFFSET only — never state. */
+  /** Camera-shake impulse (see the API block): accumulates power (cap 4)
+   * into a damped 13 Hz oscillator (not noise), applied as a rotation
+   * OFFSET only — never state. */
   shake(power: number): void {
-    if (!(power > 0)) return
-    shakePower = Math.min(SHAKE_MAX, shakePower + power)
+    addShake(feel, power, 1)
   },
 }
 
@@ -182,13 +213,22 @@ export const playerRig = {
 const shoveAccum = { x: 0, z: 0 }
 /** Pending vertical launch impulse (playerRig.launch), consumed per frame. */
 let launchAccum = 0
-/** Accumulated camera-shake power (playerRig.shake), decayed in the loop. */
-let shakePower = 0
+/** Camera feel state (bob/dip/roll/shake/hurt) — feel.ts pure core; reset on
+ * mount. Module-level so damagePlayer and playerRig.shake reach it. */
+const feel = createFeelState()
+/** Reused shake output — written by shakeOffsets every frame, never re-made. */
+const _shake = { pitch: 0, yaw: 0 }
 /** Reused MoveConfig for playerRig.speedScale ≠ 1 — module temp, only the
  * two target speeds are rewritten per frame, never a fresh object. */
 const scaledMove: MoveConfig = { ...MOVE }
 /** Summed-dt session clock — never Date.now() in render paths. */
 let clock = 0
+/** Loop health counters for QA (sample.loopCalls / loopNoSession): how many
+ * times the frame callback ran this session and how many of those returned
+ * early because no session was live — a frozen game clock with frames still
+ * flowing is one of these two, and the sample says which. */
+let loopCalls = 0
+let loopNoSession = 0
 let lastDamageAt = -Infinity
 /** Seconds left in the current stagger (only meaningful while staggered). */
 let staggerT = 0
@@ -230,6 +270,13 @@ export function damagePlayer(amount: number, fromDir?: { x: number; z: number })
     angle = Math.atan2(ax * cosY - az * sinY, -ax * sinY - az * cosY)
   }
 
+  // FELT hit: head-knock away from the blow + a short 13 Hz kick (feel.ts).
+  // The roll sign agrees with the HUD flash below — a hit from the right
+  // lights the right edge and knocks the head LEFT. The mercy window dampens
+  // it exactly like the shove.
+  const kick = hurtKick(feel, amount, angle) * (s.staggered ? STAGGER_SHOVE_SCALE : 1)
+  addShake(feel, kick, feel.shakeSign)
+
   // Directional edge flash: the HUD lights the screen edge(s) facing the hit.
   getSession()?.hud.damageFlash(angle)
   sfx.damage()
@@ -257,6 +304,21 @@ export type PlayerSample = {
   /** Rounds fired this session — the local end of remote gunfire (peers read
    * this counter off the pose frame and voice the difference). */
   shots: number
+  /** Feel QA: heel strikes so far, this frame's landing dip (m), shake power,
+   * the COSMETIC camera height (vs y + EYE_HEIGHT, the true eye) and the
+   * hurt roll (rad, + = head knocked left). */
+  footsteps: number
+  dip: number
+  shake: number
+  camY: number
+  hurtRoll: number
+  /** Session game-time (summed clamped dt, s) — harnesses pace themselves on
+   * it: a slow headless page clamps dt to 1/30, so wall time ≠ game time. */
+  clock: number
+  /** Loop health: frame-callback entries this session / early returns for
+   * "no live session" (see the counters' doc). */
+  loopCalls: number
+  loopNoSession: number
 }
 
 /** How far under the lot floor counts as "fell out of the world". */
@@ -273,8 +335,11 @@ export const playerDebug: {
   damage: typeof damagePlayer
   drainShove: () => { x: number; z: number }
   sample?: () => PlayerSample
+  /** The live feel state (tests reset it; QA reads it) — module-level. */
+  feel: () => FeelState
 } = {
   damage: damagePlayer,
+  feel: () => feel,
   drainShove: () => {
     const out = { x: shoveAccum.x, z: shoveAccum.z }
     shoveAccum.x = 0
@@ -316,10 +381,7 @@ export function Player({ world }: { world: GameWorld }) {
   /** Ground contact normal from the LAST move (moveCapsule writes it) —
    * the plane the next tick's grounded velocity rides at full speed. */
   const groundNormal = useRef(new Vector3(0, 1, 0))
-  const bobPhase = useRef(0)
-  const stride = useRef(0)
   const prevGrounded = useRef(true)
-  const fallSpeed = useRef(0)
 
   useEffect(() => {
     const session = getSession()
@@ -359,8 +421,10 @@ export function Player({ world }: { world: GameWorld }) {
     // Fresh combat clock per session.
     shoveAccum.x = 0
     shoveAccum.z = 0
-    shakePower = 0
+    resetFeelState(feel)
     clock = 0
+    loopCalls = 0
+    loopNoSession = 0
     lastDamageAt = -Infinity
     staggerT = 0
     recoverT = 0
@@ -394,23 +458,44 @@ export function Player({ world }: { world: GameWorld }) {
         grounded: playerRig.grounded,
         groundNy: groundNormal.current.y,
         velY: vel.current.y,
+        // Feel QA (docs/qa/qa-boots-feel.mjs): heel strikes, this frame's
+        // dip, shake power, the cosmetic camera height and the hurt roll.
+        footsteps: feel.footsteps,
+        dip: playerRig.landDip,
+        shake: feel.shakeAmp,
+        camY: camera.position.y,
+        hurtRoll: feel.hurtRoll,
+        clock,
+        loopCalls,
+        loopNoSession,
       }
     }
     // Page-eval mirror of the dev handle (headless stagger tuning) — game-
     // root's `__boots` stays the stable surface; this one is player-scoped.
     ;(globalThis as Record<string, unknown>).__bootsPlayer = playerDebug
+    // Frame crash guard (frame-guard.ts): three consecutive throws at one
+    // guarded site end the session cleanly instead of freezing fullscreen
+    // with the inputs swallowed. Player is the session's first child, so the
+    // handler is live for every guarded loop of the session.
+    setFrameCrashHandler(exitGame)
     // Restore handled by session.exitGame (it owns savedCamera).
     return () => {
+      setFrameCrashHandler(null)
       playerDebug.teleport = undefined
       playerDebug.sample = undefined
       delete (globalThis as Record<string, unknown>).__bootsPlayer
     }
   }, [camera, world])
 
-  useFrame((_, rawDt) => {
+  useFrame(guardedFrame('player', (_: RootState, rawDt: number) => {
+    loopCalls++
     const session = getSession()
-    if (!session) return
-    const dt = Math.min(rawDt, 1 / 30)
+    if (!session) {
+      loopNoSession++
+      return
+    }
+    // 0 on a rewound/NaN clock frame (a no-op frame), capped at 1/30.
+    const dt = clampFrameDt(rawDt)
     clock += dt
     const input = session.input
 
@@ -435,7 +520,7 @@ export function Player({ world }: { world: GameWorld }) {
     )
     // Look velocity from the applied deltas (mouse-driven, so teleports
     // don't spike it), smoothed at ~10 Hz for the viewmodel sway.
-    const invDt = 1 / Math.max(dt, 1e-4)
+    const invDt = dt > 1e-4 ? 1 / dt : 0
     const smooth = Math.min(1, dt * 10)
     playerRig.yawVelocity += (-dx * sens * invDt - playerRig.yawVelocity) * smooth
     playerRig.pitchVelocity += ((playerRig.pitch - prevPitch) * invDt - playerRig.pitchVelocity) * smooth
@@ -507,7 +592,7 @@ export function Player({ world }: { world: GameWorld }) {
       launchAccum = 0
     }
 
-    fallSpeed.current = vel.current.y
+    const fallSpeed = vel.current.y
     // Integrate + slide + STEP OFFSET + ground snap (collision.moveCapsule):
     // blocked risers within STEP_OFFSET lift in-stride at full speed.
     let grounded = moveCapsule(
@@ -528,30 +613,47 @@ export function Player({ world }: { world: GameWorld }) {
     ) || grounded
     playerRig.grounded = grounded
 
-    if (grounded && !prevGrounded.current && fallSpeed.current < -4) sfx.land()
+    if (grounded && !prevGrounded.current) {
+      // Touchdown: the camera dips from a curb (−3 m/s, feel.ts), the thump
+      // only voices for a real drop (−4 m/s: a 0.5 m ledge, a jump).
+      triggerLanding(feel, fallSpeed)
+      if (fallSpeed < -FEEL.LAND_SFX_FALL) sfx.land()
+    }
     prevGrounded.current = grounded
 
-    // Footsteps + view bob, cadenced by actual travel.
+    // Footsteps + head bob share ONE phase, cadenced by actual travel: the
+    // footstep voices at the bob low point (heel strike). The phase freezes
+    // on a stop / in the air (only the amplitude eases out) — the old
+    // multiplicative phase decay aliased into a 26 mm/frame eye buzz on every
+    // jump at run speed.
     const speed = Math.hypot(vel.current.x, vel.current.z)
     playerRig.speed = speed
-    if (grounded && speed > 0.5) {
-      stride.current += speed * dt
-      bobPhase.current += speed * dt * 1.9
-      if (stride.current > FOOTSTEP_STRIDE) {
-        stride.current = 0
-        sfx.footstep()
-      }
-    } else {
-      bobPhase.current *= 1 - Math.min(1, dt * 10)
-    }
-    const bobY = Math.abs(Math.sin(bobPhase.current)) * 0.028 * Math.min(1, speed / MOVE.runSpeed)
-    const bobX = Math.sin(bobPhase.current) * 0.014 * Math.min(1, speed / MOVE.runSpeed)
+    if (advanceBob(feel, speed, grounded, MOVE.runSpeed, dt)) sfx.footstep()
+    const dip = landDip(feel, dt)
+    const bY = bobY(feel)
+    const bX = bobX(feel)
+    // Step-offset lifts ride an eased eye (≤ 0.35 m over ~200 ms) instead of
+    // popping the camera up a whole riser in one frame; the TRUE eye below
+    // still snaps — only the render lags. The pre-move vel.y × dt is the rise
+    // the velocity already explains (a slope ride, the last fall frame) and
+    // passes straight through — only the collider's unexplained lift eases,
+    // so a 43° stairs sprint no longer sinks the camera 24 cm into the treads.
+    const camFeetY = smoothEyeY(feel, feet.current.y, grounded, dt, fallSpeed * dt)
 
-    playerRig.position.set(
-      feet.current.x + cosY * bobX,
-      feet.current.y + EYE_HEIGHT + bobY,
-      feet.current.z - sinY * bobX,
-    )
+    // TRUTH: the exact eye — no bob, no dip, no lag. Everything that is not
+    // the camera reads this (and the wire carries it), so remote avatars stop
+    // double-bobbing and nothing placed from the eye sinks with a landing.
+    playerRig.position.set(feet.current.x, feet.current.y + EYE_HEIGHT, feet.current.z)
+    playerRig.bobPhase = feel.bobPhase
+    playerRig.bobAmp = feel.bobAmp
+    playerRig.landDip = dip
+
+    // Strafe lean: velocity along the camera's right vector (cosY, −sinY) —
+    // the same basis as wishX/wishZ above. Thumb mode gets no lean (a phone
+    // in the hands has no horizon to tilt against).
+    const touch = input.touchMode
+    const lateral = vel.current.x * cosY - vel.current.z * sinY
+    const roll = advanceRoll(feel, touch ? 0 : lateral, MOVE.runSpeed, dt)
 
     // --- Stagger: 2.5s of woozy "almost died" instead of dying ------------
     // ADS zoom base: the viewmodel writes playerRig.ads (0..1); FOV lerps
@@ -613,23 +715,32 @@ export function Player({ world }: { world: GameWorld }) {
       camera.updateProjectionMatrix()
     }
 
-    // Camera shake (playerRig.shake impulses): a decaying random pitch/yaw
-    // OFFSET on the rotation write only — yaw/pitch state stays untouched.
-    let shakePitch = 0
-    let shakeYaw = 0
-    if (shakePower > 0) {
-      shakePitch = (Math.random() * 2 - 1) * SHAKE_AMP * shakePower
-      shakeYaw = (Math.random() * 2 - 1) * SHAKE_AMP * shakePower
-      shakePower -= shakePower * Math.min(1, dt * SHAKE_DECAY)
-      if (shakePower < 0.01) shakePower = 0
-    }
+    // Camera shake (playerRig.shake / hurt kick impulses): a damped 13 Hz
+    // oscillator OFFSET on the rotation write only — yaw/pitch state stays
+    // untouched. Zero Math.random, zero allocation.
+    shakeOffsets(feel, dt, _shake)
+    decayHurt(feel, dt)
+    const shakeK = touch ? FEEL.TOUCH_SHAKE_SCALE : 1
+    const landPitch = touch ? 0 : dip * FEEL.LAND_PITCH_PER_M
 
-    camera.position.copy(playerRig.position)
+    // COSMETICS — applied here and nowhere else: bob (lateral along the right
+    // vector), eased step height, landing dip, strafe lean, shake, hurt kick.
+    // The viewmodel copies camera.position/quaternion so it rides along;
+    // aimDirection reads playerRig.yaw/pitch and never sees any of this.
+    camera.position.set(
+      playerRig.position.x + cosY * bX,
+      camFeetY + EYE_HEIGHT + bY - dip,
+      playerRig.position.z - sinY * bX,
+    )
     camera.rotation.order = 'YXZ'
     camera.rotation.set(
-      playerRig.pitch + playerRig.recoil + swayPitch + shakePitch,
-      playerRig.yaw + shakeYaw,
-      swayRoll,
+      playerRig.pitch +
+        playerRig.recoil +
+        swayPitch +
+        (_shake.pitch + feel.hurtPitch) * shakeK -
+        landPitch,
+      playerRig.yaw + _shake.yaw * shakeK,
+      swayRoll + roll + feel.hurtRoll * shakeK,
     )
 
     // Fall off the world guard. Re-settle: the ground at the spawn XZ may
@@ -642,7 +753,7 @@ export function Player({ world }: { world: GameWorld }) {
       settleSpawnFeet(world.colliders, feet.current, PLAYER_CAPSULE)
       vel.current.set(0, 0, 0)
     }
-  })
+  }))
 
   return null
 }

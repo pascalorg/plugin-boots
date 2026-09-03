@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { useBoots } from '../store'
-import { damagePlayer, getUpPitch, playerDebug } from './player'
+import { FEEL, resetFeelState } from './feel'
+import { damagePlayer, getUpPitch, playerDebug, playerRig } from './player'
 
 /**
  * Headless coverage for the "you can't die" damage entry point. The frame-
@@ -15,6 +16,8 @@ describe('damagePlayer', () => {
   beforeEach(() => {
     useBoots.setState({ phase: 'game', health: 100, staggered: false })
     playerDebug.drainShove()
+    resetFeelState(playerDebug.feel())
+    playerRig.yaw = 0
   })
 
   test('reduces health by the amount', () => {
@@ -96,6 +99,72 @@ describe('damagePlayer', () => {
     expect(useBoots.getState().staggered).toBe(true)
     const shove = playerDebug.drainShove()
     expect(shove.z).toBeCloseTo(-2.5, 5)
+  })
+
+  // --- FELT hit: the camera reacts (feel.ts hurt kick + shake) --------------
+
+  /** damagePlayer's bearing formula: attacker sits at −fromDir, yaw 0 → +x is RIGHT. */
+  const bearing = (fromDir: { x: number; z: number }): number => {
+    const ax = -fromDir.x
+    const az = -fromDir.z
+    const sinY = Math.sin(playerRig.yaw)
+    const cosY = Math.cos(playerRig.yaw)
+    return Math.atan2(ax * cosY - az * sinY, -ax * sinY - az * cosY)
+  }
+
+  test('a 10-dmg PvP round from the side shakes ≥ 1.0 and knocks the head AWAY from the attacker', () => {
+    // Push direction +x → the attacker stands at −x. With yaw 0, −x is the
+    // player's LEFT (bearing −π/2), so the head is knocked RIGHT (negative roll).
+    damagePlayer(10, { x: 1, z: 0 })
+    const f = playerDebug.feel()
+    expect(f.shakeAmp).toBeGreaterThanOrEqual(1.0)
+    expect(f.shakeT).toBe(0)
+    const angle = bearing({ x: 1, z: 0 })
+    expect(Math.sin(angle)).toBeLessThan(0) // attacker on the left…
+    expect(f.hurtRoll).toBeLessThan(0) // …head knocked right, away from it
+    expect(Math.sign(f.hurtRoll)).toBe(Math.sign(Math.sin(angle)))
+    expect(f.shakeSign).toBe(-1)
+  })
+
+  test('a push toward −x (attacker on the RIGHT) rolls the head LEFT: positive', () => {
+    damagePlayer(10, { x: -1, z: 0 })
+    const f = playerDebug.feel()
+    expect(Math.sin(bearing({ x: -1, z: 0 }))).toBeGreaterThan(0)
+    expect(f.hurtRoll).toBeGreaterThan(0)
+    expect(f.hurtRoll).toBeCloseTo(FEEL.HURT_ROLL, 6)
+    expect(f.shakeSign).toBe(1)
+  })
+
+  test('direction-less damage: shake ≥ 1.0, no roll, a pitch snap-back', () => {
+    damagePlayer(10)
+    const f = playerDebug.feel()
+    expect(f.shakeAmp).toBeGreaterThanOrEqual(1.0)
+    expect(f.hurtRoll).toBe(0)
+    expect(f.hurtPitch).toBeGreaterThan(0)
+  })
+
+  test('a hit taken while staggered shakes at the mercy scale (40 %)', () => {
+    useBoots.setState({ health: 1, staggered: true })
+    damagePlayer(10, { x: 0, z: 1 })
+    expect(playerDebug.feel().shakeAmp).toBeCloseTo(FEEL.HURT_SHAKE_MIN * 0.4, 6)
+  })
+
+  test('a hit in the editor phase leaves the feel state untouched', () => {
+    useBoots.setState({ phase: 'editor' })
+    damagePlayer(50, { x: 1, z: 0 })
+    const f = playerDebug.feel()
+    expect(f.shakeAmp).toBe(0)
+    expect(f.hurtRoll).toBe(0)
+    expect(f.hurtPitch).toBe(0)
+  })
+
+  test('playerRig.shake feeds the same oscillator (grenade / hammer callers)', () => {
+    playerRig.shake(1.4)
+    expect(playerDebug.feel().shakeAmp).toBeCloseTo(1.4, 6)
+    playerRig.shake(10)
+    expect(playerDebug.feel().shakeAmp).toBe(FEEL.SHAKE_MAX)
+    playerRig.shake(-1)
+    expect(playerDebug.feel().shakeAmp).toBe(FEEL.SHAKE_MAX)
   })
 })
 
