@@ -5,7 +5,9 @@ import { useEffect } from 'react'
 import { BOOTS_LOADER } from '../art'
 import { useBoots } from '../store'
 import { enterGame } from './session'
+import { ASK_HINT, beginEntry, currentEntryPlan, primeMicPermission } from './mic-gate'
 import { currentNick, googleFirstName, setNick } from './nickname'
+import { loadMicPref, micState, releaseMic, saveMicPref } from './voice'
 
 /**
  * THE SHAREABLE-LINK DROP GATE (owner vision, refined): open a project URL
@@ -29,6 +31,16 @@ import { currentNick, googleFirstName, setNick } from './nickname'
  * One-shot per page load, latched ON THE CLICK: React StrictMode
  * double-invokes effects in dev — a mount-time latch made the first pass
  * consume the gate while its cleanup removed the veil.
+ *
+ * THE MIC IS DECIDED HERE TOO (mic-gate.ts). The browser's permission prompt
+ * must never open inside enterGame's fullscreen + pointer-lock sequence —
+ * session.ts exits the game when either is lost — so the veil carries a
+ * MIC ON/OFF toggle (remembered across visits, default on) and JUMP IN runs
+ * through `beginEntry`: when the browser has to ask, that click IS the prompt
+ * ("ALLOW THE MIC ↑" → "⏵ PLAY") and the next one enters; when it already said
+ * yes, one click does both. The re-entry pill takes the same path. A page that
+ * leaves the veil without entering releases the mic; one that entered hands it
+ * to the session, which releases it on Esc.
  */
 
 /** Pure gate: offer the interstitial? Exported for tests. */
@@ -158,20 +170,54 @@ export function DropGate() {
     nameInput.oninput = () => setNick(nameInput.value)
     // Keep the veil's own keyboard handling from swallowing typing.
     nameInput.onkeydown = (e) => e.stopPropagation()
-    nameRow.append(nameLabel, nameInput)
+    // THE MIC, BEFORE THE GAME (see the header). The toggle is the standing
+    // choice; the prompt itself, when the browser needs one, is the JUMP IN
+    // click. Reading the permission now means the button knows which it is by
+    // the time it appears.
+    primeMicPermission()
+    const micToggle = document.createElement('button')
+    micToggle.type = 'button'
+    micToggle.dataset.bootsMicPref = '1' // QA hook: [data-boots-mic-pref-value] = on|off
+    micToggle.style.cssText =
+      `font:600 11px/1 ${FONT};letter-spacing:0.22em;color:rgba(255,255,255,0.85);background:rgba(255,255,255,0.06);` +
+      'border:1px solid rgba(255,255,255,0.14);border-radius:999px;padding:8px 14px;cursor:pointer;margin-top:4px'
+    nameRow.append(nameLabel, nameInput, micToggle)
     // The ONE button — hidden until the world is ready.
     const button = document.createElement('button')
     button.textContent = '⏵ JUMP IN'
     button.style.cssText =
       `display:none;font:700 20px/1 ${FONT};letter-spacing:0.12em;color:#0f1113;background:#e8c229;` +
       'border:none;border-radius:8px;padding:16px 44px;cursor:pointer'
-    veil.append(hero, word, nameRow, track, button)
+    // Under the button, only while the click will be a permission prompt.
+    const micHint = document.createElement('div')
+    micHint.dataset.bootsMicHint = '1' // QA hook
+    micHint.textContent = ASK_HINT
+    micHint.style.cssText = `display:none;font:600 11px/1 ${FONT};letter-spacing:0.12em;color:rgba(255,255,255,0.45);margin-top:-14px`
+    veil.append(hero, word, nameRow, track, button, micHint)
     document.body.appendChild(veil)
 
     const t0 = performance.now()
     let lastCensus = -1
     let stablePolls = 0
     let ready = false
+    const renderMic = () => {
+      const pref = loadMicPref()
+      micToggle.textContent = pref === 'on' ? '🎙 MIC ON' : '🎙 MIC OFF'
+      micToggle.dataset.bootsMicPrefValue = pref
+      micToggle.style.color = pref === 'on' ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.45)'
+      micHint.style.display = ready && currentEntryPlan() === 'ask-first' ? 'block' : 'none'
+    }
+    micToggle.onclick = () => {
+      const next = loadMicPref() === 'on' ? 'off' : 'on'
+      saveMicPref(next)
+      // MIC OFF lets go of a device the first click already acquired ('ask-first'
+      // settled to PLAY): the recording indicator goes out here, not on the next
+      // click, and nothing live can be carried into the game. The permission
+      // read is unaffected — flipping back on re-acquires without a prompt.
+      if (next === 'off' && (micState() === 'live' || micState() === 'muted')) releaseMic()
+      renderMic()
+    }
+    renderMic()
     const timer = setInterval(() => {
       const census = registryCensus()
       if (census === lastCensus && census >= 0) stablePolls++
@@ -182,30 +228,50 @@ export function DropGate() {
       fill.style.width = `${Math.round(p * 100)}%`
       if (!ready && p >= 1) {
         ready = true
-        clearInterval(timer)
         // Bar → button: the swap IS the "it's ready" tell.
         track.style.display = 'none'
         button.style.display = 'block'
       }
+      // The permission read (primeMicPermission) settles asynchronously; the
+      // toggle can flip; either changes whether the next click asks or enters.
+      renderMic()
     }, POLL_MS)
 
-    button.onclick = () => {
-      dropConsumed = true
-      enterGame()
-      // Hold the opaque veil until the game's own loading card is up, so
-      // the editor never flashes between the click and the game veil.
-      const holdT0 = performance.now()
-      const hold = setInterval(() => {
-        const gameVeil = document.querySelector('[data-boots-veil]')
-        if (gameVeil || performance.now() - holdT0 > 3000) {
-          clearInterval(hold)
-          veil.remove()
-        }
-      }, 100)
-    }
+    button.onclick = () =>
+      beginEntry({
+        setLabel: (text, busy) => {
+          button.textContent = text
+          button.disabled = busy
+          button.style.opacity = busy ? '0.6' : '1'
+          micHint.style.display = 'none'
+        },
+        enter: () => {
+          dropConsumed = true
+          if (!enterGame()) {
+            // Nothing entered (no canvas yet), so nothing may keep the mic.
+            releaseMic()
+            return
+          }
+          // Hold the opaque veil until the game's own loading card is up, so
+          // the editor never flashes between the click and the game veil.
+          const holdT0 = performance.now()
+          const hold = setInterval(() => {
+            const gameVeil = document.querySelector('[data-boots-veil]')
+            if (gameVeil || performance.now() - holdT0 > 3000) {
+              clearInterval(hold)
+              veil.remove()
+            }
+          }, 100)
+        },
+      })
     return () => {
       clearInterval(timer)
       veil.remove()
+      // A page that leaves the veil without entering must not keep a hot mic.
+      // One that entered hands it to the session: setPhase('game') is
+      // synchronous inside enterGame, so by the time this cleanup runs the
+      // phase already says so, and the session's stopVoice releases it on Esc.
+      if (useBoots.getState().phase !== 'game') releaseMic()
     }
   }, [phase])
 
@@ -228,11 +294,26 @@ export function DropGate() {
       'border:none;border-radius:8px;padding:13px 30px;cursor:pointer;' +
       'box-shadow:0 6px 20px rgba(0,0,0,0.35)'
     // The click is the user gesture fullscreen and pointer lock require — the
-    // same reason the first-arrival gate is a button and not an auto-enter.
-    pill.onclick = () => enterGame()
+    // same reason the first-arrival gate is a button and not an auto-enter. It
+    // runs through the mic gate like the first one: Esc released the mic, and
+    // re-acquiring an already-granted device is prompt-free.
+    pill.onclick = () =>
+      beginEntry({
+        setLabel: (text, busy) => {
+          pill.textContent = text
+          pill.disabled = busy
+          pill.style.opacity = busy ? '0.6' : '1'
+        },
+        enter: () => {
+          if (!enterGame()) releaseMic()
+        },
+      })
     document.body.appendChild(pill)
 
-    return () => pill.remove()
+    return () => {
+      pill.remove()
+      if (useBoots.getState().phase !== 'game') releaseMic()
+    }
   }, [phase])
 
   return null

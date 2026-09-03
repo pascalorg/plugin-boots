@@ -1,12 +1,20 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  DEFAULT_ICE_SERVERS,
+  iceHasRelay,
+  keyCap,
   MAX_ACK_ENTRIES,
   MAX_ICE_CANDIDATES,
+  MAX_ICE_SERVERS,
+  MAX_ICE_URLS_PER_SERVER,
   MAX_SDP_CHARS,
   MAX_VOICE_PEERS,
+  mergeIceServers,
+  MIC_KEY,
   mixGain,
   nextSignalTarget,
   proximityGain,
+  readIceServers,
   readVoiceFrame,
   sdpIsAudioOnly,
   talkGate,
@@ -421,5 +429,165 @@ describe('voiceRoom / voicePeersFor', () => {
     const all = roster(MAX_VOICE_PEERS + 3)
     const shuffled = [...all].reverse()
     expect(voiceRoom(shuffled)).toEqual(voiceRoom(all))
+  })
+})
+
+/**
+ * THE ICE SEAM. A relay's credentials arrive from a host global or a same-origin
+ * route — places we did not write — and whatever survives here is handed to the
+ * browser as addresses it will send packets to. So the validator is total, both
+ * vendor shapes are accepted, half a credential is no credential, and nothing
+ * can make the STUN defaults disappear.
+ */
+describe('readIceServers', () => {
+  const turn = { urls: 'turn:relay.example:3478', username: 'u', credential: 'p' }
+  // What comes out is OURS: `urls` is always an array.
+  const normalized = { urls: ['turn:relay.example:3478'], username: 'u', credential: 'p' }
+
+  test('accepts a bare array (metered.ca) and both Cloudflare shapes', () => {
+    expect(readIceServers([turn])).toEqual([normalized])
+    expect(readIceServers({ iceServers: [turn] })).toEqual([normalized])
+    expect(readIceServers({ iceServers: turn })).toEqual([normalized])
+  })
+
+  test('urls may be one string or a short array, all stun/turn', () => {
+    const many = {
+      urls: ['turn:relay.example:3478?transport=udp', 'turns:relay.example:5349?transport=tcp'],
+      username: 'u',
+      credential: 'p',
+    }
+    expect(readIceServers([many])).toEqual([many])
+    expect(readIceServers([{ urls: ['stun:a.example', 'http://evil.example'] }])).toBeNull()
+    expect(readIceServers([{ urls: 'ws://evil.example' }])).toBeNull()
+    expect(readIceServers([{ urls: 'turn:relay.example:3478?transport=sctp', username: 'u', credential: 'p' }])).toBeNull()
+    // Too many addresses is truncated, not thrown away: the first N, provider order.
+    const flood = Array.from({ length: MAX_ICE_URLS_PER_SERVER + 3 }, (_, i) => `stun:s${i}.example`)
+    expect(readIceServers([{ urls: flood }])).toEqual([{ urls: flood.slice(0, MAX_ICE_URLS_PER_SERVER) }])
+  })
+
+  test("the REAL Cloudflare answer — one object, eight urls — survives whole, relay and all", () => {
+    // generate-ice-servers hands back a single server with every transport
+    // (stun 3478/53, turn udp 3478/53, turn tcp 3478/80, turns 5349/443). This
+    // is the shape the round-2 host route will forward; a per-server url cap
+    // under 8 would drop the relay wholesale and the seam would be a no-op.
+    const cloudflare = {
+      iceServers: {
+        urls: [
+          'stun:stun.cloudflare.com:3478',
+          'stun:stun.cloudflare.com:53',
+          'turn:turn.cloudflare.com:3478?transport=udp',
+          'turn:turn.cloudflare.com:53?transport=udp',
+          'turn:turn.cloudflare.com:3478?transport=tcp',
+          'turn:turn.cloudflare.com:80?transport=tcp',
+          'turns:turn.cloudflare.com:5349?transport=tcp',
+          'turns:turn.cloudflare.com:443?transport=tcp',
+        ],
+        username: 'g'.repeat(64),
+        credential: 'c'.repeat(86),
+      },
+    }
+    expect(MAX_ICE_URLS_PER_SERVER).toBeGreaterThanOrEqual(8)
+    const read = readIceServers(cloudflare)
+    expect(read).toEqual([cloudflare.iceServers])
+    expect(iceHasRelay(read!)).toBe(true)
+    expect(iceHasRelay(mergeIceServers(DEFAULT_ICE_SERVERS, read!))).toBe(true)
+  })
+
+  test('a relay WITHOUT both credential halves is dropped whole — the browser would throw on it', () => {
+    // RTCPeerConnection({iceServers}) raises InvalidAccessError for a turn:/turns:
+    // URL missing username or credential; passed through credential-less, one
+    // such entry would kill every link. So it never reaches the browser.
+    expect(readIceServers([{ urls: 'turn:r.example', username: 'u' }])).toBeNull()
+    expect(readIceServers([{ urls: 'turn:r.example', credential: 'p' }])).toBeNull()
+    expect(readIceServers([{ urls: 'turn:r.example', username: 1, credential: 'p' }])).toBeNull()
+    expect(readIceServers([{ urls: 'turn:r.example', username: 'u', credential: 'x'.repeat(600) }])).toBeNull()
+    expect(readIceServers([{ urls: ['stun:s.example', 'turns:r.example:443?transport=tcp'] }])).toBeNull()
+    // The rest of the list is unaffected by one dropped relay.
+    expect(readIceServers([{ urls: 'turn:r.example' }, { urls: 'stun:s.example' }])).toEqual([
+      { urls: ['stun:s.example'] },
+    ])
+  })
+
+  test('a STUN entry never needs credentials; half a pair on it is dropped, the entry kept', () => {
+    expect(readIceServers([{ urls: 'stun:s.example', username: 'u' }])).toEqual([{ urls: ['stun:s.example'] }])
+    expect(readIceServers([{ urls: 'stun:s.example', username: 'u', credential: 7 }])).toEqual([
+      { urls: ['stun:s.example'] },
+    ])
+  })
+
+  test('drops junk entries, truncates to the cap, null when nothing survives', () => {
+    const list = Array.from({ length: MAX_ICE_SERVERS + 4 }, (_, i) => ({ urls: `stun:s${i}.example` }))
+    expect(readIceServers(list)?.length).toBe(MAX_ICE_SERVERS)
+    expect(readIceServers([null, 1, 'stun:x', {}, { urls: 7 }])).toBeNull()
+    for (const input of [null, undefined, 0, '', 'turn:x', {}, { iceServers: 'turn:x' }]) {
+      expect(readIceServers(input)).toBeNull()
+    }
+  })
+
+  test('is total — a cyclic object does not throw', () => {
+    const cyclic: Record<string, unknown> = {}
+    cyclic.iceServers = cyclic
+    expect(() => readIceServers(cyclic)).not.toThrow()
+  })
+})
+
+describe('mergeIceServers', () => {
+  test('base first, no duplicate URL sets, capped', () => {
+    const extra = [{ urls: 'turn:r.example', username: 'u', credential: 'p' }, { ...DEFAULT_ICE_SERVERS[0]! }]
+    const merged = mergeIceServers(DEFAULT_ICE_SERVERS, extra)
+    expect(merged.slice(0, DEFAULT_ICE_SERVERS.length)).toEqual([...DEFAULT_ICE_SERVERS])
+    expect(merged.length).toBe(DEFAULT_ICE_SERVERS.length + 1)
+    expect(iceHasRelay(merged)).toBe(true)
+    expect(iceHasRelay(DEFAULT_ICE_SERVERS)).toBe(false)
+    const flood = Array.from({ length: 20 }, (_, i) => ({ urls: `stun:s${i}.example` }))
+    expect(mergeIceServers(DEFAULT_ICE_SERVERS, flood).length).toBe(MAX_ICE_SERVERS)
+  })
+
+  test('the defaults are three STUN servers from two operators', () => {
+    expect(DEFAULT_ICE_SERVERS.length).toBe(3)
+    expect(readIceServers([...DEFAULT_ICE_SERVERS])?.length).toBe(3)
+  })
+})
+
+/**
+ * THE COUNT BUDGET. Our receiver refuses more than MAX_ICE_CANDIDATES lines, and
+ * 24 lines are far under the character cap — so a description that fits on
+ * length alone could still be dropped by the peer. The trim must squeeze the
+ * count too, or adding a relay to the ICE set silences multi-interface laptops.
+ */
+describe('trimSdpToBudget squeezes the candidate COUNT, not only the length', () => {
+  const candidate = (type: string, n: number) =>
+    `a=candidate:${n} 1 udp 2113937151 10.0.0.${n} ${1000 + n} typ ${type}`
+
+  test('30 candidates across 4 types under the char cap come back readable', () => {
+    const lines: string[] = []
+    for (let i = 0; i < 12; i++) lines.push(candidate('host', i))
+    for (let i = 0; i < 8; i++) lines.push(candidate('srflx', 20 + i))
+    for (let i = 0; i < 6; i++) lines.push(candidate('prflx', 40 + i))
+    for (let i = 0; i < 4; i++) lines.push(candidate('relay', 60 + i))
+    const fat = withLines(lines)
+    expect(fat.length).toBeLessThan(MAX_SDP_CHARS)
+    expect(sdpIsAudioOnly(fat)).toBe(false) // our own receiver would refuse it
+    const trimmed = trimSdpToBudget(fat, MAX_SDP_CHARS)
+    expect(trimmed).not.toBeNull()
+    const kept = (trimmed?.match(/a=candidate:/g) ?? []).length
+    expect(kept).toBeLessThanOrEqual(MAX_ICE_CANDIDATES)
+    for (const type of ['host', 'srflx', 'prflx', 'relay']) expect(trimmed).toContain(`typ ${type}`)
+    expect(sdpIsAudioOnly(trimmed)).toBe(true)
+  })
+
+  test('exactly the cap is left alone', () => {
+    // AUDIO_SDP already carries two candidate lines of its own.
+    const lines = Array.from({ length: MAX_ICE_CANDIDATES - 2 }, (_, i) => candidate('host', i))
+    const sdp = withLines(lines)
+    expect(trimSdpToBudget(sdp, MAX_SDP_CHARS)).toBe(sdp)
+  })
+})
+
+describe('the mic key', () => {
+  test('one constant, one caption', () => {
+    expect(MIC_KEY).toBe('KeyM')
+    expect(keyCap(MIC_KEY)).toBe('M')
+    expect(keyCap('Digit4')).toBe('4')
   })
 })

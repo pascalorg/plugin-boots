@@ -2,6 +2,7 @@ import { sharedAudioContext } from './audio'
 import {
   localSessionId,
   netAvailable,
+  netBus,
   type NetMessage,
   onFrame,
   publishFrame,
@@ -11,10 +12,16 @@ import { browserPendingStorage } from './pending-store'
 import { getRemotes, participantName } from './presence'
 import { latestSnapshot } from './presence-interp'
 import {
+  DEFAULT_ICE_SERVERS,
+  iceHasRelay,
   isVoiceMode,
   MAX_SDP_CHARS,
+  MAX_SESSION_ID_CHARS,
+  MAX_VOICE_PEERS,
+  mergeIceServers,
   mixGain,
   nextSignalTarget,
+  readIceServers,
   readVoiceFrame,
   talkGate,
   trimSdpToBudget,
@@ -26,6 +33,7 @@ import {
   type VoiceMode,
   voiceOffererIsUs,
   voicePeersFor,
+  voiceRoom,
 } from './voice-policy'
 
 /**
@@ -43,6 +51,17 @@ import {
  * `getUserMedia` → the mesh still forms and you can HEAR everyone, you just
  * cannot speak. Permission denied → identical, and the state says so. There is
  * no configuration in which failing to get voice costs the game anything.
+ *
+ * ── THE MIC IS ASKED FOR ON THE VEIL, NEVER MID-ENTRY ───────────────────────
+ * enterGame() fires requestFullscreen and the pointer lock, and it EXITS the
+ * game the moment either is lost. A permission bubble opening inside that
+ * sequence can end the very first Jump In. So the mic is acquired BEFORE the
+ * game is entered — by the click on the drop veil / re-entry pill (mic-gate.ts):
+ * in the same click when the browser already said yes, in a preceding click
+ * ("ALLOW THE MIC ↑" → "⏵ PLAY") when it has to ask. The choice persists as a
+ * preference (`loadMicPref`), the mic is released unconditionally when the game
+ * ends (`releaseMic`, first line of `stopVoice`), and an acquisition that
+ * outlives the session that asked for it is stopped by an epoch check.
  *
  * ── WHO IS IN THE CALL ──────────────────────────────────────────────────────
  * The peers currently in a Boots session, taken from the presence registry —
@@ -64,12 +83,26 @@ import {
  * iPhone 'proximity' mixes flat. 'squad' — the default, and what "talk to each
  * other like we are on a call" asks for — is unaffected.
  *
- * ── NO TURN SERVER ──────────────────────────────────────────────────────────
- * STUN only, so two peers behind NATs that both refuse to be traversed cannot
- * connect. There is no infrastructure here to fix that and pretending otherwise
- * would hide it: `voiceDebug().failed` counts those peers, and the HUD says
- * "voice unreachable" rather than sitting silent. `setVoiceIceServers` is the
- * seam for a relay when there is one.
+ * ── THE RELAY SEAM ──────────────────────────────────────────────────────────
+ * STUN alone cannot connect two peers behind NATs that both refuse traversal
+ * (a phone on LTE against a laptop is the everyday case). A relay needs
+ * short-lived credentials, and credentials never belong in a plugin bundle, so
+ * this module takes them from two validated, feature-detected sources: a host
+ * global (`__pascalIceServers`) and a same-origin route the host may serve
+ * (`/api/plugins/boots/turn`, minted server-side, fetched once per hour). Both
+ * pass through `readIceServers`; either failing keeps the STUN defaults, which
+ * is exactly today's behaviour. Peers that still cannot be reached are given up
+ * on countably (`given_up`), the pill says "N UNREACHABLE", and the overlay
+ * shows `ice=<source>/<n> relay=<bool>` so a silent pair is a readable one.
+ *
+ * ── TWO TABS ON ONE MACHINE ─────────────────────────────────────────────────
+ * The owner's own QA is two tabs in one browser, and those two tabs share one
+ * pair of speakers and one microphone: played out loud, each hears itself
+ * through the other with a delay. The host's `clientId` is minted PER TAB so
+ * it cannot say "same machine"; a BroadcastChannel beacon can — same origin,
+ * same browser profile — so peers heard on it are mixed at zero gain and the
+ * pill SAYS so ("SAME DEVICE — MUTED"). `setVoiceLocalEcho(true)` restores the
+ * audio for a test that wants to hear it.
  */
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
@@ -120,23 +153,127 @@ export const DISCONNECT_GRACE_MS = 5000
  */
 export const TICK_STALL_MS = 1000
 
-let iceServers: RTCIceServer[] = [
-  // Public STUN. Enough to discover a reflexive candidate, which is what makes
-  // two ordinary home connections reach each other.
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-]
+// ── ICE ──────────────────────────────────────────────────────────────────────
 
-/** Point voice at a relay (TURN) when there is one. Takes effect on new peers. */
+/** A host may hand us ICE servers here (a relay with credentials) — validated, never trusted. */
+export const ICE_SERVERS_GLOBAL = '__pascalIceServers'
+/**
+ * Same-origin route that mints short-lived relay credentials SERVER-SIDE (the
+ * plugin never sees a key). A 404 means "this host has no relay", which keeps
+ * the STUN defaults and is not an error.
+ */
+export const RELAY_CREDENTIALS_PATH = '/api/plugins/boots/turn'
+export const RELAY_FETCH_TIMEOUT_MS = 2500
+/** Fetched credentials are good for their TTL (an hour); refresh before it. */
+export const ICE_CACHE_MS = 50 * 60_000
+/** A failed fetch (404, offline) is not retried sooner than this. */
+export const ICE_RETRY_MS = 60_000
+
+export type IceSource = 'default' | 'host' | 'fetched' | 'set'
+
+let iceServers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS]
+let iceSource: IceSource = 'default'
+let iceFetchedAt = 0
+let iceFailedAt = 0
+let iceFetchInFlight = false
+/**
+ * Set when `new RTCPeerConnection({ iceServers })` threw on a non-default set:
+ * the validator let something through the browser would not take. The link is
+ * rebuilt on the defaults on the spot (makeLink) and the host global / route are
+ * not adopted again this session — re-adopting the same set would fail the same
+ * way on the next tick, forever. An explicit `setVoiceIceServers` clears it.
+ */
+let iceRefused = false
+
+/**
+ * Point voice at a relay (TURN) when there is one. Validated like every other
+ * source; garbage leaves the defaults in place. Takes effect on new peers.
+ */
 export function setVoiceIceServers(servers: RTCIceServer[]): void {
-  iceServers = servers
+  const read = readIceServers(servers)
+  iceServers = read ? mergeIceServers(DEFAULT_ICE_SERVERS, read) : [...DEFAULT_ICE_SERVERS]
+  iceSource = read ? 'set' : 'default'
+  iceRefused = false
+}
+
+/** The set the next RTCPeerConnection will be built with. */
+export function voiceIceServers(): readonly RTCIceServer[] {
+  return iceServers
+}
+
+function adoptHostIceServers(): boolean {
+  const read = readIceServers((globalThis as Record<string, unknown>)[ICE_SERVERS_GLOBAL])
+  if (!read) return false
+  iceServers = mergeIceServers(DEFAULT_ICE_SERVERS, read)
+  iceSource = 'host'
+  return true
+}
+
+/**
+ * Resolve the ICE set: an explicit `setVoiceIceServers` wins, then the host
+ * global, then the same-origin credentials route — fire-and-forget, cached,
+ * every failure silent. Called from the veil click (seconds before the first
+ * link is built, so the first offer already carries the relay) and again from
+ * `startVoice`. `makeLink` reads `iceServers` at construction, so a fetch that
+ * lands late still benefits every restart.
+ */
+export function prefetchIceServers(now = Date.now()): void {
+  if (iceSource === 'set' || iceRefused) return
+  if (adoptHostIceServers()) return
+  if (iceSource === 'fetched' && now - iceFetchedAt < ICE_CACHE_MS) return
+  if (iceFailedAt !== 0 && now - iceFailedAt < ICE_RETRY_MS) return
+  if (iceFetchInFlight) return
+  if (typeof fetch !== 'function' || typeof location === 'undefined') return
+  if (!/^https?:$/.test(location.protocol)) return
+  iceFetchInFlight = true
+  let signal: AbortSignal | undefined
+  try {
+    signal = AbortSignal.timeout?.(RELAY_FETCH_TIMEOUT_MS)
+  } catch {
+    signal = undefined
+  }
+  fetch(RELAY_CREDENTIALS_PATH, { credentials: 'same-origin', signal })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((body: unknown) => {
+      const read = readIceServers(body)
+      if (!read) {
+        iceFailedAt = Date.now()
+        return
+      }
+      // An explicit set or a host global that appeared meanwhile outranks us.
+      if (iceSource === 'set' || iceSource === 'host') return
+      iceServers = mergeIceServers(DEFAULT_ICE_SERVERS, read)
+      iceSource = 'fetched'
+      iceFetchedAt = Date.now()
+    })
+    .catch(() => {
+      iceFailedAt = Date.now()
+    })
+    .finally(() => {
+      iceFetchInFlight = false
+    })
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-export type MicState = 'off' | 'live' | 'muted' | 'denied' | 'unavailable'
+/**
+ * 'asking' is the permission dialog being open: set synchronously before the
+ * getUserMedia await so a second press (or a second entry path) cannot start a
+ * second prompt, and so the pill can say what is happening.
+ */
+export type MicState = 'off' | 'asking' | 'live' | 'muted' | 'denied' | 'unavailable'
+
+/** The player's standing choice — asked for on the veil, remembered across reloads. */
+export type MicPref = 'on' | 'off'
 
 export type PeerLinkState = 'idle' | 'negotiating' | 'connected' | 'failed'
+
+/** Something the HUD may want to say the moment it happens (voice-controls.tsx). */
+export type VoiceEvent = {
+  type: 'connected' | 'lost' | 'unreachable'
+  sessionId: string
+  name: string
+}
 
 type PeerLink = {
   sessionId: string
@@ -194,6 +331,8 @@ type PeerLink = {
   step: string
   /** Whatever a caught negotiation error said, for the same reason. */
   error: string | null
+  /** Heard on the same-device beacon (or same clientId): mixed at zero gain. */
+  sameDevice: boolean
 }
 
 type VoiceState = {
@@ -220,6 +359,22 @@ type VoiceState = {
   analyserBuffer: Parameters<AnalyserNode['getFloatTimeDomainData']>[0] | null
   micSource: MediaStreamAudioSourceNode | null
   talking: boolean
+  /** The talk flag the last SENT frame carried — an edge publishes at once. */
+  lastSentTalking: boolean
+  /**
+   * Something the next frame should carry NOW rather than on the heartbeat: a
+   * talk edge, or an ack we just earned. The heartbeat is right for a flag that
+   * has not changed and wrong for one that has — 400 ms is how long the peer
+   * keeps re-sending an answer we already applied, and how long a mouth moves
+   * before its ring lights.
+   */
+  signalDirty: boolean
+  /** True for the duration of stopVoice, so teardown emits no 'lost' events. */
+  stopping: boolean
+  /** Peers currently mixed at zero because they share this machine. */
+  sameDevice: number
+  /** We are in a game with others but outside the voice room (past the cap). */
+  excluded: boolean
   lastOverOpenAt: number
   ticks: number
   /**
@@ -282,6 +437,12 @@ type VoiceState = {
      * event is "every peer went silent at once".
      */
     stalls: number
+    /**
+     * `new RTCPeerConnection` threw. With a validated ICE set this should never
+     * happen; when it does, the link falls back to the default set (makeLink)
+     * and this is the only trace of it.
+     */
+    pcFailed: number
   }
 }
 
@@ -303,6 +464,28 @@ function loadMode(): VoiceMode {
   return isVoiceMode(stored) ? stored : 'squad'
 }
 
+/**
+ * The mic PREFERENCE, same reasoning as the mode: the owner wants everyone
+ * talking by default, so missing or garbage reads 'on'; a player who switched
+ * it off on the veil or muted in-game is not asked again on the next visit.
+ * Written ONLY on an explicit choice — never on a denial, because a first-time
+ * refusal must not become a permanent opt-out (see toggleMic).
+ */
+export const MIC_PREF_KEY = 'boots.voice.mic.1'
+
+export function loadMicPref(): MicPref {
+  const stored = browserPendingStorage()?.getItem(MIC_PREF_KEY)
+  return stored === 'off' ? 'off' : 'on'
+}
+
+export function saveMicPref(pref: MicPref): void {
+  try {
+    browserPendingStorage()?.setItem(MIC_PREF_KEY, pref)
+  } catch {
+    // A refusing storage costs the memory of the choice, not the choice.
+  }
+}
+
 const state: VoiceState = {
   active: false,
   mode: loadMode(),
@@ -318,6 +501,11 @@ const state: VoiceState = {
   analyserBuffer: null,
   micSource: null,
   talking: false,
+  lastSentTalking: false,
+  signalDirty: false,
+  stopping: false,
+  sameDevice: 0,
+  excluded: false,
   lastOverOpenAt: 0,
   ticks: 0,
   clock: 0,
@@ -337,6 +525,7 @@ const state: VoiceState = {
     threw: 0,
     reaped: 0,
     stalls: 0,
+    pcFailed: 0,
   },
 }
 
@@ -346,8 +535,164 @@ export function voiceSupported(): boolean {
   return typeof globalThis.RTCPeerConnection === 'function'
 }
 
-function micSupported(): boolean {
+export function micSupported(): boolean {
   return typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia)
+}
+
+// ── Output elements ──────────────────────────────────────────────────────────
+
+/** Elements primed in the entry click — one per possible peer. */
+export const OUTPUT_POOL_SIZE = MAX_VOICE_PEERS
+/**
+ * One silent 16-bit mono sample at 44.1 kHz — 46 bytes, RIFF size 38, a `data`
+ * chunk of 2 bytes: the smallest thing an element can play(). It carries a
+ * REAL sample on purpose: a WAV whose data chunk is empty is refused by some
+ * decoders (play() rejects NotSupportedError), and a refused play() is no
+ * gesture unlock at all.
+ */
+const SILENT_WAV =
+  'data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQIAAAAAAA=='
+const outputPool: HTMLAudioElement[] = []
+
+/**
+ * PRIME THE OUTPUTS INSIDE THE GESTURE. Safari — iOS above all — lets an
+ * HTMLAudioElement play a stream later only if THAT ELEMENT was played once by
+ * a user gesture; a peer's track arriving seconds after the click lands on an
+ * element the browser has never seen, and play() is refused in silence. So the
+ * entry click (mic-gate.ts, before any preference branch) creates the pool and
+ * play()s a silent sample through each; attachRemote hands those out. Everyone
+ * gets this, mic on or off: hearing does not depend on speaking.
+ */
+export function primeVoiceOutputs(): void {
+  if (typeof Audio !== 'function') return
+  while (outputPool.length < OUTPUT_POOL_SIZE) {
+    let element: HTMLAudioElement
+    try {
+      element = new Audio(SILENT_WAV)
+    } catch {
+      return
+    }
+    try {
+      const played = element.play()
+      if (played && typeof played.catch === 'function') played.catch(() => {})
+    } catch {
+      // A stack whose play() throws synchronously: the element is still usable.
+    }
+    outputPool.push(element)
+  }
+}
+
+function takeOutput(): HTMLAudioElement | null {
+  const pooled = outputPool.pop()
+  if (pooled) return pooled
+  if (typeof Audio !== 'function') return null
+  try {
+    return new Audio()
+  } catch {
+    return null
+  }
+}
+
+function returnOutput(element: HTMLAudioElement): void {
+  element.pause()
+  element.srcObject = null
+  if (outputPool.length < OUTPUT_POOL_SIZE) outputPool.push(element)
+}
+
+// ── Same-device beacon ───────────────────────────────────────────────────────
+
+export const SAME_DEVICE_CHANNEL = 'boots.voice.same-device.1'
+/** A beacon rides every heartbeat (400 ms); this many ms without one and the tab is gone. */
+export const SAME_DEVICE_STALE_MS = 3000
+
+let sameDeviceChannel: BroadcastChannel | null = null
+/** sessionId → clock reading of the last beacon heard from it. */
+const sameDeviceSeen = new Map<string, number>()
+let localEcho = false
+
+function openSameDeviceBeacon(me: string): void {
+  closeSameDeviceBeacon()
+  if (typeof BroadcastChannel !== 'function') return
+  try {
+    const channel = new BroadcastChannel(SAME_DEVICE_CHANNEL)
+    channel.onmessage = (event: MessageEvent) => {
+      const data = event.data as { v?: unknown; sessionId?: unknown } | null
+      if (!data || typeof data !== 'object' || data.v !== 1) return
+      const sessionId = data.sessionId
+      if (typeof sessionId !== 'string' || sessionId.length === 0) return
+      if (sessionId.length > MAX_SESSION_ID_CHARS || sessionId === me) return
+      sameDeviceSeen.set(sessionId, state.clock)
+    }
+    sameDeviceChannel = channel
+  } catch {
+    sameDeviceChannel = null
+  }
+}
+
+function closeSameDeviceBeacon(): void {
+  try {
+    sameDeviceChannel?.close()
+  } catch {
+    // Already closed.
+  }
+  sameDeviceChannel = null
+  sameDeviceSeen.clear()
+}
+
+function sendSameDeviceBeacon(me: string): void {
+  try {
+    sameDeviceChannel?.postMessage({ v: 1, sessionId: me })
+  } catch {
+    // A closed channel — nothing to say to nobody.
+  }
+}
+
+function isSameDevice(sessionId: string): boolean {
+  if (localEcho) return false
+  const heardAt = sameDeviceSeen.get(sessionId)
+  if (heardAt !== undefined && state.clock - heardAt <= SAME_DEVICE_STALE_MS) return true
+  // Belt to the beacon's braces: a host that mints one clientId per browser.
+  const bus = netBus()
+  const remote = getRemotes().get(sessionId)
+  return bus !== null && remote !== undefined && remote.clientId === bus.clientId
+}
+
+/**
+ * Hear same-machine peers anyway (a QA run that wants audio out of two tabs).
+ * Off by default: two tabs on one laptop played out loud is feedback.
+ */
+export function setVoiceLocalEcho(on: boolean): void {
+  localEcho = on
+  for (const link of state.peers.values()) link.gain = -1
+}
+
+// ── Events ───────────────────────────────────────────────────────────────────
+
+const voiceListeners = new Set<(event: VoiceEvent) => void>()
+
+/** Subscribe to connected / lost / unreachable per peer. Returns the unsubscribe. */
+export function onVoiceEvent(handler: (event: VoiceEvent) => void): () => void {
+  voiceListeners.add(handler)
+  return () => {
+    voiceListeners.delete(handler)
+  }
+}
+
+function peerName(sessionId: string): string {
+  const remote = getRemotes().get(sessionId)
+  return remote?.nick || participantName(remote?.userId ?? '')
+}
+
+function emitVoiceEvent(type: VoiceEvent['type'], sessionId: string): void {
+  if (voiceListeners.size === 0) return
+  const event: VoiceEvent = { type, sessionId, name: peerName(sessionId) }
+  for (const handler of [...voiceListeners]) {
+    try {
+      handler(event)
+    } catch {
+      // A listener's bug is not the call's problem.
+    }
+  }
 }
 
 // ── Peer lifecycle ───────────────────────────────────────────────────────────
@@ -387,18 +732,23 @@ function attachRemote(link: PeerLink, stream: MediaStream): void {
     link.element.srcObject = stream
     return
   }
-  const element = new Audio()
+  // Primed in the entry click when there was one (see primeVoiceOutputs); a
+  // fresh element otherwise. Never in the DOM: a floating element plays fine and
+  // cannot be styled, clicked or scrolled away by the host page.
+  const element = takeOutput()
+  if (!element) return
   element.srcObject = stream
   element.autoplay = true
-  // Never in the DOM: a floating element plays fine and cannot be styled,
-  // clicked or scrolled away by the host page.
+  element.muted = false
   element.volume = state.mode === 'squad' ? 1 : 0
   void element.play().catch(() => {
     // Autoplay refusal. Entry to a session is a click, so by the time a peer's
     // track arrives the page is nearly always allowed to play audio; when it is
-    // not, the next tick's play() attempt after any input succeeds.
+    // not, the heartbeat retries play() until one attempt after an input lands.
   })
   link.element = element
+  // The tick writes the real level (same-device, proximity) on its next pass.
+  link.gain = -1
 }
 
 function makeLink(sessionId: string): PeerLink | null {
@@ -406,7 +756,20 @@ function makeLink(sessionId: string): PeerLink | null {
   try {
     pc = new RTCPeerConnection({ iceServers })
   } catch {
-    return null
+    // The browser refused the configuration (a relay entry it will not take).
+    // Counted — the tick's `if (!link) continue` is otherwise a silent death
+    // for every peer — and, when the set was not ours, rebuilt on the defaults
+    // in the same tick so the pair does not lose a round to it.
+    state.counters.pcFailed++
+    if (iceSource === 'default') return null
+    iceServers = [...DEFAULT_ICE_SERVERS]
+    iceSource = 'default'
+    iceRefused = true
+    try {
+      pc = new RTCPeerConnection({ iceServers })
+    } catch {
+      return null
+    }
   }
   const link: PeerLink = {
     sessionId,
@@ -428,6 +791,7 @@ function makeLink(sessionId: string): PeerLink | null {
     gain: -1,
     step: 'new',
     error: null,
+    sameDevice: false,
   }
   // ONE sendrecv audio transceiver, created before any description exists.
   // Negotiating the send direction up front is what lets the mic be enabled
@@ -453,6 +817,9 @@ function makeLink(sessionId: string): PeerLink | null {
   })
   pc.addEventListener('connectionstatechange', () => {
     if (pc.connectionState === 'connected') {
+      // The moment a pair is up is the one thing worth announcing: until now the
+      // only proof of a working call was somebody speaking.
+      if (link.state !== 'connected') emitVoiceEvent('connected', sessionId)
       link.state = 'connected'
       link.droppedAt = 0
       // THE ATTEMPT BUDGET IS FOR "CANNOT CONNECT", NOT FOR "HAS BEEN CONNECTED".
@@ -487,8 +854,7 @@ function closeLink(link: PeerLink): void {
     // A closed connection closing again is not a problem worth a branch.
   }
   if (link.element) {
-    link.element.pause()
-    link.element.srcObject = null
+    returnOutput(link.element)
     link.element = null
   }
   state.peers.delete(link.sessionId)
@@ -497,13 +863,17 @@ function closeLink(link: PeerLink): void {
 /** Tear a link down and start over, unless this peer has used up its attempts. */
 function restart(link: PeerLink, _why: string): void {
   const { sessionId, attempts, epoch } = link
+  // A pair that WAS up and is being rebuilt is news; a pair that never
+  // connected is not (its outcome is 'connected' or 'unreachable', below).
+  if (link.state === 'connected' && !state.stopping) emitVoiceEvent('lost', sessionId)
   closeLink(link)
   if (attempts + 1 >= MAX_NEGOTIATION_ATTEMPTS) {
-    // Given up ON PURPOSE and countably. With STUN only, some pairs genuinely
+    // Given up ON PURPOSE and countably. Without a relay, some pairs genuinely
     // cannot reach each other; retrying forever would burn a connection attempt
     // every fifteen seconds for the rest of the session and still be silent.
     state.unreachable.add(sessionId)
     state.counters.given_up++
+    emitVoiceEvent('unreachable', sessionId)
     return
   }
   state.counters.restarts++
@@ -667,6 +1037,7 @@ async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void
       return
     }
     link.applied = offer.epoch
+    state.signalDirty = true // our ack map just changed
     // The answer carries the OFFER's epoch, so a late answer to a description
     // that has already been superseded is detectable instead of confusing.
     link.outbound = { type: 'answer', epoch: offer.epoch, sdp: trimmed }
@@ -730,6 +1101,9 @@ function publishSignal(): void {
     state.counters.notSent++
     return
   }
+  // What went out is what they now know: an edge or an ack is no longer owed.
+  state.lastSentTalking = state.talking
+  state.signalDirty = false
   if (!carriedDescription) return
   if (frame.sdp?.type === 'offer') state.counters.offersSent++
   else state.counters.answersSent++
@@ -821,6 +1195,9 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
       link.applied = description.epoch
       // Applying the answer IS the acknowledgement: stop re-sending the offer.
       link.outbound = null
+      // And TELL them on the next tick, not the next heartbeat: until our ack
+      // lands they re-send that answer every 100 ms and we drop every copy.
+      state.signalDirty = true
     })
     .catch(() => {
       restart(link, 'answer-rejected')
@@ -853,12 +1230,53 @@ function attachAnalyser(stream: MediaStream): void {
 }
 
 /**
+ * THE EPOCH OF THE MICROPHONE. Bumped by every release; an acquisition that
+ * resolves under a different epoch than it started with belongs to a session
+ * that has already ended (Esc before the dialog was answered, a page leaving
+ * the veil) and is stopped on the spot instead of becoming a hot mic nobody
+ * asked for.
+ */
+let micEpoch = 0
+
+/**
+ * Let the microphone go — UNCONDITIONALLY. Runs first in stopVoice and from the
+ * veil's cleanup: the recording indicator must go out whether or not a call was
+ * ever active, and the old `if (!state.active) return` in front of the track
+ * loop was exactly the mic leak this exists to close.
+ */
+export function releaseMic(): void {
+  micEpoch++
+  try {
+    state.micSource?.disconnect()
+  } catch {
+    // A source on a closed context.
+  }
+  state.micSource = null
+  state.analyser = null
+  state.analyserBuffer = null
+  for (const track of state.mic?.getTracks() ?? []) track.stop()
+  state.mic = null
+  state.micTrack = null
+  state.micState = 'off'
+  state.talking = false
+  for (const link of state.peers.values()) {
+    if (link.sender) void link.sender.replaceTrack(null).catch(() => {})
+  }
+}
+
+function isNoDeviceError(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : ''
+  return name === 'NotFoundError' || name === 'OverconstrainedError'
+}
+
+/**
  * Ask for the microphone. Must be called from a user gesture the first time, or
  * the browser refuses without prompting.
  *
- * Idempotent, and safe to call when there is no bus or no peer: the track is
- * swapped into every existing sender with `replaceTrack`, so enabling the mic
- * mid-call costs no renegotiation.
+ * Idempotent — a second call while the dialog is open returns 'asking' and
+ * starts NO second prompt — and safe to call when there is no bus or no peer:
+ * the track is swapped into every existing sender with `replaceTrack`, so
+ * enabling the mic mid-call costs no renegotiation.
  */
 export async function enableMic(): Promise<MicState> {
   if (!micSupported()) {
@@ -870,6 +1288,9 @@ export async function enableMic(): Promise<MicState> {
     state.micState = 'live'
     return state.micState
   }
+  if (state.micState === 'asking') return state.micState
+  state.micState = 'asking'
+  const epoch = micEpoch
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -882,6 +1303,11 @@ export async function enableMic(): Promise<MicState> {
       },
       video: false,
     })
+    if (epoch !== micEpoch) {
+      // Released while the dialog was open: whoever asked is gone.
+      for (const track of stream.getTracks()) track.stop()
+      return state.micState
+    }
     const track = stream.getAudioTracks()[0] ?? null
     if (!track) {
       state.micState = 'unavailable'
@@ -895,9 +1321,10 @@ export async function enableMic(): Promise<MicState> {
       if (link.sender) void link.sender.replaceTrack(track).catch(() => {})
     }
     return state.micState
-  } catch {
+  } catch (error) {
+    if (epoch !== micEpoch) return state.micState
     // Denied, or no input device. Either way we can still HEAR the room.
-    state.micState = 'denied'
+    state.micState = isNoDeviceError(error) ? 'unavailable' : 'denied'
     return state.micState
   }
 }
@@ -914,20 +1341,41 @@ export function micState(): MicState {
   return state.micState
 }
 
-/** Toggle: acquires on the first press, then mutes and unmutes. */
+/**
+ * Toggle: acquires on the first press, then mutes and unmutes. An explicit
+ * choice, so it is REMEMBERED — 'on' when the mic came up or was unmuted, 'off'
+ * when it was muted. A denial writes nothing: a refused dialog is not a
+ * preference, and must not silence every future visit.
+ */
 export async function toggleMic(): Promise<MicState> {
-  if (!state.micTrack) return enableMic()
+  if (state.micState === 'asking') return state.micState
+  if (!state.micTrack) {
+    const result = await enableMic()
+    if (result === 'live') saveMicPref('on')
+    return result
+  }
   setMicMuted(state.micState === 'live')
+  saveMicPref(state.micState === 'live' ? 'on' : 'off')
   return state.micState
 }
 
 /**
- * Turn the mic on WITHOUT prompting, but only if permission was already given.
- * Called at session start so the second session onward is seamless — a
- * permission dialog appearing mid-firefight is worse than no voice at all.
+ * Turn the mic on WITHOUT prompting, but only if permission was already given
+ * and the player has not switched the mic off.
+ *
+ * @deprecated The veil preflight (mic-gate.ts) acquires the mic before the game
+ * is entered. This remains as the backstop for entry paths that have no veil
+ * (the sidebar's Jump in) and is idempotent against a mic the veil already
+ * brought up.
  */
 export async function enableMicIfAlreadyPermitted(): Promise<MicState> {
   if (!micSupported()) return 'unavailable'
+  if (loadMicPref() === 'off') return state.micState
+  // The permission read is an await with nothing holding the device yet, so a
+  // release in that window (Esc in the first ~100 ms, the auto-exit when
+  // fullscreen is refused) would otherwise be followed by an acquisition in a
+  // NEW epoch: a hot mic in the editor with nothing left to release it.
+  const epoch = micEpoch
   try {
     const status = await navigator.permissions?.query({
       name: 'microphone' as PermissionName,
@@ -938,10 +1386,18 @@ export async function enableMicIfAlreadyPermitted(): Promise<MicState> {
     // conservative answer: the HUD still offers the key.
     return state.micState
   }
+  if (epoch !== micEpoch) return state.micState
   return enableMic()
 }
 
+/** Test seam: an RMS source in place of the analyser (bun has no WebAudio). */
+let micLevelSource: (() => number) | null = null
+export function setMicLevelSource(read: (() => number) | null): void {
+  micLevelSource = read
+}
+
 function readMicLevel(): number {
+  if (micLevelSource) return micLevelSource()
   const analyser = state.analyser
   const buffer = state.analyserBuffer
   if (!analyser || !buffer) return 0
@@ -993,6 +1449,9 @@ function meshNow(): string[] {
   for (const [sessionId, remote] of getRemotes()) {
     if (remote.ph === 'game') inGame.push(sessionId)
   }
+  // Past the room cap, and not in it: the pill says so instead of the player
+  // wondering why a lot full of people is silent.
+  state.excluded = inGame.length > 1 && !voiceRoom(inGame).includes(me)
   return voicePeersFor(me, inGame).filter((id) => !state.unreachable.has(id))
 }
 
@@ -1018,6 +1477,7 @@ export function voiceTick(now: number): void {
       link.talkingAt += stall
       if (link.droppedAt !== 0) link.droppedAt += stall
     }
+    for (const [sessionId, heardAt] of sameDeviceSeen) sameDeviceSeen.set(sessionId, heardAt + stall)
   }
   const me = localSessionId()
   if (me === null) return
@@ -1119,32 +1579,55 @@ export function voiceTick(now: number): void {
   } else {
     state.talking = false
   }
+  // An EDGE goes out on this tick, not the heartbeat: 400 ms between a mouth
+  // moving and its ring lighting is the difference between "it works" and
+  // "is it working?"; the hang-off would otherwise last TALKING_STALE_MS.
+  if (state.talking !== state.lastSentTalking) state.signalDirty = true
 
-  // 3. Levels. Written only on change, so a squad call touches nothing.
+  const heartbeat = state.ticks % SIGNAL_EVERY_TICKS === 0
+
+  // 3. Levels. Written only on change, so a squad call touches nothing — except
+  //    the heartbeat's play() retry on an element that is still paused, which is
+  //    how a refused autoplay heals once the player has clicked something.
+  let sameDevice = 0
   for (const link of state.peers.values()) {
-    const gain = mixGain(state.mode, distanceTo(link.sessionId))
-    if (Math.abs(gain - link.gain) < 0.01) continue
+    const same = isSameDevice(link.sessionId)
+    link.sameDevice = same
+    if (same) sameDevice++
+    const gain = same ? 0 : mixGain(state.mode, distanceTo(link.sessionId))
+    const element = link.element
+    if (Math.abs(gain - link.gain) < 0.01) {
+      if (heartbeat && element && element.paused && element.srcObject) {
+        void element.play().catch(() => {})
+      }
+      continue
+    }
     link.gain = gain
-    if (link.element) {
-      link.element.volume = Math.min(1, Math.max(0, gain))
-      // A refused autoplay heals here: by now the player has clicked something.
-      if (link.element.paused) void link.element.play().catch(() => {})
+    if (element) {
+      element.volume = Math.min(1, Math.max(0, gain))
+      // iOS treats `volume` as read-only; `muted` is honoured everywhere, so a
+      // zero gain is ALSO a mute and silence is silence on the phone too.
+      element.muted = gain <= 0.001
+      if (element.paused) void element.play().catch(() => {})
     }
   }
+  state.sameDevice = sameDevice
 
-  // 4. One signalling frame: every tick while a description is owed, otherwise
-  //    every SIGNAL_EVERY_TICKS as a heartbeat. At most one description either
-  //    way.
+  // 4. One signalling frame: every tick while a description is owed or a flag
+  //    changed, otherwise every SIGNAL_EVERY_TICKS as a heartbeat. At most one
+  //    description either way.
   //
   //    The heartbeat rate is right for what a heartbeat carries — a talk flag and
-  //    an ack map — and wrong for a handshake, where it is pure added latency on
-  //    every hop, twice per round trip, on top of ICE gathering. A pair that
-  //    cannot finish inside the negotiation deadline gets restarted, and a
-  //    restart is far more expensive than the frames saved by waiting. So while
-  //    anything is owed, this runs at the tick.
-  if (netAvailable() && (state.ticks % SIGNAL_EVERY_TICKS === 0 || anythingOwed())) {
+  //    an ack map that have not changed — and wrong for a handshake, where it is
+  //    pure added latency on every hop, twice per round trip, on top of ICE
+  //    gathering. A pair that cannot finish inside the negotiation deadline gets
+  //    restarted, and a restart is far more expensive than the frames saved by
+  //    waiting. So while anything is owed, this runs at the tick.
+  if (netAvailable() && (heartbeat || state.signalDirty || anythingOwed())) {
     publishSignal()
   }
+  // The same-device beacon rides the heartbeat: "I am session X, in this browser".
+  if (heartbeat) sendSameDeviceBeacon(me)
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -1163,7 +1646,17 @@ export function startVoice(args: {
   state.ticks = 0
   state.clock = Date.now()
   state.lastTarget = null
+  state.lastSentTalking = false
+  state.signalDirty = false
+  state.sameDevice = 0
+  state.excluded = false
   state.unreachable.clear()
+  prefetchIceServers()
+  const me = localSessionId()
+  if (me !== null) {
+    openSameDeviceBeacon(me)
+    sendSameDeviceBeacon(me)
+  }
   registerFrameKind<VoiceFrame>(VOICE_KIND, readVoiceFrame)
   state.offFrame = onFrame<VoiceFrame>(VOICE_KIND, ingest)
   state.timer = setInterval(() => voiceTick(Date.now()), VOICE_TICK_MS)
@@ -1176,23 +1669,22 @@ export function startVoice(args: {
  * check whether we are still listening.
  */
 export function stopVoice(): void {
+  // ABOVE the active check, on purpose: a mic acquired on the veil for a call
+  // that never started (no bus, no WebRTC, Esc during loading) is still a mic.
+  releaseMic()
   if (!state.active) return
   state.active = false
+  state.stopping = true
   if (state.timer !== null) clearInterval(state.timer)
   state.timer = null
   state.offFrame?.()
   state.offFrame = null
   for (const link of [...state.peers.values()]) closeLink(link)
   state.peers.clear()
-  state.micSource?.disconnect()
-  state.micSource = null
-  state.analyser = null
-  state.analyserBuffer = null
-  for (const track of state.mic?.getTracks() ?? []) track.stop()
-  state.mic = null
-  state.micTrack = null
-  state.micState = 'off'
-  state.talking = false
+  state.stopping = false
+  closeSameDeviceBeacon()
+  state.sameDevice = 0
+  state.excluded = false
   state.getLocalPosition = null
 }
 
@@ -1221,6 +1713,126 @@ export function talkingPeers(now = state.clock): string[] {
   const out: string[] = []
   for (const link of state.peers.values()) {
     if (link.talking && now - link.talkingAt <= TALKING_STALE_MS) out.push(link.sessionId)
+  }
+  return out
+}
+
+/** How many peers are talking — the per-frame pill read, without the array. */
+export function talkingPeerCount(now = state.clock): number {
+  let count = 0
+  for (const link of state.peers.values()) {
+    if (link.talking && now - link.talkingAt <= TALKING_STALE_MS) count++
+  }
+  return count
+}
+
+/** In a game with others, but outside the voice room (past MAX_VOICE_PEERS). */
+export function voiceExcluded(): boolean {
+  return state.excluded
+}
+
+/** Peers mixed at zero gain because they share this machine (see the header). */
+export function voiceSameDeviceCount(): number {
+  return state.sameDevice
+}
+
+export function voiceUnreachableCount(): number {
+  return state.unreachable.size
+}
+
+/** Links whose RTCPeerConnection is up right now — the "we are connected" number. */
+export function voiceConnectedCount(): number {
+  let count = 0
+  for (const link of state.peers.values()) {
+    if (link.state === 'connected') count++
+  }
+  return count
+}
+
+/**
+ * Is a peer's stream sitting on a PAUSED element? That is a refused autoplay —
+ * the browser wants a gesture before it will play sound this page did not start
+ * — and the pill can say "click" instead of the player hearing nothing.
+ */
+export function voiceOutputBlocked(): boolean {
+  for (const link of state.peers.values()) {
+    if (link.element?.srcObject && link.element.paused) return true
+  }
+  return false
+}
+
+/** Retry every paused output now (call from a gesture handler). */
+export function resumeVoiceOutputs(): void {
+  for (const link of state.peers.values()) {
+    const element = link.element
+    if (element?.srcObject && element.paused) void element.play().catch(() => {})
+  }
+}
+
+export type VoicePeerStats = {
+  sessionId: string
+  bytesReceived: number
+  bytesSent: number
+  /** Inbound audio level 0..1 as the receiver measures it (0 when the stack has none). */
+  audioLevel: number
+  rttMs: number | null
+  /** The local candidate type of the selected pair: host | srflx | prflx | relay. */
+  pair: string | null
+}
+
+/**
+ * The numbers behind "connected but silent": bytes actually arriving, the
+ * receiver's own level, the round trip and WHICH path won (`relay` is the one
+ * that says the TURN seam is doing its job). Feature-detected per connection;
+ * a stack without getStats yields nothing rather than throwing.
+ */
+export async function voiceStats(): Promise<VoicePeerStats[]> {
+  const out: VoicePeerStats[] = []
+  for (const link of [...state.peers.values()]) {
+    const pc = link.pc as RTCPeerConnection & { getStats?: () => Promise<RTCStatsReport> }
+    if (typeof pc.getStats !== 'function') continue
+    let report: RTCStatsReport
+    try {
+      report = await pc.getStats()
+    } catch {
+      continue
+    }
+    const row: VoicePeerStats = {
+      sessionId: link.sessionId,
+      bytesReceived: 0,
+      bytesSent: 0,
+      audioLevel: 0,
+      rttMs: null,
+      pair: null,
+    }
+    const localTypes = new Map<string, string>()
+    let selected: Record<string, unknown> | null = null
+    report.forEach((entry: unknown) => {
+      const s = entry as Record<string, unknown>
+      if (s.type === 'inbound-rtp' && s.kind === 'audio') {
+        if (typeof s.bytesReceived === 'number') row.bytesReceived += s.bytesReceived
+        if (typeof s.audioLevel === 'number') row.audioLevel = Math.max(row.audioLevel, s.audioLevel)
+      } else if (s.type === 'outbound-rtp' && s.kind === 'audio') {
+        if (typeof s.bytesSent === 'number') row.bytesSent += s.bytesSent
+      } else if (s.type === 'local-candidate') {
+        if (typeof s.id === 'string' && typeof s.candidateType === 'string') {
+          localTypes.set(s.id, s.candidateType)
+        }
+      } else if (s.type === 'candidate-pair') {
+        const usable = s.state === 'succeeded' || s.nominated === true
+        if (usable && (selected === null || s.nominated === true)) selected = s
+      }
+    })
+    if (selected !== null) {
+      const chosen = selected as Record<string, unknown>
+      if (typeof chosen.currentRoundTripTime === 'number') {
+        row.rttMs = Math.round(chosen.currentRoundTripTime * 1000)
+      }
+      if (typeof chosen.localCandidateId === 'string') {
+        row.pair = localTypes.get(chosen.localCandidateId) ?? null
+      }
+    }
+    out.push(row)
   }
   return out
 }
@@ -1260,8 +1872,20 @@ export function voiceDebug(): {
      * healthy call look like a stuck one in the two-browser dump.
      */
     acked: boolean
+    /** Mixed at zero because this peer is a tab in the same browser. */
+    sameDevice: boolean
+    /** Did OUR description carry a relay candidate — is the TURN seam live for this pair. */
+    localRelay: boolean
   }>
   unreachable: string[]
+  /** Where the ICE set came from, how big it is, and whether it has a relay. */
+  ice: { source: IceSource; servers: number; relay: boolean }
+  /** Same-machine peers, currently muted (see voiceSameDeviceCount). */
+  sameDevice: number
+  /** Outside the voice room (past the cap) while others are in the game. */
+  excluded: boolean
+  /** A peer's stream is on an element the browser refused to play. */
+  outputBlocked: boolean
   counters: VoiceState['counters']
   /**
    * How many times the tick has run. Two readings a known wall-time apart say
@@ -1288,6 +1912,8 @@ export function voiceDebug(): {
     state: link.state,
     step: link.step,
     talking: link.talking,
+    sameDevice: link.sameDevice,
+    localRelay: /typ relay/.test(link.pc.localDescription?.sdp ?? ''),
   }))
   return {
     active: state.active,
@@ -1299,6 +1925,10 @@ export function voiceDebug(): {
     talking: state.talking,
     ticks: state.ticks,
     unreachable: [...state.unreachable],
+    ice: { source: iceSource, servers: iceServers.length, relay: iceHasRelay(iceServers) },
+    sameDevice: state.sameDevice,
+    excluded: state.excluded,
+    outputBlocked: voiceOutputBlocked(),
   }
 }
 
@@ -1367,6 +1997,16 @@ export function resetVoice(): void {
   state.unreachable.clear()
   state.mode = 'squad'
   state.lastTarget = null
+  iceServers = [...DEFAULT_ICE_SERVERS]
+  iceSource = 'default'
+  iceFetchedAt = 0
+  iceFailedAt = 0
+  iceFetchInFlight = false
+  iceRefused = false
+  localEcho = false
+  micLevelSource = null
+  outputPool.length = 0
+  voiceListeners.clear()
   state.counters = {
     abandoned: 0,
     answersApplied: 0,
@@ -1376,6 +2016,7 @@ export function resetVoice(): void {
     notSent: 0,
     offersApplied: 0,
     offersSent: 0,
+    pcFailed: 0,
     reaped: 0,
     restarts: 0,
     stalls: 0,

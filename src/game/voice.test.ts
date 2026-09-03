@@ -14,24 +14,55 @@ import { type LocalPose, startPresence, stopPresence } from './presence'
 import type { PresenceFrame } from './presence-interp'
 import {
   DISCONNECT_GRACE_MS,
+  enableMic,
+  enableMicIfAlreadyPermitted,
+  ICE_SERVERS_GLOBAL,
+  loadMicPref,
   MAX_NEGOTIATION_ATTEMPTS,
+  MIC_PREF_KEY,
   micState,
   NEGOTIATION_TIMEOUT_MS,
+  onVoiceEvent,
+  OUTPUT_POOL_SIZE,
   PEER_ABSENT_MS,
+  prefetchIceServers,
+  primeVoiceOutputs,
+  releaseMic,
   resetVoice,
+  SAME_DEVICE_CHANNEL,
+  SAME_DEVICE_STALE_MS,
   selfTalking,
+  setMicLevelSource,
+  setVoiceIceServers,
+  setVoiceLocalEcho,
   setVoiceMode,
   startVoice,
   stopVoice,
+  talkingPeerCount,
   talkingPeers,
   TALKING_STALE_MS,
   TICK_STALL_MS,
+  toggleMic,
+  type VoiceEvent,
   voiceActive,
+  voiceConnectedCount,
   voiceDebug,
+  voiceExcluded,
   voiceMode,
+  voiceOutputBlocked,
+  voiceSameDeviceCount,
+  voiceStats,
   voiceTick,
 } from './voice'
-import { VOICE_FAR_M, VOICE_PROTOCOL, type VoiceFrame } from './voice-policy'
+import {
+  DEFAULT_ICE_SERVERS,
+  iceHasRelay,
+  MAX_VOICE_PEERS,
+  VAD_OPEN_RMS,
+  VOICE_FAR_M,
+  VOICE_PROTOCOL,
+  type VoiceFrame,
+} from './voice-policy'
 
 /**
  * VOICE, RUNTIME. voice-policy.test.ts owns the decisions; this owns the state
@@ -155,6 +186,8 @@ function makeSender(): FakeSender {
 class FakePeerConnection {
   static made: FakePeerConnection[] = []
   static rejectSetRemote = false
+  /** Throw from the constructor on any relay URL — the browser refusing a set. */
+  static refuseRelay = false
   /** Accept setLocalDescription and hand back nothing — the silent abandon. */
   static swallowLocalDescription = false
   /**
@@ -179,6 +212,9 @@ class FakePeerConnection {
   private listeners = new Map<string, Set<(event: unknown) => void>>()
 
   constructor(public config: { iceServers?: unknown[] }) {
+    if (FakePeerConnection.refuseRelay && iceHasRelay((config.iceServers ?? []) as RTCIceServer[])) {
+      throw new DOMException('refused', 'InvalidAccessError')
+    }
     FakePeerConnection.made.push(this)
   }
 
@@ -330,6 +366,7 @@ function installWebRtc(): void {
   FakePeerConnection.made = []
   FakePeerConnection.holdAnswer = null
   FakePeerConnection.rejectSetRemote = false
+  FakePeerConnection.refuseRelay = false
   FakePeerConnection.swallowLocalDescription = false
   FakeAudio.made = []
   g.RTCPeerConnection = FakePeerConnection
@@ -1024,7 +1061,7 @@ describe('a pending description does not wait for the heartbeat', () => {
     expect(voiceDebug().counters.offersSent).toBe(1)
   })
 
-  test('with nothing owed it stays on the heartbeat', async () => {
+  test('with nothing owed it stays on the heartbeat — after ONE prompt ack', async () => {
     const bus = boot()
     seePeer('session-z')
     voiceTick(1000)
@@ -1037,11 +1074,16 @@ describe('a pending description does not wait for the heartbeat', () => {
     await settle()
     expect(peer('session-z')?.owed).toBeNull()
     const before = sent(bus).length
+    // Applying their answer earned them an ack, and until it lands they re-send
+    // that answer every tick: it goes out on the NEXT tick, not the heartbeat.
     voiceTick(1100)
-    voiceTick(1200)
-    expect(sent(bus).length).toBe(before)
-    voiceTick(1300) // ticks % SIGNAL_EVERY_TICKS === 0
     expect(sent(bus).length).toBe(before + 1)
+    expect(sent(bus).at(-1)?.ack).toEqual({ 'session-z': 1 })
+    // Then nothing changes, so nothing goes out until the heartbeat.
+    voiceTick(1200)
+    expect(sent(bus).length).toBe(before + 1)
+    voiceTick(1300) // ticks % SIGNAL_EVERY_TICKS === 0
+    expect(sent(bus).length).toBe(before + 2)
   })
 })
 
@@ -1549,6 +1591,40 @@ describe('the microphone is optional in every direction', () => {
     const { enableMicIfAlreadyPermitted } = await import('./voice')
     expect(await enableMicIfAlreadyPermitted()).toBe('off')
   })
+
+  test('the backstop stops at a release that lands DURING its permission read', async () => {
+    // game-root calls this on bind; Esc in the first ~100 ms (or the auto-exit
+    // when fullscreen is refused) runs stopVoice → releaseMic while the
+    // permissions.query is still pending. Without the epoch check the grant
+    // that follows would be a hot mic in the editor with nothing to release it.
+    boot()
+    let answer: ((status: { state: string }) => void) | null = null
+    let asked = 0
+    g.navigator = {
+      mediaDevices: {
+        getUserMedia: async () => {
+          asked++
+          mic.track = makeTrack()
+          return new FakeMediaStream([mic.track])
+        },
+      },
+      permissions: {
+        query: () =>
+          new Promise<{ state: string }>((resolve) => {
+            answer = resolve
+          }),
+      },
+    }
+    const { enableMicIfAlreadyPermitted } = await import('./voice')
+    const pending = enableMicIfAlreadyPermitted()
+    await settle()
+    stopVoice()
+    answer!({ state: 'granted' })
+    expect(await pending).toBe('off')
+    expect(asked).toBe(0)
+    expect(micState()).toBe('off')
+    expect(mic.track).toBeNull()
+  })
 })
 
 // ── Leaving ──────────────────────────────────────────────────────────────────
@@ -1666,5 +1742,647 @@ describe('voice mode persistence', () => {
       expect(() => setVoiceMode('squad')).not.toThrow()
       expect(voiceMode()).toBe('squad')
     })
+  })
+})
+
+// ── The mic, on the veil ─────────────────────────────────────────────────────
+
+/**
+ * The prompt is a STATE, the release is UNCONDITIONAL, the choice is REMEMBERED.
+ * Every one of these was a way to end up with a hot microphone nobody asked for
+ * — the browser's red dot lit after Esc — or a second dialog under the first.
+ */
+describe('the mic dialog is a state', () => {
+  type Nav = { mediaDevices: { getUserMedia: () => Promise<unknown> } }
+
+  test("'asking' synchronously, 'live' once granted, and the track is in every sender", async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pending = enableMic()
+    expect(micState()).toBe('asking')
+    expect(await pending).toBe('live')
+    expect(FakePeerConnection.made[0]!.transceivers[0]!.sender.track).toBe(mic.track)
+  })
+
+  test('a press while the dialog is open starts NO second prompt', async () => {
+    boot()
+    const nav = g.navigator as Nav
+    let calls = 0
+    const real = nav.mediaDevices.getUserMedia
+    nav.mediaDevices.getUserMedia = async () => {
+      calls++
+      return real()
+    }
+    const first = enableMic()
+    expect(await toggleMic()).toBe('asking')
+    expect(await enableMic()).toBe('asking')
+    expect(await first).toBe('live')
+    expect(calls).toBe(1)
+  })
+
+  test('released BEFORE the grant resolves: the late track is stopped, no leak', async () => {
+    boot()
+    const nav = g.navigator as Nav
+    let grant!: () => void
+    const gate = new Promise<void>((resolve) => {
+      grant = resolve
+    })
+    nav.mediaDevices.getUserMedia = async () => {
+      await gate
+      mic.track = makeTrack()
+      return new FakeMediaStream([mic.track])
+    }
+    const pending = enableMic()
+    expect(micState()).toBe('asking')
+    stopVoice() // Esc while the dialog is still up
+    grant()
+    expect(await pending).toBe('off')
+    expect(mic.track?.stopped).toBe(true)
+    expect(micState()).toBe('off')
+  })
+
+  test('stopVoice with NO active call still releases a live mic (the old leak)', async () => {
+    installBus()
+    installWebRtc()
+    // No startNet, no startVoice: the veil acquired a mic for a call that never began.
+    expect(await enableMic()).toBe('live')
+    expect(voiceActive()).toBe(false)
+    stopVoice()
+    expect(mic.track?.stopped).toBe(true)
+    expect(micState()).toBe('off')
+  })
+
+  test('releaseMic pulls the track out of every sender', async () => {
+    boot()
+    await enableMic()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const sender = FakePeerConnection.made[0]!.transceivers[0]!.sender
+    expect(sender.track).toBe(mic.track)
+    releaseMic()
+    await settle()
+    expect(sender.track).toBeNull()
+    expect(micState()).toBe('off')
+  })
+
+  test('no input device reads unavailable, a refusal reads denied', async () => {
+    boot()
+    const nav = g.navigator as Nav
+    nav.mediaDevices.getUserMedia = async () => {
+      throw new DOMException('no device', 'NotFoundError')
+    }
+    expect(await enableMic()).toBe('unavailable')
+    releaseMic()
+    nav.mediaDevices.getUserMedia = async () => {
+      throw new DOMException('nope', 'NotAllowedError')
+    }
+    expect(await enableMic()).toBe('denied')
+  })
+})
+
+describe('the mic preference', () => {
+  const globals = globalThis as { localStorage?: unknown }
+
+  function fakeStorage(): Storage {
+    const map = new Map<string, string>()
+    return {
+      clear: () => map.clear(),
+      getItem: (key: string) => map.get(key) ?? null,
+      key: (index: number) => [...map.keys()][index] ?? null,
+      get length() {
+        return map.size
+      },
+      removeItem: (key: string) => map.delete(key),
+      setItem: (key: string, value: string) => void map.set(key, value),
+    } as Storage
+  }
+
+  async function withStorage(storage: unknown, run: () => Promise<void>): Promise<void> {
+    const real = Object.getOwnPropertyDescriptor(globals, 'localStorage')
+    Object.defineProperty(globals, 'localStorage', { configurable: true, value: storage })
+    try {
+      await run()
+    } finally {
+      if (real) Object.defineProperty(globals, 'localStorage', real)
+      else Object.defineProperty(globals, 'localStorage', { configurable: true, value: undefined })
+    }
+  }
+
+  test('missing or garbage reads ON — everyone talks by default', async () => {
+    const storage = fakeStorage()
+    await withStorage(storage, async () => {
+      expect(loadMicPref()).toBe('on')
+      storage.setItem(MIC_PREF_KEY, 'maybe')
+      expect(loadMicPref()).toBe('on')
+      storage.setItem(MIC_PREF_KEY, 'off')
+      expect(loadMicPref()).toBe('off')
+    })
+  })
+
+  test('an explicit toggle is remembered: on, off, on', async () => {
+    const storage = fakeStorage()
+    await withStorage(storage, async () => {
+      boot()
+      expect(await toggleMic()).toBe('live')
+      expect(storage.getItem(MIC_PREF_KEY)).toBe('on')
+      expect(await toggleMic()).toBe('muted')
+      expect(storage.getItem(MIC_PREF_KEY)).toBe('off')
+      expect(await toggleMic()).toBe('live')
+      expect(storage.getItem(MIC_PREF_KEY)).toBe('on')
+    })
+  })
+
+  test('a DENIAL writes nothing — a refused dialog is not a preference', async () => {
+    const storage = fakeStorage()
+    await withStorage(storage, async () => {
+      boot()
+      mic.grant = false
+      expect(await toggleMic()).toBe('denied')
+      expect(storage.getItem(MIC_PREF_KEY)).toBeNull()
+    })
+  })
+
+  test("the session-start backstop honours 'off' even when the browser would allow it", async () => {
+    const storage = fakeStorage()
+    await withStorage(storage, async () => {
+      boot()
+      mic.permission = 'granted'
+      storage.setItem(MIC_PREF_KEY, 'off')
+      expect(await enableMicIfAlreadyPermitted()).toBe('off')
+      expect(mic.track).toBeNull()
+    })
+  })
+})
+
+// ── Signals that do not wait for the heartbeat ───────────────────────────────
+
+describe('a talk EDGE goes out on the tick it happens', () => {
+  test('the gate opening publishes at once, off-heartbeat, with talking:true; closing too', async () => {
+    const bus = boot()
+    await enableMic()
+    let rms = 0
+    setMicLevelSource(() => rms)
+    seePeer('session-z')
+    voiceTick(1000) // tick 1
+    await settle()
+    hearVoice('session-z', {
+      v: VOICE_PROTOCOL,
+      to: 'session-me',
+      sdp: { type: 'answer', epoch: 1, sdp: SDP('sendrecv') },
+    })
+    await settle()
+    voiceTick(1100) // tick 2: the prompt ack
+    voiceTick(1200) // tick 3: quiet
+    const before = sent(bus).length
+    rms = VAD_OPEN_RMS * 2
+    voiceTick(1300) // tick 4 would be a heartbeat anyway — skip to a non-heartbeat tick
+    voiceTick(1400) // tick 5: still talking, nothing new
+    const afterOpen = sent(bus).length
+    expect(sent(bus).at(-1)?.talking).toBe(true)
+    expect(selfTalking()).toBe(true)
+    // Nothing changed on tick 5, so tick 4's frame is the last one.
+    expect(afterOpen).toBe(before + 1)
+    rms = 0
+    // The gate hangs for VAD_HANG_MS after the level drops; run it out.
+    voiceTick(1900) // tick 6: hang time over → talking false → edge → publish
+    expect(selfTalking()).toBe(false)
+    expect(sent(bus).length).toBe(afterOpen + 1)
+    expect(sent(bus).at(-1)?.talking).toBe(false)
+    voiceTick(2000) // tick 7: nothing
+    expect(sent(bus).length).toBe(afterOpen + 1)
+  })
+})
+
+// ── Events ───────────────────────────────────────────────────────────────────
+
+describe('voice events', () => {
+  test('one connected per link, one lost when a live pair is rebuilt, none during stopVoice', async () => {
+    boot()
+    const events: VoiceEvent[] = []
+    const off = onVoiceEvent((event) => events.push(event))
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.goLive()
+    pc.goLive() // a second 'connected' from the same connection is not news
+    expect(events.filter((e) => e.type === 'connected').length).toBe(1)
+    expect(events[0]?.sessionId).toBe('session-z')
+    expect(voiceConnectedCount()).toBe(1)
+
+    pc.connectionState = 'disconnected'
+    pc.emit('connectionstatechange')
+    runUntil(1100 + DISCONNECT_GRACE_MS + 200, 1000)
+    expect(events.filter((e) => e.type === 'lost').length).toBe(1)
+    expect(voiceConnectedCount()).toBe(0)
+
+    FakePeerConnection.made[1]!.goLive()
+    expect(events.filter((e) => e.type === 'connected').length).toBe(2)
+    const count = events.length
+    stopVoice()
+    expect(events.length).toBe(count)
+    off()
+  })
+
+  test('giving up on a peer is announced once', async () => {
+    boot()
+    const events: VoiceEvent[] = []
+    onVoiceEvent((event) => events.push(event))
+    seePeer('session-z')
+    let now = 1000
+    voiceTick(now)
+    await settle()
+    for (let attempt = 0; attempt < (MAX_NEGOTIATION_ATTEMPTS + 2) * 2; attempt++) {
+      const next = now + NEGOTIATION_TIMEOUT_MS + 200
+      runUntil(next, now)
+      now = next
+      await settle()
+    }
+    expect(voiceDebug().unreachable).toEqual(['session-z'])
+    expect(events.filter((e) => e.type === 'unreachable').length).toBe(1)
+    expect(events.filter((e) => e.type === 'lost').length).toBe(0) // never connected
+  })
+})
+
+// ── Outputs ──────────────────────────────────────────────────────────────────
+
+describe('primed outputs', () => {
+  test('the click primes a pool; a peer’s track lands on a primed element, not a new one', async () => {
+    boot()
+    primeVoiceOutputs()
+    expect(FakeAudio.made.length).toBe(OUTPUT_POOL_SIZE)
+    expect(FakeAudio.made.every((element) => element.playCalls > 0)).toBe(true)
+    primeVoiceOutputs() // idempotent
+    expect(FakeAudio.made.length).toBe(OUTPUT_POOL_SIZE)
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    expect(FakeAudio.made.length).toBe(OUTPUT_POOL_SIZE)
+    expect(FakeAudio.made.some((element) => element.srcObject !== null)).toBe(true)
+  })
+
+  test('a paused element with a stream is re-played on the heartbeat, with no gain change', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000) // 1
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    voiceTick(1100) // 2: writes the gain
+    const element = FakeAudio.made[0]!
+    element.pause()
+    const before = element.playCalls
+    voiceTick(1200) // 3: not a heartbeat, gain unchanged → left alone
+    expect(element.playCalls).toBe(before)
+    expect(voiceOutputBlocked()).toBe(true)
+    voiceTick(1300) // 4: heartbeat → retry
+    expect(element.playCalls).toBe(before + 1)
+    expect(voiceOutputBlocked()).toBe(false)
+  })
+
+  test('a zero gain is ALSO a mute (iOS ignores volume)', async () => {
+    boot()
+    seePeer('session-z', { p: [0, 0, VOICE_FAR_M + 10] })
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    setVoiceMode('proximity')
+    voiceTick(1100)
+    const element = FakeAudio.made[0]! as FakeAudio & { muted?: boolean }
+    expect(element.volume).toBe(0)
+    expect(element.muted).toBe(true)
+    setVoiceMode('squad')
+    voiceTick(1200)
+    expect(element.muted).toBe(false)
+  })
+})
+
+// ── Same device ──────────────────────────────────────────────────────────────
+
+class FakeBroadcastChannel {
+  static all = new Set<FakeBroadcastChannel>()
+  onmessage: ((event: { data: unknown }) => void) | null = null
+  constructor(public name: string) {
+    FakeBroadcastChannel.all.add(this)
+  }
+  postMessage(data: unknown): void {
+    for (const other of FakeBroadcastChannel.all) {
+      if (other !== this && other.name === this.name) other.onmessage?.({ data })
+    }
+  }
+  close(): void {
+    FakeBroadcastChannel.all.delete(this)
+  }
+}
+
+describe('two tabs in one browser', () => {
+  const bc = globalThis as { BroadcastChannel?: unknown }
+  const realChannel = bc.BroadcastChannel
+
+  function withFakeChannel(run: () => void): void {
+    FakeBroadcastChannel.all.clear()
+    bc.BroadcastChannel = FakeBroadcastChannel
+    try {
+      run()
+    } finally {
+      bc.BroadcastChannel = realChannel
+    }
+  }
+
+  test('a peer heard on the beacon is mixed at ZERO and the count says so', async () => {
+    let other!: FakeBroadcastChannel
+    let element!: FakeAudio & { muted?: boolean }
+    let pcs!: FakePeerConnection[]
+    withFakeChannel(() => {
+      boot()
+      other = new FakeBroadcastChannel(SAME_DEVICE_CHANNEL)
+    })
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    pcs = FakePeerConnection.made
+    pcs[0]!.goLive()
+    voiceTick(1100)
+    element = FakeAudio.made[0]!
+    expect(element.volume).toBe(1)
+    expect(voiceSameDeviceCount()).toBe(0)
+
+    // The other tab announces itself: same browser, same speakers.
+    other.postMessage({ v: 1, sessionId: 'session-z' })
+    voiceTick(1200)
+    expect(element.volume).toBe(0)
+    expect(element.muted).toBe(true)
+    expect(voiceSameDeviceCount()).toBe(1)
+    expect(peer('session-z')?.sameDevice).toBe(true)
+    expect(voiceDebug().sameDevice).toBe(1)
+
+    // A QA run that wants to hear it anyway.
+    setVoiceLocalEcho(true)
+    voiceTick(1300)
+    expect(element.volume).toBe(1)
+    expect(voiceSameDeviceCount()).toBe(0)
+    setVoiceLocalEcho(false)
+    voiceTick(1400)
+    expect(element.volume).toBe(0)
+
+    // The beacon goes stale when the other tab stops sending.
+    runUntil(1400 + SAME_DEVICE_STALE_MS + 1000, 1400)
+    expect(element.volume).toBe(1)
+    expect(voiceSameDeviceCount()).toBe(0)
+  })
+
+  test('we announce OURSELVES on the heartbeat; junk on the channel is ignored', async () => {
+    let other!: FakeBroadcastChannel
+    withFakeChannel(() => {
+      boot()
+      other = new FakeBroadcastChannel(SAME_DEVICE_CHANNEL)
+    })
+    const heard: unknown[] = []
+    other.onmessage = (event) => heard.push(event.data)
+    seePeer('session-z')
+    for (let t = 0; t < 4; t++) voiceTick(1000 + t * 100)
+    expect(heard).toContainEqual({ v: 1, sessionId: 'session-me' })
+    await settle()
+    for (const junk of [null, 'x', { v: 2, sessionId: 'session-z' }, { v: 1 }, { v: 1, sessionId: 7 }]) {
+      other.postMessage(junk)
+    }
+    voiceTick(1500)
+    expect(voiceSameDeviceCount()).toBe(0)
+  })
+
+  test('a shared clientId is the belt to the beacon’s braces', async () => {
+    boot()
+    // The peer's frames arrive stamped with OUR clientId (a host that mints one
+    // per browser rather than per tab).
+    ingestBusMessage({
+      event: 'pose',
+      data: { v: NET_PROTOCOL, kind: 'pose', seq: nextSeq('session-z'), data: poseFrame() },
+      sessionId: 'session-z',
+      clientId: 'client-me',
+      userId: 'user-session-z',
+      sentAt: 1000,
+    })
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    voiceTick(1100)
+    expect(FakeAudio.made[0]!.volume).toBe(0)
+    expect(voiceSameDeviceCount()).toBe(1)
+  })
+
+  test('no BroadcastChannel at all is not an error', () => {
+    const saved = bc.BroadcastChannel
+    bc.BroadcastChannel = undefined
+    try {
+      expect(() => boot()).not.toThrow()
+      seePeer('session-z')
+      expect(() => voiceTick(1000)).not.toThrow()
+    } finally {
+      bc.BroadcastChannel = saved
+    }
+  })
+})
+
+// ── The room cap ─────────────────────────────────────────────────────────────
+
+describe('outside the call', () => {
+  test('the 7th of 7 knows it is excluded; the 6th does not', () => {
+    boot()
+    // Six ids that sort BELOW 'session-me' fill the room without us.
+    const lower = ['session-a', 'session-b', 'session-c', 'session-d', 'session-e', 'session-f']
+    expect(lower.length).toBe(MAX_VOICE_PEERS)
+    for (const id of lower.slice(0, MAX_VOICE_PEERS - 1)) seePeer(id)
+    voiceTick(1000)
+    expect(voiceExcluded()).toBe(false)
+    expect(voiceDebug().peers.length).toBe(MAX_VOICE_PEERS - 1)
+    seePeer(lower[MAX_VOICE_PEERS - 1]!, {}, 1100)
+    voiceTick(1200)
+    expect(voiceExcluded()).toBe(true)
+    expect(voiceDebug().excluded).toBe(true)
+  })
+
+  test('alone, or with a room that has space, we are not excluded', () => {
+    boot()
+    voiceTick(1000)
+    expect(voiceExcluded()).toBe(false)
+    seePeer('session-z')
+    voiceTick(1100)
+    expect(voiceExcluded()).toBe(false)
+  })
+})
+
+// ── ICE ──────────────────────────────────────────────────────────────────────
+
+describe('the ICE seam', () => {
+  const turn = { urls: 'turn:relay.example:3478', username: 'u', credential: 'p' }
+  const normalized = { urls: ['turn:relay.example:3478'], username: 'u', credential: 'p' }
+  const ice = globalThis as Record<string, unknown> & { location?: unknown; fetch?: unknown }
+
+  test('defaults: three STUN servers, no relay', () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS])
+    expect(voiceDebug().ice).toEqual({ source: 'default', servers: 3, relay: false })
+  })
+
+  test('a host global is merged OVER the defaults, validated', () => {
+    ice[ICE_SERVERS_GLOBAL] = [turn]
+    try {
+      boot()
+      seePeer('session-z')
+      voiceTick(1000)
+      expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS, normalized])
+      expect(voiceDebug().ice).toEqual({ source: 'host', servers: 4, relay: true })
+    } finally {
+      delete ice[ICE_SERVERS_GLOBAL]
+    }
+  })
+
+  test('a set the browser refuses falls back to the defaults IN THE SAME TICK, counted', () => {
+    // The validator is the first line; this is the second. A relay entry the
+    // browser will not take must not turn `if (!link) continue` into a silent
+    // death for every peer, and must not be re-adopted on the next prefetch.
+    ice[ICE_SERVERS_GLOBAL] = [turn]
+    try {
+      boot() // installs a fresh fake stack, so the refusal is scripted after it
+      FakePeerConnection.refuseRelay = true
+      expect(voiceDebug().ice.source).toBe('host')
+      seePeer('session-z')
+      voiceTick(1000)
+      expect(FakePeerConnection.made.length).toBe(1)
+      expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS])
+      expect(voiceDebug().ice).toEqual({ source: 'default', servers: 3, relay: false })
+      expect(voiceDebug().counters.pcFailed).toBe(1)
+      expect(voiceDebug().peers.length).toBe(1)
+      // The host global is still there; it is not taken again this session.
+      prefetchIceServers()
+      expect(voiceDebug().ice.source).toBe('default')
+      // An explicit set is a new decision and is tried again.
+      setVoiceIceServers([turn])
+      expect(voiceDebug().ice.source).toBe('set')
+    } finally {
+      delete ice[ICE_SERVERS_GLOBAL]
+    }
+  })
+
+  test('a garbage host global leaves the defaults alone', () => {
+    ice[ICE_SERVERS_GLOBAL] = [{ urls: 'http://evil.example' }, 'turn:x']
+    try {
+      boot()
+      seePeer('session-z')
+      voiceTick(1000)
+      expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS])
+      expect(voiceDebug().ice.source).toBe('default')
+    } finally {
+      delete ice[ICE_SERVERS_GLOBAL]
+    }
+  })
+
+  test('the same-origin credentials route feeds the NEXT link', async () => {
+    const realFetch = ice.fetch
+    const realLocation = ice.location
+    let url: unknown = null
+    ice.location = { protocol: 'http:' }
+    ice.fetch = async (input: unknown) => {
+      url = input
+      return { ok: true, json: async () => ({ iceServers: [turn] }) }
+    }
+    try {
+      boot() // startVoice fires the fetch
+      await settle()
+      seePeer('session-z')
+      voiceTick(1000)
+      expect(url).toBe('/api/plugins/boots/turn')
+      expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS, normalized])
+      expect(voiceDebug().ice).toEqual({ source: 'fetched', servers: 4, relay: true })
+    } finally {
+      ice.fetch = realFetch
+      ice.location = realLocation
+    }
+  })
+
+  test('a 404 or a rejected fetch keeps the defaults and throws nothing', async () => {
+    const realFetch = ice.fetch
+    const realLocation = ice.location
+    ice.location = { protocol: 'http:' }
+    ice.fetch = async () => ({ ok: false, json: async () => ({}) })
+    try {
+      boot()
+      await settle()
+      seePeer('session-z')
+      voiceTick(1000)
+      expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS])
+      resetVoice()
+      stopNet()
+      ice.fetch = async () => {
+        throw new Error('offline')
+      }
+      expect(() => boot()).not.toThrow()
+      await settle()
+      seePeer('session-z')
+      voiceTick(1000)
+      expect(FakePeerConnection.made.at(-1)!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS])
+      expect(voiceDebug().ice.source).toBe('default')
+    } finally {
+      ice.fetch = realFetch
+      ice.location = realLocation
+    }
+  })
+
+  test('setVoiceIceServers validates too, and outranks the fetch', () => {
+    boot()
+    setVoiceIceServers([turn])
+    seePeer('session-z')
+    voiceTick(1000)
+    expect(FakePeerConnection.made[0]!.config.iceServers).toEqual([...DEFAULT_ICE_SERVERS, normalized])
+    expect(voiceDebug().ice.source).toBe('set')
+    setVoiceIceServers([{ urls: 'ws://nope' }])
+    expect(voiceDebug().ice.source).toBe('default')
+  })
+})
+
+// ── getStats ─────────────────────────────────────────────────────────────────
+
+describe('voiceStats', () => {
+  test('a stack without getStats yields nothing and throws nothing', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    expect(await voiceStats()).toEqual([])
+  })
+
+  test('reads bytes, level, RTT and the selected pair’s local candidate type', async () => {
+    boot()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]! as FakePeerConnection & { getStats?: () => Promise<unknown> }
+    pc.getStats = async () =>
+      new Map<string, unknown>([
+        ['in', { type: 'inbound-rtp', kind: 'audio', bytesReceived: 20480, audioLevel: 0.4 }],
+        ['out', { type: 'outbound-rtp', kind: 'audio', bytesSent: 1024 }],
+        ['lc', { type: 'local-candidate', id: 'lc', candidateType: 'srflx' }],
+        ['pair-old', { type: 'candidate-pair', state: 'failed', localCandidateId: 'lc' }],
+        ['pair', { type: 'candidate-pair', state: 'succeeded', nominated: true, localCandidateId: 'lc', currentRoundTripTime: 0.032 }],
+      ])
+    expect(await voiceStats()).toEqual([
+      { sessionId: 'session-z', bytesReceived: 20480, bytesSent: 1024, audioLevel: 0.4, rttMs: 32, pair: 'srflx' },
+    ])
+  })
+})
+
+describe('talkingPeerCount', () => {
+  test('matches talkingPeers without the array', () => {
+    boot()
+    seePeer('session-a')
+    voiceTick(1000)
+    hearVoice('session-a', { v: VOICE_PROTOCOL, talking: true })
+    expect(talkingPeerCount(1000)).toBe(1)
+    expect(talkingPeerCount(1000 + TALKING_STALE_MS + 1)).toBe(0)
   })
 })

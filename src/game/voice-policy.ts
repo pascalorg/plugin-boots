@@ -83,6 +83,150 @@ export const MAX_ACK_ENTRIES = MAX_VOICE_PEERS + 2
 /** Session ids are host-minted; this is a sanity bound, not a format. */
 export const MAX_SESSION_ID_CHARS = 128
 
+// ── ICE servers ──────────────────────────────────────────────────────────────
+
+/**
+ * Public STUN, from two operators. Enough to discover a reflexive candidate,
+ * which is what makes two ordinary home connections reach each other; a
+ * second operator so one outage does not take the whole path. Relays (TURN)
+ * carry credentials and are never written here — they arrive validated through
+ * `readIceServers` from the host global or the same-origin credentials route
+ * (voice.ts), and the STUN path below is what every failure falls back to.
+ */
+export const DEFAULT_ICE_SERVERS: readonly RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.relay.metered.ca:80' },
+]
+
+/** Servers we will hand the browser at most — each is a place it sends packets. */
+export const MAX_ICE_SERVERS = 8
+/**
+ * URLs kept per server. Cloudflare's generate-ice-servers answers with ONE
+ * object carrying eight (stun 3478/53, turn udp 3478/53, turn tcp 3478/80,
+ * turns 5349/443), so anything under 8 discards the real relay wholesale. A
+ * longer list is truncated, never rejected: a server with too many addresses
+ * is still a server.
+ */
+export const MAX_ICE_URLS_PER_SERVER = 10
+export const MAX_ICE_CREDENTIAL_CHARS = 512
+
+/** stun/turn URL shape, RFC 7064/7065: scheme:host[:port][?transport=udp|tcp]. */
+const ICE_URL = /^(stun|stuns|turn|turns):[A-Za-z0-9.\-]+(:\d{1,5})?(\?transport=(udp|tcp))?$/
+
+/**
+ * Every URL is checked (one bad address condemns the entry — it did not come
+ * from anyone who knows what an ICE URL is); the survivors are truncated to the
+ * cap, in the provider's order.
+ */
+function readIceUrls(value: unknown): string[] | null {
+  const list = typeof value === 'string' ? [value] : Array.isArray(value) ? value : null
+  if (!list || list.length === 0) return null
+  const urls: string[] = []
+  for (const url of list) {
+    if (typeof url !== 'string' || !ICE_URL.test(url)) return null
+    if (urls.length < MAX_ICE_URLS_PER_SERVER) urls.push(url)
+  }
+  return urls
+}
+
+const TURN_URL = /^turns?:/
+
+/** A relay needs both halves, bounded — the browser refuses a turn: URL without them. */
+function readIceCredentials(e: Record<string, unknown>): { username: string; credential: string } | null {
+  if (
+    typeof e.username === 'string' &&
+    typeof e.credential === 'string' &&
+    e.username.length <= MAX_ICE_CREDENTIAL_CHARS &&
+    e.credential.length <= MAX_ICE_CREDENTIAL_CHARS
+  ) {
+    return { username: e.username, credential: e.credential }
+  }
+  return null
+}
+
+/**
+ * TOTAL validator for an ICE server list from anywhere we did not write it:
+ * a host global, a credentials route, a caller of `setVoiceIceServers`.
+ *
+ * Accepts a bare array (metered.ca's shape), `{ iceServers: [...] }`
+ * (Cloudflare's generate-ice-servers) and `{ iceServers: {...} }` (Cloudflare's
+ * single-object form). Per entry: `urls` as one string or an array (truncated
+ * to MAX_ICE_URLS_PER_SERVER), every one a stun/turn URL; `username` /
+ * `credential` copied only when BOTH are bounded strings. A turn:/turns: entry
+ * WITHOUT that pair is dropped whole, not passed on credential-less: the
+ * browser's RTCPeerConnection constructor throws InvalidAccessError on a relay
+ * URL with no credentials, and one such entry would kill every link. Anything
+ * else is dropped, never passed through. Returns null when nothing survives,
+ * so the caller keeps its defaults.
+ */
+export function readIceServers(data: unknown): RTCIceServer[] | null {
+  try {
+    let list: unknown = data
+    if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+      const inner = (data as { iceServers?: unknown }).iceServers
+      list = Array.isArray(inner) ? inner : inner !== undefined ? [inner] : null
+    }
+    if (!Array.isArray(list)) return null
+    const out: RTCIceServer[] = []
+    for (const entry of list) {
+      if (out.length >= MAX_ICE_SERVERS) break
+      if (typeof entry !== 'object' || entry === null) continue
+      const e = entry as Record<string, unknown>
+      const urls = readIceUrls(e.urls)
+      if (!urls) continue
+      const credentials = readIceCredentials(e)
+      if (!credentials && urls.some((url) => TURN_URL.test(url))) continue
+      const server: RTCIceServer = { urls }
+      if (credentials) {
+        server.username = credentials.username
+        server.credential = credentials.credential
+      }
+      out.push(server)
+    }
+    return out.length > 0 ? out : null
+  } catch {
+    return null
+  }
+}
+
+/** Base first, then whatever in `extra` names a URL set the base does not; capped. */
+export function mergeIceServers(
+  base: readonly RTCIceServer[],
+  extra: readonly RTCIceServer[],
+): RTCIceServer[] {
+  const seen = new Set<string>()
+  const out: RTCIceServer[] = []
+  for (const server of [...base, ...extra]) {
+    const key = JSON.stringify(server.urls)
+    if (seen.has(key) || out.length >= MAX_ICE_SERVERS) continue
+    seen.add(key)
+    out.push(server)
+  }
+  return out
+}
+
+/** Does this set include a relay (TURN) at all? The overlay reads it. */
+export function iceHasRelay(servers: readonly RTCIceServer[]): boolean {
+  return servers.some((server) => {
+    const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
+    return urls.some((url) => /^turns?:/.test(url))
+  })
+}
+
+// ── The mic key ──────────────────────────────────────────────────────────────
+
+/**
+ * The mic toggle key, as an `e.code`. input.ts claims the same code in
+ * GAME_KEYS; every label that names the key derives from here so a rebind is
+ * one edit. `keyCap` is the caption: 'KeyM' → 'M'.
+ */
+export const MIC_KEY = 'KeyM'
+
+export function keyCap(code: string): string {
+  return code.replace(/^(Key|Digit)/, '').toUpperCase()
+}
+
 // ── The wire payload ─────────────────────────────────────────────────────────
 
 export type VoiceMode = 'squad' | 'proximity'
@@ -226,6 +370,14 @@ export function readVoiceFrame(data: unknown): VoiceFrame | null {
 const CANDIDATE_TYPE = /\btyp\s+(host|srflx|prflx|relay)\b/
 
 /**
+ * First per-type allowance the squeeze tries. Four known types × 6 = the line
+ * cap; a line whose type the regex does not read lands in a fifth bucket
+ * ('unknown'), so this first pass can still exceed MAX_ICE_CANDIDATES — the
+ * count check in the loop, not this constant, is what guarantees the cap.
+ */
+const TRIM_START_PER_TYPE = 6
+
+/**
  * Drop surplus ICE candidates until the description fits `maxChars`.
  *
  * WHICH ONES GO, AND WHY NOT "THE LOWEST PRIORITY". ICE type preference makes
@@ -242,17 +394,29 @@ const CANDIDATE_TYPE = /\btyp\s+(host|srflx|prflx|relay)\b/
  * Original line order is preserved (candidate order in an SDP carries no
  * meaning — the priority field does).
  *
+ * TWO BUDGETS, NOT ONE. The receiver refuses more than MAX_ICE_CANDIDATES
+ * lines (sdpIsAudioOnly) as well as more than MAX_SDP_CHARS characters, and 24
+ * candidate lines are ~2.6 kB — far under the character cap. So a description
+ * that fits on length alone can still be unreadable at the other end, which is
+ * exactly what a multi-interface laptop produces the moment a relay is added
+ * to the ICE set: an untrimmed offer the peer drops without a word. The count
+ * is squeezed here, by the same breadth-first rule, so our own receiver can
+ * never refuse what our own sender built.
+ *
  * Returns null when even one candidate per type will not fit, which the caller
  * must report rather than truncate: a half-sent description is worse than an
  * unsent one.
  */
 export function trimSdpToBudget(sdp: string, maxChars = MAX_SDP_CHARS): string | null {
-  if (sdp.length <= maxChars) return sdp
-  const newline = sdp.includes('\r\n') ? '\r\n' : '\n'
   const lines = sdp.split(/\r\n|\n/)
-  for (let perType = 3; perType >= 1; perType--) {
+  let candidates = 0
+  for (const line of lines) if (line.startsWith('a=candidate:')) candidates++
+  if (sdp.length <= maxChars && candidates <= MAX_ICE_CANDIDATES) return sdp
+  const newline = sdp.includes('\r\n') ? '\r\n' : '\n'
+  for (let perType = TRIM_START_PER_TYPE; perType >= 1; perType--) {
     const seen = new Map<string, number>()
     const kept: string[] = []
+    let keptCandidates = 0
     for (const line of lines) {
       if (!line.startsWith('a=candidate:')) {
         kept.push(line)
@@ -262,13 +426,15 @@ export function trimSdpToBudget(sdp: string, maxChars = MAX_SDP_CHARS): string |
       const count = seen.get(type) ?? 0
       if (count >= perType) continue
       seen.set(type, count + 1)
+      keptCandidates++
       kept.push(line)
     }
     const out = kept.join(newline)
-    if (out.length <= maxChars) return out
+    if (out.length <= maxChars && keptCandidates <= MAX_ICE_CANDIDATES) return out
   }
   return null
 }
+
 
 // ── Who calls whom ───────────────────────────────────────────────────────────
 
