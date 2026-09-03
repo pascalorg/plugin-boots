@@ -28,8 +28,9 @@ import {
   discardDemolition,
   useDemolition,
 } from './game/save-demolition'
+import { beginEntry } from './game/mic-gate'
 import { enterGame } from './game/session'
-import { setVoiceMode, voiceMode } from './game/voice'
+import { releaseMic, setVoiceMode, voiceMode } from './game/voice'
 import type { VoiceMode } from './game/voice-policy'
 import {
   onRosterChange,
@@ -613,9 +614,11 @@ export function VoiceSettings() {
         Voice chat
       </p>
       <p className="text-[11px] text-sidebar-foreground/50 leading-relaxed">
-        Press <span className="font-semibold text-sidebar-foreground/80">M</span> in the game to turn
-        your microphone on — the MIC button on a phone. You hear everyone else whether or not you
-        ever press it, and leaving the game switches the mic off.
+        Your mic is on by default — Jump in asks your browser once, and the MIC ON/OFF switch on the
+        way in is remembered. <span className="font-semibold text-sidebar-foreground/80">M</span> mutes
+        and unmutes in the game (the MIC button on a phone). You hear everyone whether or not you
+        ever speak — so does anyone watching from the editor — and leaving the game switches the mic
+        off.
       </p>
       <div className="flex gap-1.5">
         {VOICE_MODES.map((option) => (
@@ -744,6 +747,9 @@ export function PlayTogether() {
   )
 }
 
+/** The Jump in button's resting label (mic-gate relabels it while it asks). */
+const JUMP_LABEL = '⏵ Jump in'
+
 /**
  * The Boots left-rail panel. One big verb: Jump in — the whole editor
  * becomes a game. After a session where you built pieces, the panel offers
@@ -769,6 +775,12 @@ export default function BootsPanel() {
   // paint lanes know a nodeId, and the rows have to show a NAME.
   const sceneNodes = useScene((s) => s.nodes)
   const [lastKept, setLastKept] = useState<string | null>(null)
+  // The Jump in button runs through the mic gate like every other entry surface
+  // (mic-gate.ts): when the browser has to ask for the microphone, the FIRST
+  // click becomes the prompt and the button says so ("ALLOW THE MIC ↑", busy),
+  // the second enters. Calling enterGame() straight from here put the permission
+  // bubble inside the fullscreen/pointer-lock sequence, which exits the game.
+  const [entry, setEntry] = useState<{ label: string; busy: boolean }>({ label: JUMP_LABEL, busy: false })
 
   // "You built N pieces" has to mean what it says. In a shared world the
   // stores also hold what other players built, and Save writes only this
@@ -813,14 +825,22 @@ export default function BootsPanel() {
       </header>
 
       <button
-        className="flex w-full items-center justify-center gap-2 rounded-md bg-sidebar-accent px-3 py-2 font-semibold text-sm hover:bg-sidebar-accent/80"
+        className="flex w-full items-center justify-center gap-2 rounded-md bg-sidebar-accent px-3 py-2 font-semibold text-sm hover:bg-sidebar-accent/80 disabled:opacity-60"
+        disabled={entry.busy}
         onClick={() => {
           setLastKept(null)
-          enterGame()
+          beginEntry({
+            setLabel: (label, busy) => setEntry({ label, busy }),
+            enter: () => {
+              setEntry({ label: JUMP_LABEL, busy: false })
+              // Nothing entered (no canvas yet): nothing may keep the mic.
+              if (!enterGame()) releaseMic()
+            },
+          })
         }}
         type="button"
       >
-        ⏵ Jump in
+        {entry.label}
       </button>
 
       <ShareLink />

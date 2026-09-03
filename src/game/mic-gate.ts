@@ -152,6 +152,15 @@ export function beginEntry(ui: EntryUi): void {
             : mic === 'denied' || mic === 'unavailable'
               ? 'denied'
               : 'unknown'
+        // THE CHOICE IS RE-READ THE MOMENT THE GRANT LANDS. The dialog can sit
+        // open for as long as the player takes, and the veil's toggle keeps
+        // working underneath it — a player who flips MIC OFF while the browser
+        // is still asking has made a decision the grant must not overrule. The
+        // toggle itself cannot release a track that does not exist yet, so the
+        // window between the grant and the PLAY click used to be a hot mic:
+        // permission remembered as granted (so the next click will not ask
+        // again), device let go.
+        if (loadMicPref() === 'off') releaseAcquiredMic()
       })
       .catch(() => {
         cached = 'unknown'

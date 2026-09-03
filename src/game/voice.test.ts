@@ -10,7 +10,7 @@ import {
   startNet,
   stopNet,
 } from './net'
-import { type LocalPose, startPresence, stopPresence } from './presence'
+import { getRemotes, type LocalPose, startPresence, startSpectating, stopPresence, stopSpectating } from './presence'
 import type { PresenceFrame } from './presence-interp'
 import {
   DISCONNECT_GRACE_MS,
@@ -37,7 +37,9 @@ import {
   setVoiceLocalEcho,
   setVoiceMode,
   startVoice,
+  startVoiceListen,
   stopVoice,
+  stopVoiceListen,
   talkingPeerCount,
   talkingPeers,
   TALKING_STALE_MS,
@@ -48,6 +50,7 @@ import {
   voiceConnectedCount,
   voiceDebug,
   voiceExcluded,
+  voiceListenerCount,
   voiceMode,
   voiceOutputBlocked,
   voiceSameDeviceCount,
@@ -56,12 +59,15 @@ import {
 } from './voice'
 import {
   DEFAULT_ICE_SERVERS,
+  DRAWN_FRESH_MS,
   iceHasRelay,
+  MAX_LISTENERS_PER_PLAYER,
   MAX_VOICE_PEERS,
   VAD_OPEN_RMS,
   VOICE_FAR_M,
   VOICE_PROTOCOL,
   type VoiceFrame,
+  voiceOffererIsUs,
 } from './voice-policy'
 
 /**
@@ -487,6 +493,7 @@ afterEach(() => {
   resetVoice()
   stopVoice()
   stopPresence()
+  stopSpectating()
   stopNet()
   resetNetKinds()
   resetNetIdentity()
@@ -2384,5 +2391,520 @@ describe('talkingPeerCount', () => {
     hearVoice('session-a', { v: VOICE_PROTOCOL, talking: true })
     expect(talkingPeerCount(1000)).toBe(1)
     expect(talkingPeerCount(1000 + TALKING_STALE_MS + 1)).toBe(0)
+  })
+})
+
+// ── Listening from the editor ────────────────────────────────────────────────
+
+/** A viewer: the receive-only presence adapter, then the receive-only call. */
+function bootListener(): FakeBus {
+  const bus = installBus()
+  installWebRtc()
+  startNet()
+  startSpectating()
+  expect(startVoiceListen()).toBe(true)
+  return bus
+}
+
+const recvonlyOffer = (epoch = 1) => ({ epoch, sdp: SDP('recvonly'), type: 'offer' as const })
+const anAnswer = (epoch: number, direction = 'sendonly') => ({ epoch, sdp: SDP(direction), type: 'answer' as const })
+
+describe('listening from the editor', () => {
+  /**
+   * An editor viewer who has not jumped in should HEAR the players. The whole
+   * point of this block is that nothing about a listener can leak sound the
+   * other way: no microphone is asked for, no track reaches a sender, every
+   * m-line it negotiates is recvonly. And because a listener publishes no
+   * presence, it must be the one to call.
+   */
+  test('needs the bus and WebRTC like everything else, and allocates nothing without them', () => {
+    installWebRtc()
+    expect(startVoiceListen()).toBe(false)
+    installBus()
+    startNet()
+    g.RTCPeerConnection = undefined
+    expect(startVoiceListen()).toBe(false)
+    expect(voiceDebug().listen).toBe(false)
+    expect(voiceActive()).toBe(false)
+  })
+
+  test('OFFERS TO EVERY PLAYER whatever the ids sort as, RECVONLY, and says listen:true', async () => {
+    const bus = bootListener()
+    seePeer('session-a') // sorts BELOW us: a player would wait for their offer
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    for (let t = 1; t <= 8; t++) voiceTick(1000 + t * 100)
+    expect(lastDescriptionTo(bus, 'session-a')?.sdp?.type).toBe('offer')
+    expect(lastDescriptionTo(bus, 'session-z')?.sdp?.type).toBe('offer')
+    expect(FakePeerConnection.made.length).toBe(2)
+    for (const pc of FakePeerConnection.made) {
+      expect(pc.transceivers).toEqual([expect.objectContaining({ direction: 'recvonly', kind: 'audio' })])
+      expect(pc.transceivers[0]!.sender.track).toBeNull()
+    }
+    expect(sent(bus).length).toBeGreaterThan(0)
+    expect(sent(bus).every((frame) => frame.listen === true)).toBe(true)
+    expect(voiceDebug().listen).toBe(true)
+  })
+
+  test('a live mic in a listener’s hand is not a voice in the call: no frame ever says talking', async () => {
+    // The veil's ask-first click acquires the mic while the button still reads
+    // PLAY — a listener can hold a live track for minutes. It is on no sender,
+    // so a `talking: true` from it would light 'N SPEAKING' on the players' pill
+    // for a viewer nobody can hear.
+    const bus = bootListener()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    expect(await enableMic()).toBe('live')
+    setMicLevelSource(() => VAD_OPEN_RMS * 2)
+    for (let t = 1; t <= 8; t++) voiceTick(1000 + t * 100)
+    expect(selfTalking()).toBe(false)
+    expect(sent(bus).some((frame) => frame.talking === true)).toBe(false)
+    // The handover makes it a voice: the same mic, now on a sender, opens the gate.
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    voiceTick(1900)
+    expect(selfTalking()).toBe(true)
+    expect(sent(bus).at(-1)?.talking).toBe(true)
+  })
+
+  test('never asks for the microphone; a mic acquired on the veil is NOT put on any sender', async () => {
+    bootListener()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    expect(mic.track).toBeNull() // no getUserMedia happened
+    // The veil's JUMP IN click acquires the mic a moment BEFORE the game starts,
+    // while we are still listening. It must wait for the handover.
+    expect(await enableMic()).toBe('live')
+    expect(FakePeerConnection.made[0]!.transceivers[0]!.sender.replaced).toEqual([])
+  })
+
+  test('a player who offers to a listener (glare after a restart) gets a recvonly answer', async () => {
+    bootListener()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    await enableMic()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: { epoch: 1, sdp: SDP('sendrecv'), type: 'offer' }, to: 'session-me' })
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    const associated = pc.transceivers.find((transceiver) => transceiver.mid !== null)
+    expect(associated?.direction).toBe('recvonly')
+    expect(associated?.sender.track).toBeNull()
+    expect(peer('session-a')?.owed).toBe('answer@1')
+  })
+
+  test('hears the ROOM the players form — capped like the players are, never "excluded"', () => {
+    bootListener()
+    const ids = ['session-a', 'session-b', 'session-c', 'session-d', 'session-e', 'session-f', 'session-g']
+    for (const id of ids) seePeer(id)
+    voiceTick(1000)
+    expect(voiceDebug().peers.map((p) => p.sessionId).sort()).toEqual(ids.slice(0, MAX_VOICE_PEERS))
+    expect(voiceExcluded()).toBe(false)
+  })
+
+  test('mixes FLAT even in proximity mode — a viewer has no body to be far from', async () => {
+    bootListener()
+    setVoiceMode('proximity')
+    seePeer('session-z', { p: [0, 0, VOICE_FAR_M * 3] })
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    voiceTick(1100)
+    expect(FakeAudio.made[0]!.volume).toBe(1)
+  })
+
+  test('a peer who leaves the game is dropped by the listener too', async () => {
+    bootListener()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    seePeer('session-z', { ph: 'editor' }, 1100)
+    runUntil(1200 + PEER_ABSENT_MS, 1000)
+    expect(voiceDebug().peers).toEqual([])
+  })
+
+  test('stopVoiceListen ends the listen session; startVoiceListen is idempotent', () => {
+    bootListener()
+    expect(startVoiceListen()).toBe(true)
+    seePeer('session-z')
+    voiceTick(1000)
+    stopVoiceListen()
+    expect(voiceActive()).toBe(false)
+    expect(voiceDebug().listen).toBe(false)
+    expect(FakePeerConnection.made[0]!.closed).toBe(true)
+  })
+
+  test('a game session already owns the call: startVoiceListen is a no-op on it', () => {
+    boot()
+    expect(startVoiceListen()).toBe(true)
+    expect(voiceDebug().listen).toBe(false)
+    stopVoiceListen() // not ours to stop
+    expect(voiceActive()).toBe(true)
+  })
+})
+
+describe('a player with a listener', () => {
+  test('an offer from OUTSIDE the roster is answered — and the peer is marked a listener', async () => {
+    boot()
+    voiceTick(1000)
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(), to: 'session-me' })
+    await settle()
+    expect(peer('viewer-1')?.listener).toBe(true)
+    expect(peer('viewer-1')?.owed).toBe('answer@1')
+    // We SEND on that pair: the adopted m-line is sendrecv on our side, so the
+    // answer to their recvonly offer is sendonly and they hear us.
+    const pc = FakePeerConnection.made[0]!
+    expect(pc.transceivers.find((transceiver) => transceiver.mid !== null)?.direction).toBe('sendrecv')
+  })
+
+  test('a listener is kept alive by its frames and NEVER offered to — not even after a restart', async () => {
+    const bus = boot()
+    voiceTick(1000)
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(), to: 'session-me' })
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    voiceTick(1100)
+    expect(peer('viewer-1')?.state).toBe('connected')
+    // We sort below the viewer: were it a PLAYER, the idle-link repair would offer.
+    expect(voiceOffererIsUs('session-me', 'viewer-1')).toBe(true)
+    // ICE fails; the pair is rebuilt as an idle link. The viewer's heartbeats
+    // (listen:true, no description) keep it in the roster-less grace forever.
+    const pc = FakePeerConnection.made[0]!
+    pc.connectionState = 'failed'
+    pc.emit('connectionstatechange')
+    let at = 1200
+    for (let i = 0; i < 12; i++, at += 400) {
+      hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true })
+      voiceTick(at)
+      await settle()
+    }
+    expect(peer('viewer-1')).toBeDefined()
+    expect(peer('viewer-1')?.listener).toBe(true)
+    expect(voiceDebug().counters.offersSent).toBe(0)
+    expect(lastDescriptionTo(bus, 'viewer-1')?.sdp?.type ?? 'answer').toBe('answer')
+    // The viewer's next offer is what repairs the pair.
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(2), to: 'session-me' })
+    await settle()
+    expect(peer('viewer-1')?.owed).toBe('answer@2')
+  })
+
+  test('MAX_LISTENERS_PER_PLAYER: one more offer is not answered, and it is counted', async () => {
+    boot()
+    voiceTick(1000)
+    for (let i = 0; i < MAX_LISTENERS_PER_PLAYER; i++) {
+      hearVoice(`viewer-${i}`, { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(), to: 'session-me' })
+    }
+    await settle()
+    expect(voiceDebug().peers.length).toBe(MAX_LISTENERS_PER_PLAYER)
+    hearVoice('viewer-x', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(), to: 'session-me' })
+    await settle()
+    expect(voiceDebug().peers.length).toBe(MAX_LISTENERS_PER_PLAYER)
+    expect(voiceDebug().peers.some((p) => p.sessionId === 'viewer-x')).toBe(false)
+    expect(voiceDebug().counters.listenersRefused).toBe(1)
+    // A PLAYER is never refused by the listener cap.
+    seePeer('session-a', {}, 1100)
+    voiceTick(1200)
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: { epoch: 1, sdp: SDP('sendrecv'), type: 'offer' }, to: 'session-me' })
+    await settle()
+    expect(peer('session-a')?.owed).toBe('answer@1')
+    expect(peer('session-a')?.listener).toBe(false)
+  })
+
+  test('an offerer whose presence frame was merely LATE is a player again the tick it shows up', async () => {
+    boot()
+    voiceTick(1000)
+    hearVoice('session-z', { v: VOICE_PROTOCOL, sdp: { epoch: 1, sdp: SDP('sendrecv'), type: 'offer' }, to: 'session-me' })
+    await settle()
+    expect(peer('session-z')?.listener).toBe(true) // not in the roster: assumed a listener
+    seePeer('session-z', {}, 1100)
+    voiceTick(1200)
+    expect(peer('session-z')?.listener).toBe(false)
+  })
+})
+
+describe('dropping in is a HANDOVER, not a hang-up', () => {
+  /**
+   * The viewer was hearing the players from the editor and clicks JUMP IN. The
+   * game's startVoice finds the listen session active and must adopt it: same
+   * RTCPeerConnection (the audio keeps flowing), m-line flipped to sendrecv, the
+   * mic the veil acquired put on the sender, and a fresh offer ONE EPOCH ABOVE
+   * anything the far side has recorded, so it renegotiates instead of dropping
+   * the offer as a duplicate.
+   */
+  test('startVoice adopts a CONNECTED listen link in place and re-offers sendrecv', async () => {
+    const bus = bootListener()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.transceivers[0]!.mid = '0' // the offer/answer associated our m-line
+    pc.goLive()
+    hearVoice('session-z', { v: VOICE_PROTOCOL, sdp: anAnswer(1), to: 'session-me' })
+    await settle()
+    voiceTick(1100)
+    expect(peer('session-z')?.state).toBe('connected')
+    expect(peer('session-z')?.applied).toBe(1)
+
+    await enableMic() // the veil's click, a moment before the game
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    await settle()
+
+    expect(voiceDebug().listen).toBe(false)
+    expect(voiceActive()).toBe(true)
+    expect(FakePeerConnection.made.length).toBe(1) // no new connection was built
+    expect(pc.closed).toBe(false)
+    expect(pc.transceivers[0]!.direction).toBe('sendrecv')
+    expect(pc.transceivers[0]!.sender.track).toBe(mic.track)
+    expect(peer('session-z')?.owed).toBe('offer@2')
+    // The renegotiation goes out at once, and no longer as a listener.
+    voiceTick(1200)
+    const frame = lastDescriptionTo(bus, 'session-z')
+    expect(frame?.sdp).toEqual(expect.objectContaining({ type: 'offer', epoch: 2 }))
+    expect(frame?.listen).toBeUndefined()
+    // Their answer lands on the live connection: connected again, no restart.
+    hearVoice('session-z', { v: VOICE_PROTOCOL, sdp: anAnswer(2, 'sendrecv'), to: 'session-me' })
+    await settle()
+    voiceTick(1300)
+    expect(peer('session-z')?.state).toBe('connected')
+    expect(voiceConnectedCount()).toBe(1)
+    expect(voiceDebug().counters.restarts).toBe(0)
+    // The game owns the call now: the spectator's cleanup cannot hang it up.
+    stopVoiceListen()
+    expect(voiceActive()).toBe(true)
+  })
+
+  test('a link still mid-handshake at the handover is rebuilt as a player link, not stacked — ONE EPOCH UP', async () => {
+    bootListener()
+    seePeer('session-z')
+    voiceTick(1000)
+    await settle() // recvonly offer@1 owed, nothing connected
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    await settle()
+    expect(FakePeerConnection.made[0]!.closed).toBe(true)
+    expect(FakePeerConnection.made.length).toBe(2)
+    expect(FakePeerConnection.made[1]!.transceivers[0]!.direction).toBe('sendrecv')
+    // ABOVE the offer that was in flight: the far side may already have applied
+    // it, and would drop a second epoch 1 as a duplicate on every tick.
+    expect(peer('session-z')?.owed).toBe('offer@2')
+    voiceTick(1100)
+    await settle()
+    expect(FakePeerConnection.made.length).toBe(2) // the tick did not build a third
+  })
+
+  test('a mid-handshake link whose offer WAS ANSWERED is rebuilt above that epoch — and we offer, whatever the ids sort as', async () => {
+    // The listener offered epoch 1 to 'session-a'; the answer landed (applied on
+    // both sides) but ICE never reached 'connected' — the viewer clicked JUMP IN
+    // two seconds after the pill appeared. A rebuilt link that started at zero
+    // would offer epoch 1 again, dropped by the far side as a duplicate on every
+    // tick; and since 'session-a' sorts BELOW us, a player link would sit
+    // waiting for ITS offer while it holds an answer to a connection we closed.
+    bootListener()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anAnswer(1), to: 'session-me' })
+    await settle()
+    expect(peer('session-a')?.applied).toBe(1)
+    expect(peer('session-a')?.state).toBe('negotiating')
+    const stale = FakePeerConnection.made[0]!
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    await settle()
+    expect(stale.closed).toBe(true)
+    expect(FakePeerConnection.made.length).toBe(2)
+    expect(FakePeerConnection.made[1]!.transceivers[0]!.direction).toBe('sendrecv')
+    expect(voiceOffererIsUs('session-me', 'session-a')).toBe(false) // the ordering would have had us wait
+    expect(peer('session-a')?.owed).toBe('offer@2')
+    // Their stale answer@1, still being re-sent, no longer matches and is dropped.
+    const dropped = voiceDebug().counters.dropped
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anAnswer(1), to: 'session-me' })
+    await settle()
+    expect(voiceDebug().counters.dropped).toBe(dropped + 1)
+    expect(peer('session-a')?.owed).toBe('offer@2')
+    // Their answer to the live offer completes the rebuilt pair.
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: anAnswer(2, 'sendrecv'), to: 'session-me' })
+    await settle()
+    expect(peer('session-a')?.owed).toBeNull()
+    expect(peer('session-a')?.applied).toBe(2)
+    expect(voiceDebug().counters.restarts).toBe(0)
+  })
+
+  test('the listener’s give-up list does not follow it into the game', async () => {
+    // A viewer refused past a player's listener cap is never answered: four
+    // timeouts later it has written that player off — AS A LISTENER. Dropping
+    // in, it is a player the room wants; a fresh startVoice would start clean,
+    // and so must the handover, or that pair is silent for the whole game.
+    bootListener()
+    seePeer('session-z')
+    let now = 1000
+    voiceTick(now)
+    await settle()
+    for (let attempt = 0; attempt < (MAX_NEGOTIATION_ATTEMPTS + 2) * 2; attempt++) {
+      const next = now + NEGOTIATION_TIMEOUT_MS + 200
+      runUntil(next, now)
+      now = next
+      await settle()
+    }
+    expect(voiceDebug().unreachable).toEqual(['session-z'])
+    expect(voiceDebug().peers).toEqual([])
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    expect(voiceDebug().unreachable).toEqual([])
+    seePeer('session-z', {}, now + 50)
+    voiceTick(now + 100)
+    await settle()
+    expect(peer('session-z')?.listener).toBe(false)
+    expect(peer('session-z')?.owed).toBe('offer@1')
+  })
+
+  test('a former ANSWERER offers ABOVE the epoch the far side applied from us', async () => {
+    // The player (lower id) offered to the listener — we answered epoch 3, so
+    // the far side holds applied=3 for us. Re-using 1 would be dropped forever.
+    bootListener()
+    seePeer('session-a')
+    voiceTick(1000)
+    await settle()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, sdp: { epoch: 3, sdp: SDP('sendrecv'), type: 'offer' }, to: 'session-me' })
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.goLive()
+    hearVoice('session-a', { v: VOICE_PROTOCOL, ack: { 'session-me': 3 } })
+    voiceTick(1100)
+    expect(peer('session-a')?.applied).toBe(3)
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    await settle()
+    expect(peer('session-a')?.owed).toBe('offer@4')
+    expect(pc.transceivers.find((transceiver) => transceiver.mid !== null)?.direction).toBe('sendrecv')
+  })
+
+  test('the PLAYER side of a handover: the re-offer is answered on the live connection and reads connected again', async () => {
+    boot()
+    voiceTick(1000)
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(1), to: 'session-me' })
+    await settle()
+    const pc = FakePeerConnection.made[0]!
+    pc.goLive()
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true, ack: { 'session-me': 1 } })
+    voiceTick(1100)
+    expect(peer('viewer-1')?.state).toBe('connected')
+    // They dropped in: a sendrecv offer, one epoch up, no listen flag.
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, sdp: { epoch: 2, sdp: SDP('sendrecv'), type: 'offer' }, to: 'session-me' })
+    await settle()
+    expect(peer('viewer-1')?.owed).toBe('answer@2')
+    // A renegotiation on a live connection never reads as disconnected: the pair
+    // can hear each other the whole way through it (negotiationState).
+    expect(peer('viewer-1')?.state).toBe('connected')
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, ack: { 'session-me': 2 } })
+    voiceTick(1200)
+    expect(peer('viewer-1')?.state).toBe('connected')
+    expect(pc.closed).toBe(false)
+    expect(voiceDebug().counters.restarts).toBe(0)
+  })
+})
+
+describe('a full room does not grow by a handover', () => {
+  /**
+   * A listener is outside the roster and never counts against the room, so a
+   * full room happily carries one. The moment it drops in it IS in the roster —
+   * and past the cap. Both sides used to keep the pair: the players' frames
+   * refreshed its links (proof of life), the sendrecv re-offer was answered, and
+   * a 7th person was two-way in a 6-person call with its own pill reading
+   * OUTSIDE THE CALL and the players' still counting it as a listener.
+   */
+  test('PLAYER side: the listener is closed the tick its presence lands, and its re-sent offer is not answered', async () => {
+    boot() // 'session-me'; five ids below us fill the room WITH us
+    for (const id of ['session-a', 'session-b', 'session-c', 'session-d', 'session-e']) seePeer(id)
+    voiceTick(1000)
+    await settle()
+    expect(voiceDebug().peers.length).toBe(MAX_VOICE_PEERS - 1)
+    hearVoice('session-v', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(1), to: 'session-me' })
+    await settle()
+    const viewerPc = FakePeerConnection.made[MAX_VOICE_PEERS - 1]!
+    viewerPc.goLive()
+    voiceTick(1100)
+    expect(voiceListenerCount()).toBe(1)
+    expect(voiceDebug().peers.length).toBe(MAX_VOICE_PEERS)
+    // It drops in: presence says 'game', the room says no.
+    seePeer('session-v', {}, 1200)
+    voiceTick(1300)
+    expect(peer('session-v')).toBeUndefined()
+    expect(viewerPc.closed).toBe(true)
+    expect(voiceListenerCount()).toBe(0)
+    expect(voiceDebug().peers.length).toBe(MAX_VOICE_PEERS - 1)
+    // Its sendrecv re-offer, still being re-sent, does not build a link per tick.
+    const made = FakePeerConnection.made.length
+    const dropped = voiceDebug().counters.dropped
+    hearVoice('session-v', { v: VOICE_PROTOCOL, sdp: { epoch: 2, sdp: SDP('sendrecv'), type: 'offer' }, to: 'session-me' })
+    await settle()
+    expect(FakePeerConnection.made.length).toBe(made)
+    expect(peer('session-v')).toBeUndefined()
+    expect(voiceDebug().counters.dropped).toBe(dropped + 1)
+  })
+
+  test('EXCLUDED side: the viewer hangs up on the players it was hearing — OUTSIDE THE CALL is now true', async () => {
+    bootListener()
+    const room = ['session-a', 'session-b', 'session-c', 'session-d', 'session-e', 'session-f']
+    for (const id of room) seePeer(id)
+    voiceTick(1000)
+    await settle()
+    expect(voiceDebug().peers.length).toBe(MAX_VOICE_PEERS)
+    FakePeerConnection.made[0]!.goLive() // one pair live: the handover would have kept it
+    voiceTick(1100)
+    expect(voiceConnectedCount()).toBe(1)
+    expect(startVoice({ getLocalPosition: () => [0, 0, 0] })).toBe(true)
+    await settle()
+    expect(voiceDebug().peers).toEqual([])
+    expect(FakePeerConnection.made.length).toBe(MAX_VOICE_PEERS) // nothing rebuilt, nothing re-offered
+    expect(FakePeerConnection.made.every((pc) => pc.closed)).toBe(true)
+    voiceTick(1200)
+    expect(voiceExcluded()).toBe(true)
+    expect(voiceDebug().peers).toEqual([])
+  })
+})
+
+describe('the proximity mix follows the DRAWN body', () => {
+  test('fresh drawn position wins over the snapshot; a stale one yields to it', async () => {
+    boot()
+    seePeer('session-z', { p: [0, 0, 1] })
+    voiceTick(1000)
+    await settle()
+    FakePeerConnection.made[0]!.goLive()
+    setVoiceMode('proximity')
+    voiceTick(1100)
+    expect(FakeAudio.made[0]!.volume).toBe(1) // the snapshot is a metre away
+    // The renderer draws the peer far away (interpolation lag, a teleport in
+    // flight): the voice follows the picture.
+    const remote = getRemotes().get('session-z')!
+    remote.drawnX = 0
+    remote.drawnY = 0
+    remote.drawnZ = VOICE_FAR_M + 10
+    remote.drawnAt = 1200
+    voiceTick(1200)
+    expect(FakeAudio.made[0]!.volume).toBe(0)
+    // Nothing drawn for a while (culled, hidden tab): back to the snapshot.
+    voiceTick(1200 + DRAWN_FRESH_MS + 100)
+    expect(FakeAudio.made[0]!.volume).toBe(1)
+  })
+})
+
+describe('voiceListenerCount', () => {
+  test('counts CONNECTED listeners only — the pill must not claim an audience mid-handshake', async () => {
+    boot()
+    voiceTick(1000)
+    expect(voiceListenerCount()).toBe(0)
+    hearVoice('viewer-1', { v: VOICE_PROTOCOL, listen: true, sdp: recvonlyOffer(), to: 'session-me' })
+    await settle()
+    expect(voiceListenerCount()).toBe(0) // answering, not connected
+    FakePeerConnection.made[0]!.goLive()
+    voiceTick(1100)
+    expect(voiceListenerCount()).toBe(1)
+    // A player on the same call is not a listener.
+    seePeer('session-z', {}, 1100)
+    voiceTick(1200)
+    await settle()
+    FakePeerConnection.made[1]!.goLive()
+    voiceTick(1300)
+    expect(voiceConnectedCount()).toBe(2)
+    expect(voiceListenerCount()).toBe(1)
   })
 })

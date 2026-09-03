@@ -23,6 +23,19 @@ import {
   spectatorHintText,
   WATCH_POLL_MS,
 } from './spectator-hint'
+import {
+  resumeVoiceOutputs,
+  setVoiceLocalEcho,
+  startVoiceListen,
+  stopVoiceListen,
+  talkingPeerCount,
+  voiceConnectedCount,
+  voiceDebug,
+  voiceInternals,
+  voiceOutputBlocked,
+  voiceStats,
+} from './voice'
+import { ListenPill, listenPillText } from './voice-overlay'
 
 /**
  * SPECTATOR LAYER — the render side of "people looking at the project can see
@@ -259,10 +272,67 @@ export function SpectatorPlayers() {
     }
   }, [phase])
 
+  // ── LISTEN: the viewer HEARS the people they are watching ──────────────────
+  //
+  // A receive-only voice session (voice.ts startVoiceListen: no microphone,
+  // recvonly links to the players' room) opens once there is somebody in the
+  // game to hear and closes when the last of them leaves. It rides the presence
+  // adapter above (`bound`) for its roster and signalling. On a drop-in it is
+  // deliberately NOT stopped — the game's startVoice adopts the live links in
+  // place (same connections, no gap in the audio), mirroring how startPresence
+  // adopts the spectating registry; stopVoiceListen is a no-op after that.
+  //
+  // The pill: a spectator page may never have been clicked, and a browser that
+  // wants a gesture before it plays sound the page did not start refuses every
+  // play() in silence. voice.ts retries on its heartbeat; this shows the viewer
+  // WHY it is quiet and gives them the click ("SOUND BLOCKED — CLICK TO HEAR
+  // THE PLAYERS" → resumeVoiceOutputs). Otherwise a quiet "LISTENING · N ON
+  // VOICE" under the hint. QA reads `globalThis.__bootsListen`.
+  const watching = names.length > 0
+  useEffect(() => {
+    if (phase !== 'editor' || !bound || !watching) return
+    if (!startVoiceListen()) return
+    const pill = new ListenPill(() => resumeVoiceOutputs())
+    pill.mount()
+    const drive = () => {
+      pill.set(
+        listenPillText({
+          blocked: voiceOutputBlocked(),
+          connected: voiceConnectedCount(),
+          talkers: talkingPeerCount(),
+          players: liveNames.length,
+        }),
+      )
+    }
+    drive()
+    const timer = setInterval(drive, WATCH_POLL_MS)
+    const qa = {
+      debug: voiceDebug,
+      internals: voiceInternals,
+      stats: voiceStats,
+      pill: () => pill.content(),
+      resume: () => resumeVoiceOutputs(),
+      localEcho: (on: boolean) => {
+        setVoiceLocalEcho(on)
+        return on
+      },
+    }
+    const g = globalThis as Record<string, unknown>
+    g.__bootsListen = qa
+    return () => {
+      clearInterval(timer)
+      pill.unmount()
+      if (g.__bootsListen === qa) delete g.__bootsListen
+      if (shouldStopOnCleanup(useBoots.getState().phase)) stopVoiceListen()
+      // else: a drop-in — the game's startVoice has adopted (or will adopt) the
+      // live links; stopping here would hang up on the people they can hear.
+    }
+  }, [phase, bound, watching])
+
   if (phase !== 'editor' || !bound) return null
   return (
     <>
-      <RemotePlayers />
+      <RemotePlayers spectator />
       <SpectatorHint text={spectatorHintText(names)} event={lastEvent} hidden={suppressed} />
     </>
   )

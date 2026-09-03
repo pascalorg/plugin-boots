@@ -1,18 +1,25 @@
 import { describe, expect, test } from 'bun:test'
+import { DRAWN_FRESH_MS as PVP_DRAWN_FRESH_MS } from './pvp-damage'
 import {
+  acceptsListener,
   DEFAULT_ICE_SERVERS,
+  DRAWN_FRESH_MS,
   iceHasRelay,
   keyCap,
+  listenTargets,
   MAX_ACK_ENTRIES,
   MAX_ICE_CANDIDATES,
+  MAX_ICE_CREDENTIAL_CHARS,
   MAX_ICE_SERVERS,
   MAX_ICE_URLS_PER_SERVER,
+  MAX_LISTENERS_PER_PLAYER,
   MAX_SDP_CHARS,
   MAX_VOICE_PEERS,
   mergeIceServers,
   MIC_KEY,
   mixGain,
   nextSignalTarget,
+  pickPeerPosition,
   proximityGain,
   readIceServers,
   readVoiceFrame,
@@ -27,6 +34,7 @@ import {
   voiceOffererIsUs,
   voicePeersFor,
   voiceRoom,
+  voiceShouldOffer,
 } from './voice-policy'
 
 /**
@@ -508,6 +516,60 @@ describe('readIceServers', () => {
     ])
   })
 
+  test('SIXTEEN urls on one server survive whole; the seventeenth is truncated, not fatal', () => {
+    // A coturn behind two hostnames × (stun, turn udp, turn tcp, turns) × two
+    // ports is sixteen addresses on one credential pair. Under the cap, nothing
+    // is lost; over it, the tail goes and the relay stays.
+    expect(MAX_ICE_URLS_PER_SERVER).toBe(16)
+    const sixteen = Array.from({ length: 16 }, (_, i) =>
+      i % 2 === 0 ? `turn:r${i}.example:3478?transport=udp` : `turns:r${i}.example:443?transport=tcp`,
+    )
+    const read = readIceServers([{ urls: sixteen, username: 'u', credential: 'p' }])
+    expect(read).toEqual([{ urls: sixteen, username: 'u', credential: 'p' }])
+    const seventeen = [...sixteen, 'stun:tail.example']
+    expect(readIceServers([{ urls: seventeen, username: 'u', credential: 'p' }])).toEqual([
+      { urls: sixteen, username: 'u', credential: 'p' },
+    ])
+  })
+
+  test('credentials must be NON-EMPTY strings within the bound — empty is "missing"', () => {
+    expect(readIceServers([{ urls: 'turn:r.example', username: '', credential: 'p' }])).toBeNull()
+    expect(readIceServers([{ urls: 'turn:r.example', username: 'u', credential: '' }])).toBeNull()
+    const long = 'x'.repeat(MAX_ICE_CREDENTIAL_CHARS)
+    expect(readIceServers([{ urls: 'turn:r.example', username: long, credential: long }])).toEqual([
+      { urls: ['turn:r.example'], username: long, credential: long },
+    ])
+    expect(readIceServers([{ urls: 'turn:r.example', username: `${long}x`, credential: 'p' }])).toBeNull()
+  })
+
+  test('ONE malformed entry costs that entry, never the list', () => {
+    const good = { urls: 'turn:r.example:3478', username: 'u', credential: 'p' }
+    const list = [
+      { urls: ['stun:a.example', 'http://evil.example'] }, // one bad address condemns the entry
+      { urls: 'turn:half.example', username: 'u' }, // half a credential pair
+      { urls: 'turn:empty.example', username: '', credential: 'p' },
+      'stun:not-an-object',
+      null,
+      good,
+      { urls: 'stun:fine.example' },
+    ]
+    expect(readIceServers(list)).toEqual([
+      { urls: ['turn:r.example:3478'], username: 'u', credential: 'p' },
+      { urls: ['stun:fine.example'] },
+    ])
+    expect(readIceServers({ iceServers: list })).toEqual([
+      { urls: ['turn:r.example:3478'], username: 'u', credential: 'p' },
+      { urls: ['stun:fine.example'] },
+    ])
+  })
+
+  test('the STUN fallback is untouched by any of this', () => {
+    expect(readIceServers([...DEFAULT_ICE_SERVERS])).toEqual(
+      DEFAULT_ICE_SERVERS.map((server) => ({ urls: [server.urls as string] })),
+    )
+    expect(iceHasRelay(DEFAULT_ICE_SERVERS)).toBe(false)
+  })
+
   test('a STUN entry never needs credentials; half a pair on it is dropped, the entry kept', () => {
     expect(readIceServers([{ urls: 'stun:s.example', username: 'u' }])).toEqual([{ urls: ['stun:s.example'] }])
     expect(readIceServers([{ urls: 'stun:s.example', username: 'u', credential: 7 }])).toEqual([
@@ -589,5 +651,119 @@ describe('the mic key', () => {
     expect(MIC_KEY).toBe('KeyM')
     expect(keyCap(MIC_KEY)).toBe('M')
     expect(keyCap('Digit4')).toBe('4')
+  })
+})
+
+// ── Listeners ────────────────────────────────────────────────────────────────
+
+describe('the listen flag on the wire', () => {
+  test('optional, boolean, normalized; anything else refuses the frame', () => {
+    expect(readVoiceFrame({ v: 1 })?.listen).toBeUndefined()
+    expect(readVoiceFrame({ v: 1, listen: true })).toEqual({ v: 1, listen: true })
+    expect(readVoiceFrame({ v: 1, listen: false })).toEqual({ v: 1, listen: false })
+    expect(readVoiceFrame({ v: 1, listen: 'yes' })).toBeNull()
+    expect(readVoiceFrame({ v: 1, listen: 1 })).toBeNull()
+  })
+
+  test('a frame a listener sends today reads on a validator that ignores the field', () => {
+    // What an older pin does with `listen`: nothing. The rest of the frame must
+    // still be exactly what it was, so the offer inside it is answered.
+    const frame = readVoiceFrame({
+      v: 1,
+      listen: true,
+      to: 'player',
+      sdp: { type: 'offer', epoch: 1, sdp: AUDIO_SDP },
+      talking: false,
+    })
+    expect(frame?.to).toBe('player')
+    expect(frame?.sdp?.type).toBe('offer')
+    expect(frame?.talking).toBe(false)
+  })
+})
+
+describe('voiceShouldOffer — who calls whom when a listener is present', () => {
+  test('a LISTENER always offers, whatever the ids sort as', () => {
+    expect(voiceShouldOffer({ mySessionId: 'z', peerSessionId: 'a', meListening: true, peerInGame: true })).toBe(true)
+    expect(voiceShouldOffer({ mySessionId: 'a', peerSessionId: 'z', meListening: true, peerInGame: true })).toBe(true)
+    // …but never to itself.
+    expect(voiceShouldOffer({ mySessionId: 'a', peerSessionId: 'a', meListening: true, peerInGame: true })).toBe(false)
+  })
+
+  test('a PLAYER never offers to a peer outside the game — that is a listener, and it will call', () => {
+    expect(voiceShouldOffer({ mySessionId: 'a', peerSessionId: 'z', meListening: false, peerInGame: false })).toBe(false)
+    expect(voiceShouldOffer({ mySessionId: 'z', peerSessionId: 'a', meListening: false, peerInGame: false })).toBe(false)
+  })
+
+  test('between players the total order stands, so exactly one side offers', () => {
+    const ab = voiceShouldOffer({ mySessionId: 'a', peerSessionId: 'b', meListening: false, peerInGame: true })
+    const ba = voiceShouldOffer({ mySessionId: 'b', peerSessionId: 'a', meListening: false, peerInGame: true })
+    expect(ab).toBe(voiceOffererIsUs('a', 'b'))
+    expect(ba).toBe(voiceOffererIsUs('b', 'a'))
+    expect(ab !== ba).toBe(true)
+  })
+
+  test('a listener never offers AUDIO: the policy is one-directional by construction', () => {
+    // The listener offers the connection; what it offers to SEND is nothing
+    // (voice.ts negotiates its m-line recvonly). The two sides of a
+    // listener/player pair therefore never both offer, and the player never
+    // initiates — so a listener link can never be turned around into a sender
+    // by the peer.
+    expect(voiceShouldOffer({ mySessionId: 'viewer', peerSessionId: 'player', meListening: true, peerInGame: true })).toBe(true)
+    expect(voiceShouldOffer({ mySessionId: 'player', peerSessionId: 'viewer', meListening: false, peerInGame: false })).toBe(false)
+  })
+})
+
+describe('listenTargets — a listener hears the players’ room', () => {
+  test('the same MAX_VOICE_PEERS lowest ids the players themselves form', () => {
+    const players = ['g', 'c', 'a', 'e', 'b', 'f', 'd', 'h']
+    expect(listenTargets(players)).toEqual(voiceRoom(players))
+    expect(listenTargets(players).length).toBe(MAX_VOICE_PEERS)
+    expect(listenTargets(players)).toEqual(['a', 'b', 'c', 'd', 'e', 'f'])
+  })
+
+  test('junk and duplicates are filtered, an empty game is nobody to hear', () => {
+    expect(listenTargets([])).toEqual([])
+    expect(listenTargets(['a', 'a', '', 'x'.repeat(200)])).toEqual(['a'])
+  })
+})
+
+describe('acceptsListener — a player carries a bounded number of listeners', () => {
+  test('under the cap yes, at the cap no', () => {
+    expect(MAX_LISTENERS_PER_PLAYER).toBeGreaterThan(0)
+    for (let n = 0; n < MAX_LISTENERS_PER_PLAYER; n++) expect(acceptsListener(n)).toBe(true)
+    expect(acceptsListener(MAX_LISTENERS_PER_PLAYER)).toBe(false)
+    expect(acceptsListener(MAX_LISTENERS_PER_PLAYER + 5)).toBe(false)
+  })
+})
+
+// ── Where a peer is ──────────────────────────────────────────────────────────
+
+describe('pickPeerPosition — the voice fades where the eye sees the peer', () => {
+  const snapshot = { x: 1, y: 2, z: 3 }
+  const drawn = { drawnX: 10, drawnY: 20, drawnZ: 30, drawnAt: 1000 }
+
+  test('a FRESH drawn body wins over the newest snapshot', () => {
+    expect(pickPeerPosition(drawn, snapshot, 1000)).toEqual([10, 20, 30])
+    expect(pickPeerPosition(drawn, snapshot, 1000 + DRAWN_FRESH_MS - 1)).toEqual([10, 20, 30])
+  })
+
+  test('a STALE drawn body yields to the snapshot — the avatar is not being drawn', () => {
+    expect(pickPeerPosition(drawn, snapshot, 1000 + DRAWN_FRESH_MS)).toEqual([1, 2, 3])
+    expect(pickPeerPosition(drawn, snapshot, 99_000)).toEqual([1, 2, 3])
+  })
+
+  test('never drawn (drawnAt 0) is the snapshot; neither is null', () => {
+    const never = { ...drawn, drawnAt: 0 }
+    expect(pickPeerPosition(never, snapshot, 0)).toEqual([1, 2, 3])
+    expect(pickPeerPosition(never, null, 0)).toBeNull()
+    expect(pickPeerPosition(drawn, null, 99_000)).toBeNull()
+  })
+
+  test('the freshness window is the rule the task states: strictly under 250 ms — and the SAME window PvP hit-reg uses', () => {
+    expect(DRAWN_FRESH_MS).toBe(250)
+    // Two modules answer "is the drawn body the picture anyone is looking at";
+    // voice-policy is the pure half and cannot import pvp-damage's runtime, so
+    // the value is pinned equal here instead. Change one, this fails.
+    expect(DRAWN_FRESH_MS).toBe(PVP_DRAWN_FRESH_MS)
   })
 })

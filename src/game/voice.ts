@@ -12,15 +12,18 @@ import { browserPendingStorage } from './pending-store'
 import { getRemotes, participantName } from './presence'
 import { latestSnapshot } from './presence-interp'
 import {
+  acceptsListener,
   DEFAULT_ICE_SERVERS,
   iceHasRelay,
   isVoiceMode,
+  listenTargets,
   MAX_SDP_CHARS,
   MAX_SESSION_ID_CHARS,
   MAX_VOICE_PEERS,
   mergeIceServers,
   mixGain,
   nextSignalTarget,
+  pickPeerPosition,
   readIceServers,
   readVoiceFrame,
   talkGate,
@@ -34,6 +37,7 @@ import {
   voiceOffererIsUs,
   voicePeersFor,
   voiceRoom,
+  voiceShouldOffer,
 } from './voice-policy'
 
 /**
@@ -103,6 +107,20 @@ import {
  * same browser profile — so peers heard on it are mixed at zero gain and the
  * pill SAYS so ("SAME DEVICE — MUTED"). `setVoiceLocalEcho(true)` restores the
  * audio for a test that wants to hear it.
+ *
+ * ── LISTENING FROM THE EDITOR ───────────────────────────────────────────────
+ * An editor viewer who has not jumped in sees the players (spectator.tsx) and,
+ * since this section, HEARS them: `startVoiceListen` runs the same module in
+ * LISTEN mode — no microphone is ever asked for or attached, every transceiver
+ * is RECVONLY, and the mesh is the players' own room (listenTargets). The
+ * listener OFFERS to each player (a player cannot want a peer that publishes
+ * no presence — see voiceShouldOffer), flags its frames `listen: true`, and the
+ * player side answers as it always has answered an unknown offerer, capped at
+ * MAX_LISTENERS_PER_PLAYER. Dropping in is a HANDOVER, not a restart: the game's
+ * `startVoice` finds the listen session active and adopts it — same links, same
+ * connections, same audio — flips every live transceiver to sendrecv, attaches
+ * the mic, and re-offers one epoch up so the far side renegotiates in place.
+ * Nothing the viewer was hearing stops.
  */
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
@@ -333,10 +351,24 @@ type PeerLink = {
   error: string | null
   /** Heard on the same-device beacon (or same clientId): mixed at zero gain. */
   sameDevice: boolean
+  /**
+   * THE PEER is a listener: it offered to us from outside the game roster, or
+   * its frames say `listen: true`. We never offer to a listener (its next offer
+   * is what repairs the pair) and it counts against MAX_LISTENERS_PER_PLAYER.
+   * Cleared the tick the session shows up in the game roster — a player whose
+   * presence frame arrived after its offer is a player.
+   */
+  listener: boolean
 }
 
 type VoiceState = {
   active: boolean
+  /**
+   * LISTEN MODE (startVoiceListen): we are an editor viewer hearing the game.
+   * No mic is attached to any sender, every transceiver is recvonly, we offer
+   * to every player in the room, and `startVoice` adopts us in place on drop-in.
+   */
+  listen: boolean
   mode: VoiceMode
   timer: ReturnType<typeof setInterval> | null
   offFrame: (() => void) | null
@@ -443,6 +475,12 @@ type VoiceState = {
      * and this is the only trace of it.
      */
     pcFailed: number
+    /**
+     * Offers from listeners we did not answer because we already carry
+     * MAX_LISTENERS_PER_PLAYER of them. The listener sees a timeout and gives
+     * up countably on its side; this is the matching number on ours.
+     */
+    listenersRefused: number
   }
 }
 
@@ -488,6 +526,7 @@ export function saveMicPref(pref: MicPref): void {
 
 const state: VoiceState = {
   active: false,
+  listen: false,
   mode: loadMode(),
   timer: null,
   offFrame: null,
@@ -526,6 +565,7 @@ const state: VoiceState = {
     reaped: 0,
     stalls: 0,
     pcFailed: 0,
+    listenersRefused: 0,
   },
 }
 
@@ -751,7 +791,23 @@ function attachRemote(link: PeerLink, stream: MediaStream): void {
   link.gain = -1
 }
 
-function makeLink(sessionId: string): PeerLink | null {
+/** The direction we negotiate: a listener only ever receives. */
+function ourDirection(): RTCRtpTransceiverDirection {
+  return state.listen ? 'recvonly' : 'sendrecv'
+}
+
+/** Sessions in the game roster right now (a player, as opposed to a listener). */
+function peerInGame(sessionId: string): boolean {
+  return getRemotes().get(sessionId)?.ph === 'game'
+}
+
+function listenerLinkCount(): number {
+  let count = 0
+  for (const link of state.peers.values()) if (link.listener) count++
+  return count
+}
+
+function makeLink(sessionId: string, listener = false): PeerLink | null {
   let pc: RTCPeerConnection
   try {
     pc = new RTCPeerConnection({ iceServers })
@@ -792,18 +848,21 @@ function makeLink(sessionId: string): PeerLink | null {
     step: 'new',
     error: null,
     sameDevice: false,
+    listener,
   }
   // ONE sendrecv audio transceiver, created before any description exists.
   // Negotiating the send direction up front is what lets the mic be enabled
   // later with `replaceTrack` and no second handshake — the alternative is a
-  // renegotiation in the middle of a firefight.
+  // renegotiation in the middle of a firefight. A LISTENER's is recvonly, and
+  // no track ever touches its sender: the answer to a recvonly offer can only
+  // be sendonly, so a listener cannot be heard even by accident.
   try {
-    const transceiver = pc.addTransceiver('audio', { direction: 'sendrecv' })
+    const transceiver = pc.addTransceiver('audio', { direction: ourDirection() })
     link.sender = transceiver.sender
-    if (state.micTrack) void transceiver.sender.replaceTrack(state.micTrack).catch(() => {})
+    if (state.micTrack && !state.listen) void transceiver.sender.replaceTrack(state.micTrack).catch(() => {})
   } catch {
     // Very old stacks: fall back to whatever a track add gives us.
-    if (state.micTrack) {
+    if (state.micTrack && !state.listen) {
       try {
         link.sender = pc.addTrack(state.micTrack, new MediaStream([state.micTrack]))
       } catch {
@@ -877,7 +936,8 @@ function restart(link: PeerLink, _why: string): void {
     return
   }
   state.counters.restarts++
-  const fresh = makeLink(sessionId)
+  // A listener stays a listener across the rebuild: we must still not offer to it.
+  const fresh = makeLink(sessionId, link.listener)
   if (!fresh) return
   fresh.attempts = attempts + 1
   /**
@@ -914,8 +974,21 @@ function describeError(error: unknown): string {
   return String(error).slice(0, 160)
 }
 
+/**
+ * A RENEGOTIATION DOES NOT UN-CONNECT A PAIR. `state` answers "can these two
+ * hear each other"; a second offer/answer on a connection that is already up (a
+ * listener dropping in and flipping its m-line to sendrecv) never takes the media
+ * down, and `connectionstatechange` will not fire 'connected' a second time — so
+ * writing 'negotiating' here would leave the pair reading disconnected forever
+ * while it was audibly working, and would hand it to the negotiation timeout,
+ * whose cure (tear the connection down) is worse than anything it could fix.
+ */
+function negotiationState(link: PeerLink): PeerLinkState {
+  return link.pc.connectionState === 'connected' ? 'connected' : 'negotiating'
+}
+
 async function makeOffer(link: PeerLink): Promise<void> {
-  link.state = 'negotiating'
+  link.state = negotiationState(link)
   link.startedAt = state.clock
   link.error = null
   try {
@@ -939,7 +1012,13 @@ async function makeOffer(link: PeerLink): Promise<void> {
       state.counters.tooLarge++
       return
     }
-    link.epoch += 1
+    // ABOVE ANYTHING THEY HAVE SEEN FROM US. `epoch` counts the offers we made;
+    // `applied` is the newest epoch we took from THEM — and when they were the
+    // offerer, the answer they applied from us carried that same number. A side
+    // that answered and now offers (a listener dropping in, a glare loser after
+    // a restart) would otherwise re-use an epoch the far side has already
+    // recorded as applied, and its offer would be dropped as a duplicate forever.
+    link.epoch = Math.max(link.epoch, link.applied) + 1
     link.outbound = { type: 'offer', epoch: link.epoch, sdp: trimmed }
     link.step = 'offer:owed'
   } catch (error) {
@@ -977,13 +1056,13 @@ function adoptAssociatedTransceiver(link: PeerLink): void {
   const associated = transceivers.find((transceiver) => transceiver.mid !== null)
   if (!associated) return
   try {
-    associated.direction = 'sendrecv'
+    associated.direction = ourDirection()
   } catch {
     // A stack that refuses the assignment leaves the pair receive-only rather
     // than failing it — half a call beats none.
   }
   link.sender = associated.sender
-  if (state.micTrack) void associated.sender.replaceTrack(state.micTrack).catch(() => {})
+  if (state.micTrack && !state.listen) void associated.sender.replaceTrack(state.micTrack).catch(() => {})
   for (const transceiver of transceivers) {
     if (transceiver === associated || transceiver.mid !== null) continue
     try {
@@ -996,7 +1075,7 @@ function adoptAssociatedTransceiver(link: PeerLink): void {
 }
 
 async function makeAnswer(link: PeerLink, offer: VoiceDescription): Promise<void> {
-  link.state = 'negotiating'
+  link.state = negotiationState(link)
   link.startedAt = state.clock
   // Claimed synchronously: every line below is an await, and the offerer is
   // re-sending this same description every tick until we acknowledge it.
@@ -1081,6 +1160,7 @@ function publishSignal(): void {
   const target = nextSignalTarget(owed, state.lastTarget)
   state.lastTarget = target
   const frame: VoiceFrame = { v: VOICE_PROTOCOL, mode: state.mode, talking: state.talking }
+  if (state.listen) frame.listen = true
   const ack = ackMap()
   if (Object.keys(ack).length > 0) frame.ack = ack
   let carriedDescription = false
@@ -1132,6 +1212,8 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
     link.talking = frame.talking
     link.talkingAt = state.clock
   }
+  // A peer that SAYS it is a listener is one, whatever the roster says.
+  if (link && frame.listen === true) link.listener = true
 
   // Did they acknowledge the description we are still re-sending?
   if (link?.outbound && frame.ack?.[me] === link.outbound.epoch) link.ackedByThem = true
@@ -1147,7 +1229,25 @@ function ingest(msg: NetMessage<VoiceFrame>): void {
     let target = link
     if (!target) {
       if (state.unreachable.has(from)) return
-      target = makeLink(from) ?? undefined
+      // An offerer we have no roster entry for is a LISTENER (or a player whose
+      // presence frame is a beat behind its offer — the tick reclassifies that
+      // one the moment it shows up). Listeners are capped per player: past the
+      // cap the offer is simply not answered, and counted.
+      const listener = frame.listen === true || !peerInGame(from)
+      if (listener && !acceptsListener(listenerLinkCount())) {
+        state.counters.listenersRefused++
+        return
+      }
+      // A PLAYER the room does not pair us with (past the cap, or we are) is
+      // not answered either: the tick closes such a link on its next pass, and
+      // answering each re-send in between would build and tear down a
+      // connection every 100 ms until the offerer's deadline. Its re-sends are
+      // free to us, and the roster converges on both sides the same way.
+      if (!listener && !meshNow().includes(from)) {
+        state.counters.dropped++
+        return
+      }
+      target = makeLink(from, listener) ?? undefined
       if (!target) return
     }
     if (description.epoch <= target.applied || description.epoch === target.busy) {
@@ -1317,8 +1417,14 @@ export async function enableMic(): Promise<MicState> {
     state.micTrack = track
     state.micState = 'live'
     attachAnalyser(stream)
-    for (const link of state.peers.values()) {
-      if (link.sender) void link.sender.replaceTrack(track).catch(() => {})
+    // NOT WHILE LISTENING. The veil acquires the mic a click before the game
+    // starts, and if the viewer was listening in the editor that click lands
+    // while the links are still recvonly. The track waits here; the handover
+    // (adoptListen) puts it on every sender the moment the game owns the call.
+    if (!state.listen) {
+      for (const link of state.peers.values()) {
+        if (link.sender) void link.sender.replaceTrack(track).catch(() => {})
+      }
     }
     return state.micState
   } catch (error) {
@@ -1436,15 +1542,28 @@ function distanceTo(sessionId: string): number {
   const local = state.getLocalPosition?.()
   const remote = getRemotes().get(sessionId)
   if (!local || !remote) return Number.POSITIVE_INFINITY
-  const snapshot = latestSnapshot(remote.ring)
-  if (!snapshot) return Number.POSITIVE_INFINITY
-  return Math.hypot(local[0] - snapshot.x, local[1] - snapshot.y, local[2] - snapshot.z)
+  // The DRAWN body when the renderer is drawing it, the newest snapshot
+  // otherwise — the voice fades where the eye sees the peer, not where the
+  // wire last put them (pickPeerPosition).
+  const at = pickPeerPosition(remote, latestSnapshot(remote.ring), state.clock)
+  if (!at) return Number.POSITIVE_INFINITY
+  return Math.hypot(local[0] - at[0], local[1] - at[1], local[2] - at[2])
 }
 
 /** The sessions we should be in a call with, right now. */
 function meshNow(): string[] {
   const me = localSessionId()
   if (me === null) return []
+  if (state.listen) {
+    // A listener hears the players' room and is never "outside the call": it
+    // was never in the roster the room is cut from.
+    const players: string[] = []
+    for (const [sessionId, remote] of getRemotes()) {
+      if (remote.ph === 'game' && sessionId !== me) players.push(sessionId)
+    }
+    state.excluded = false
+    return listenTargets(players).filter((id) => !state.unreachable.has(id))
+  }
   const inGame: string[] = [me]
   for (const [sessionId, remote] of getRemotes()) {
     if (remote.ph === 'game') inGame.push(sessionId)
@@ -1494,6 +1613,22 @@ export function voiceTick(now: number): void {
   for (const link of [...state.peers.values()]) {
     if (wanted.has(link.sessionId)) {
       link.seenAt = now
+      // In the game roster now: whatever it looked like when it first offered,
+      // this is a player, and the repair below may offer to it.
+      link.listener = false
+      continue
+    }
+    // IN THE GAME ROSTER, YET NOT WANTED: the room cap says no — this peer is
+    // past it, or we are. That is a verdict, not a flicker (the peer is right
+    // there in presence), and it is the one case the frames-as-proof-of-life
+    // rule in `ingest` would otherwise hold open for the rest of the session: a
+    // listener who dropped into a FULL room stayed two-way connected to every
+    // player it had been hearing, its own pill reading OUTSIDE THE CALL and
+    // theirs still counting it as a listener; a player evicted by a lower id
+    // joining kept hearing a room its pill said it was outside of.
+    if (peerInGame(link.sessionId)) {
+      state.counters.reaped++
+      closeLink(link)
       continue
     }
     if (now - link.seenAt <= PEER_ABSENT_MS) continue
@@ -1504,9 +1639,19 @@ export function voiceTick(now: number): void {
     if (state.peers.has(sessionId)) continue
     const link = makeLink(sessionId)
     if (!link) continue
-    // Only the lower session id offers. The other side builds its link when
-    // the offer lands, which is why this is not a deadlock.
-    if (voiceOffererIsUs(me, sessionId)) void makeOffer(link)
+    // Among players only the lower session id offers; the other side builds its
+    // link when the offer lands, which is why this is not a deadlock. A
+    // listener offers to everyone — nobody can offer to a peer they cannot see.
+    if (
+      voiceShouldOffer({
+        mySessionId: me,
+        peerSessionId: sessionId,
+        meListening: state.listen,
+        peerInGame: true,
+      })
+    ) {
+      void makeOffer(link)
+    }
   }
 
   // 1b. Repair, over EVERY link rather than only the ones the roster currently
@@ -1559,13 +1704,27 @@ export function voiceTick(now: number): void {
     }
     // An idle link on our side of the ordering never got its offer out (the
     // publish was coalesced away, or the mesh grew after we built the link).
-    if (link.state === 'idle' && link.outbound === null && voiceOffererIsUs(me, sessionId)) {
+    // Never to a listener: its own next offer is what repairs that pair.
+    if (
+      link.state === 'idle' &&
+      link.outbound === null &&
+      voiceShouldOffer({
+        mySessionId: me,
+        peerSessionId: sessionId,
+        meListening: state.listen,
+        peerInGame: !link.listener,
+      })
+    ) {
       void makeOffer(link)
     }
   }
 
-  // 2. Our own talk state, off the mic analyser.
-  if (state.micState === 'live') {
+  // 2. Our own talk state, off the mic analyser. NEVER WHILE LISTENING: the
+  //    veil's ask-first click can leave a listener holding a live mic for as long
+  //    as the PLAY button sits there, and that track is on no sender — a
+  //    `talking: true` in its frames would light 'N SPEAKING' on the players'
+  //    pill for a viewer nobody can hear.
+  if (state.micState === 'live' && !state.listen) {
     const rms = readMicLevel()
     // The SAME threshold the gate opens on — the hang time is "time since the
     // level was last loud enough to open", so a second copy of the number here
@@ -1594,7 +1753,8 @@ export function voiceTick(now: number): void {
     const same = isSameDevice(link.sessionId)
     link.sameDevice = same
     if (same) sameDevice++
-    const gain = same ? 0 : mixGain(state.mode, distanceTo(link.sessionId))
+    // A listener has no body to measure from, so it hears the room flat.
+    const gain = same ? 0 : mixGain(state.listen ? 'squad' : state.mode, distanceTo(link.sessionId))
     const element = link.element
     if (Math.abs(gain - link.gain) < 0.01) {
       if (heartbeat && element && element.paused && element.srcObject) {
@@ -1632,17 +1792,12 @@ export function voiceTick(now: number): void {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
-/**
- * Open the voice layer for this session. Returns false — having done nothing at
- * all — with no bus or no WebRTC.
- */
-export function startVoice(args: {
-  getLocalPosition: () => readonly [number, number, number]
-}): boolean {
-  if (state.active) return true
+/** What startVoice and startVoiceListen share: the transport, the beacon, the tick. */
+function openVoice(listen: boolean, getLocalPosition: VoiceState['getLocalPosition']): boolean {
   if (!netAvailable() || !voiceSupported()) return false
   state.active = true
-  state.getLocalPosition = args.getLocalPosition
+  state.listen = listen
+  state.getLocalPosition = getLocalPosition
   state.ticks = 0
   state.clock = Date.now()
   state.lastTarget = null
@@ -1664,6 +1819,117 @@ export function startVoice(args: {
 }
 
 /**
+ * THE HANDOVER. The viewer who was listening just dropped in: the same module
+ * keeps running, and the links it holds are kept — same RTCPeerConnections, same
+ * ICE, same elements, so nothing the viewer was hearing stops. What changes is
+ * the direction: every live m-line is flipped to sendrecv, the mic (acquired on
+ * the veil, waiting) goes onto its sender, and a fresh offer one epoch up asks
+ * the far side to renegotiate in place — its answerer path already adopts the
+ * associated transceiver as sendrecv (adoptAssociatedTransceiver), so a pin that
+ * has never heard of listeners completes this handshake correctly.
+ *
+ * A link that had NOT connected yet is rebuilt instead, HERE, as a player link:
+ * it was mid-handshake as a recvonly offer, and stacking a second offer on a
+ * first still in flight is a restart with extra steps. No audio was flowing on
+ * it, so nothing is lost — but the PAIR's numbering is, unless it comes along
+ * exactly as in `restart`: the far side may already have applied our epoch-1
+ * offer (it answered; only ICE had not landed), and a rebuilt link that started
+ * back at zero re-offered epoch 1, which the far side dropped as a duplicate on
+ * every tick until a deadline fired. And WE offer, whatever the ids sort as: we
+ * were this pair's offerer as a listener, so the far side holds no offer of its
+ * own to glare with — only an answer to a connection we just closed, which it
+ * would otherwise keep re-sending until its own timeout if it sorts as the
+ * players' offerer and we sat waiting for it.
+ *
+ * THE GIVE-UP LIST WAS THE LISTENER'S. A viewer refused past a player's listener
+ * cap (never answered, four timeouts) or failed by ICE from the editor wrote
+ * those players off — as a listener. As a player it is somebody the room wants
+ * and the players will offer to, and a fresh startVoice would have started
+ * clean; carrying the list over made those pairs silent for the whole game with
+ * no counter moving. Cleared for the same reason openVoice clears it.
+ */
+function adoptListen(getLocalPosition: VoiceState['getLocalPosition']): void {
+  state.listen = false
+  state.getLocalPosition = getLocalPosition
+  state.excluded = false
+  state.unreachable.clear()
+  // The room WE are in now, as a player — a listener heard the players' room
+  // from outside it; dropping into one that is already full puts us past the
+  // cap, and a link to a player the room does not pair us with is closed here
+  // rather than flipped to sendrecv and closed by the tick a beat later.
+  const wanted = new Set(meshNow())
+  for (const link of [...state.peers.values()]) {
+    if (peerInGame(link.sessionId) && !wanted.has(link.sessionId)) {
+      closeLink(link)
+      continue
+    }
+    if (link.state !== 'connected' || link.pc.connectionState !== 'connected') {
+      const { sessionId, epoch, applied } = link
+      closeLink(link)
+      const fresh = makeLink(sessionId)
+      if (!fresh) continue
+      fresh.epoch = Math.max(epoch, applied)
+      void makeOffer(fresh)
+      continue
+    }
+    // The m-line's transceiver — ours from addTransceiver when we offered, the
+    // adopted one when a player offered to us. A connected link always has one;
+    // the first transceiver is the fallback for a stack that never reports mids.
+    const transceivers = link.pc.getTransceivers?.() ?? []
+    const associated = transceivers.find((transceiver) => transceiver.mid !== null) ?? transceivers[0] ?? null
+    if (associated) {
+      try {
+        associated.direction = 'sendrecv'
+      } catch {
+        // A stack that refuses the assignment: the re-offer below still goes out
+        // and the pair stays as it was — hearing, not speaking — rather than dying.
+      }
+      link.sender = associated.sender
+    }
+    if (link.sender && state.micTrack) void link.sender.replaceTrack(state.micTrack).catch(() => {})
+    link.outbound = null
+    link.ackedByThem = false
+    void makeOffer(link)
+  }
+}
+
+/**
+ * Open the voice layer for this session. Returns false — having done nothing at
+ * all — with no bus or no WebRTC. Finding a LISTEN session active (the viewer
+ * was hearing the game from the editor) adopts it in place: see adoptListen.
+ */
+export function startVoice(args: {
+  getLocalPosition: () => readonly [number, number, number]
+}): boolean {
+  if (state.active) {
+    if (state.listen) adoptListen(args.getLocalPosition)
+    return true
+  }
+  return openVoice(false, args.getLocalPosition)
+}
+
+/**
+ * HEAR THE GAME WITHOUT BEING IN IT. For the editor viewer: receive-only links
+ * to the players' room, no microphone, flat mix. Idempotent, and a no-op while a
+ * game session owns the call (that session hears everything already). Returns
+ * false — having allocated nothing — with no bus or no WebRTC.
+ */
+export function startVoiceListen(): boolean {
+  if (state.active) return true
+  return openVoice(true, null)
+}
+
+/**
+ * Stop listening. A NO-OP once the viewer has dropped in: the game session owns
+ * the call then (`listen` is false) and its own stopVoice is the only thing
+ * allowed to end it — mirroring how stopSpectating yields to stopPresence.
+ */
+export function stopVoiceListen(): void {
+  if (!state.active || !state.listen) return
+  stopVoice()
+}
+
+/**
  * Close it. The MICROPHONE IS RELEASED, deliberately: leaving a game must turn
  * the browser's recording indicator off, or the next thing the player does is
  * check whether we are still listening.
@@ -1674,6 +1940,7 @@ export function stopVoice(): void {
   releaseMic()
   if (!state.active) return
   state.active = false
+  state.listen = false
   state.stopping = true
   if (state.timer !== null) clearInterval(state.timer)
   state.timer = null
@@ -1738,6 +2005,22 @@ export function voiceSameDeviceCount(): number {
 
 export function voiceUnreachableCount(): number {
   return state.unreachable.size
+}
+
+/**
+ * How many editor viewers are LISTENING to us right now.
+ *
+ * Worth a number on the pill rather than nothing: a listener publishes no
+ * presence, so somebody hearing the game is otherwise completely invisible to
+ * the people in it — which is both a courtesy problem and, the first time
+ * anybody notices, a "who was that" problem.
+ */
+export function voiceListenerCount(): number {
+  let count = 0
+  for (const link of state.peers.values()) {
+    if (link.listener && link.state === 'connected') count++
+  }
+  return count
 }
 
 /** Links whose RTCPeerConnection is up right now — the "we are connected" number. */
@@ -1840,6 +2123,8 @@ export async function voiceStats(): Promise<VoicePeerStats[]> {
 /** One line per peer plus the counters — the QA dump behind `__boots.voice`. */
 export function voiceDebug(): {
   active: boolean
+  /** Running as an editor viewer's receive-only listen session. */
+  listen: boolean
   mode: VoiceMode
   mic: MicState
   talking: boolean
@@ -1876,6 +2161,8 @@ export function voiceDebug(): {
     sameDevice: boolean
     /** Did OUR description carry a relay candidate — is the TURN seam live for this pair. */
     localRelay: boolean
+    /** This peer is a listener (an editor viewer hearing us): we never offer to it. */
+    listener: boolean
   }>
   unreachable: string[]
   /** Where the ICE set came from, how big it is, and whether it has a relay. */
@@ -1914,9 +2201,11 @@ export function voiceDebug(): {
     talking: link.talking,
     sameDevice: link.sameDevice,
     localRelay: /typ relay/.test(link.pc.localDescription?.sdp ?? ''),
+    listener: link.listener,
   }))
   return {
     active: state.active,
+    listen: state.listen,
     counters: { ...state.counters },
     mic: state.micState,
     mode: state.mode,
@@ -1995,6 +2284,7 @@ export function voiceInternals(): Array<{
 export function resetVoice(): void {
   stopVoice()
   state.unreachable.clear()
+  state.listen = false
   state.mode = 'squad'
   state.lastTarget = null
   iceServers = [...DEFAULT_ICE_SERVERS]
@@ -2022,5 +2312,6 @@ export function resetVoice(): void {
     stalls: 0,
     threw: 0,
     tooLarge: 0,
+    listenersRefused: 0,
   }
 }

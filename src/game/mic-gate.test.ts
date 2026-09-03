@@ -335,6 +335,40 @@ describe('beginEntry', () => {
     }
   })
 
+  test('MIC OFF while the dialog is open and NO second click: the grant is let go the moment it lands', async () => {
+    // The round-1 review's hot mic: with permission 'prompt', JUMP IN opened the
+    // dialog; the player flipped MIC OFF on the veil while it was open (nothing
+    // to release yet, so the toggle could not); the grant then landed as a live
+    // track and sat there recording, under a button that read PLAY, until the
+    // next click. The choice must be re-read when the grant lands.
+    installWorld()
+    noteMicPermission('prompt')
+    const restore = withStorage(fakeStorage())
+    let open: (() => void) | null = null
+    media.hold = new Promise<void>((resolve) => {
+      open = resolve
+    })
+    try {
+      const ui = fakeUi()
+      beginEntry(ui)
+      expect(micState()).toBe('asking')
+      saveMicPref('off') // the veil toggle, with no track to release yet
+      open!()
+      await settle()
+      expect(micState()).toBe('off')
+      expect(media.track?.stopped).toBe(true)
+      // What the prompt taught us is kept: PLAY will not ask again.
+      expect(cachedMicPermission()).toBe('granted')
+      expect(ui.labels.at(-1)).toEqual({ text: READY_LABEL, busy: false })
+      beginEntry(ui)
+      expect(ui.entered).toBe(1)
+      expect(micState()).toBe('off')
+      expect(media.calls).toBe(1)
+    } finally {
+      restore()
+    }
+  })
+
   test('a denied mic is NOT cleared by a silent entry — the pill keeps its reason', async () => {
     installWorld()
     media.grant = false

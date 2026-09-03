@@ -34,6 +34,8 @@ export type MicPillArgs = {
   sameDevice: number
   /** A peer's stream sits on an element the browser refused to play. */
   outputBlocked: boolean
+  /** Editor viewers listening to us (they have no avatar and no presence). */
+  listeners?: number
 }
 
 const KEY = keyCap(MIC_KEY)
@@ -46,8 +48,12 @@ const KEY = keyCap(MIC_KEY)
  */
 export function micPillText(args: MicPillArgs): string | null {
   const { mic, talking, talkers, peers } = args
+  const listeners = args.listeners ?? 0
   if (args.excluded) return `OUTSIDE THE CALL (${MAX_VOICE_PEERS} MAX)`
-  if (peers <= 0 && mic === 'off') return null
+  // Alone with the mic off and nobody listening there is nothing to say. A
+  // LISTENER is somebody, though — being heard by a viewer with no avatar is
+  // exactly the state a player should never be in unknowingly.
+  if (peers <= 0 && mic === 'off' && listeners <= 0) return null
   let base: string
   switch (mic) {
     case 'asking':
@@ -74,6 +80,7 @@ export function micPillText(args: MicPillArgs): string | null {
     else if (peers > args.unreachable + args.sameDevice) parts.push('CONNECTING…')
   }
   if (talkers > 0) parts.push(`${talkers} SPEAKING`)
+  if (listeners > 0) parts.push(`${listeners} LISTENING FROM THE EDITOR`)
   if (args.unreachable > 0) parts.push(`${args.unreachable} UNREACHABLE`)
   if (args.sameDevice > 0) parts.push('SAME DEVICE — MUTED')
   if (args.outputBlocked) parts.push('SOUND BLOCKED — CLICK')
@@ -92,6 +99,100 @@ export function micPillTone(mic: MicState, talking: boolean): string {
       return '#ff6b5e'
     default:
       return 'rgba(255,255,255,0.78)'
+  }
+}
+
+// ── The listen pill (editor viewers) ─────────────────────────────────────────
+
+export type ListenPillArgs = {
+  /** A player's stream sits on an element the browser refused to play. */
+  blocked: boolean
+  /** Players whose connection to us is up. */
+  connected: number
+  /** Players talking right now. */
+  talkers: number
+  /** Players in the game (from presence). */
+  players: number
+}
+
+export const LISTEN_BLOCKED_TEXT = '🔇 SOUND BLOCKED — CLICK TO HEAR THE PLAYERS'
+
+/**
+ * PURE: what an editor viewer who is LISTENING sees, or null for nothing.
+ *
+ * The one line that matters is the blocked one: a spectator page may never have
+ * been clicked, and a browser that wants a gesture before it plays sound the
+ * page did not start refuses every play() in silence — the viewer sees people
+ * talk and hears nothing, with no idea a click would fix it. So that state is a
+ * button. Otherwise a quiet status while a link is up ("LISTENING · 2 ON
+ * VOICE · 1 SPEAKING"), and nothing at all before one is: "CONNECTING…" on a
+ * page that never asked to connect is noise.
+ */
+export function listenPillText(args: ListenPillArgs): string | null {
+  if (args.players <= 0) return null
+  if (args.blocked) return LISTEN_BLOCKED_TEXT
+  if (args.connected <= 0) return null
+  const parts = [`🔈 LISTENING · ${args.connected} ON VOICE`]
+  if (args.talkers > 0) parts.push(`${args.talkers} SPEAKING`)
+  return parts.join('  ·  ')
+}
+
+/** Only the blocked state is actionable, so only it is a button. */
+export function listenPillClickable(text: string | null): boolean {
+  return text === LISTEN_BLOCKED_TEXT
+}
+
+/**
+ * Body-level pill for the editor page (no fullscreen container exists there),
+ * under the spectator hint. Change-gated on text; click calls `onResume`, which
+ * is the gesture a refused autoplay was waiting for.
+ */
+export class ListenPill {
+  private el: HTMLButtonElement | null = null
+  private text = ''
+
+  constructor(private readonly onResume: () => void) {}
+
+  mount(): void {
+    if (this.el || typeof document === 'undefined') return
+    const el = document.createElement('button')
+    el.type = 'button'
+    el.dataset.bootsListenPill = '1'
+    el.setAttribute('aria-label', 'Voice from the game')
+    el.style.cssText =
+      'position:fixed;left:50%;top:104px;transform:translateX(-50%);z-index:9996;display:none;' +
+      `font:${FONT};letter-spacing:0.1em;white-space:nowrap;color:rgba(255,255,255,0.86);background:rgba(0,0,0,0.62);` +
+      'border:none;border-radius:999px;padding:6px 12px;cursor:default;text-shadow:0 1px 3px rgba(0,0,0,0.7);' +
+      'box-shadow:0 4px 14px rgba(0,0,0,0.3)'
+    el.onclick = () => {
+      this.onResume()
+    }
+    document.body.appendChild(el)
+    this.el = el
+  }
+
+  set(text: string | null): void {
+    const next = text ?? ''
+    const el = this.el
+    if (!el || next === this.text) return
+    this.text = next
+    el.textContent = next
+    el.style.display = next ? 'block' : 'none'
+    const clickable = listenPillClickable(text)
+    el.style.cursor = clickable ? 'pointer' : 'default'
+    el.style.color = clickable ? '#ffd7d2' : 'rgba(255,255,255,0.86)'
+    el.style.background = clickable ? 'rgba(160,30,20,0.86)' : 'rgba(0,0,0,0.62)'
+  }
+
+  /** The current text — the QA hook reads it. */
+  content(): string {
+    return this.text
+  }
+
+  unmount(): void {
+    this.el?.remove()
+    this.el = null
+    this.text = ''
   }
 }
 
@@ -119,7 +220,7 @@ export function voiceOverlayText(
 ): string {
   const lines: string[] = []
   lines.push(
-    `mic=${debug.mic} mode=${debug.mode} ice=${debug.ice.source}/${debug.ice.servers} relay=${debug.ice.relay} ` +
+    `mic=${debug.mic} mode=${debug.mode}${debug.listen ? ' LISTEN' : ''} ice=${debug.ice.source}/${debug.ice.servers} relay=${debug.ice.relay} ` +
       `excluded=${debug.excluded} sameDevice=${debug.sameDevice} blocked=${debug.outputBlocked} ticks=${debug.ticks}`,
   )
   if (debug.peers.length === 0) lines.push('(no peers)')
@@ -133,14 +234,15 @@ export function voiceOverlayText(
         `talk=${peer.talking ? 't' : 'f'} acked=${peer.acked ? 't' : 'f'} pair=${stat?.pair ?? '?'} ` +
         `rx=${stat ? (stat.bytesReceived / 1024).toFixed(1) : '?'}kB lvl=${stat ? stat.audioLevel.toFixed(2) : '?'} ` +
         `rtt=${stat?.rttMs ?? '?'} dir=${direction} rxMuted=${receiverMuted}` +
-        `${peer.sameDevice ? ' SAME-DEVICE' : ''}${peer.localRelay ? ' relay-cand' : ''} err=${peer.error ?? '-'}`,
+        `${peer.sameDevice ? ' SAME-DEVICE' : ''}${peer.localRelay ? ' relay-cand' : ''}${peer.listener ? ' LISTENER' : ''} err=${peer.error ?? '-'}`,
     )
   }
   const c = debug.counters
   lines.push(
     `offers ${c.offersSent}/${c.offersApplied} answers ${c.answersSent}/${c.answersApplied} dropped=${c.dropped} ` +
       `notSent=${c.notSent} restarts=${c.restarts} given_up=${c.given_up} reaped=${c.reaped} threw=${c.threw} ` +
-      `abandoned=${c.abandoned} tooLarge=${c.tooLarge} stalls=${c.stalls} pcFailed=${c.pcFailed}`,
+      `abandoned=${c.abandoned} tooLarge=${c.tooLarge} stalls=${c.stalls} pcFailed=${c.pcFailed}` +
+      `${c.listenersRefused > 0 ? ` listenersRefused=${c.listenersRefused}` : ''}`,
   )
   if (debug.unreachable.length > 0) lines.push(`unreachable: ${debug.unreachable.join(' ')}`)
   return lines.join('\n')

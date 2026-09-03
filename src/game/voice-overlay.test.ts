@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import type { voiceDebug, voiceInternals, VoicePeerStats } from './voice'
 import {
+  LISTEN_BLOCKED_TEXT,
+  ListenPill,
+  type ListenPillArgs,
+  listenPillClickable,
+  listenPillText,
   type MicPillArgs,
   micPillText,
   micPillTone,
@@ -78,6 +83,18 @@ describe('micPillText', () => {
   test('outside the call overrides everything', () => {
     expect(pill({ mic: 'live', peers: 7, excluded: true })).toBe(`OUTSIDE THE CALL (${MAX_VOICE_PEERS} MAX)`)
   })
+
+  test('a viewer LISTENING from the editor is named, even to a player who is alone', () => {
+    // A listener publishes no presence, so `peers` is 0 and nothing else on this
+    // pill would mention them: being heard unknowingly is the state to avoid.
+    expect(pill({ listeners: 1 })).toBe('M — TALK  ·  1 LISTENING FROM THE EDITOR')
+    expect(pill({ mic: 'live', peers: 1, connected: 1, talkers: 1, listeners: 2 })).toBe(
+      '● MIC ON  ·  1 ON VOICE  ·  1 SPEAKING  ·  2 LISTENING FROM THE EDITOR',
+    )
+    // Zero, or an older caller that does not pass the field, is the old pill.
+    expect(pill({ listeners: 0 })).toBeNull()
+    expect(pill({})).toBeNull()
+  })
 })
 
 describe('micPillTone', () => {
@@ -98,6 +115,7 @@ describe('voiceOverlayText', () => {
 
   const debug: Debug = {
     active: true,
+    listen: false,
     mode: 'squad',
     mic: 'live',
     talking: false,
@@ -122,6 +140,7 @@ describe('voiceOverlayText', () => {
         acked: true,
         sameDevice: false,
         localRelay: false,
+        listener: false,
       },
     ],
     unreachable: ['C-session'],
@@ -144,6 +163,7 @@ describe('voiceOverlayText', () => {
       reaped: 0,
       stalls: 0,
       pcFailed: 0,
+      listenersRefused: 0,
     },
     ticks: 42,
   }
@@ -206,6 +226,22 @@ describe('voiceOverlayText', () => {
   test('no peers says so', () => {
     expect(voiceOverlayText({ ...debug, peers: [], unreachable: [] }, [], []).split('\n')[1]).toBe('(no peers)')
   })
+
+  test('a listen session, a listener peer and refused listeners are all visible', () => {
+    const listening: Debug = {
+      ...debug,
+      listen: true,
+      peers: [{ ...debug.peers[0]!, listener: true }],
+      counters: { ...debug.counters, listenersRefused: 2 },
+    }
+    const lines = voiceOverlayText(listening, internals, stats).split('\n')
+    expect(lines[0]).toContain('mode=squad LISTEN')
+    expect(lines[1]).toContain('LISTENER')
+    expect(lines[2]).toContain('listenersRefused=2')
+    // Absent by default: the ordinary dump does not grow a field nobody hit.
+    expect(voiceOverlayText(debug, internals, stats)).not.toContain('listenersRefused')
+    expect(voiceOverlayText(debug, internals, stats).split('\n')[0]).not.toContain('LISTEN')
+  })
 })
 
 describe('voiceOverlayWanted', () => {
@@ -227,5 +263,56 @@ describe('VoiceOverlay without a document', () => {
       overlay.unmount()
     }).not.toThrow()
     expect(overlay.pillContent()).toBe('')
+  })
+})
+
+// ── The listen pill (editor viewers) ─────────────────────────────────────────
+
+describe('listenPillText', () => {
+  const quiet: ListenPillArgs = { blocked: false, connected: 0, talkers: 0, players: 0 }
+  const listen = (over: Partial<ListenPillArgs>) => listenPillText({ ...quiet, ...over })
+
+  test('nobody in the game: nothing at all', () => {
+    expect(listen({})).toBeNull()
+    expect(listen({ blocked: true })).toBeNull()
+    expect(listen({ connected: 1 })).toBeNull()
+  })
+
+  test('a refused autoplay is THE line, and it wins over everything', () => {
+    expect(listen({ players: 1, blocked: true })).toBe(LISTEN_BLOCKED_TEXT)
+    expect(listen({ players: 2, blocked: true, connected: 2, talkers: 1 })).toBe(LISTEN_BLOCKED_TEXT)
+    expect(LISTEN_BLOCKED_TEXT).toMatch(/CLICK/)
+  })
+
+  test('nothing before a link is up — no CONNECTING… on a page that never asked', () => {
+    expect(listen({ players: 2 })).toBeNull()
+  })
+
+  test('a live link reads LISTENING · N ON VOICE, speakers appended', () => {
+    expect(listen({ players: 2, connected: 2 })).toBe('🔈 LISTENING · 2 ON VOICE')
+    expect(listen({ players: 2, connected: 1, talkers: 1 })).toBe('🔈 LISTENING · 1 ON VOICE  ·  1 SPEAKING')
+  })
+
+  test('only the blocked line is a button', () => {
+    expect(listenPillClickable(LISTEN_BLOCKED_TEXT)).toBe(true)
+    expect(listenPillClickable('🔈 LISTENING · 2 ON VOICE')).toBe(false)
+    expect(listenPillClickable(null)).toBe(false)
+  })
+})
+
+describe('ListenPill without a document', () => {
+  test('mount, set, content and unmount are all no-ops headless', () => {
+    let resumed = 0
+    const pill = new ListenPill(() => {
+      resumed++
+    })
+    expect(() => {
+      pill.mount()
+      pill.set(LISTEN_BLOCKED_TEXT)
+      pill.set(null)
+      pill.unmount()
+    }).not.toThrow()
+    expect(pill.content()).toBe('')
+    expect(resumed).toBe(0)
   })
 })

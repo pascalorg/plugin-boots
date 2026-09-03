@@ -16,6 +16,7 @@ import {
   voiceDebug,
   voiceExcluded,
   voiceInternals,
+  voiceListenerCount,
   voiceOutputBlocked,
   type VoicePeerStats,
   voiceSameDeviceCount,
@@ -93,6 +94,7 @@ function emptyPill(): MicPillArgs {
     unreachable: 0,
     sameDevice: 0,
     outputBlocked: false,
+    listeners: 0,
   }
 }
 
@@ -106,7 +108,8 @@ function samePill(a: MicPillArgs, b: MicPillArgs): boolean {
     a.excluded === b.excluded &&
     a.unreachable === b.unreachable &&
     a.sameDevice === b.sameDevice &&
-    a.outputBlocked === b.outputBlocked
+    a.outputBlocked === b.outputBlocked &&
+    a.listeners === b.listeners
   )
 }
 
@@ -120,6 +123,7 @@ function copyPill(from: MicPillArgs, to: MicPillArgs): void {
   to.unreachable = from.unreachable
   to.sameDevice = from.sameDevice
   to.outputBlocked = from.outputBlocked
+  to.listeners = from.listeners
 }
 
 /**
@@ -170,6 +174,7 @@ export function VoiceControls() {
     a.unreachable = active ? voiceUnreachableCount() : 0
     a.sameDevice = active ? voiceSameDeviceCount() : 0
     a.outputBlocked = active && voiceOutputBlocked()
+    a.listeners = active ? voiceListenerCount() : 0
     if (!samePill(a, shown.current)) {
       copyPill(a, shown.current)
       overlayRef.current?.pill(micPillText(a), micPillTone(a.mic, a.talking))

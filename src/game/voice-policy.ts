@@ -50,6 +50,8 @@
  */
 
 /** Our frame kind on the Boots transport (net.ts). */
+import type { HittablePeer } from './pvp-damage'
+
 export const VOICE_KIND = 'boots/voice' as const
 
 /** Wire protocol for the voice payload specifically. */
@@ -104,11 +106,12 @@ export const MAX_ICE_SERVERS = 8
 /**
  * URLs kept per server. Cloudflare's generate-ice-servers answers with ONE
  * object carrying eight (stun 3478/53, turn udp 3478/53, turn tcp 3478/80,
- * turns 5349/443), so anything under 8 discards the real relay wholesale. A
- * longer list is truncated, never rejected: a server with too many addresses
- * is still a server.
+ * turns 5349/443) and a self-hosted coturn behind two hostnames can double
+ * that, so anything under 16 risks discarding a real relay wholesale. A longer
+ * list is truncated, never rejected: a server with too many addresses is still
+ * a server.
  */
-export const MAX_ICE_URLS_PER_SERVER = 10
+export const MAX_ICE_URLS_PER_SERVER = 16
 export const MAX_ICE_CREDENTIAL_CHARS = 512
 
 /** stun/turn URL shape, RFC 7064/7065: scheme:host[:port][?transport=udp|tcp]. */
@@ -132,11 +135,17 @@ function readIceUrls(value: unknown): string[] | null {
 
 const TURN_URL = /^turns?:/
 
-/** A relay needs both halves, bounded — the browser refuses a turn: URL without them. */
+/**
+ * A relay needs both halves, NON-EMPTY and bounded — the browser refuses a
+ * turn: URL without them, and an empty string is "without" as far as a TURN
+ * server's long-term credential check is concerned.
+ */
 function readIceCredentials(e: Record<string, unknown>): { username: string; credential: string } | null {
   if (
     typeof e.username === 'string' &&
     typeof e.credential === 'string' &&
+    e.username.length > 0 &&
+    e.credential.length > 0 &&
     e.username.length <= MAX_ICE_CREDENTIAL_CHARS &&
     e.credential.length <= MAX_ICE_CREDENTIAL_CHARS
   ) {
@@ -260,6 +269,15 @@ export type VoiceFrame = {
   talking?: boolean
   /** How we are mixing the room — informational, each side mixes its own. */
   mode?: VoiceMode
+  /**
+   * We are a LISTENER — an editor viewer hearing the game without being in it
+   * (voice.ts startVoiceListen). Soft, optional: a pin that predates it ignores
+   * the field and still answers our offer, because an offer from a session it
+   * has never seen is answered regardless (that is how a peer whose presence
+   * frame is late has always been handled). A pin that reads it can count its
+   * listeners against MAX_LISTENERS_PER_PLAYER and never offer back to one.
+   */
+  listen?: boolean
 }
 
 const isInt = (v: unknown, min: number, max: number): v is number =>
@@ -358,6 +376,10 @@ export function readVoiceFrame(data: unknown): VoiceFrame | null {
     if (f.mode !== undefined) {
       if (!isVoiceMode(f.mode)) return null
       out.mode = f.mode
+    }
+    if (f.listen !== undefined) {
+      if (typeof f.listen !== 'boolean') return null
+      out.listen = f.listen
     }
     return out
   } catch {
@@ -571,4 +593,106 @@ export function voicePeersFor(mySessionId: string, roster: readonly string[]): s
   const room = voiceRoom(roster)
   if (!room.includes(mySessionId)) return []
   return room.filter((id) => id !== mySessionId)
+}
+
+// ── Listeners: hearing the game without being in it ──────────────────────────
+
+/**
+ * A LISTENER is an editor viewer who has not jumped in and wants to hear the
+ * players — receive-only, no microphone, no presence of its own.
+ *
+ * WHY THE LISTENER ALWAYS OFFERS. Players learn about each other from presence,
+ * and a listener publishes none (spectating is receive-only by design: it must
+ * not put a phantom avatar in the game). So nobody in the game knows a listener
+ * exists until it speaks up, and the only message the protocol has for "I want
+ * to be in your call" is an offer. The session-id total order that assigns the
+ * offerer among PLAYERS (voiceOffererIsUs) therefore does not apply to a
+ * listener pair: the listener offers whatever its id sorts as, with a RECVONLY
+ * m-line so the answer can only ever be sendonly — a listener never offers
+ * audio, and a player never sends its mic anywhere it could be heard back from.
+ * The player side answers that offer exactly as it answers a peer whose
+ * presence frame is late (an unknown offerer has always been answered), which
+ * is what makes this work against a pin that has never heard of listeners.
+ *
+ * And a player NEVER OFFERS TO A LISTENER: it has no roster entry to want, and
+ * after a restart its idle-link repair must wait for the listener's next offer
+ * rather than send a sendrecv offer of its own into a link that must stay
+ * one-directional.
+ */
+export function voiceShouldOffer(args: {
+  mySessionId: string
+  peerSessionId: string
+  /** We are the listener (startVoiceListen). */
+  meListening: boolean
+  /** The peer is in the game roster (a player, not a listener). */
+  peerInGame: boolean
+}): boolean {
+  if (args.meListening) return args.mySessionId !== args.peerSessionId
+  if (!args.peerInGame) return false
+  return voiceOffererIsUs(args.mySessionId, args.peerSessionId)
+}
+
+/**
+ * Who a listener hears: THE ROOM the players themselves form — the same
+ * MAX_VOICE_PEERS lowest ids voiceRoom hands every player — so what a viewer
+ * hears is exactly the call that is happening, not a different subset of it. A
+ * listener is outside the roster and never counts against the room.
+ */
+export function listenTargets(inGameRoster: readonly string[]): string[] {
+  return voiceRoom(inGameRoster)
+}
+
+/**
+ * Listeners one player will carry. Each is another Opus uplink on top of the
+ * (n − 1) the mesh already costs, so a busy project with twenty people watching
+ * cannot be allowed to melt the players' connections: past the cap a player
+ * simply does not answer another listener's offer (the listener's link times
+ * out, restarts, and is given up on countably — no error anywhere, and the
+ * players' call is untouched).
+ */
+export const MAX_LISTENERS_PER_PLAYER = 4
+
+/** May a player take one more listener, holding this many already? */
+export function acceptsListener(listenerLinks: number): boolean {
+  return listenerLinks < MAX_LISTENERS_PER_PLAYER
+}
+
+// ── Where a peer IS, for the proximity mix ───────────────────────────────────
+
+/**
+ * How old a drawn position may be and still be the one voice mixes by (ms).
+ * The renderer stamps `drawnAt` every frame it draws a peer; a stamp older than
+ * this means the avatar is not being drawn (culled, tab hidden, the viewer is
+ * not rendering), and the newest snapshot is the honest fallback.
+ *
+ * THE SAME RULE AS PVP HIT-REG — pvp-damage.ts's DRAWN_FRESH_MS answers the same
+ * question ("is the drawn body the picture anyone is looking at") for a shot,
+ * and the two must not disagree on which body is real. This module is the pure
+ * half and imports no runtime (pvp-damage pulls in three and the player), so
+ * the value is spelled here and PINNED EQUAL by voice-policy.test.ts; the body
+ * type is that module's, structurally.
+ */
+export const DRAWN_FRESH_MS = 250
+
+/** The drawn body voice mixes by: the drawn fields of a HittablePeer. `drawnAt` 0 = never drawn. */
+export type DrawnBody = Pick<HittablePeer, 'drawnX' | 'drawnY' | 'drawnZ' | 'drawnAt'>
+
+/**
+ * THE POSITION VOICE MIXES BY IS THE ONE THE PLAYER SEES. Interpolation and
+ * smoothing draw a peer up to a couple of hundred milliseconds behind the newest
+ * snapshot, and a proximity gain computed off the snapshot while the eye is on
+ * the drawn body makes a voice fade before its owner has visibly walked away.
+ * So: the drawn body when it is fresh, the newest snapshot otherwise, null when
+ * there is neither. Pure so the rule is one tested line, not a comment.
+ */
+export function pickPeerPosition(
+  body: DrawnBody,
+  snapshot: { x: number; y: number; z: number } | null,
+  now: number,
+): readonly [number, number, number] | null {
+  if (body.drawnAt > 0 && now - body.drawnAt < DRAWN_FRESH_MS) {
+    return [body.drawnX, body.drawnY, body.drawnZ]
+  }
+  if (!snapshot) return null
+  return [snapshot.x, snapshot.y, snapshot.z]
 }
