@@ -1,13 +1,31 @@
 import { describe, expect, test } from 'bun:test'
-import { Bone, Group, Matrix4, Object3D, Quaternion, Vector3 } from 'three'
 import {
+  Bone,
+  BufferGeometry,
+  Group,
+  Matrix4,
+  MeshStandardMaterial,
+  Object3D,
+  Quaternion,
+  Skeleton,
+  SkinnedMesh,
+  Texture,
+  Vector3,
+} from 'three'
+import {
+  adoptFaceOpenTexture,
   armHangZ,
   DEFAULT_DIMS,
   decodeBase64,
+  faceOpenReady,
   insertPivot,
   instantiatePascaline,
   JOINT_NAMES,
+  MOUTH_FLAP_MS,
+  mouthOpenAt,
   PIVOT_NAMES,
+  resetFaceOpenTexture,
+  setMouth,
 } from './pascaline-model'
 
 /**
@@ -287,5 +305,97 @@ describe('instantiatePascaline — joints', () => {
     body.root.updateMatrixWorld(true)
     const a2 = new Vector3().setFromMatrixPosition(shinProbe.matrixWorld)
     expect(a2.z).toBeGreaterThan(b2.z) // the foot goes back
+  })
+})
+
+/** The full skeleton plus a skinned face plate (material `face`) and a body
+ * mesh (material `model`), bound the way the GLB binds them. */
+function skinnedTemplate() {
+  const t = fullSkeleton()
+  const bones: Bone[] = []
+  t.scene.traverse((o) => {
+    if ((o as Bone).isBone) bones.push(o as Bone)
+  })
+  const skeleton = new Skeleton(bones)
+  const mk = (name: string) => {
+    const mesh = new SkinnedMesh(new BufferGeometry(), new MeshStandardMaterial({ name }))
+    mesh.name = `${name}-mesh`
+    mesh.bind(skeleton)
+    return mesh
+  }
+  const holder = new Group()
+  holder.name = 'Pascaline'
+  holder.add(mk('model'), mk('face'))
+  t.scene.add(holder)
+  return t
+}
+
+describe('the talking mouth', () => {
+  test('mouthOpenAt: a 125 ms square wave on the wall clock while talking, closed otherwise', () => {
+    expect(mouthOpenAt(false, 0)).toBe(false)
+    expect(mouthOpenAt(false, MOUTH_FLAP_MS)).toBe(false)
+    expect(mouthOpenAt(true, 0)).toBe(false)
+    expect(mouthOpenAt(true, MOUTH_FLAP_MS)).toBe(true)
+    expect(mouthOpenAt(true, 2 * MOUTH_FLAP_MS)).toBe(false)
+    expect(mouthOpenAt(true, 3 * MOUTH_FLAP_MS - 1)).toBe(false)
+    expect(mouthOpenAt(true, 3 * MOUTH_FLAP_MS)).toBe(true)
+    // Four open phases a second.
+    let opens = 0
+    for (let ms = 0; ms < 1000; ms++) if (mouthOpenAt(true, ms) && !mouthOpenAt(true, ms - 1)) opens++
+    expect(opens).toBe(4)
+  })
+
+  test('instantiatePascaline finds the face plate and gives it a hidden open-mouth twin on the same skeleton', () => {
+    resetFaceOpenTexture()
+    const body = instantiatePascaline(skinnedTemplate())
+    expect(body.face).not.toBeNull()
+    const face = body.face!
+    expect((face.closed.material as MeshStandardMaterial).name).toBe('face')
+    expect(face.open.name).toBe('face-open')
+    expect(face.open.visible).toBe(false)
+    expect(face.closed.visible).toBe(true)
+    expect(face.isOpen).toBe(false)
+    expect(face.open.parent).toBe(face.closed.parent)
+    expect(face.open.skeleton).toBe(face.closed.skeleton)
+    expect(face.open.geometry).toBe(face.closed.geometry)
+    expect(face.open.material).not.toBe(face.closed.material)
+    expect(face.open.frustumCulled).toBe(false)
+    // The open material is ONE, shared by every body on the lot.
+    const other = instantiatePascaline(skinnedTemplate())
+    expect(other.face!.open.material).toBe(face.open.material)
+    // A body without a plate has no face.
+    expect(instantiatePascaline(fullSkeleton()).face).toBeNull()
+  })
+
+  test('setMouth: closed until the open plate has decoded, then a change-gated visible swap', () => {
+    resetFaceOpenTexture()
+    const face = instantiatePascaline(skinnedTemplate()).face!
+    expect(faceOpenReady()).toBe(false)
+    // No texture yet: an open request is honoured as closed, and reports no change.
+    expect(setMouth(face, true)).toBe(false)
+    expect(face.isOpen).toBe(false)
+    expect(face.open.visible).toBe(false)
+    // The plate lands: the shared material wears it, with the closed plate's sampler.
+    const closedMap = new Texture()
+    closedMap.anisotropy = 8
+    closedMap.flipY = false
+    ;(face.closed.material as MeshStandardMaterial).map = closedMap
+    ;(face.open.material as MeshStandardMaterial).map = closedMap
+    const openMap = new Texture()
+    adoptFaceOpenTexture(openMap)
+    expect(faceOpenReady()).toBe(true)
+    expect((face.open.material as MeshStandardMaterial).map).toBe(openMap)
+    expect(openMap.anisotropy).toBe(8)
+    expect(openMap.flipY).toBe(false)
+    expect(setMouth(face, true)).toBe(true)
+    expect(face.isOpen).toBe(true)
+    expect(face.open.visible).toBe(true)
+    expect(face.closed.visible).toBe(false)
+    expect(setMouth(face, true)).toBe(false) // gated
+    expect(setMouth(face, false)).toBe(true)
+    expect(face.open.visible).toBe(false)
+    expect(face.closed.visible).toBe(true)
+    expect(setMouth(face, false)).toBe(false)
+    resetFaceOpenTexture()
   })
 })

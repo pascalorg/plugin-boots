@@ -14,21 +14,44 @@ import {
   MeshBasicMaterial,
   MeshStandardMaterial,
   Quaternion,
+  RingGeometry,
   SphereGeometry,
   TorusGeometry,
 } from 'three'
-import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js'
 import { type RemoteShotKind, sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
+import {
+  type LodCamera,
+  noopRaycast,
+  ringGeometry,
+  ringMaterialFor,
+  ringVisible,
+  SPECTATOR_RING_RENDER_ORDER,
+  spectatorTagOpacity,
+  tagDepthTest,
+  tagFontPx,
+  tagLiftY,
+  tagRenderOrder,
+  tagScale,
+  worldPerPixel,
+} from './far-lod'
+import { clampFrameDt } from './feel'
+import { gripQuaternion, gripToShoulder, holdFor, leftGripFor } from './hand-grips'
+import { AVATAR_SKIN_HEX } from './hand-pose'
+import { HandMesh } from './hand-rig'
 import { MOVE } from './movement'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
 import {
   DEFAULT_DIMS,
+  faceOpenStatus,
   GRIP_IN_HAND,
   instantiatePascaline,
+  mouthOpenAt,
   type PascalineDims,
+  type PascalineFace,
   type PascalineTemplate,
+  setMouth,
   usePascalineTemplate,
 } from './pascaline-model'
 import {
@@ -51,6 +74,7 @@ import {
   wrapAngle,
 } from './presence'
 import { footPlants, remoteFootstep } from './remote-footsteps'
+import { remoteLabel, sameNames } from './roster-names'
 import { getSession } from './session'
 import { isPeerTalking } from './voice'
 import {
@@ -125,8 +149,18 @@ import {
  * the wire and the root: a per-peer adaptive interpolation delay and a residual
  * smoother (presence-interp.ts), so late frames glide instead of popping.
  *
- * Zero per-frame allocations: one module-level SampledPose + quaternions
- * are reused across every avatar; geometries/materials are module caches.
+ * THEY ARE SEEN AND HEARD (2026-09-02 avatar pass): a spectator in the editor
+ * gets the far-LOD tag (far-lod.ts) — constant ~36 px, lifted, drawn through
+ * walls over a floor ring — while the in-game tag stays depth-tested and
+ * unscaled; a talking peer wears a green halo around the tag and the dot above
+ * it, and the face plate flaps between its closed and open-mouth paints
+ * (pascaline-model.ts setMouth); the fists are the first-person hands
+ * (hand-rig.tsx) on the grip table's points (hand-grips.ts), the support arm
+ * solved to exactly the table's point; the roster chip carries names.
+ *
+ * Zero per-frame allocations: one module-level SampledPose + quaternions +
+ * two arm solutions are reused across every avatar; geometries/materials are
+ * module caches.
  */
 
 // ── Palette (pure, tested) ───────────────────────────────────────────────────
@@ -377,16 +411,28 @@ export function limbDir(theta: number, yaw: number): [number, number, number] {
   return [-st * Math.sin(yaw), -Math.cos(theta), -st * Math.cos(yaw)]
 }
 
+/** A blank solution to solve into (solveArm's optional `out`). */
+export function createArmSolution(): ArmSolution {
+  return { swing: 0, yaw: 0, elbow: 0, hand: [0, 0, 0] }
+}
+
 /**
  * Two-bone IK for one arm: the shoulder swing, yaw and elbow flexion that put
  * the grip at `target` (relative to that shoulder, three axes: x right, y up,
  * −z forward). Unreachable targets get a straight arm pointed at them. The
- * elbow always bends the human way: forward/up, never back.
+ * elbow always bends the human way: forward/up, never back. Writes into `out`
+ * when given (the frame loop's scratch — no allocation), a fresh object otherwise.
  */
-export function solveArm(target: readonly [number, number, number], arms: ArmDims = MODEL_ARMS): ArmSolution {
+export function solveArm(
+  target: readonly [number, number, number],
+  arms: ArmDims = MODEL_ARMS,
+  out: ArmSolution = createArmSolution(),
+): ArmSolution {
   const a = arms.upperArmLen
   const c = arms.reach
-  const [vx, vy, vz] = target
+  const vx = target[0]
+  const vy = target[1]
+  const vz = target[2]
   const h = Math.hypot(vx, vz)
   const yaw = h > 1e-6 ? Math.atan2(-vx, -vz) : 0
   const t = Math.atan2(h, -vy) // from straight down toward the target
@@ -395,24 +441,44 @@ export function solveArm(target: readonly [number, number, number], arms: ArmDim
   const elbow = Math.PI - Math.acos(cosElbowOuter)
   const alpha = Math.acos(clamp((a * a + D * D - c * c) / (2 * a * D), -1, 1))
   const swing = t - alpha
-  const du = limbDir(swing, yaw)
-  const df = limbDir(swing + elbow, yaw)
-  const hand: [number, number, number] = [
-    a * du[0] + c * df[0],
-    a * du[1] + c * df[1],
-    a * du[2] + c * df[2],
-  ]
-  return { swing, yaw, elbow, hand }
+  // limbDir, inlined twice: the frame loop solves two arms per avatar per frame.
+  const su = Math.sin(swing)
+  const sf = Math.sin(swing + elbow)
+  const sy = Math.sin(yaw)
+  const cy = Math.cos(yaw)
+  out.swing = swing
+  out.yaw = yaw
+  out.elbow = elbow
+  out.hand[0] = a * (-su * sy) + c * (-sf * sy)
+  out.hand[1] = a * -Math.cos(swing) + c * -Math.cos(swing + elbow)
+  out.hand[2] = a * (-su * cy) + c * (-sf * cy)
+  return out
 }
 
 /** A grip's hand point (inward, up, forward at zero pitch) as a right-shoulder-
- * relative three vector, the whole hold pivoted about the shoulder by `pitch`. */
-function rightHandTarget(hand: readonly [number, number, number], pitch: number): [number, number, number] {
-  const [inward, up, fwd] = hand
+ * relative three vector, the whole hold pivoted about the shoulder by `pitch`.
+ * Writes into `out` (module scratch in the frame loop). */
+function rightHandTarget(
+  hand: readonly [number, number, number],
+  pitch: number,
+  out: [number, number, number],
+): [number, number, number] {
+  const inward = hand[0]
+  const up = hand[1]
+  const fwd = hand[2]
   const c = Math.cos(pitch)
   const s = Math.sin(pitch)
-  return [-inward, fwd * s + up * c, -(fwd * c - up * s)]
+  out[0] = -inward
+  out[1] = fwd * s + up * c
+  out[2] = -(fwd * c - up * s)
+  return out
 }
+
+/** Frame-loop scratch for the two arm solutions and their targets. */
+const _rightTarget: [number, number, number] = [0, 0, 0]
+const _leftTarget: [number, number, number] = [0, 0, 0]
+const _rightSol = createArmSolution()
+const _leftSol = createArmSolution()
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v
@@ -539,6 +605,11 @@ export function advanceGait(phase: number, s: number, dt: number): number {
  *   body (GRIPS) solved by two-bone IK for both arms, and the weapon is tilted
  *   in the hand so its BARREL points where the peer looks
  * - head tracks the remote pitch (clamped); `t` (s) drives the idle breath
+ * - `leftGrip`, when given, is the support hand's palm in the HELD-WEAPON
+ *   frame (hand-grips' leftGripFor — the one grip table the first-person hands
+ *   use), and the left arm is solved to EXACTLY that point through the right
+ *   arm's chain (gripToShoulder); without it the legacy foregrip-along-the-
+ *   barrel approximation (GRIPS.foregrip) stands
  */
 export function articulate(
   out: AvatarArticulation,
@@ -552,6 +623,7 @@ export function articulate(
   arms: ArmDims = MODEL_ARMS,
   seed = 0,
   moveRel = 0,
+  leftGrip: readonly [number, number, number] | null = null,
 ): AvatarArticulation {
   const clampedPitch = clamp(pitch, -PITCH_CLAMP, PITCH_CLAMP)
   // How much of the idle layer applies: all of it standing, none at a jog.
@@ -640,7 +712,7 @@ export function articulate(
     return out
   }
   const g = GRIPS[grip]
-  const right = solveArm(rightHandTarget(g.hand, clampedPitch), arms)
+  const right = solveArm(rightHandTarget(g.hand, clampedPitch, _rightTarget), arms, _rightSol)
   out.armAim = right.swing
   out.armRYaw = right.yaw
   out.elbowR = right.elbow
@@ -648,16 +720,20 @@ export function articulate(
   const barrel = g.barrelFromDown + clampedPitch
   out.weaponTilt = barrel - (right.swing + right.elbow)
   if (g.foregrip > 0) {
-    // The left hand takes the foregrip: that far from the right hand along the
-    // barrel (which carries the right arm's yaw), a touch to the left of it.
-    const bd = limbDir(barrel, right.yaw)
-    const [hx, hy, hz] = right.hand
-    const leftTarget: [number, number, number] = [
-      hx + 2 * arms.shoulderX + g.foregrip * bd[0] - 0.03,
-      hy + g.foregrip * bd[1],
-      hz + g.foregrip * bd[2],
-    ]
-    const left = solveArm(leftTarget, arms)
+    if (leftGrip) {
+      // The support hand is EXACTLY where the grip table puts it on the gun:
+      // that point, carried through the right arm's chain and the weapon's
+      // tilt, into the left shoulder's frame.
+      gripToShoulder(leftGrip, right, barrel, arms.shoulderX, _leftTarget)
+    } else {
+      // Legacy: that far from the right hand along the barrel (which carries
+      // the right arm's yaw), a touch to the left of it.
+      const bd = limbDir(barrel, right.yaw)
+      _leftTarget[0] = right.hand[0] + 2 * arms.shoulderX + g.foregrip * bd[0] - 0.03
+      _leftTarget[1] = right.hand[1] + g.foregrip * bd[1]
+      _leftTarget[2] = right.hand[2] + g.foregrip * bd[2]
+    }
+    const left = solveArm(_leftTarget, arms, _leftSol)
     out.armSwing = left.swing
     out.armLYaw = left.yaw
     out.elbowL = left.elbow
@@ -1122,6 +1198,10 @@ export function avatarDebug(): Record<string, AvatarStats> {
 }
 
 registerPresenceDebugSource('avatars', avatarDebug)
+// The talking mouth's loader state (pascaline-model.ts) rides the same dump —
+// `__boots.presence().extra.face` — so a QA can tell "never opened" from
+// "plate never decoded".
+registerPresenceDebugSource('face', faceOpenStatus)
 
 // ── Join scale-in + name-tag gate (pure, tested) ─────────────────────────────
 
@@ -1258,7 +1338,9 @@ const HAT_MARK_MATERIAL = new MeshStandardMaterial({ color: '#1a1a1c', roughness
 const JACKET_MATERIAL = new MeshStandardMaterial({ color: '#22242a', roughness: 0.7 })
 const PANTS_MATERIAL = new MeshStandardMaterial({ color: '#2f3238', roughness: 0.85 })
 const HAIR_MATERIAL = new MeshStandardMaterial({ color: '#3b2419', roughness: 0.8 })
-const SKIN_MATERIAL = new MeshStandardMaterial({ color: '#e8b48f', roughness: 0.65 })
+/** The mascot's skin tone (hand-pose.ts: the GLB's hand/forearm texels), so the
+ * box rig's head and the procedural hands meet the modelled wrist without a step. */
+const SKIN_MATERIAL = new MeshStandardMaterial({ color: AVATAR_SKIN_HEX, roughness: 0.65 })
 const EYE_MATERIAL = new MeshStandardMaterial({ color: '#241a14', roughness: 0.4 })
 const LEATHER_MATERIAL = new MeshStandardMaterial({ color: '#8a5a33', roughness: 0.8 })
 const TAPE_MATERIAL = new MeshStandardMaterial({ color: '#e8c229', roughness: 0.5 })
@@ -1284,6 +1366,23 @@ const SPEAK_MATERIAL = new MeshBasicMaterial({
   depthWrite: false,
   transparent: true,
 })
+/** The same green with depth off — the spectator's X-ray tag carries its
+ * speaking cues through walls too (one material per mode; both shared). */
+const SPEAK_MATERIAL_XRAY = new MeshBasicMaterial({
+  color: '#7ee081',
+  depthTest: false,
+  depthWrite: false,
+  transparent: true,
+})
+/**
+ * The speaking HALO — a ring stretched around the whole name tag (0.72 × 0.18
+ * m), lit while the peer transmits. The dot above the name is a 9 cm cue; the
+ * halo is the one you see from across the lot, and it scales with the tag for
+ * a spectator. Non-uniform X scale on a plain ring: the sides come out a little
+ * thicker than the top and bottom, which reads as a brush stroke, not a bug.
+ */
+const SPEAK_RING_GEO = new RingGeometry(0.16, 0.19, 32)
+export const SPEAK_SCALE_X = 2.4
 /** Tan work boots, dark sole — the pack's are caramel leather, well worn. */
 const BOOT_MATERIAL = new MeshStandardMaterial({ color: '#9c6b3f', roughness: 0.85 })
 const SOLE_MATERIAL = new MeshStandardMaterial({ color: '#26221e', roughness: 0.95 })
@@ -1354,27 +1453,35 @@ export function materialsFor(paletteIndex: number): {
 
 // ── Name-tag texture (TableSign idiom — external texture, disposed) ─────────
 
+/** 512 × 128: crisp at the 1× in-game size AND when a spectator's constant-
+ * pixel tag is scaled up to 12× (far-lod.ts) — the texture is what gets read. */
 function makeNameTexture(name: string, tint: string): CanvasTexture | null {
   if (typeof document === 'undefined') return null
   const canvas = document.createElement('canvas')
-  canvas.width = 256
-  canvas.height = 64
+  canvas.width = 512
+  canvas.height = 128
   const g = canvas.getContext('2d')
   if (!g) return null
   g.fillStyle = 'rgba(12,14,16,0.72)'
   g.beginPath()
-  g.roundRect(4, 8, 248, 48, 12)
+  g.roundRect(8, 16, 496, 96, 24)
   g.fill()
   // The vest color, again, around the name: the tag is where a player LEARNS
   // which color is which, so it has to carry both halves of the pairing.
   g.strokeStyle = tint
-  g.lineWidth = 4
+  g.lineWidth = 8
   g.stroke()
   g.fillStyle = 'rgba(255,255,255,0.92)'
-  g.font = 'bold 28px system-ui, sans-serif'
+  const label = name.slice(0, 16)
+  // Shrink-to-fit: a long nickname gets a smaller face, never a clipped one.
+  const px = tagFontPx((size) => {
+    g.font = `bold ${size}px system-ui, sans-serif`
+    return g.measureText(label).width
+  }, 470)
+  g.font = `bold ${px}px system-ui, sans-serif`
   g.textAlign = 'center'
   g.textBaseline = 'middle'
-  g.fillText(name.slice(0, 16), 128, 33)
+  g.fillText(label, 256, 66)
   return new CanvasTexture(canvas)
 }
 
@@ -1393,13 +1500,30 @@ const WEAPON_COMPONENT: Record<string, () => ReactElement> = {
 }
 
 /** Feature-detected HUD surface (structural — same defensive idiom as the
- * pinned-typings casts elsewhere: an older Hud without the chip is a no-op). */
-type PresenceHud = { presenceChip?: (count: number) => void }
+ * pinned-typings casts elsewhere: an older Hud without the chip is a no-op;
+ * one that only knows the count ignores the names). */
+type PresenceHud = { presenceChip?: (count: number, names?: readonly string[]) => void }
 
-function driveChip(count: number): void {
+function driveChip(count: number, names?: readonly string[]): void {
   const hud = getSession()?.hud as unknown as PresenceHud | undefined
-  hud?.presenceChip?.(count)
+  hud?.presenceChip?.(count, names)
 }
+
+/**
+ * The roster chip's names: every listed remote's label (nick, else the host
+ * roster's name, else 'builder' — roster-names' one rule), sorted so the chip
+ * reads the same on every screen. Allocates: roster edges and slow polls only.
+ */
+export function rosterNames(list: readonly Pick<RemotePlayer, 'nick' | 'userId'>[]): string[] {
+  const names: string[] = []
+  for (const remote of list) names.push(remoteLabel(remote))
+  names.sort()
+  return names
+}
+
+/** How often (frames) RemotePlayers re-reads the names for the chip between
+ * roster edges: a nick that resolves late must reach the chip too. */
+const CHIP_NAME_POLL_FRAMES = 120
 
 // ── Reused frame temps (zero per-frame allocations) ──────────────────────────
 
@@ -1438,13 +1562,17 @@ export type AvatarRigRefs = {
   kneeR?: { current: Group | null }
   /** The held weapon's group (HeldWeapon) — tilted per frame so the barrel tracks the aim. */
   weapon?: { current: Group | null }
-  /** Hand bones (collapse while gripping) and the fists that replace them. */
+  /** Hand bones (collapse while gripping) and the procedural hands that replace
+   * them on the weapon (HeldWeapon: `fistR` is the right hand on the grip,
+   * `fistL` the support hand — shown while that hand grips). */
   handL?: { current: Group | null }
   handR?: { current: Group | null }
   fistL?: { current: Group | null }
   fistR?: { current: Group | null }
   fx?: { current: Group | null }
   flash?: { current: Group | null }
+  /** The face plate's two mouths (the model only) — setMouth flips them. */
+  face?: { current: PascalineFace | null }
 }
 
 /** A fresh set of empty handles — for callers that are not React components
@@ -1468,6 +1596,7 @@ export function createRigRefs(): AvatarRigRefs {
     handR: { current: null },
     fistL: { current: null },
     fistR: { current: null },
+    face: { current: null },
   }
 }
 
@@ -1565,6 +1694,14 @@ function PrimitiveRig({
   )
 }
 
+/** Does this hold put the support hand ON the weapon (articulate's gripL)? The
+ * grip decides, not the table: a warhammer has a second hand in the table, but
+ * the avatar carries tools one-handed at the hip (GRIPS.tool.foregrip = 0). */
+export function twoHanded(weapon: string): boolean {
+  const grip = gripFor(weapon)
+  return grip !== 'none' && GRIPS[grip].foregrip > 0 && leftGripFor(weapon) !== null
+}
+
 /**
  * The held weapon, in THE ARM FRAME: hanging −y from the shoulder, barrel down
  * the arm (weapon-models contract: grip at the origin, barrel down −Z), muzzle
@@ -1572,6 +1709,18 @@ function PrimitiveRig({
  * it straight under its arm pivot, the model under its arm frame (see
  * pascaline-model.ts), and the two agree on where a rifle is in space.
  * `reach` is shoulder → grip: the box rig's 0.52, the model's arm plus a hand.
+ *
+ * THE HANDS ARE THE FIRST-PERSON HANDS (hand-rig.tsx / hand-grips.ts): the
+ * same merged one-draw-call hand per pose and side, at the same table point
+ * and orientation on the same weapon model, so what a teammate sees on your
+ * rifle is what you see on yours. The right PALM sits at the group's origin —
+ * the reach point the arm IK solves for — and the weapon is pulled back behind
+ * it by the table's right-hand offset, so the gun rides the hand rather than
+ * the hand floating beside the gun; the support hand is rigid to the weapon at
+ * its table point and the left arm is solved to exactly there (articulate's
+ * `leftGrip`). Both hands ride the weapon group, so they take the aim tilt and
+ * the recoil kick for free. Trigger articulation stays first-person only: at
+ * 90 px a finger is a pixel, and one draw call per hand is the budget.
  */
 function HeldWeapon({
   reach = 0.52,
@@ -1584,10 +1733,18 @@ function HeldWeapon({
 }) {
   const Weapon = WEAPON_COMPONENT[weapon]
   const muzzle = refs.fx ? remoteMuzzle(weapon) : null
+  const hold = holdFor(weapon)
+  const support = twoHanded(weapon) ? hold.left : null
+  // Orientation of each hand in weapon space — a weapon-swap event, not a frame.
+  const qR = useMemo(() => gripQuaternion(hold.right, 'R', new Quaternion()), [hold])
+  const qL = useMemo(() => (support ? gripQuaternion(support, 'L', new Quaternion()) : null), [support])
   if (!Weapon) return null
+  const r = hold.right.position
   return (
     <group position={[0, -reach, 0.02]} ref={refs.weapon} rotation={[-Math.PI / 2, 0, 0]}>
-      <Weapon />
+      {/* Palm at the origin: the weapon sits behind the right hand's table offset. */}
+      <group position={[-r[0], -r[1], -r[2]]}>
+        <Weapon />
         {/* Muzzle fx, parented to the gun: the flash points wherever the
             peer aims for free, through the arm chain, with no per-frame
             math of ours. Mounted once and toggled, like the speaking dot,
@@ -1613,6 +1770,24 @@ function HeldWeapon({
             />
           </group>
         ) : null}
+        {/* The right hand on the grip (shown while gripping — always, with a
+            weapon in hand; applyArticulation owns the boolean). */}
+        <group position={[r[0], r[1], r[2]]} quaternion={qR} ref={refs.fistR}>
+          <HandMesh pose={hold.right.pose} side="R" />
+        </group>
+        {/* The support hand at its table point, hidden until the left arm
+            has reached across (gripL > 0.5). */}
+        {support && qL ? (
+          <group
+            position={[support.position[0], support.position[1], support.position[2]]}
+            quaternion={qL}
+            ref={refs.fistL}
+            visible={false}
+          >
+            <HandMesh pose={support.pose} side="L" />
+          </group>
+        ) : null}
+      </group>
     </group>
   )
 }
@@ -1620,8 +1795,6 @@ function HeldWeapon({
 // ── Tint bands for the model (shared geometry per body measurement) ──────────
 
 const bandGeometries = new Map<string, { hat: TorusGeometry; sleeve: CylinderGeometry }>()
-/** A fist: what a hand looks like closed on a grip. Shared by every body. */
-const FIST_GEO = new RoundedBoxGeometry(0.08, 0.075, 0.09, 3, 0.022)
 
 /** The hat band ring and the sleeve band, sized to the body they wrap. */
 function bandGeometriesFor(dims: PascalineDims) {
@@ -1675,6 +1848,7 @@ function PascalineRig({
     if (refs.kneeR) refs.kneeR.current = body.joints.kneeR
     if (refs.handL) refs.handL.current = body.hands.L as Group | null
     if (refs.handR) refs.handR.current = body.hands.R as Group | null
+    if (refs.face) refs.face.current = body.face
   })
   const d = body.dims
   return (
@@ -1701,22 +1875,9 @@ function PascalineRig({
       {/* Sleeve bands, a little below each shoulder, in the arm frame (hanging −y). */}
       {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.L)}
       {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.R)}
-      {/* Fists, at each grip point in the hand frames: shown while that hand
-          holds something (applyArticulation collapses the skinned hand and
-          shows this). An open hand modelled around a grip never closes; a
-          fist that replaces it does. */}
-      {createPortal(
-        <group position={[0, -(d.foreArmLen + d.handLen * GRIP_IN_HAND) + 0.015, 0.01]} ref={refs.fistL} visible={false}>
-          <mesh geometry={FIST_GEO} material={SKIN_MATERIAL} />
-        </group>,
-        body.handFrames.L,
-      )}
-      {createPortal(
-        <group position={[0, -(d.foreArmLen + d.handLen * GRIP_IN_HAND) + 0.015, 0.01]} ref={refs.fistR} visible={false}>
-          <mesh geometry={FIST_GEO} material={SKIN_MATERIAL} />
-        </group>,
-        body.handFrames.R,
-      )}
+      {/* The gripping hands live on the weapon (HeldWeapon): applyArticulation
+          collapses the skinned hand that holds something and shows the
+          procedural one on the grip in its place. */}
     </>
   )
 }
@@ -1738,7 +1899,22 @@ export function AvatarRig(props: { paletteIndex: number; refs: AvatarRigRefs; we
   return <PascalineRig template={template} {...props} />
 }
 
-function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: RemotePlayer }) {
+/**
+ * One peer. `spectator` (constant for the component's life) switches the name
+ * tag to the far-LOD path (far-lod.ts): a constant-pixel tag lifted so it never
+ * covers the body, drawn through walls and last, over a floor ring once the
+ * body itself has stopped reading as a person. The IN-GAME path is untouched —
+ * a depth-tested, unscaled tag fading at 24–40 m is PvP fairness.
+ */
+function RemoteAvatar({
+  paletteIndex,
+  remote,
+  spectator = false,
+}: {
+  paletteIndex: number
+  remote: RemotePlayer
+  spectator?: boolean
+}) {
   const rootRef = useRef<Group>(null)
   const torsoRef = useRef<Group>(null)
   const headRef = useRef<Group>(null)
@@ -1762,6 +1938,11 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   const tagRef = useRef<Group>(null)
   const tagMatRef = useRef<MeshBasicMaterial>(null)
   const speakRef = useRef<Mesh>(null)
+  const speakRingRef = useRef<Mesh>(null)
+  // Spectator far LOD: the floor ring and the last tag scale written.
+  const ringRef = useRef<Mesh>(null)
+  const lastTagScale = useRef(1)
+  const faceRef = useRef<PascalineFace | null>(null)
   // The two LOD groups (head detail lives under the head pivot, body detail
   // under the torso pivot, so the gate needs a handle on each).
   const headDetailRef = useRef<Group>(null)
@@ -1798,6 +1979,7 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     fistR: fistRRef,
     fx: fxRef,
     flash: flashRef,
+    face: faceRef,
   }).current
   const flashT = useRef(0)
   const lastShots = useRef(-1)
@@ -1850,8 +2032,9 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     const now = Date.now()
     const offset = Number.isFinite(remote.clockOffset) ? remote.clockOffset : 0
 
-    // Capped dt like every game loop here (a hitch never teleports a limb).
-    const dt = Math.min(rawDt, 1 / 30)
+    // The one frame delta every integrator here uses (feel.ts): capped so a
+    // hitch never teleports a limb, and a rewound clock's negative dt is 0.
+    const dt = clampFrameDt(rawDt)
 
     // The interpolation delay this peer has earned from its measured arrival
     // timing, slewed so it never steps; then the sample at that point in the
@@ -1898,6 +2081,7 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       MODEL_ARMS,
       idleSeed,
       m.moveRel,
+      leftGripFor(_pose.w),
     )
     blendArticulation(pose.current, _artic, dt)
     layerMotion(_layered, pose.current, m, _pose.yaw)
@@ -1984,12 +2168,28 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       if (bodyDetailRef.current) bodyDetailRef.current.visible = detail
     }
 
+    // Voice: one map lookup (isPeerTalking, not talkingPeers() — that one
+    // allocates an array per call, and a dozen avatars asking it every frame is
+    // hundreds of throwaway arrays a second for one boolean each). `now` is
+    // passed explicitly so a peer whose last voice frame stopped arriving goes
+    // quiet on WALL time; the voice module's own clock only advances while its
+    // tick is running.
+    const talking = isPeerTalking(remote.sessionId, now)
+
+    // The talking mouth: the face plate flaps between its two paints on the
+    // wall clock while the peer transmits (setMouth is change-gated — two
+    // boolean writes per flip, nothing otherwise). Sub-pixel past the detail
+    // range, so it stays closed there.
+    const face = faceRef.current
+    if (face) setMouth(face, detail && mouthOpenAt(talking, now))
+
     // Name tag: distance fade + billboard (parent-compensated camera copy).
     const tag = tagRef.current
     if (tag) {
-      const opacity = tagOpacity(distSq)
+      const opacity = spectator ? spectatorTagOpacity(distSq) : tagOpacity(distSq)
       const visible = opacity > 0
       if (tag.visible !== visible) tag.visible = visible
+      const ring = ringRef.current
       if (visible) {
         // Change-gated (per-avatar JSX-owned material — never shared).
         const material = tagMatRef.current
@@ -1998,17 +2198,33 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
         }
         root.getWorldQuaternion(_worldQuat).invert()
         tag.quaternion.copy(_worldQuat.multiply(camera.quaternion))
-        // Speaking dot: one map lookup (isPeerTalking, not talkingPeers() —
-        // that one allocates an array per call, and a dozen avatars asking it
-        // every frame is hundreds of throwaway arrays a second for one boolean
-        // each). `now` is passed explicitly so a peer whose last voice frame
-        // stopped arriving goes quiet on WALL time; the voice module's own clock
-        // only advances while its tick is running.
-        const speak = speakRef.current
-        if (speak) {
-          const talking = isPeerTalking(remote.sessionId, now)
-          if (speak.visible !== talking) speak.visible = talking
+        if (spectator) {
+          // FAR LOD (far-lod.ts): the tag reads ~36 px tall from wherever the
+          // editor camera is — perspective or plan view — lifted with its
+          // scale so it grows upward off the body, over a floor ring once the
+          // avatar is a speck. One sqrt per avatar per frame; writes only when
+          // the scale moved by more than 2 %.
+          const s = tagScale(
+            worldPerPixel(camera as unknown as LodCamera, Math.sqrt(distSq), rootState.size.height),
+          )
+          if (Math.abs(s - lastTagScale.current) > 0.02) {
+            lastTagScale.current = s
+            tag.scale.setScalar(s)
+            tag.position.y = tagLiftY(s)
+            if (ring) ring.scale.set(s, s, 1)
+          }
+          if (ring) {
+            const ringOn = ringVisible(s)
+            if (ring.visible !== ringOn) ring.visible = ringOn
+          }
         }
+        // Speaking cues: the dot over the name and the halo around the tag.
+        const speak = speakRef.current
+        if (speak && speak.visible !== talking) speak.visible = talking
+        const halo = speakRingRef.current
+        if (halo && halo.visible !== talking) halo.visible = talking
+      } else if (ring?.visible) {
+        ring.visible = false
       }
     }
 
@@ -2032,12 +2248,21 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
           object is rebuilt per render, but every ref INSIDE it is stable, so
           React never detaches a handle; renders here are weapon/name events. */}
       <AvatarRig paletteIndex={paletteIndex} refs={rigRefs} weapon={weapon} />
-      {/* Name-tag billboard — hidden past 40 m, texture disposed on despawn. */}
+      {/* Name-tag billboard — hidden past 40 m in game (200 m for a spectator,
+          who also gets it depth-free and drawn last); texture disposed on
+          despawn. Never a raycast target: a depth-ignoring plane must not
+          become the editor's hover/selection hit. */}
       <group ref={tagRef} position={[0, 2.05, 0]}>
         {tagTexture ? (
-          <mesh>
+          <mesh raycast={noopRaycast} renderOrder={tagRenderOrder(spectator)}>
             <planeGeometry args={[0.72, 0.18]} />
-            <meshBasicMaterial ref={tagMatRef} map={tagTexture} transparent depthWrite={false} />
+            <meshBasicMaterial
+              ref={tagMatRef}
+              map={tagTexture}
+              transparent
+              depthWrite={false}
+              depthTest={tagDepthTest(spectator)}
+            />
           </mesh>
         ) : null}
         {/* Speaking dot — above the name, hidden until this peer transmits.
@@ -2045,12 +2270,41 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
             boolean on an existing object rather than a mid-firefight remount. */}
         <mesh
           geometry={SPEAK_GEO}
-          material={SPEAK_MATERIAL}
+          material={spectator ? SPEAK_MATERIAL_XRAY : SPEAK_MATERIAL}
           position={[0, 0.16, 0]}
+          raycast={noopRaycast}
           ref={speakRef}
+          renderOrder={tagRenderOrder(spectator)}
+          visible={false}
+        />
+        {/* Speaking halo — the ring around the whole tag, same boolean. */}
+        <mesh
+          geometry={SPEAK_RING_GEO}
+          material={spectator ? SPEAK_MATERIAL_XRAY : SPEAK_MATERIAL}
+          position={[0, 0, -0.002]}
+          raycast={noopRaycast}
+          ref={speakRingRef}
+          renderOrder={tagRenderOrder(spectator)}
+          scale={[SPEAK_SCALE_X, 1, 1]}
           visible={false}
         />
       </group>
+      {/* Spectator only: the floor ring that grounds a far speck (far-lod.ts),
+          in the vest tint, depth-free, under the tag in draw order. `spectator`
+          is constant for the component's life and this is not a light, so the
+          conditional mount is fine. */}
+      {spectator ? (
+        <mesh
+          geometry={ringGeometry()}
+          material={ringMaterialFor(tint)}
+          position={[0, 0.02, 0]}
+          raycast={noopRaycast}
+          ref={ringRef}
+          renderOrder={SPECTATOR_RING_RENDER_ORDER}
+          rotation={[-Math.PI / 2, 0, 0]}
+          visible={false}
+        />
+      ) : null}
     </group>
   )
 }
@@ -2097,16 +2351,31 @@ export function localPaletteIndex(): number {
 /**
  * Mounts one <RemoteAvatar> per live in-game remote. Re-renders only when
  * the roster version bumps (join/leave); per-frame work is the version
- * poll + the change-gated HUD chip drive ("N builders here").
+ * poll + the change-gated HUD chip drive ("2 players: Alice, Bob").
+ * `spectator` (spectator.tsx mounts it so) switches every avatar's tag to the
+ * far-LOD path; the game mounts it bare.
  */
-export function RemotePlayers() {
+export function RemotePlayers({ spectator = false }: { spectator?: boolean } = {}) {
   const versionSeen = useRef(-1)
   const chipCount = useRef(-1)
+  const chipNames = useRef<readonly string[]>([])
+  const chipFrame = useRef(0)
   const [roster, setRoster] = useState<RemotePlayer[]>([])
   const [colors, setColors] = useState<Map<string, number>>(() => new Map())
 
   useFrame(() => {
     const version = getRosterVersion()
+    // Between edges, a nick can still resolve late (it rides the peer's pose
+    // frame): every ~2 s the names are re-read and the chip re-driven if they
+    // moved. A same-text drive is a no-op in the HUD, so this is an array per
+    // two seconds, never per frame.
+    if (version === versionSeen.current && roster.length > 0 && ++chipFrame.current % CHIP_NAME_POLL_FRAMES === 0) {
+      const fresh = rosterNames(roster)
+      if (!sameNames(fresh, chipNames.current)) {
+        chipNames.current = fresh
+        driveChip(roster.length, fresh)
+      }
+    }
     if (version !== versionSeen.current) {
       versionSeen.current = version
       const list: RemotePlayer[] = []
@@ -2129,11 +2398,14 @@ export function RemotePlayers() {
         for (const listener of localPaletteListeners) listener()
       }
       setColors(deal)
-      // Chip rides the same edge (roster changes are the only count moves);
+      // Chip rides the same edge (roster changes are the only count moves),
+      // WITH the names — the label rule the spectator pill and the toasts use;
       // feature-detected like every cross-module hud call.
-      if (list.length !== chipCount.current) {
+      const names = rosterNames(list)
+      if (list.length !== chipCount.current || !sameNames(names, chipNames.current)) {
         chipCount.current = list.length
-        driveChip(list.length)
+        chipNames.current = names
+        driveChip(list.length, names)
       }
     }
   })
@@ -2154,6 +2426,7 @@ export function RemotePlayers() {
           key={remote.sessionId}
           paletteIndex={colors.get(remote.userId) ?? paletteIndexFor(remote.userId)}
           remote={remote}
+          spectator={spectator}
         />
       ))}
     </>

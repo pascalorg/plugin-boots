@@ -1,5 +1,14 @@
 import { useEffect, useState } from 'react'
-import { type Bone, Group, type Object3D, type SkinnedMesh } from 'three'
+import {
+  type Bone,
+  Group,
+  type Material,
+  type MeshStandardMaterial,
+  type Object3D,
+  type SkinnedMesh,
+  SRGBColorSpace,
+  Texture,
+} from 'three'
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { clone as cloneWithSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js'
 import { itemModelLoader } from './item-place'
@@ -121,7 +130,201 @@ export type PascalineInstance = {
   hands: { L: Object3D | null; R: Object3D | null }
   /** Empty LOD handles — the model has no detail groups to drop, but callers toggle them. */
   detail: { head: Group; body: Group }
+  /** The face plate's two mouths (null on a body without a `face` material). */
+  face: PascalineFace | null
   dims: PascalineDims
+}
+
+// ── The talking mouth ────────────────────────────────────────────────────────
+
+/**
+ * THE FACE, TWICE. The forward head polys wear their own opaque material
+ * (`face`, the repainted 1024 px plate — scripts/face-plate.py). To show a
+ * word being said, the SAME polys are cloned once more per body, bound to the
+ * same skeleton, and dressed in ONE module-shared material whose map is the
+ * open-mouth repaint (pascaline-face-open.ts, decoded once, lazily). Talking
+ * is then a `visible` swap between the two meshes — no per-avatar material
+ * clone, no texture rebinding at 8 Hz, nothing renderer-specific: on WebGPU
+ * and WebGL alike a hidden mesh simply is not drawn. Both materials are shared
+ * across every body on the lot, so a full lobby costs two face programs.
+ */
+export type PascalineFace = {
+  /** The template's own face mesh — the closed mouth. */
+  closed: SkinnedMesh
+  /** The clone wearing the open-mouth plate; hidden until a word is said. */
+  open: SkinnedMesh
+  /** Which one is showing right now (the change gate). */
+  isOpen: boolean
+}
+
+/** Mouth flap half-period (ms): 4 open/close cycles a second while talking. */
+export const MOUTH_FLAP_MS = 125
+
+/**
+ * Is the mouth open at wall time `now` for a peer whose talk flag is `talking`?
+ * A square wave on the wall clock, so every avatar of the same peer on every
+ * screen flaps in the same phase and a peer who goes quiet closes at once.
+ */
+export function mouthOpenAt(talking: boolean, now: number): boolean {
+  return talking && (Math.floor(now / MOUTH_FLAP_MS) & 1) === 1
+}
+
+/**
+ * Show the open or the closed mouth — change-gated, two boolean writes per
+ * flip and nothing otherwise. An open mouth is only shown once its plate has
+ * decoded; until then (and on a runtime with no image decoder) the face stays
+ * closed. Returns whether anything changed.
+ */
+export function setMouth(face: PascalineFace, open: boolean): boolean {
+  const want = open && faceOpenTexture !== null
+  if (want === face.isOpen) return false
+  face.isOpen = want
+  face.closed.visible = !want
+  face.open.visible = want
+  return true
+}
+
+let faceOpenTexture: Texture | null = null
+let faceOpenPromise: Promise<Texture> | null = null
+let faceOpenFailed: string | null = null
+/** The one open-mouth material every body shares — cloned from the first face material seen. */
+let faceOpenMaterial: MeshStandardMaterial | null = null
+
+/** Is the open-mouth plate decoded and on its material? (QA/test read.) */
+export function faceOpenReady(): boolean {
+  return faceOpenTexture !== null
+}
+
+/** Sampler parity: the open plate takes the closed plate's wrap, filters,
+ * anisotropy, colour space, orientation and UV channel, so the swap changes
+ * pixels and nothing else. */
+function matchSampler(open: Texture, closed: Texture | null): void {
+  if (!closed) return
+  open.wrapS = closed.wrapS
+  open.wrapT = closed.wrapT
+  open.magFilter = closed.magFilter
+  open.minFilter = closed.minFilter
+  open.anisotropy = closed.anisotropy
+  open.generateMipmaps = closed.generateMipmaps
+  open.colorSpace = closed.colorSpace
+  open.flipY = closed.flipY
+  open.channel = closed.channel
+  open.needsUpdate = true
+}
+
+/**
+ * Adopt a decoded open-mouth plate: match its sampler to the closed plate's
+ * and put it on the shared open material (one program rebuild, once — the
+ * material had the closed map until now). Exported as the test/QA seam the
+ * loader itself goes through.
+ */
+export function adoptFaceOpenTexture(texture: Texture): void {
+  faceOpenTexture = texture
+  if (faceOpenMaterial) {
+    matchSampler(texture, faceOpenMaterial.map)
+    faceOpenMaterial.map = texture
+    faceOpenMaterial.needsUpdate = true
+  }
+}
+
+/** Test seam: forget the decoded plate (a fresh module state). */
+export function resetFaceOpenTexture(): void {
+  faceOpenTexture = null
+  faceOpenPromise = null
+  faceOpenFailed = null
+  faceOpenMaterial = null
+}
+
+function openMaterialFor(closed: Material): Material {
+  if (!faceOpenMaterial) {
+    faceOpenMaterial = (closed as MeshStandardMaterial).clone()
+    faceOpenMaterial.name = 'face-open'
+    if (faceOpenTexture) {
+      matchSampler(faceOpenTexture, faceOpenMaterial.map)
+      faceOpenMaterial.map = faceOpenTexture
+      faceOpenMaterial.needsUpdate = true
+    }
+  }
+  return faceOpenMaterial
+}
+
+/** Can this runtime decode a JPEG into something a Texture can wear? */
+function canDecodeImages(): boolean {
+  return typeof createImageBitmap === 'function' || typeof Image === 'function'
+}
+
+/**
+ * Decode the open-mouth plate ONCE for the module: the base64 module is a
+ * dynamic import (its own chunk, fetched only when a face is instantiated),
+ * decoded the way GLTFLoader decoded the closed plate (createImageBitmap with
+ * premultiplyAlpha 'none' where it exists, an <img> otherwise), flipY false and
+ * sRGB like every glTF colour texture. Failure is remembered and harmless: the
+ * face simply never opens.
+ */
+export function loadFaceOpenTexture(): Promise<Texture> {
+  if (!faceOpenPromise) {
+    faceOpenPromise = (async () => {
+      const { PASCALINE_FACE_OPEN_JPG_BASE64 } = await import('./pascaline-face-open')
+      const bytes = decodeBase64(PASCALINE_FACE_OPEN_JPG_BASE64)
+      const blob = new Blob([bytes.buffer as ArrayBuffer], { type: 'image/jpeg' })
+      let image: ImageBitmap | HTMLImageElement
+      if (typeof createImageBitmap === 'function') {
+        image = await createImageBitmap(blob, { premultiplyAlpha: 'none' })
+      } else {
+        const url = URL.createObjectURL(blob)
+        try {
+          const img = new Image()
+          img.src = url
+          await img.decode()
+          image = img
+        } finally {
+          URL.revokeObjectURL(url)
+        }
+      }
+      const texture = new Texture(image)
+      texture.flipY = false
+      texture.colorSpace = SRGBColorSpace
+      texture.needsUpdate = true
+      adoptFaceOpenTexture(texture)
+      return texture
+    })().catch((err: unknown) => {
+      faceOpenFailed = err instanceof Error ? err.message : String(err)
+      throw err
+    })
+  }
+  return faceOpenPromise
+}
+
+/** What the mouth loader knows right now — plain copies, for QA. */
+export function faceOpenStatus(): { ready: boolean; failed: string | null } {
+  return { ready: faceOpenTexture !== null, failed: faceOpenFailed }
+}
+
+/**
+ * Find the plate on a freshly cloned body and give it its second mouth: the
+ * first SkinnedMesh whose (single) material is named `face` is cloned, bound
+ * to the same skeleton, dressed in the shared open-mouth material, hidden,
+ * and added beside the original. Kicks the one decode on a runtime that can.
+ */
+function attachFace(root: Object3D): PascalineFace | null {
+  const plates: SkinnedMesh[] = []
+  root.traverse((o) => {
+    const mesh = o as SkinnedMesh
+    if (!mesh.isSkinnedMesh) return
+    const material = mesh.material
+    if (!Array.isArray(material) && material.name === 'face') plates.push(mesh)
+  })
+  const closedMesh = plates[0]
+  const parent = closedMesh?.parent
+  if (!closedMesh || !parent) return null
+  const open = closedMesh.clone(false) as SkinnedMesh
+  open.name = 'face-open'
+  open.material = openMaterialFor(closedMesh.material as Material)
+  open.frustumCulled = false
+  open.visible = false
+  parent.add(open)
+  if (canDecodeImages()) loadFaceOpenTexture().catch(() => {})
+  return { closed: closedMesh, open, isOpen: false }
 }
 
 /**
@@ -249,7 +452,10 @@ export function instantiatePascaline(template: PascalineTemplate): PascalineInst
   detail.body.name = 'body-detail'
   pivots.head.add(detail.head)
   pivots.torso.add(detail.body)
-  return { root, pivots, joints, armFrames, handFrames, hands, detail, dims }
+  // The talking mouth: the face plate's polys again, hidden, on the shared
+  // open-mouth material (attachFace). Null on a body that has no plate.
+  const face = attachFace(root)
+  return { root, pivots, joints, armFrames, handFrames, hands, detail, face, dims }
 }
 
 // ── Loading (once per module, on demand) ─────────────────────────────────────

@@ -69,8 +69,13 @@ import {
   TURN,
   updateMotion,
   WALK_S,
+  createArmSolution,
+  rosterNames,
+  SPEAK_SCALE_X,
+  twoHanded,
 } from './remote-players'
 import { presenceDebug, wrapAngle } from './presence'
+import { gripToShoulder, leftGripFor } from './hand-grips'
 
 /**
  * The pure half of the avatar renderer: palette assignment, articulation
@@ -1064,5 +1069,97 @@ describe('remote gunfire — only guns flash', () => {
     // client, so the streak only has to say "that barrel just fired".
     expect(TRACER_LEN).toBeGreaterThan(1)
     expect(TRACER_LEN).toBeLessThan(5)
+  })
+})
+
+describe('avatar hands — the first-person grip table on the third-person arms', () => {
+  const a = MODEL_ARMS
+  const fk = (swing: number, yaw: number, elbow: number) => {
+    const du = limbDir(swing, yaw)
+    const df = limbDir(swing + elbow, yaw)
+    return [0, 1, 2].map((i) => a.upperArmLen * du[i]! + a.reach * df[i]!)
+  }
+
+  test('solveArm writes into a caller scratch exactly what a fresh call returns (no per-frame allocation)', () => {
+    const target: [number, number, number] = [-0.14, -0.05, -0.3]
+    const fresh = solveArm(target)
+    const out = createArmSolution()
+    const returned = solveArm(target, MODEL_ARMS, out)
+    expect(returned).toBe(out)
+    expect(out.swing).toBeCloseTo(fresh.swing, 12)
+    expect(out.yaw).toBeCloseTo(fresh.yaw, 12)
+    expect(out.elbow).toBeCloseTo(fresh.elbow, 12)
+    for (let i = 0; i < 3; i++) expect(out.hand[i]).toBeCloseTo(fresh.hand[i]!, 12)
+    // The solved hand sits on the target (reachable).
+    for (let i = 0; i < 3; i++) expect(out.hand[i]).toBeCloseTo(target[i]!, 6)
+  })
+
+  test('with the grip table, the support hand lands EXACTLY on the table point through the right arm chain, within reach', () => {
+    const out = createArticulation()
+    const right = createArmSolution()
+    const expectLeft: [number, number, number] = [0, 0, 0]
+    for (const [weapon, grip] of [
+      ['rifle', 'long'],
+      ['minigun', 'long'],
+      ['pistol', 'short'],
+    ] as const) {
+      const leftGrip = leftGripFor(weapon)
+      expect(leftGrip).not.toBeNull()
+      for (const pitch of [-0.5, -0.2, 0, 0.3, 0.6]) {
+        articulate(out, Math.PI / 2, 1, pitch, true, false, grip, 0, a, 0, 0, leftGrip)
+        // Re-derive the right arm's solution from the pose the rule wrote.
+        right.swing = out.armAim
+        right.yaw = out.armRYaw
+        right.elbow = out.elbowR
+        const rh = fk(out.armAim, out.armRYaw, out.elbowR)
+        right.hand[0] = rh[0]!
+        right.hand[1] = rh[1]!
+        right.hand[2] = rh[2]!
+        const barrel = GRIPS[grip].barrelFromDown + pitch
+        gripToShoulder(leftGrip!, right, barrel, a.shoulderX, expectLeft)
+        // Reachable from the left shoulder — a clamped IK would land short.
+        expect(Math.hypot(...expectLeft)).toBeLessThan(a.upperArmLen + a.reach)
+        const left = fk(out.armSwing, out.armLYaw, out.elbowL)
+        for (let i = 0; i < 3; i++) expect(left[i]).toBeCloseTo(expectLeft[i]!, 6)
+        expect(out.gripL).toBe(1)
+        expect(out.gripR).toBe(1)
+      }
+    }
+  })
+
+  test('without a table point the legacy foregrip approximation still stands (older callers)', () => {
+    const withTable = createArticulation()
+    const legacy = createArticulation()
+    articulate(withTable, 0, 0, 0, true, false, 'long', 0, a, 0, 0, leftGripFor('rifle'))
+    articulate(legacy, 0, 0, 0, true, false, 'long', 0, a, 0, 0, null)
+    // Same right arm, different left arm.
+    expect(legacy.armAim).toBeCloseTo(withTable.armAim, 12)
+    expect(legacy.elbowR).toBeCloseTo(withTable.elbowR, 12)
+    expect(Math.abs(legacy.armSwing - withTable.armSwing) + Math.abs(legacy.elbowL - withTable.elbowL)).toBeGreaterThan(0.01)
+  })
+
+  test('twoHanded: guns take the support hand, tools ride one-handed (the warhammer too), strangers and empty hands do not', () => {
+    for (const w of ['rifle', 'minigun', 'pistol']) expect(twoHanded(w)).toBe(true)
+    for (const w of ['knife', 'hammer', 'builder', 'paint', '', 'laser-of-the-future']) expect(twoHanded(w)).toBe(false)
+  })
+
+  test('the speaking halo encloses the 0.72 × 0.18 tag with a margin and its inner edge clears the tag', () => {
+    const outerX = 0.19 * SPEAK_SCALE_X
+    const innerX = 0.16 * SPEAK_SCALE_X
+    expect(innerX).toBeGreaterThan(0.36)
+    expect(0.16).toBeGreaterThan(0.09)
+    expect(outerX).toBeLessThan(0.6) // a halo, not a hula hoop
+  })
+})
+
+describe('roster chip names', () => {
+  test('rosterNames: nick first, roster name second, builder last — sorted', () => {
+    const names = rosterNames([
+      { nick: 'Zed', userId: 'u-zed' },
+      { nick: '', userId: 'nobody-known' },
+      { nick: 'Alice', userId: 'u-alice' },
+    ])
+    expect(names).toEqual(['Alice', 'Zed', 'builder'])
+    expect(rosterNames([])).toEqual([])
   })
 })

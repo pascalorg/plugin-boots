@@ -20,9 +20,13 @@ import {
 import { useBoots } from '../store'
 import { EYE_HEIGHT } from './collision'
 import { DEPOT_NODE_ID, DEPOT_NODE_TYPE, depotWorldYaw, worldToDepotLocal } from './guntable'
+import { clampFrameDt } from './feel'
+import { leftGripFor } from './hand-grips'
 import { aimMirrorCamera, flipPaneUv, MirrorCamera, type MirrorPane, paneInView } from './mirror-view'
 import { MOVE } from './movement'
+import { mouthOpenAt, setMouth } from './pascaline-model'
 import { playerRig } from './player'
+import { shotsFired } from './presence-interp'
 import {
   advanceGait,
   applyArticulation,
@@ -31,13 +35,18 @@ import {
   AvatarRig,
   blendArticulation,
   createArticulation,
+  createMotion,
   createRigRefs,
   gripFor,
+  layerMotion,
   localPaletteIndex,
+  MODEL_ARMS,
   placeRoot,
   subscribeLocalPalette,
+  updateMotion,
 } from './remote-players'
 import { VIEWMODEL_NAME } from './viewmodel'
+import { selfTalking } from './voice'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -178,6 +187,13 @@ const VIEWMODEL_RESCAN = 30
  */
 const _warmCam = new OrthographicCamera(-5000, 5000, 5000, -5000, -5000, 5000)
 
+/** The motion layer's output — the blended pose plus body-yaw split, landing
+ * squash and recoil kick (remote-players layerMotion). Module scratch. */
+const _layered: AvatarArticulation = createArticulation()
+/** One drawn step beyond this (m) between two engaged frames is a re-engage
+ * jump, not a fall: no vertical speed is read off it. */
+const MIRROR_VY_SNAP_M = 1
+
 /**
  * The glass, its frame, and the body it reflects. Rendered as a CHILD of the
  * depot's root group, so every number above is in the depot's own frame and
@@ -197,6 +213,13 @@ export function DepotMirror({ world }: { world: GameWorld }) {
   const clock = useRef(0)
   // The live pose the body wears, eased toward each frame's target.
   const pose = useRef(createArticulation())
+  // PARITY WITH THE PEERS' RIGS: the same motion layer remote-players runs on a
+  // peer — the legs hold while the head looks around and the body follows
+  // past a dead zone, a real landing squashes the knees, each shot kicks the
+  // gun arm — fed from OUR eye, yaw and shot counter in the depot's frame (the
+  // exact numbers we publish), so the glass shows what teammates see.
+  const motion = useRef(createMotion())
+  const lastShots = useRef(0)
   // WARM-UP. The first pass used to hitch: every material in the scene needed
   // a pipeline for the render target's format (it differs from the canvas's),
   // and the skinned body had never been drawn. Both now happen in the first
@@ -310,9 +333,26 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     if (!engaged && !warmPass) return
 
     // ── the body: ours, posed like a peer's ────────────────────────────────
-    const dt = Math.min(rawDt, 1 / 30)
+    const dt = clampFrameDt(rawDt)
     const s = Math.min(1, playerRig.speed / MOVE.runSpeed)
     const staggered = useBoots.getState().staggered
+    // playerRig.position is the EYE (feet + EYE_HEIGHT + bob) — exactly what
+    // goes out on the wire, so plant the feet exactly as remote-players does.
+    _local.copy(playerRig.position)
+    parent.worldToLocal(_local)
+    const localYaw = playerRig.yaw - yawOffset
+    // The motion layer, off our own eye in the depot frame: body yaw lags the
+    // view, landings are judged on the fall, shots kick. The vertical speed is
+    // the eye's finite difference (the wire's `vy` is the same thing, sampled),
+    // except across a re-engage jump — the frames while nobody was at the glass
+    // did not run, so that step is not motion.
+    const m = motion.current
+    const dy = _local.y - m.ly
+    const vy = m.primed && dt > 0 && Math.abs(dy) < MIRROR_VY_SNAP_M ? dy / dt : 0
+    const shots = shotsFired(lastShots.current, playerRig.shots)
+    lastShots.current = playerRig.shots
+    updateMotion(m, _local.x, _local.y, _local.z, localYaw, playerRig.grounded, staggered, shots, weapon, vy, dt)
+    // The gait paces off the TRUE local speed (no wire, nothing to smooth).
     gaitPhase.current = advanceGait(gaitPhase.current, playerRig.grounded ? s : 0, dt)
     clock.current += dt
     articulate(
@@ -324,16 +364,19 @@ export function DepotMirror({ world }: { world: GameWorld }) {
       staggered,
       gripFor(weapon),
       clock.current,
+      MODEL_ARMS,
+      0,
+      m.moveRel,
+      leftGripFor(weapon),
     )
     blendArticulation(pose.current, _artic, dt)
-    // playerRig.position is the EYE (feet + EYE_HEIGHT + bob) — exactly what
-    // goes out on the wire, so plant the feet exactly as remote-players does.
-    _local.copy(playerRig.position)
-    parent.worldToLocal(_local)
-    const localYaw = playerRig.yaw - yawOffset
-    placeRoot(self, _local.x, _local.y - EYE_HEIGHT, _local.z, localYaw, pose.current)
-    self.rotation.y = localYaw
-    applyArticulation(refs, pose.current)
+    layerMotion(_layered, pose.current, m, localYaw)
+    placeRoot(self, _local.x, _local.y - EYE_HEIGHT, _local.z, m.bodyYaw, _layered)
+    self.rotation.y = m.bodyYaw
+    applyArticulation(refs, _layered)
+    // The reflection talks when we do (voice.ts's own talk gate).
+    const mouth = refs.face?.current
+    if (mouth) setMouth(mouth, mouthOpenAt(selfTalking(), Date.now()))
 
     // ── the camera: the reflected eye, frustum fitted to the glass ─────────
     camera.getWorldPosition(_eye)
