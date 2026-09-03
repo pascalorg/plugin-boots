@@ -161,20 +161,32 @@ const SCOPE_PATH = /\/(?:editor|play|scene)\/([A-Za-z0-9_-]{1,120})(?:[/?#]|$)/
 const PIECE_KINDS = new Set<string>(['wall', 'floor', 'stairs', 'roof'])
 
 /**
- * Which project is this? The collaboration bus knows for certain when it is
- * installed; otherwise read the route. Null means "cannot tell" — and null
+ * Which project is this? THE ROUTE FIRST; the collaboration bus only when the
+ * page has no project route at all. Null means "cannot tell" — and null
  * disables persistence entirely (see the header).
+ *
+ * The route used to be the fallback and the bus the authority ("it knows for
+ * certain"). It does — about the project it was installed for. But the bus is
+ * a page global installed asynchronously after realtime auth, and the prod
+ * editor switches projects with a CLIENT-SIDE navigation: for as long as the
+ * old bus lingers (or forever, if the new one never installs) a bus-first
+ * scope names the project you just LEFT, and its pending fort is restored into
+ * the one you opened (owner P0, 2026-09-02). The URL changes on the first
+ * frame of a navigation and never lags, so it is the identity; on every Boots
+ * route the two name the same project anyway.
  */
 export function pendingScopeFrom(input: {
   projectId?: unknown
   path?: string | null
 }): string | null {
+  if (typeof input.path === 'string') {
+    const match = SCOPE_PATH.exec(input.path)
+    if (match) return match[1] as string
+  }
   if (typeof input.projectId === 'string' && SCOPE_TOKEN.test(input.projectId)) {
     return input.projectId
   }
-  if (typeof input.path !== 'string') return null
-  const match = SCOPE_PATH.exec(input.path)
-  return match ? (match[1] as string) : null
+  return null
 }
 
 export function pendingKey(scope: string): string {
@@ -436,7 +448,7 @@ export function browserPendingStorage(): PendingStorage | null {
   }
 }
 
-/** The current project, from the collab bus if it is installed, else the URL. */
+/** The current project, from the URL if it names one, else the collab bus. */
 export function currentPendingScope(): string | null {
   const bus = (globalThis as { __pascalCollabBus?: { projectId?: unknown } }).__pascalCollabBus
   const path = (globalThis as { location?: { pathname?: string } }).location?.pathname ?? null

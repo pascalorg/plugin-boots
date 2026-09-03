@@ -3,23 +3,26 @@
 import { useEffect } from 'react'
 import { DropGate } from './drop-gate'
 import { GameRoot } from './game-root'
-import { restorePendingChanges } from './pending-lanes'
 import { PendingPreview } from './preview'
+import { watchProjectScope } from './project-scope'
 import { SpectatorPlayers } from './spectator'
 
 /**
- * Put back whatever decision was still open when this project was last closed.
+ * Keep every Boots store keyed to THIS project, and put back whatever decision
+ * was still open when the project was last closed.
  *
  * Mounted here because this is the earliest thing the plugin owns on the page
  * and it mounts in EDITOR phase: the lanes are filled before the sidebar reads
  * them, before the preview draws, and before the drop gate can hand anyone a
- * Jump in. Runs once per project per page load — `restorePendingChanges` holds
- * the latch, so a canvas remount cannot double the fort.
+ * Jump in. The watcher runs the restore (once per project — the latch in
+ * pending-lanes.ts, so a canvas remount cannot double the fort) and, the part a
+ * remount alone can never do, hard-resets the module-level session state when
+ * the host switches project under the plugin without a page load
+ * (project-scope.ts — owner P0 2026-09-02, one project's fort offered in
+ * another).
  */
-function PendingRestore() {
-  useEffect(() => {
-    restorePendingChanges()
-  }, [])
+function ProjectScopeGuard() {
+  useEffect(() => watchProjectScope(), [])
   return null
 }
 
@@ -35,7 +38,7 @@ function PendingRestore() {
 export default function BootsSystem() {
   return (
     <>
-      <PendingRestore />
+      <ProjectScopeGuard />
       <DropGate />
       <GameRoot />
       <SpectatorPlayers />

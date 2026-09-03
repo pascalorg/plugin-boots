@@ -117,8 +117,18 @@ const aperture = (over: Partial<Extract<PersistedPlacement, { kind: 'aperture' }
 // ── Scope ───────────────────────────────────────────────────────────────────
 
 describe('pendingScopeFrom (the scope is mandatory)', () => {
-  test('the collaboration bus wins over the route, because it is certain', () => {
-    expect(pendingScopeFrom({ path: '/editor/project_B', projectId: 'project_A' })).toBe('project_A')
+  test('the route wins over the collaboration bus, because the route never lags', () => {
+    // The bus is a page global installed after realtime auth and the editor
+    // switches projects client-side: a bus still naming the project you just
+    // left must not re-key the one you opened (owner P0, 2026-09-02).
+    expect(pendingScopeFrom({ path: '/editor/project_B', projectId: 'project_A' })).toBe('project_B')
+  })
+
+  test('the bus is the fallback for a page with no project route', () => {
+    expect(pendingScopeFrom({ path: '/lab/portable-editor', projectId: 'project_A' })).toBe(
+      'project_A',
+    )
+    expect(pendingScopeFrom({ path: null, projectId: 'project_A' })).toBe('project_A')
   })
 
   test('all three Boots routes name the project', () => {
@@ -146,8 +156,7 @@ describe('pendingScopeFrom (the scope is mandatory)', () => {
   })
 
   test('a project id that could escape a storage key is refused, not sanitised', () => {
-    // It falls through to the route, which is the trustworthy source.
-    expect(pendingScopeFrom({ path: '/editor/project_A', projectId: '../other' })).toBe('project_A')
+    expect(pendingScopeFrom({ path: '/no-route', projectId: '../other' })).toBeNull()
     expect(pendingScopeFrom({ projectId: 'a.b' })).toBeNull()
     expect(pendingScopeFrom({ projectId: '' })).toBeNull()
     expect(pendingScopeFrom({ projectId: 42 })).toBeNull()
@@ -160,21 +169,26 @@ describe('pendingScopeFrom (the scope is mandatory)', () => {
   })
 })
 
-describe('currentPendingScope (bus, else URL)', () => {
+describe('currentPendingScope (URL, else bus)', () => {
   const globals = globalThis as {
     __pascalCollabBus?: { projectId?: unknown }
     location?: { pathname?: string }
   }
 
-  test('reads the collab bus first, then the location', () => {
+  test('reads the location first, then the collab bus', () => {
     const bus = globals.__pascalCollabBus
     const location = globals.location
     try {
       globals.location = { pathname: '/editor/from_url' }
       globals.__pascalCollabBus = undefined
       expect(currentPendingScope()).toBe('from_url')
+      // A bus naming another project is a bus that has not caught up.
       globals.__pascalCollabBus = { projectId: 'from_bus' }
+      expect(currentPendingScope()).toBe('from_url')
+      globals.location = { pathname: '/lab/no-route' }
       expect(currentPendingScope()).toBe('from_bus')
+      globals.__pascalCollabBus = undefined
+      expect(currentPendingScope()).toBeNull()
     } finally {
       globals.__pascalCollabBus = bus
       globals.location = location

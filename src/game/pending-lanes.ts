@@ -30,7 +30,8 @@ import { useDemolition } from './save-demolition'
  * here, next to the store, exactly as shared-build does it for a remote peer.
  *
  * Writes happen at Esc (session.ts) and at the decision (panel.tsx). Reads
- * happen once, when the plugin's in-canvas system mounts (system.tsx).
+ * happen once per project, from the scope guard the plugin's in-canvas system
+ * mounts (system.tsx → project-scope.ts).
  */
 
 /** Everything pending that is OURS.
@@ -64,7 +65,7 @@ export function collectPendingLanes(): PendingLanes {
  * is unchanged and nothing else in the plugin depends on this succeeding. */
 export function persistPendingChanges(): void {
   const storage = browserPendingStorage()
-  const scope = currentPendingScope()
+  const scope = laneScopeFor()
   if (!storage || !scope) return
   const lanes = collectPendingLanes()
   if (isEmptyPending(lanes)) {
@@ -86,7 +87,7 @@ export function persistPendingChanges(): void {
  * `persistPendingChanges`, which clears the key because the lanes are empty. */
 export function forgetPendingChanges(): void {
   const storage = browserPendingStorage()
-  const scope = currentPendingScope()
+  const scope = laneScopeFor()
   if (storage && scope) forgetPendingSnapshot(storage, scope)
 }
 
@@ -118,9 +119,49 @@ const EMPTY_REPORT: PendingRestoreReport = {
  */
 let restoredScope: string | null = null
 
-/** Test-only: forget that a restore already ran. */
+/**
+ * THE PROJECT THE LANES BELONG TO.
+ *
+ * The four stores are module singletons: they outlive the editor tree, and the
+ * prod editor switches projects with a client-side navigation that never
+ * reloads the page. So the lanes have to know WHOSE fort they hold, separately
+ * from where the page currently is — the two disagree for exactly as long as a
+ * project switch is in flight, and that window is where a fort built in one
+ * building was offered for saving into another (owner P0, 2026-09-02).
+ *
+ * Adopted from the page the first time anything asks; changed only by
+ * `adoptLaneScope`, which project-scope.ts calls AFTER emptying the lanes.
+ * Every write goes under the lane scope, never under the URL of the moment: an
+ * Esc that lands mid-switch writes the fort under the project it was built in.
+ *
+ * `undefined` = never adopted (a fresh page load); `null` = adopted, and the
+ * page names no project. The two must differ: lanes that belong to NO project
+ * hold in-page-only work, and a project appearing later must not inherit it.
+ */
+let laneScope: string | null | undefined
+
+/** The scope the in-memory lanes belong to — the current page's, adopted on
+ * first use (a fresh page load). Null = no project = no key, ever. */
+export function laneScopeFor(): string | null {
+  if (laneScope === undefined) laneScope = currentPendingScope()
+  return laneScope
+}
+
+/**
+ * Re-key the lanes to `scope` and forget that a restore already ran. The
+ * latch is per lane scope, not per page: coming BACK to a project whose lanes
+ * were replaced in between must restore its window again. Only project-scope.ts
+ * calls this, and only with the lanes already empty.
+ */
+export function adoptLaneScope(scope: string | null): void {
+  laneScope = scope
+  restoredScope = null
+}
+
+/** Test-only: forget the project and that a restore already ran. */
 export function resetPendingRestore(): void {
   restoredScope = null
+  laneScope = undefined
 }
 
 /**
@@ -137,7 +178,7 @@ export function resetPendingRestore(): void {
  */
 export function restorePendingChanges(): PendingRestoreReport {
   const storage = browserPendingStorage()
-  const scope = currentPendingScope()
+  const scope = laneScopeFor()
   if (!storage || !scope || scope === restoredScope) return EMPTY_REPORT
   if (useBoots.getState().phase !== 'editor') return EMPTY_REPORT
   const parsed = readPendingSnapshot(storage, scope)
