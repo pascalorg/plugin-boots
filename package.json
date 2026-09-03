@@ -25,7 +25,8 @@
   ],
   "scripts": {
     "check-types": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "avatar:build": "bash scripts/build-avatar.sh"
   },
   "peerDependencies": {
     "@pascal-app/core": ">=0.9.1 <1",

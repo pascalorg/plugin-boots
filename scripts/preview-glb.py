@@ -24,7 +24,7 @@ if "--pose" in argv:
         POSE[name] = float(val)
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
-bpy.ops.import_scene.gltf(filepath=SRC)
+bpy.ops.import_scene.gltf(filepath=SRC, disable_bone_shape=True)
 scene = bpy.context.scene
 
 if POSE:
