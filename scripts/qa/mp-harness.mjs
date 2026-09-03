@@ -106,7 +106,10 @@ function releaseLock() {
 let browser = null
 async function shutdown(code) {
   try {
-    if (browser) await browser.close()
+    // browser.close() has been seen to hang after PASS while this process still
+    // held the lock; never let a stuck teardown keep the fleet waiting.
+    if (browser)
+      await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 10_000))])
   } catch {}
   browser = null
   releaseLock()
