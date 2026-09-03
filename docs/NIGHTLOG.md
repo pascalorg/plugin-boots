@@ -2989,3 +2989,309 @@ three shipped:
 Plus the review's top engineering item, at effort one: `.github/workflows/
 ci.yml` runs `check-types` and `bun test` on every push and PR. Until tonight
 nothing outside a developer's machine ran either.
+
+## 2026-09-02/03 — The all-nighter: two friends see and hear each other
+
+Owner brief for the night: make the multiplayer experience great — hands,
+motion, fluidity, a face you can read; players must reliably SEE and HEAR each
+other; someone looking at the project from the editor must see the players
+live. Then, at dawn, the second brief: finalize a version to prod within the
+hour — finish what is close, cut what is half-done, verify live, report
+honestly.
+
+The night ran as a fleet: round 1 was seven builders on disjoint lanes (face,
+see, motion, voice, feel, hands, and the host-side P1), each followed by an
+adversarial reviewer reading the diff, not the report, and a fixer; round 2
+integrated the lanes into the shared files (avatar, voice2, wiring, hands2,
+audio, presence, the TURN route, this log); a finisher pass closed the lanes a
+timed-out builder had left open. Baseline at 20:33: 2535 tests across 133
+files, `tsc` clean. At the time of this entry, with the finishers still
+editing: 2964 tests across 150 files, 0 failing, `tsc` clean.
+
+### The harness came first, and it changed what "verified" means
+
+Until tonight the handoff carried a hard constraint: the assistant could not
+see the rendered game (the auth gate blocks a headless sign-in), so every
+visual and multiplayer feature shipped verified by code and tests, and a human
+had to eyeball it. `scripts/qa/mp-harness.mjs` (`b0a63ad`) removed that
+constraint for the local dev server: two pages in ONE Chrome on `:3002`, no
+login, a `__pascalCollabBus` v1 stub per page bridged over a BroadcastChannel
+and faithful to the host module — host-stamped sender, no self-echo, the
+8 000-byte cap, latest-value coalescing per `(pluginId, event)` at 66 ms — plus
+a React-devtools hook stub that finds the R3F root in ANY phase, so a spectator
+page with no `__boots` can still be asked for its three.js scene. A capture
+guard denies pointer lock and fullscreen, because two pages in one browser
+share one focus and `session.ts` treats a lost lock as Esc. `MODE=play`,
+`spectate` and `voice`; one JSON line and PASS/FAIL; screenshots you look at.
+Every lane below adapted it, and every lane's numbers come from it. One
+automation browser at a time on the machine, behind `/tmp/boots-browser.lock`.
+
+### P1 — the share link that landed on a bare editor
+
+`/play/<id>?boots=drop` dropped a signed-in stranger on the read-only house
+with no veil and no JUMP IN; `/editor` plus a manual install worked, so the
+plugin itself loaded. Root cause, in the host (`private-editor` PR #529, merged
+2026-09-03 02:08 UTC): the lobby page-client's `if (!sceneGraph?.installedPlugins)
+return sceneGraph` skipped exactly the key-less scene. The registry's legacy
+"undefined means everything enabled" branch is unreachable from the store
+(typed `string[]`, defaults `[]`), `/play` registers no host panels so the load
+path's defaults are also `[]`, Boots is `defaultInstalled: false`, and the
+read-only lease makes every later repair — the panel's Install button, the
+default sync — a no-op. Projects whose saved graph had the key worked; those
+whose graph never recorded one (collaboration projects never persist installs)
+did not. The fix materializes the key: `withLobbyPlugins(graph, lobbyIds,
+defaults)` — missing key → defaults + lobby ids, explicit list → append what is
+missing, identity when present, membership not length. Play-only, in memory,
+no save path. Reproduced on `:3002` with the same `RegisteredSystems` gate: the
+670-node scene copied WITHOUT the key showed no `[data-boots-drop-veil]` after
+15.4 s while `__pascalNodeRegistry.has('boots:job')` was true; the same graph
+WITH `['pascal:boots']` showed the veil and `⏵ JUMP IN` in 2.8 s. Not verified
+on prod itself — that needs a signed-in stranger. Follow-up left in the PR:
+persist installs on collaboration projects so the materialization is a belt,
+not the trousers.
+
+### Round 1 — six lanes, six commits
+
+- **Face** (`9cac15e`). The generator's face was a smear at any texel count and
+  a peer's head is ~90 px at 1.5 m. `scripts/face-plate.py` splits the ~2.2k
+  forward head polys onto a second opaque material `face` with ortho-projected
+  UVs, CLAMP_TO_EDGE, roughness sampled from the body's MR map so there is no
+  gloss step at the hat; `scripts/face-repaint.mjs` repaints the flat render as
+  the mascot (seed 1234, chosen at 96 px — the acceptance view, because a face
+  that does not read there does not read in the game). The embedded GLB is
+  491 432 bytes (+~70 KB), one extra draw call per avatar. Live at 1.2 m: two
+  eyes with white sclera, brows, a smile, the wordmark on the hat.
+  `bun run avatar:build` chains rig → plate → embed → contract test so a re-rig
+  can never ship the un-plated body.
+- **See** (`ef293af`). The spectator layer bound once against a bus the host
+  installs after realtime auth; a viewer whose bus landed late saw nobody.
+  `net-retry.ts` (`untilNet`, 1 s) retries the bind for the spectator AND for a
+  fast Jump In (`game-root.tsx`, landed with the feel commit): before, one miss
+  meant a whole session alone. Measured: the spectator bound 1005 ms after a
+  held bus was released; a player who had jumped in with the bus held had
+  `published 0` after 2.5 s, then published 700 ms after the release; the
+  viewer listed Alice 115 ms after that. A body-level pill — "Alice is playing
+  — ⏵ JUMP IN", with a joined/left line — replaces the spectator FrameBooster
+  (the editor's own frame limiter animates the avatars now; it no longer runs
+  uncapped while friends play). The drop-in is seamless: 432 ms from click to
+  game, `rosterVersion 1 → 1` across the flip (the receive-only adapter is
+  adopted, not rebuilt), A saw Bob 29 ms later. Esc: Alice despawned on B in
+  56 ms and A was spectating Bob 7 ms after. The in-game chip is a roster —
+  "2 players: Alice, Bob", cap 4 then +N.
+- **Motion** (`728a75d`). Peers were drawn off what was really a 10 Hz ring
+  (the 25 ms adapter tick quantized the 83 ms gate to 100 ms) with 50 ms of
+  jitter margin, and the gait was paced by wire speed — a 3.4× slide at a run.
+  Now a true ~12 Hz: 11.05 and 11.58 Hz measured through the host-faithful
+  coalescing, arrival gaps min 71 / median 92 / p90 113 / max 116 ms, and a
+  per-peer adaptive delay (spacing + 3·jitter + 40 ms, floor 150, cap 320:
+  86.2 + 5.4 + 40 = 131 → the 150 ms floor; observed 150–162 ms). Drawn speed
+  against the sender's true speed: 10.1 % mean error (4.7 % the run before).
+  After the key went up the displayed speed read 4.98, 3.5, 1.05, 0.28, 0.06,
+  0 at 100 ms steps — exactly zero within ~500 ms of the first post-release
+  sample, no slide-and-snap. The stride is a real step length paced by drawn
+  displacement, the body turns only past a 0.35 rad dead zone while head and
+  gun follow the aim, landings squash the knees, shots kick the arm, and every
+  foot plant voices a footstep from the peer's direction.
+- **Voice** (`aa69ef6`). A well-built call almost nobody heard: the mic was
+  opt-in on a key nobody pressed, its only hint an 11 px line. The drop veil
+  now carries MIC ON/OFF (remembered, on by default) and the JUMP IN click is
+  the permission gesture — if the browser has to ask, that click becomes the
+  prompt ("ALLOW THE MIC ↑", then "⏵ PLAY") so the dialog can never collide
+  with fullscreen or pointer lock and throw the player out. A mic pill you
+  cannot miss: TALKING · 1 ON VOICE · 1 SPEAKING, amber while asking, red when
+  blocked, CONNECTING…, N UNREACHABLE, OUTSIDE THE CALL (6 MAX), and SAME
+  DEVICE — MUTED for a second tab of your own browser (muted instead of
+  howling). Live: connected both ways, both mics live at entry without the M
+  press, RTP received 32.4 kB and growing 41.5 kB over 2 s, the fake device's
+  tone opened A's talk gate and B saw `talking: true`. `readIceServers` is a
+  validated relay seam — `globalThis.__pascalIceServers` or same-origin
+  `GET /api/plugins/boots/turn` — with three STUN servers and no credential in
+  the bundle; the route it asks did not exist yet (see round 2).
+- **Feel** (`cdb53cf`). The camera was a bare rig. `feel.ts` is one pure core:
+  a single 2.3 m stride whose low point IS the footstep (8.92 m walked → 4 heel
+  strikes, expected round(8.92/2.3) = 4), a landing dip that scales with the
+  fall (−60.3 mm within 0.35 s of touchdown, back to exactly 0 at 300 game-ms),
+  strafe lean (mean roll −0.0185 rad at 6.58 m/s, 1e-4 0.6 s after release), a
+  damped-oscillator shake identical on 60 and 120 Hz screens, and a directional
+  hurt kick (power 1.00 within two frames, gone a second later). The plan had
+  misattributed the "stop buzz": re-simulating the old formula showed 5.8 mm
+  per frame on a stop and 26.5 mm per frame on the AIRBORNE branch — leaving
+  the ground at a run — which is the case the regression test pins. The eye on
+  the wire no longer carries bob, so peers stop double-bobbing. `frame-guard.ts`
+  ends the session cleanly after three consecutive throws instead of freezing
+  fullscreen, and the booster rewinds R3F's clock to the limiter's epoch so
+  the first editor frame after Esc has dt +0.020, not −(session length). Live:
+  7 of 8 checks, the eighth a host "404" console line that the harness now
+  files as noise; not re-run.
+- **Hands** (`24edcb6`). One rounded box swallowed every grip. `hand-pose.ts`
+  builds a palm, four three-segment tapered fingers, a two-segment thumb and a
+  wrist as pure math; `hand-rig.tsx` merges one BufferGeometry per pose and
+  side, the left a true mirror built at geometry time (no negative scale);
+  `hand-grips.ts` is the one grip table. Seven draw calls for the right hand,
+  one for the left, zero per-frame allocation. The index rests on the trigger
+  and squeezes on every shot: peak recoil / trigger 0.36 / 0.83 pistol,
+  0.98 / 0.83 rifle, 0.97 / 0.84 minigun; ADS reached 1.0 with the finger
+  tightened (0.61 / 0.71 / 0.61 against a rest of 0.50 / 0.60 / 0.50).
+
+### Round 2 — the lanes meet in the shared files
+
+Committed: **wiring** (`a73b8be`) — a collab bus that lands after Jump In now
+triggers a snapshot exchange, so pieces placed in those solo seconds reach
+everyone instead of staying invisible until the next placement; the never-shown
+11 px voice chip is gone; the roster chip can no longer latch blank before it
+exists. **Audio** (`ef55e6b`) — peers' footsteps route through the same
+distance/pan rig as remote gunfire and under the master compressor and the
+concussion muffle (they had gone straight to the destination); walk, run,
+landing depth and hit size shape your own steps, thumps and hurts, defaults
+byte-identical to before. **Hands, second cut** (`22bc0f1`) — `feel.ts` is
+the single source for recoil, bob and sway; the hands mirror the viewmodel's
+exact values through `handSignals`; thinner fingers with a knuckle ridge; one
+shared skin constant so first-person hands and the avatar match.
+
+Finished in the same working tree as this entry, and landing with it:
+
+- **Presence.** `ROSTER_GRACE_MS` 2000: a peer missing from the host roster is
+  marked, not despawned, and dropped only after two seconds with no frame heard
+  — because a background tab's timers are throttled to 1 Hz, which stretches
+  the 500 ms keep-alive to ~1000–1100 ms, and a one-second grace expired
+  exactly between two of them. An EMPTY roster is ignored outright: the host
+  pushes one on every channel restart. `rebindTransport` runs first thing in
+  every tick and follows the installed bus by OBJECT identity — swap, outage
+  and return — moving the transport and the roster subscription with the
+  registry untouched (a spectator used to go deaf after a host restart until
+  the phase flipped). `net.ts` outbound counters are page-monotonic on purpose:
+  the host keeps our sessionId across a restart, and a counter that restarted
+  at 1 was refused by every peer as a rewind until their sweep despawned us.
+  `remoteLabel` (nick, else roster name, else 'builder') now lives in
+  `presence.ts` next to the toasts; `roster-names.ts` re-exports it.
+  `scripts/qa/see-swap-harness.mjs` drives all three host behaviours —
+  `__bootsQaSwapBus`, `__bootsQaBlipRoster`, `__bootsQaOutage` — on the
+  spectator page, then on the player page.
+- **Voice, second cut.** An editor viewer HEARS the players: `startVoiceListen`
+  runs the voice module receive-only — no microphone asked for, every
+  transceiver recvonly, the listener offers (a player cannot want a peer that
+  publishes no presence), its frames carry the soft field `listen: true`, and
+  a player answers an unknown offerer exactly as it always has, so a pin that
+  never heard of listeners completes the handshake. `MAX_LISTENERS_PER_PLAYER`
+  4; past it an offer is simply not answered, and counted. Dropping in is a
+  handover: `startVoice` adopts the live links, flips each m-line to sendrecv,
+  puts the veil's mic on the senders and re-offers one epoch up — nothing the
+  viewer was hearing stops. The listen pill's one line that matters is a
+  button: "SOUND BLOCKED — CLICK TO HEAR THE PLAYERS", because a page never
+  clicked cannot play sound it did not start. The sidebar "⏵ Jump in" now runs
+  through the mic gate like every other entry surface (it called `enterGame()`
+  directly and put the permission bubble inside the fullscreen sequence), and
+  a MIC OFF flipped while the browser is still asking is honoured the moment
+  the grant lands — the window between grant and PLAY used to be a hot mic.
+  `MAX_ICE_URLS_PER_SERVER` 16 (a Cloudflare relay ships eight addresses).
+  `scripts/qa/listen-harness.mjs` proves bytes, directions and element state;
+  audibility cannot be asserted with two pages in one browser (the same-device
+  guard mutes the pair by design).
+- **Avatar.** The talking mouth: the face polys are cloned once per body onto a
+  second, hidden SkinnedMesh on the same skeleton, wearing one module-shared
+  material whose map is the open-mouth repaint (`pascaline-face-open.ts`,
+  ~84 KB, its own lazy chunk); talking is a `visible` swap, `MOUTH_FLAP_MS`
+  125 — four cycles a second on the wall clock, so every screen flaps in phase
+  — with no per-avatar material and no texture rebinding. A talking peer also
+  wears a green ring around the tag. Spectators get the far-LOD tag that round
+  1 left pure: a constant ~36 px tag lifted off the body, drawn through walls
+  over a floor ring, scale cap 12, out to 200 m; the in-game tag stays
+  depth-tested and unscaled — that is PvP fairness. The avatar's fists are the
+  first-person hands at the grip table's own points, the support arm solved to
+  exactly that point; the depot mirror runs the same motion layer off our own
+  eye, yaw and shot counter, so the glass shows what teammates see.
+- **The TURN route** (host PR #530, merged 2026-09-03 03:44 UTC).
+  `GET /api/plugins/boots/turn` answers the seam the voice lane opened: `200
+  { iceServers, ttlSeconds }` when a relay is configured, `204` when none is
+  (the plugin keeps STUN), `401` unsigned, `429` past 20/min per user, `502`
+  if the provider is down with nothing cached; `Cache-Control: private,
+  no-store`. Configuration is env only — `CLOUDFLARE_TURN_KEY_ID` +
+  `CLOUDFLARE_TURN_API_TOKEN` (credentials minted for 24 h, cached 10 min per
+  process, single-flight, stale set served while still valid), or a static
+  `BOOTS_TURN_URLS` + `BOOTS_TURN_USERNAME` + `BOOTS_TURN_CREDENTIAL`. A
+  half-set group is treated as unset and logged once, naming the group, never
+  a value. Both response shapes were fed through the plugin's real
+  `readIceServers`; 27 host tests. Merged, deployed, and inert: no variable is
+  set yet, so voice is still STUN-only tonight.
+- **Polish** (this lane). `spectator-adopt.test.ts` pins the seamless drop-in
+  headless against a stub bus, through the real transport: `startSpectating`,
+  a `ph:'game'` frame from Alice, the spectator effect's cleanup with the phase
+  at 'game' (which must NOT stop), then `startPresence` — same entry object,
+  same `joinedAt`, `rosterVersion` unchanged, no join or leave event, one
+  subscription for the life of the page, received counters intact; plus the
+  no-drop-in teardown, the way back after Esc, and a stray `stopSpectating`
+  after the drop-in being a no-op. `net-retry.test.ts` polls every positive
+  claim to a 2 s deadline and gives every negative one a 60 ms quiet window
+  (twelve periods of the 5 ms interval) instead of fixed naps that a loaded
+  machine broke. `pascaline-glb.test.ts` reads the container at module scope
+  without `expect()` (bun files an expect outside a test as a nameless
+  failure) and pins semantics — the face material samples its own image, a
+  different picture from the body atlas, with no normal or MR map — instead of
+  an image count. `face-repaint.mjs` rejects `--seed` with no value, `--seed
+  --png-inputs` and `--seed abc` (they used to ship `seed: null` in the job
+  record). `assets/README.md` no longer claims the plated GLB's rig is
+  byte-for-byte the body's: node transforms agree within 1e-6 (measured
+  4.8e-7), extras and 13 joints identical, 24 000 triangles preserved, bytes
+  differ because Draco re-encodes.
+
+### P0 — a fort followed the owner into another project
+
+Owner, mid-night: *"i placed items and walls in a project. then changed
+project went to boots. and even though i just started on this one I see 'save
+changes' 'discard all' and many items and walls and roofs that i placed IN THE
+DIFFERENT PROJECT."* Every Boots store is a module singleton — `placed`, the
+item catalog, demolition, paint, the shared lane's attribution, the slot
+registry — and the prod editor switches projects with a client-side navigation
+that never reloads the page. Nothing observed the project identity, so project
+B inherited A's four lanes: offered in the sidebar, drawn by the preview into
+B's viewport, and one Save away from being written into B's document — the one
+thing `docs/SESSION-CHANGES.md` promises can never happen. A second fault
+underneath: `pendingScopeFrom` trusted the collab bus first and the route
+second, and the bus is a page global installed asynchronously, so for as long
+as the old bus lingered the scope named the project just LEFT. The fix
+(`project-scope.ts`, mounted by `system.tsx`): the lanes carry their own scope
+(`pending-lanes.ts` `laneScopeFor`, adopted on first use and changed only by
+the guard), every write goes under the lane scope and never under the URL of
+the moment, and the identity is the route first, the bus only for a page with
+no project route. When the two differ, `syncProjectScope` ends a live session
+the ordinary way (its Esc-time write lands under the OLD key), otherwise writes
+the old window down once more under the old key, hard-resets every store that
+outlives a session, adopts the new scope and clears the restore latch — so the
+new project's own window comes back, and the old project's comes back when you
+return. The restore is held until the host replaces the nodes map
+(`RESTORE_HOLD_MS` 5000 cap), because pruning the new window against the old
+document would drop every leveled and painted row as "gone". Checked on
+mount, on every scene or viewer store document swap, on `popstate`, and at
+1 Hz; the steady-state check is two string reads. `project-scope.test.ts`
+pins the three promises in twelve tests; `scripts/qa/project-leak.mjs`
+reproduces the owner's sequence on `:3002` with a real client-side
+`router.push` between two copies of the scene, `TAG=before` against the
+unfixed copy and `TAG=after` against the fixed one.
+
+### Still open
+
+- **Prod, with two humans.** Nothing here has been seen on `editor.pascal.app`
+  by anyone yet. The check is the P1 flow: a signed-in non-member opens
+  `/play/<id>?boots=drop` and must get the veil and JUMP IN without touching
+  the Plugins panel, then walk, shoot, talk and Esc; the owner watches from
+  `/editor/<same id>` for the small player and the pill. If the owner does not
+  see the player, suspect the late-bus race or a non-collaboration project
+  before suspecting the fix.
+- **TURN credentials.** The route is live and answers `204`. Until
+  `CLOUDFLARE_TURN_KEY_ID` + `CLOUDFLARE_TURN_API_TOKEN` (or the static
+  `BOOTS_TURN_*` trio) are set with `vercel env add`, two players behind strict
+  NATs — offices, some carriers, most VPNs — see each other and read
+  `1 UNREACHABLE` instead of hearing each other.
+- **Known rough edges.** The far cheek shows jagged plate/atlas triangles at
+  1024 px in three-quarter view (invisible at 96 px; widening the selection
+  made it worse, so the 0.30 normal threshold stays). The strafe-step and
+  turn-lean signs are asserted for symmetry only — one human look needed.
+  Remote footstep levels are tuned by formula, not by ear. Voice audibility
+  from the editor is proven by bytes and directions, not by a listener.
+- **The backlog.** A 35-idea panel ranked ten for two friends tonight
+  (`/tmp/boots-ideas-top10.md`): spawn beside your friend facing them, a ping
+  beacon, a moments feed with join/leave chimes, a friend compass, a fort
+  tally, emotes, wave telegraphs, breach, a HOLD-N match, a party photo. Round
+  3 was drafted around the first five and did not run; its "do not do tonight"
+  list — a director-owned shared horde, a pause veil, an editor follow-cam —
+  stands.

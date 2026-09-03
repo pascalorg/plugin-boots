@@ -58,8 +58,19 @@ const [INPUT, REF, OUT] = positional
 if (!INPUT || !REF || !OUT) usage()
 if (!existsSync(INPUT)) usage(`no such file: ${INPUT}`)
 if (!existsSync(REF)) usage(`no such file: ${REF}`)
-const N = Number(opt('--n', '4'))
-const SEED = argv.includes('--seed') ? Number(opt('--seed')) : undefined
+/** An integer flag value, validated: `--seed` alone, `--seed --png-inputs` or
+ * `--seed abc` used to yield NaN and ship `seed: null` in the job record. */
+function intOpt(name, dflt, { min = 0 } = {}) {
+  if (!argv.includes(name)) return dflt
+  const raw = opt(name)
+  if (raw === undefined || raw.startsWith('--') || !/^\d+$/.test(raw) || Number(raw) < min) {
+    usage(`${name} needs an integer value ≥ ${min}, got ${raw === undefined ? 'nothing' : JSON.stringify(raw)}`)
+  }
+  return Number(raw)
+}
+
+const N = intOpt('--n', 4, { min: 1 })
+const SEED = intOpt('--seed', undefined)
 const PNG_INPUTS = argv.includes('--png-inputs')
 const SUFFIX = opt('--prompt-suffix', '')
 const PROMPT_FILE = opt('--prompt-file', null)

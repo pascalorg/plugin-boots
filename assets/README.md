@@ -19,17 +19,23 @@ Files:
 - `pascaline-face-ref.png` — 520 px crop of the mascot's head from the design
   render; the style reference the repaint model gets as image 2.
 - `pascaline.glb` — body + face plate: what ships. Two materials (`model`, `face`),
-  two Draco primitives sharing the one skin, rig and extras byte-for-byte those of
-  the body.
+  two Draco primitives sharing the one skin; rig, joints and `rigDims` semantically
+  identical to the body's (node transforms within 1e-6; geometry re-encoded by
+  Draco, so the bytes differ; 24k triangles preserved).
 - `pascaline-tpose-ref.png` — the T-pose redraw the mesh was generated from.
 - `pascaline-face-open.jpg` — the same paint with the mouth open mid-word (an edit
   of `pascaline-face.jpg`, fal-ai/nano-banana/edit request
   `01a064ec-fb1a-70b3-af7c-29ca63d2f080`, candidate 1; only the mouth differs).
-  NOT wired yet: the plan is a per-avatar clone of the `face` material whose `.map`
-  swaps to this plate while `isPeerTalking()` (voice.ts) so people can SEE who is
-  talking. Build its plate with
-  `face-plate.py apply pascaline-body.glb x.glb --paint pascaline-face-open.jpg --plate-only open-plate.png`
-  (same projection, same tone match, no GLB written) and embed it as a second base64 module.
+  Wired in the 2026-09-02 avatar pass: `scripts/embed-avatar.mjs` re-encodes it
+  (sips, quality 60, ~84 KB) into `src/game/pascaline-face-open.ts`, its own lazy
+  chunk; `pascaline-model.ts` clones the plate's polys onto a second, hidden
+  SkinnedMesh on the same skeleton wearing ONE module-shared open-mouth material,
+  and `remote-players.tsx` flips the two meshes' `visible` while `isPeerTalking()`
+  (voice.ts) says so — `MOUTH_FLAP_MS` 125, four open/close cycles a second on the
+  wall clock, so every screen flaps in phase. No per-avatar material clone, no
+  texture rebinding: a hidden mesh is simply not drawn, on WebGPU and WebGL alike.
+  The paint is a straight repaint of the closed plate, so it needs no projection
+  step of its own; a new open-mouth paint goes through `bun run avatar:build`.
 
 Provenance (2026-09-01/02):
 
@@ -68,9 +74,16 @@ Provenance (2026-09-01/02):
      over the same polys (no gloss step at the hat), metallic 0, no normal/MR
      textures, opaque. Skin tone is matched to the atlas (scale ≈ 1.00/0.98/0.99).
      The rest of the mesh, its UVs, weights, 13 bones and `rigDims` are untouched.
-   - `bun test src/game/pascaline-glb.test.ts` pins the contract (two materials,
-     clamp, opaque, Draco+skin on every primitive, ≥ 13 joints, JPEG images,
-     rigDims, < 1 MB).
+   - `bun test src/game/pascaline-glb.test.ts` pins the contract, not tonight's
+     numbers: a well-formed v2 GLB under 1 MB; the two materials; the `face`
+     material samples its own `pascaline_face` image (a different picture from
+     the body atlas) and carries no normal or metallic-roughness map; the plate
+     sampler clamps; both materials opaque; Draco + skin + UVs on every
+     primitive; one skin with ≥ 13 joints and every bone the runtime looks up
+     by name; `rigDims` with every measured key; every image JPEG. The body's
+     own normal and metallic-roughness maps (~80 KB each in the GLB) are
+     deliberately outside the contract — dropping them for size is the
+     pipeline's call and must not fail the test.
 
 ## Build chain
 
