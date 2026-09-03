@@ -36,9 +36,8 @@ import {
   worldPerPixel,
 } from './far-lod'
 import { clampFrameDt } from './feel'
-import { gripQuaternion, gripToShoulder, holdFor, leftGripFor } from './hand-grips'
+import { gripToShoulder, holdFor, leftGripFor } from './hand-grips'
 import { AVATAR_SKIN_HEX } from './hand-pose'
-import { HandMesh } from './hand-rig'
 import { MOVE } from './movement'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
@@ -355,9 +354,8 @@ export const STRIDE = {
  * and the trunk ease. */
 export const BLEND_RATE = { legs: 60, arms: 12, trunk: 9, hands: 14 } as const
 /** A hand holding something collapses to this scale (its fist mesh takes over). */
-export const HAND_COLLAPSE = 0.02
-/** Procedural grip hands are camera-readable without dwarfing Pascaline arms. */
-export const AVATAR_GRIP_HAND_SCALE = 0.82
+/** Native model hands remain at full scale; there is exactly one pair. */
+export const HAND_COLLAPSE = 1
 /**
  * The arm the poses are solved for: shoulder half-width, upper arm, and the
  * reach from elbow to the grip in the palm. The mascot model's numbers (the box
@@ -776,9 +774,9 @@ export function blendArticulation(live: AvatarArticulation, target: AvatarArticu
 /**
  * Write a pose onto a body's handles — the one place the sign conventions
  * live: the right leg mirrors the left, knees bend backward (−x), elbows bend
- * forward (+x), arm yaws are written as given, a gripping hand collapses to
- * HAND_COLLAPSE and its fist shows. Handles a body does not have (the box
- * rig's elbows, knees, hands) are simply absent. The root's bob and sway are
+ * forward (+x), arm yaws are written as given, native hands remain full-size,
+ * and any legacy procedural fists stay hidden. Handles a body does not have
+ * (the box rig's elbows and knees) are simply absent. The root's bob and sway are
  * the caller's — it owns the root's world position.
  */
 export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): void {
@@ -823,8 +821,10 @@ export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): v
     fist: { current: Group | null } | undefined,
     grip: number,
   ) => {
-    if (bone?.current) bone.current.scale.setScalar(1 + (HAND_COLLAPSE - 1) * grip)
-    if (fist?.current) fist.current.visible = grip > 0.5
+    if (bone?.current) bone.current.scale.setScalar(1)
+    // Older/fallback rigs may still expose a procedural replacement. Never
+    // show it over the Pascaline model's own hand.
+    if (fist?.current) fist.current.visible = false
   }
   hand(refs.handL, refs.fistL, a.gripL)
   hand(refs.handR, refs.fistR, a.gripR)
@@ -1564,9 +1564,8 @@ export type AvatarRigRefs = {
   kneeR?: { current: Group | null }
   /** The held weapon's group (HeldWeapon) — tilted per frame so the barrel tracks the aim. */
   weapon?: { current: Group | null }
-  /** Hand bones (collapse while gripping) and the procedural hands that replace
-   * them on the weapon (HeldWeapon: `fistR` is the right hand on the grip,
-   * `fistL` the support hand — shown while that hand grips). */
+  /** Native hand bones. `fist*` remains optional for compatibility with an
+   * older mounted rig, but is forcibly hidden so hands are never doubled. */
   handL?: { current: Group | null }
   handR?: { current: Group | null }
   fistL?: { current: Group | null }
@@ -1712,17 +1711,10 @@ export function twoHanded(weapon: string): boolean {
  * pascaline-model.ts), and the two agree on where a rifle is in space.
  * `reach` is shoulder → grip: the box rig's 0.52, the model's arm plus a hand.
  *
- * THE HANDS ARE THE FIRST-PERSON HANDS (hand-rig.tsx / hand-grips.ts): the
- * same merged one-draw-call hand per pose and side, at the same table point
- * and orientation on the same weapon model, so what a teammate sees on your
- * rifle is what you see on yours. The right PALM sits at the group's origin —
- * the reach point the arm IK solves for — and the weapon is pulled back behind
- * it by the table's right-hand offset, so the gun rides the hand rather than
- * the hand floating beside the gun; the support hand is rigid to the weapon at
- * its table point and the left arm is solved to exactly there (articulate's
- * `leftGrip`). Both hands ride the weapon group, so they take the aim tilt and
- * the recoil kick for free. Trigger articulation stays first-person only: at
- * 90 px a finger is a pixel, and one draw call per hand is the budget.
+ * The model's native skinned hands terminate the arm IK at the grip points.
+ * Do not add procedural hands here: doing so produces two complete pairs in
+ * mirrors and during the primitive-to-model swap. Trigger articulation stays
+ * first-person-only, where there is no avatar body underneath it.
  */
 function HeldWeapon({
   reach = 0.52,
@@ -1736,10 +1728,6 @@ function HeldWeapon({
   const Weapon = WEAPON_COMPONENT[weapon]
   const muzzle = refs.fx ? remoteMuzzle(weapon) : null
   const hold = holdFor(weapon)
-  const support = twoHanded(weapon) ? hold.left : null
-  // Orientation of each hand in weapon space — a weapon-swap event, not a frame.
-  const qR = useMemo(() => gripQuaternion(hold.right, 'R', new Quaternion()), [hold])
-  const qL = useMemo(() => (support ? gripQuaternion(support, 'L', new Quaternion()) : null), [support])
   if (!Weapon) return null
   const r = hold.right.position
   return (
@@ -1770,23 +1758,6 @@ function HeldWeapon({
               material={TRACER_MATERIAL}
               position={[0, 0, -(TRACER_LEN / 2) - 0.1]}
             />
-          </group>
-        ) : null}
-        {/* The right hand on the grip (shown while gripping — always, with a
-            weapon in hand; applyArticulation owns the boolean). */}
-        <group position={[r[0], r[1], r[2]]} quaternion={qR} ref={refs.fistR}>
-          <HandMesh pose={hold.right.pose} side="R" scale={AVATAR_GRIP_HAND_SCALE} />
-        </group>
-        {/* The support hand at its table point, hidden until the left arm
-            has reached across (gripL > 0.5). */}
-        {support && qL ? (
-          <group
-            position={[support.position[0], support.position[1], support.position[2]]}
-            quaternion={qL}
-            ref={refs.fistL}
-            visible={false}
-          >
-            <HandMesh pose={support.pose} side="L" scale={AVATAR_GRIP_HAND_SCALE} />
           </group>
         ) : null}
       </group>

@@ -4,7 +4,7 @@
 // wholesale (no resolveCdnUrl) and a named import would be a load-time
 // SyntaxError there; resolveUrl below feature-detects it.
 import * as viewerPkg from '@pascal-app/viewer'
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import {
   BoxGeometry,
@@ -21,6 +21,7 @@ import {
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js'
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js'
 import { create } from 'zustand'
 import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
@@ -629,6 +630,8 @@ type ModelSlot =
 
 const modelCache = new Map<string, ModelSlot>()
 let loader: GLTFLoader | null = null
+let ktx2Loader: KTX2Loader | null = null
+const ktx2Renderers = new WeakSet<object>()
 
 /** viewer's resolveCdnUrl is stubbed away under bun test — pass-through.
  * (It also types nullable in/out; catalog src is always an https string.) */
@@ -643,10 +646,9 @@ const resolveUrl = (src: string): string => {
  * Draco-compressed (extensionsRequired KHR_draco_mesh_compression), so a
  * bare GLTFLoader threw "No DRACOLoader instance provided" and EVERY
  * placement degraded to the labeled proxy box. Draco/meshopt decode is
- * CPU/WASM — WebGPU-safe, no shaders. The gstatic decoder path is the one
- * the host already ships to prod. KTX2 (basisu textures) is deliberately
- * NOT wired: no catalog GLB uses it today and it would need renderer
- * access — such items keep the proxy. */
+ * CPU/WASM — WebGPU-safe, no shaders. The API catalog also contains
+ * KHR_texture_basisu models, so GameItems configures the shared loader with
+ * the live renderer before a selection can start loading. */
 export function itemModelLoader(): GLTFLoader {
   if (!loader) {
     loader = new GLTFLoader()
@@ -656,6 +658,24 @@ export function itemModelLoader(): GLTFLoader {
     loader.setMeshoptDecoder(MeshoptDecoder)
   }
   return loader
+}
+
+/** Attach Basis/KTX2 decoding to the imperative catalog loader. */
+export function configureItemModelLoader(renderer: object): boolean {
+  if (ktx2Renderers.has(renderer)) return true
+  try {
+    if (!ktx2Loader) {
+      ktx2Loader = new KTX2Loader()
+      ktx2Loader.setTranscoderPath('https://cdn.jsdelivr.net/gh/pmndrs/drei-assets@master/basis/')
+    }
+    ktx2Loader.detectSupport(renderer as never)
+    itemModelLoader().setKTX2Loader(ktx2Loader)
+    ktx2Renderers.add(renderer)
+    return true
+  } catch (error) {
+    console.warn('[boots/items] KTX2 support unavailable; textured GLBs may use a proxy', error)
+    return false
+  }
 }
 
 /** Load (or reuse) the item's GLB scene template. Rejections are recorded
@@ -1167,6 +1187,11 @@ const _wallAim: WallAim = { frame: null, u: 0, v: 0, dist: 0 }
  *  - HUD: ghost-status 'too far' while clamped, prompt line while armed.
  */
 export function GameItems({ world }: { world: GameWorld }) {
+  const renderer = useThree((state) => state.gl)
+  // Configure before children render: a placement carried across re-entry
+  // mounts its loader in a layout effect, before this component's effects.
+  // The WeakSet makes render retries/StrictMode idempotent.
+  configureItemModelLoader(renderer)
   const items = useItems((s) => s.items)
   const armed = useItems((s) => s.armed)
   const ghostRef = useRef<Group>(null)

@@ -8,6 +8,7 @@ import {
   anchorOnFloor,
   apertureFits,
   apertureRect,
+  configureItemModelLoader,
   disposeItemContent,
   ghostYaw,
   ITEM_REACH,
@@ -252,6 +253,17 @@ describe('itemModelLoader: catalog GLBs decode (2026-08-27 real-models fix)', ()
 
   test('one loader per session — repeat calls reuse the instance', () => {
     expect(itemModelLoader()).toBe(itemModelLoader())
+  })
+
+  test('wires KTX2/Basis textures for API models such as the plunger', () => {
+    const renderer = {
+      isWebGPURenderer: true,
+      hasFeature: () => false,
+    }
+    expect(configureItemModelLoader(renderer)).toBe(true)
+    expect(
+      (itemModelLoader() as unknown as { ktx2Loader: unknown }).ktx2Loader,
+    ).toBeTruthy()
   })
 })
 

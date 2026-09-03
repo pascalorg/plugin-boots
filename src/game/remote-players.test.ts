@@ -489,7 +489,7 @@ describe('articulation — gait, airborne, slump', () => {
     expect(c.armAim).toBe(0)
   })
 
-  test('applyArticulation collapses a gripping hand and shows its fist; releases both when open', () => {
+  test('applyArticulation keeps one native hand pair and hides legacy procedural fists', () => {
     const mk = () => ({ current: new Group() })
     const refs = {
       torso: mk(), head: mk(), armL: mk(), armR: mk(), legL: mk(), legR: mk(),
@@ -500,7 +500,7 @@ describe('articulation — gait, airborne, slump', () => {
     a.gripL = 0
     applyArticulation(refs, a)
     expect(refs.handR.current.scale.x).toBeCloseTo(HAND_COLLAPSE, 9)
-    expect(refs.fistR.current.visible).toBe(true)
+    expect(refs.fistR.current.visible).toBe(false)
     expect(refs.handL.current.scale.x).toBe(1)
     expect(refs.fistL.current.visible).toBe(false)
     a.gripR = 0
