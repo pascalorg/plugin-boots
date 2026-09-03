@@ -16,6 +16,11 @@ import {
   depotPosition,
   GRAB_RANGE,
   nearestGrabbable,
+  stepTrailerYaw,
+  trailerCenterFromHitch,
+  TRAILER_HITCH_LENGTH,
+  TRAILER_MAX_ARTICULATION,
+  TRUCK_HITCH_X,
   worldToDepotLocal,
 } from './guntable'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
@@ -273,6 +278,37 @@ describe('Cybertruck convoy collision envelope', () => {
     const ground = box('site-a', 'site', [100, 0.2, 100], [0, 0, 0])
     const own = box(DEPOT_NODE_ID, DEPOT_NODE_TYPE, [6, 3, 2.5], [0, 1.5, 0])
     expect(convoyCanOccupy([ground, own], 0, 0, 0, 0)).toBe(true)
+  })
+})
+
+describe('articulated trailer kinematics', () => {
+  test('the truck turns first and the trailer follows instead of rotating as one block', () => {
+    const trailerYaw = stepTrailerYaw(0, 0.55, 6, 1 / 30)
+    expect(trailerYaw).toBeGreaterThan(0)
+    expect(trailerYaw).toBeLessThan(0.55)
+  })
+
+  test('the drawbar stays attached to the truck hitch at every angle', () => {
+    const truck = { x: 4, z: -2, yaw: 0.6 }
+    const trailerYaw = 0.18
+    const trailer = trailerCenterFromHitch(truck.x, truck.z, truck.yaw, trailerYaw)
+    const truckHitch = {
+      x: truck.x + TRUCK_HITCH_X * Math.cos(truck.yaw),
+      z: truck.z - TRUCK_HITCH_X * Math.sin(truck.yaw),
+    }
+    const trailerHitch = {
+      x: trailer.x - TRAILER_HITCH_LENGTH * Math.cos(trailerYaw),
+      z: trailer.z + TRAILER_HITCH_LENGTH * Math.sin(trailerYaw),
+    }
+    expect(Math.hypot(truckHitch.x - trailerHitch.x, truckHitch.z - trailerHitch.z)).toBeLessThan(
+      1e-9,
+    )
+  })
+
+  test('reverse jackknife is bounded before the trailer clips through the cab', () => {
+    const yaw = stepTrailerYaw(0, Math.PI, -20, 1)
+    const articulation = Math.atan2(Math.sin(Math.PI - yaw), Math.cos(Math.PI - yaw))
+    expect(Math.abs(articulation)).toBeLessThanOrEqual(TRAILER_MAX_ARTICULATION + 1e-9)
   })
 })
 

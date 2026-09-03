@@ -118,6 +118,13 @@ describe('validatePvpFrame', () => {
   test('an empty hits map is valid', () => {
     expect(validatePvpFrame({ hits: {} })).toEqual({ hits: {} })
   })
+
+  test('vehicle ram counters are independently bounded and normalized', () => {
+    expect(validatePvpFrame({ hits: {}, rams: { a: 3, b: -1, c: 'bad' } })).toEqual({
+      hits: {},
+      rams: { a: 3 },
+    })
+  })
 })
 
 // ── The roster raycast hits the DRAWN body ───────────────────────────────────

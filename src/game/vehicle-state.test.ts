@@ -17,6 +17,22 @@ describe('vehicle wire boundary', () => {
     ).toEqual({ x: 4, y: 0.5, z: -8, yaw: Math.PI, speed: 30, occupied: true })
   })
 
+  test('preserves the articulated truck pose when a current peer includes it', () => {
+    expect(
+      readVehicleFrame({
+        x: 4,
+        y: 0.5,
+        z: -8,
+        yaw: 0.2,
+        truckX: -1.5,
+        truckZ: -7,
+        truckYaw: Math.PI * 3,
+        speed: 5,
+        occupied: true,
+      }),
+    ).toMatchObject({ truckX: -1.5, truckZ: -7, truckYaw: Math.PI })
+  })
+
   test('rejects malformed and unbounded peer data', () => {
     expect(readVehicleFrame(null)).toBeNull()
     expect(readVehicleFrame({ x: 0, y: 0, z: 0, yaw: 0, speed: 0 })).toBeNull()

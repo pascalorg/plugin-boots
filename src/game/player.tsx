@@ -2,7 +2,7 @@
 
 import { type RootState, useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
-import { type PerspectiveCamera, Vector3 } from 'three'
+import { type PerspectiveCamera, Ray, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
 import { EYE_HEIGHT, moveCapsule, PLAYER_CAPSULE } from './collision'
@@ -27,6 +27,7 @@ import {
 } from './feel'
 import { guardedFrame, setFrameCrashHandler } from './frame-guard'
 import { groundSurfaceY, lotFloorY } from './ground'
+import { takeAction } from './input'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
 import { exitGame, getSession } from './session'
@@ -105,6 +106,10 @@ const GAME_FOV = 92
 const ADS_FOV = 60
 const MAX_PITCH = Math.PI / 2 - 0.02
 const _vehicleLookAt = new Vector3()
+const _thirdDesired = new Vector3()
+const _thirdDirection = new Vector3()
+const _thirdHit = new Vector3()
+const _thirdRay = new Ray()
 
 const REGEN_DELAY = 4 // s after last damage before regen kicks in
 const REGEN_RATE = 12 // hp/s
@@ -501,6 +506,12 @@ export function Player({ world }: { world: GameWorld }) {
     clock += dt
     const input = session.input
 
+    // Tab is a persistent camera toggle, on foot as well as in the truck.
+    // GunTable owns the same action at priority -2 while driving.
+    if (!vehicleRig.driving && takeAction(input.state.actions, 'Tab')) {
+      vehicleRig.view = vehicleRig.view === 'first' ? 'third' : 'first'
+    }
+
     const boots = useBoots.getState()
     // Safety net: anything still writing health<=0 directly (instead of
     // damagePlayer) also lands in the stagger path — never a death.
@@ -553,8 +564,10 @@ export function Player({ world }: { world: GameWorld }) {
         // lifts the boom, while the target remains the live cab. Keeping the
         // true playerRig position in the seat preserves every interaction and
         // network invariant; only the cosmetic camera moves.
-        const distance = 6.2
-        const lift = 2.6 + Math.sin(playerRig.pitch) * 2.1
+        // High enough to see over the supply trailer instead of placing its
+        // rear panel in the center of the chase view.
+        const distance = 7.4
+        const lift = 4.25 + Math.sin(playerRig.pitch) * 2.15
         camera.position.set(
           playerRig.position.x + Math.sin(playerRig.yaw) * distance,
           playerRig.position.y + lift,
@@ -562,7 +575,7 @@ export function Player({ world }: { world: GameWorld }) {
         )
         _vehicleLookAt.set(
           playerRig.position.x,
-          playerRig.position.y + 0.25,
+          playerRig.position.y + 0.55,
           playerRig.position.z,
         )
         camera.lookAt(_vehicleLookAt)
@@ -777,21 +790,46 @@ export function Player({ world }: { world: GameWorld }) {
     // vector), eased step height, landing dip, strafe lean, shake, hurt kick.
     // The viewmodel copies camera.position/quaternion so it rides along;
     // aimDirection reads playerRig.yaw/pitch and never sees any of this.
-    camera.position.set(
-      playerRig.position.x + cosY * bX,
-      camFeetY + EYE_HEIGHT + bY - dip,
-      playerRig.position.z - sinY * bX,
-    )
-    camera.rotation.order = 'YXZ'
-    camera.rotation.set(
-      playerRig.pitch +
-        playerRig.recoil +
-        swayPitch +
-        (_shake.pitch + feel.hurtPitch) * shakeK -
-        landPitch,
-      playerRig.yaw + _shake.yaw * shakeK,
-      swayRoll + roll + feel.hurtRoll * shakeK,
-    )
+    if (vehicleRig.view === 'third') {
+      // Fortnite-style right-shoulder chase camera. Keep its look parallel to
+      // the authoritative aim ray, then pull the boom in against walls so it
+      // cannot see through a room the player is standing inside.
+      _thirdDesired.set(
+        playerRig.position.x + Math.sin(playerRig.yaw) * 4.15 + cosY * 0.68,
+        playerRig.position.y + 0.9,
+        playerRig.position.z + Math.cos(playerRig.yaw) * 4.15 - sinY * 0.68,
+      )
+      _thirdDirection.subVectors(_thirdDesired, playerRig.position)
+      const wanted = _thirdDirection.length()
+      _thirdDirection.multiplyScalar(1 / Math.max(wanted, 1e-6))
+      _thirdRay.set(playerRig.position, _thirdDirection)
+      let allowed = wanted
+      for (const collider of world.colliders) {
+        if (collider.disabled || collider.worldBox.containsPoint(playerRig.position)) continue
+        if (!_thirdRay.intersectBox(collider.worldBox, _thirdHit)) continue
+        const hitDistance = _thirdHit.distanceTo(playerRig.position)
+        if (hitDistance < allowed) allowed = Math.max(0.45, hitDistance - 0.16)
+      }
+      camera.position.copy(playerRig.position).addScaledVector(_thirdDirection, allowed)
+      camera.rotation.order = 'YXZ'
+      camera.rotation.set(playerRig.pitch, playerRig.yaw, 0)
+    } else {
+      camera.position.set(
+        playerRig.position.x + cosY * bX,
+        camFeetY + EYE_HEIGHT + bY - dip,
+        playerRig.position.z - sinY * bX,
+      )
+      camera.rotation.order = 'YXZ'
+      camera.rotation.set(
+        playerRig.pitch +
+          playerRig.recoil +
+          swayPitch +
+          (_shake.pitch + feel.hurtPitch) * shakeK -
+          landPitch,
+        playerRig.yaw + _shake.yaw * shakeK,
+        swayRoll + roll + feel.hurtRoll * shakeK,
+      )
+    }
 
     // Fall off the world guard. Re-settle: the ground at the spawn XZ may
     // have changed since the snapshot (voxelized away, pieces placed). The

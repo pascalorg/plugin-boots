@@ -48,6 +48,7 @@ import { resetGameOperables } from './interact'
 import { GameItems } from './item-place'
 import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
+import { LocalPlayerAvatar } from './local-player-avatar'
 import { PaintTool } from './paint'
 import { MOVE } from './movement'
 import { localDisplayName } from './nickname'
@@ -1192,6 +1193,7 @@ function ActiveGame() {
   return (
     <>
       <Player world={world} />
+      <LocalPlayerAvatar />
       <RemotePlayers />
       <VoiceControls />
       <Viewmodel world={world} />

@@ -176,13 +176,22 @@ export function raycastRemotePlayers(
 }
 
 // ── Wire state ──────────────────────────────────────────────────────────────
-type PvpFrame = { hits: Record<string, number> }
+type PvpFrame = {
+  hits: Record<string, number>
+  /** Cumulative vehicle impacts, kept separate so a ram can add vertical
+   * launch without making a coalesced minigun burst throw somebody skyward. */
+  rams?: Record<string, number>
+}
 
 /** Per-victim cumulative tags WE have landed (rebuilt into every frame so the
  * latest coalesced frame is self-sufficient). */
 const outgoing = new Map<string, number>()
+const outgoingRams = new Map<string, number>()
 /** Per-shooter last counter we have already applied. */
 const seen = new Map<string, number>()
+const seenRams = new Map<string, number>()
+/** Driver-side debounce: overlap lasts several frames but is one impact. */
+const rammedAt = new Map<string, number>()
 let active = false
 let offFrame: (() => void) | null = null
 
@@ -194,7 +203,21 @@ export function validatePvpFrame(data: unknown): PvpFrame | null {
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof v === 'number' && Number.isFinite(v) && v >= 0) hits[k] = v
   }
-  return { hits }
+  const rawRams = (data as { rams?: unknown }).rams
+  if (!rawRams || typeof rawRams !== 'object') return { hits }
+  const rams: Record<string, number> = {}
+  for (const [k, v] of Object.entries(rawRams as Record<string, unknown>)) {
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) rams[k] = v
+  }
+  return { hits, rams }
+}
+
+function publishPvpCounters(): void {
+  const hits: Record<string, number> = {}
+  const rams: Record<string, number> = {}
+  for (const [k, n] of outgoing) hits[k] = n
+  for (const [k, n] of outgoingRams) rams[k] = n
+  publishFrame(PVP_KIND, { hits, ...(outgoingRams.size > 0 ? { rams } : {}) })
 }
 
 /** Shooter side (called from shooting.ts on a player hit): count the tag and
@@ -202,9 +225,28 @@ export function validatePvpFrame(data: unknown): PvpFrame | null {
 function recordPvpHit(sessionId: string): void {
   if (!active) return
   outgoing.set(sessionId, (outgoing.get(sessionId) ?? 0) + 1)
-  const hits: Record<string, number> = {}
-  for (const [k, n] of outgoing) hits[k] = n
-  publishFrame(PVP_KIND, { hits })
+  publishPvpCounters()
+}
+
+/** Driver-authoritative overlap against the same live/drawn remote poses used
+ * by hitscan. One overlap per player per second becomes one heavy red damage
+ * pulse plus a grenade-like loft on the victim's own client. */
+export function ramRemotePlayersAt(x: number, z: number, radius: number, now = Date.now()): number {
+  if (!active) return 0
+  let hit = 0
+  const radiusSq = radius * radius
+  for (const remote of getRemotes().values()) {
+    if (remote.ph !== 'game' || !sampleRemoteNow(remote, now)) continue
+    const dx = _sample.x - x
+    const dz = _sample.z - z
+    if (dx * dx + dz * dz > radiusSq) continue
+    if (now - (rammedAt.get(remote.sessionId) ?? -Infinity) < 1_000) continue
+    rammedAt.set(remote.sessionId, now)
+    outgoingRams.set(remote.sessionId, (outgoingRams.get(remote.sessionId) ?? 0) + 1)
+    hit++
+  }
+  if (hit > 0) publishPvpCounters()
+  return hit
 }
 
 const _fromDir = { x: 0, z: 0 }
@@ -215,7 +257,8 @@ function onPvpFrame(msg: NetMessage<PvpFrame>): void {
   const mine = localSessionId()
   if (!mine) return
   const burst = consumeHits(msg.sessionId, msg.data.hits[mine], seen, MAX_BURST)
-  if (burst <= 0) return
+  const rams = consumeHits(msg.sessionId, msg.data.rams?.[mine], seenRams, 1)
+  if (burst <= 0 && rams <= 0) return
   const shooter = getRemotes().get(msg.sessionId)
   let hasDir = false
   if (shooter && sampleRemoteNow(shooter)) {
@@ -229,6 +272,11 @@ function onPvpFrame(msg: NetMessage<PvpFrame>): void {
     }
   }
   for (let i = 0; i < burst; i++) damagePlayer(PVP_DAMAGE, hasDir ? _fromDir : undefined)
+  if (rams > 0) {
+    damagePlayer(38, hasDir ? _fromDir : undefined)
+    playerRig.launch(5.8)
+    playerRig.shake(3.2)
+  }
 }
 
 /**
@@ -242,7 +290,10 @@ export function startPvpSync(): void {
   if (active) return
   active = true
   outgoing.clear()
+  outgoingRams.clear()
   seen.clear()
+  seenRams.clear()
+  rammedAt.clear()
   registerFrameKind<PvpFrame>(PVP_KIND, validatePvpFrame, { ordered: false })
   offFrame = onFrame<PvpFrame>(PVP_KIND, onPvpFrame)
   registerPvpRoutes({ raycast: raycastRemotePlayers, onHit: recordPvpHit })
@@ -255,7 +306,10 @@ export function stopPvpSync(): void {
   offFrame?.()
   offFrame = null
   outgoing.clear()
+  outgoingRams.clear()
   seen.clear()
+  seenRams.clear()
+  rammedAt.clear()
 }
 
 /** Test-only reset of the module singletons. */
@@ -263,5 +317,8 @@ export function resetPvpForTests(): void {
   active = false
   offFrame = null
   outgoing.clear()
+  outgoingRams.clear()
   seen.clear()
+  seenRams.clear()
+  rammedAt.clear()
 }

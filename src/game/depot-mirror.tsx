@@ -22,6 +22,7 @@ import { EYE_HEIGHT } from './collision'
 import { DEPOT_NODE_ID, DEPOT_NODE_TYPE } from './guntable'
 import { clampFrameDt } from './feel'
 import { leftGripFor } from './hand-grips'
+import { LOCAL_AVATAR_NAME } from './local-player-avatar'
 import { aimMirrorCamera, flipPaneUv, MirrorCamera, type MirrorPane, paneInView } from './mirror-view'
 import { MOVE } from './movement'
 import { mouthOpenAt, setMouth } from './pascaline-model'
@@ -206,6 +207,8 @@ export function DepotMirror({ world }: { world: GameWorld }) {
   const glRef = useRef<WebGLRenderer | null>(null)
   const viewmodel = useRef<Object3D | null>(null)
   const viewmodelScan = useRef(0)
+  const localAvatar = useRef<Object3D | null>(null)
+  const localAvatarScan = useRef(0)
   // One stable handle object for the rig's pivots (createRigRefs, not eight
   // useRef calls — the rig's shape is the rig's business).
   const refs = useRef(createRigRefs()).current
@@ -399,14 +402,25 @@ export function DepotMirror({ world }: { world: GameWorld }) {
         viewmodel.current = gun
       }
     }
+    let localBody = localAvatar.current
+    if (!localBody || !localBody.parent) {
+      localBody = null
+      if (localAvatarScan.current-- <= 0) {
+        localAvatarScan.current = VIEWMODEL_RESCAN
+        localBody = state.scene.getObjectByName(LOCAL_AVATAR_NAME) ?? null
+        localAvatar.current = localBody
+      }
+    }
 
     // ── the pass ───────────────────────────────────────────────────────────
     const gl = state.gl
     const prevTarget = gl.getRenderTarget()
     const prevAutoClear = gl.autoClear
     const gunWasVisible = gun ? gun.visible : false
+    const bodyWasVisible = localBody ? localBody.visible : false
     pane.visible = false
     if (gun) gun.visible = false
+    if (localBody) localBody.visible = false
     self.visible = true
     gl.autoClear = true
     gl.setRenderTarget(gear.target)
@@ -415,6 +429,7 @@ export function DepotMirror({ world }: { world: GameWorld }) {
     gl.autoClear = prevAutoClear
     self.visible = false
     if (gun) gun.visible = gunWasVisible
+    if (localBody) localBody.visible = bodyWasVisible
     pane.visible = true
     mirrorDebug.passes++
   })

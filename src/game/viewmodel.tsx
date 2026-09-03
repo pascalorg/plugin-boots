@@ -296,7 +296,9 @@ export function Viewmodel({ world }: { world: GameWorld }) {
       }
       return
     }
-    rig.visible = true
+    // Third person keeps the weapon logic live (shots/building still work),
+    // but the camera-mounted first-person hands would float over Pascaline.
+    rig.visible = vehicleRig.view === 'first'
 
     // Discrete actions: weapon slots, wheel cycling, build controls.
     const state = useBoots.getState()

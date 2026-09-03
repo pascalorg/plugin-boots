@@ -11,16 +11,27 @@ export type VehicleFrame = {
   y: number
   z: number
   yaw: number
+  /** Tractor pose. Optional only for rolling compatibility with the previous
+   * rigid-convoy wire frame; every current publisher includes all three. */
+  truckX?: number
+  truckZ?: number
+  truckYaw?: number
   speed: number
   occupied: boolean
 }
 
 export type ConvoyPose = VehicleFrame & {
+  truckX: number
+  truckZ: number
+  truckYaw: number
   ready: boolean
   targetX: number
   targetY: number
   targetZ: number
   targetYaw: number
+  targetTruckX: number
+  targetTruckZ: number
+  targetTruckYaw: number
   remoteDriver: string | null
   remoteAt: number
 }
@@ -31,12 +42,18 @@ export const convoyPose: ConvoyPose = {
   y: 0,
   z: 0,
   yaw: 0,
+  truckX: 0,
+  truckZ: 0,
+  truckYaw: 0,
   speed: 0,
   occupied: false,
   targetX: 0,
   targetY: 0,
   targetZ: 0,
   targetYaw: 0,
+  targetTruckX: 0,
+  targetTruckZ: 0,
+  targetTruckYaw: 0,
   remoteDriver: null,
   remoteAt: 0,
 }
@@ -51,12 +68,23 @@ export const vehicleRig = {
   speed: 0,
 }
 
-export function resetConvoyPose(x: number, y: number, z: number, yaw: number): void {
+export function resetConvoyPose(
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+  truckX = x,
+  truckZ = z,
+  truckYaw = yaw,
+): void {
   convoyPose.ready = true
   convoyPose.x = convoyPose.targetX = x
   convoyPose.y = convoyPose.targetY = y
   convoyPose.z = convoyPose.targetZ = z
   convoyPose.yaw = convoyPose.targetYaw = yaw
+  convoyPose.truckX = convoyPose.targetTruckX = truckX
+  convoyPose.truckZ = convoyPose.targetTruckZ = truckZ
+  convoyPose.truckYaw = convoyPose.targetTruckYaw = truckYaw
   convoyPose.speed = 0
   convoyPose.occupied = false
   convoyPose.remoteDriver = null
@@ -104,6 +132,20 @@ export function readVehicleFrame(data: unknown): VehicleFrame | null {
     y: f.y,
     z: f.z,
     yaw: wrapVehicleYaw(f.yaw),
+    ...(typeof f.truckX === 'number' &&
+    typeof f.truckZ === 'number' &&
+    typeof f.truckYaw === 'number' &&
+    Number.isFinite(f.truckX) &&
+    Number.isFinite(f.truckZ) &&
+    Number.isFinite(f.truckYaw) &&
+    Math.abs(f.truckX) <= 1_000_000 &&
+    Math.abs(f.truckZ) <= 1_000_000
+      ? {
+          truckX: f.truckX,
+          truckZ: f.truckZ,
+          truckYaw: wrapVehicleYaw(f.truckYaw),
+        }
+      : {}),
     speed: Math.max(-20, Math.min(30, f.speed)),
     occupied: f.occupied,
   }
