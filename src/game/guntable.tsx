@@ -829,6 +829,12 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     if (vehicleRig.driving) {
       if (takeAction(session.input.state.actions, 'Tab')) {
         vehicleRig.view = vehicleRig.view === 'first' ? 'third' : 'first'
+        session.hud.hint(
+          `camera-${vehicleRig.view}`,
+          vehicleRig.view === 'third'
+            ? 'Third person · Tab returns to first person'
+            : 'First person · Tab returns to third person',
+        )
       }
       if (takeAction(session.input.state.actions, 'KeyE')) {
         vehicleRig.driving = false

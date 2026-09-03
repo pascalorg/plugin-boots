@@ -510,6 +510,12 @@ export function Player({ world }: { world: GameWorld }) {
     // GunTable owns the same action at priority -2 while driving.
     if (!vehicleRig.driving && takeAction(input.state.actions, 'Tab')) {
       vehicleRig.view = vehicleRig.view === 'first' ? 'third' : 'first'
+      session.hud.hint(
+        `camera-${vehicleRig.view}`,
+        vehicleRig.view === 'third'
+          ? 'Third person · Tab returns to first person'
+          : 'First person · Tab returns to third person',
+      )
     }
 
     const boots = useBoots.getState()

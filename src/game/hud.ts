@@ -313,7 +313,7 @@ const LOADING_QUIPS = ['lacing up your boots…', 'hanging the drywall…'] as c
  * rotation interval dies at reveal and at unmount — it never outlives the
  * veil. */
 export const LOADING_TIPS = [
-  'WASD move · Space jump · E drives · Tab changes truck camera',
+  'WASD move · Space jump · E drives · Tab changes camera',
   'E gears you up at the depot behind you',
   'Face the breaker outside to start — or stop — the waves',
   '4 builds · Z X C V pick a piece',
