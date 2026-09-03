@@ -235,8 +235,16 @@ describe('the button table agrees with the game', () => {
     expect(mic?.mode).toBe('tap')
   })
 
+  test('the phone can move aimed furniture without borrowing the mic button', () => {
+    const move = BUTTONS.find((b) => b.code === 'KeyL')
+    expect(move, 'no touch button for KeyL').toBeDefined()
+    expect(move?.sub).toBe('MOVE')
+    expect(move?.mode).toBe('tap')
+    expect(BUTTONS.find((b) => b.code === 'KeyM')?.sub).toBe('MIC')
+  })
+
   test('the top-left session row does not stack its buttons on each other', () => {
-    // EXIT / GEAR / MIC share one row, hit-tested by rect with 6px of slop, and
+    // EXIT / GEAR / MIC / MOVE share one row, hit-tested by rect with 6px of slop, and
     // the first match in declaration order wins — overlapping rects would make
     // one of them unpressable rather than looking wrong.
     const row = BUTTONS.filter((b) => /top:/.test(b.place) && /left:/.test(b.place))

@@ -843,7 +843,7 @@ export function publishItem(
 
 /**
  * Replace a placed item's immutable shared record while keeping its runtime
- * identity. This is the M-to-move path: peers receive the old tombstone and
+ * identity. This is the L-to-move path: peers receive the old tombstone and
  * the new grounded pose in one flushed delta, so nobody observes a private
  * local teleport.
  */

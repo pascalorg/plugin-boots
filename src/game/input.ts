@@ -22,6 +22,8 @@ export type GameInputState = {
  * rebind on one side only can never print a key that does nothing (or leave
  * the real key unclaimed for the host editor to run a tool on). */
 export const MIC_KEY = 'KeyM'
+/** Lift/drop the aimed catalog item. Kept off M because M owns the mic. */
+export const MOVE_ITEM_KEY = 'KeyL'
 
 /** Every physical code the game claims. Exported so touch.ts's button table
  * can be proved to press codes that actually exist (a typo'd code is a button
@@ -46,6 +48,7 @@ export const GAME_KEYS = new Set([
   'KeyV',
   'KeyU',
   'KeyI',
+  MOVE_ITEM_KEY,
   // Mic toggle (voice-controls.tsx). Claimed here even though voice may be
   // unavailable: an unclaimed code reaches the host editor, and a keystroke
   // that runs an editor tool mid-session is the one thing this plugin promises

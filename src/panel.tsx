@@ -893,7 +893,7 @@ export default function BootsPanel() {
           in waves. E again throws it back up and calls the whole thing off.
         </p>
         <p>1 knife · 2 pistol · 3 rifle · 4/B build · 5 the big one · 6 hammer · 7 paint</p>
-        <p>RMB aim (pistol/rifle) · Q or Z/X/C/V pick piece · R cycles paint color · M moves furniture · Esc exit</p>
+        <p>RMB aim (pistol/rifle) · Q or Z/X/C/V pick piece · R cycles paint color · L moves furniture · Esc exit</p>
         <p>
           Pieces lock to the grid — look up to build the ceiling above you, R rotates (walls flip
           sides, stairs turn, roofs cycle shapes), run up your stairs while holding click to chain

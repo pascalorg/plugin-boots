@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Object3D } from 'three'
+import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import { useDestruction, type VoxelTarget } from './destruction'
 import {
   bakedChunkOrders,
@@ -8,6 +9,7 @@ import {
   drainPaintTints,
   flushPendingSplatZeros,
   pendingSplatZeroCensus,
+  paintNeedsCellClipping,
   getPaintedByNode,
   releaseNodeSplats,
   resetPaint,
@@ -38,11 +40,28 @@ afterEach(() => {
   resetPaintSplats()
   resetPaint()
   useDestruction.getState().reset()
+  useBoots.getState().resolvePlaced()
 })
 
 // A unit +Z face normal for stamps that don't care about orientation.
 const stamp = (nodeId: string, x: number, color = 2, radius = 0.25) =>
   stampSplat(nodeId, x, 0, 0, 0, 0, 1, radius, color)
+
+describe('F-edited wall paint clipping', () => {
+  const piece = (id: number, mask: number, kind: PlacedPiece['piece'] = 'wall') =>
+    [{ id, piece: kind, mask }] as Pick<PlacedPiece, 'id' | 'piece' | 'mask'>[]
+
+  test('suppresses an unclipped round quad on a built wall with a missing cell', () => {
+    expect(paintNeedsCellClipping('__boots-piece-7', piece(7, FULL_MASK & ~(1 << 4)))).toBe(true)
+  })
+
+  test('keeps round splats on intact walls and unrelated surfaces', () => {
+    expect(paintNeedsCellClipping('__boots-piece-7', piece(7, FULL_MASK))).toBe(false)
+    expect(paintNeedsCellClipping('__boots-piece-7', piece(7, 1, 'floor'))).toBe(false)
+    expect(paintNeedsCellClipping('wall-host', piece(7, 1))).toBe(false)
+    expect(paintNeedsCellClipping('__boots-piece-7-extra', piece(7, 1))).toBe(false)
+  })
+})
 
 describe('splatSpriteSize (scale jitter bounds)', () => {
   test('band pinned around the true 2 × radius diameter', () => {
@@ -357,5 +376,20 @@ describe('sprite eviction on drop/collapse (drainPaintTints wiring)', () => {
     ledger().set('alive', new Map([[2, (2 << 8) | 128]]))
     drainPaintTints(scene)
     expect(splatSpriteCensus('alive')).toBe(1)
+  })
+
+  test('an F-edited built wall sheds full-disc sprites but keeps its clipped cell coat', () => {
+    const nodeId = '__boots-piece-7'
+    useBoots.setState({
+      placed: [{ id: 7, piece: 'wall', position: [0, 0, 0], yaw: 0, mask: FULL_MASK & ~(1 << 4) }],
+    })
+    useDestruction.getState().targets.set(nodeId, fakeTarget(nodeId, 5))
+    expect(stamp(nodeId, 0)).toBe(true)
+    ledger().set(nodeId, new Map([[2, (2 << 8) | 128]]))
+
+    drainPaintTints(scene)
+
+    expect(splatSpriteCensus(nodeId)).toBe(0)
+    expect(ledger().get(nodeId)!.size).toBe(1)
   })
 })

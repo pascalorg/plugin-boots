@@ -19,7 +19,7 @@ import {
 } from 'three'
 import { DecalGeometry } from 'three/examples/jsm/geometries/DecalGeometry.js'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
-import { useBoots } from '../store'
+import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import { sfx, type SprayHandle } from './audio'
 import * as destructionModule from './destruction'
 import { ensureVoxelTarget, raycastVoxelTargets, useDestruction, type VoxelTarget } from './destruction'
@@ -971,6 +971,27 @@ export const SPLAT_SPRITE_JITTER_MAX = 1
  * quad orientation whenever the spray crosses it by at least this much —
  * a glancing pass down a wall still stamps flat on the drywall. */
 export const SPLAT_FACE_BIAS = 0.2
+
+const BUILT_PIECE_PREFIX = '__boots-piece-'
+
+/**
+ * A round sprite is one camera-facing quad, so it cannot contain a real hole.
+ * F-edited walls already have the correct per-cell tint underneath; suppress
+ * the decorative quad there so paint can reach the reveal edges without ever
+ * bridging the missing wall cells as a sheet floating in the opening.
+ */
+export function paintNeedsCellClipping(
+  nodeId: string,
+  placed: readonly Pick<PlacedPiece, 'id' | 'piece' | 'mask'>[] = useBoots.getState().placed,
+): boolean {
+  if (!nodeId.startsWith(BUILT_PIECE_PREFIX)) return false
+  const suffix = nodeId.slice(BUILT_PIECE_PREFIX.length)
+  if (!/^\d+$/.test(suffix)) return false
+  const id = Number.parseInt(suffix, 10)
+  if (!Number.isSafeInteger(id)) return false
+  const piece = placed.find((candidate) => candidate.id === id)
+  return piece?.piece === 'wall' && piece.mask !== FULL_MASK
+}
 
 /** Quad side (m): 2 × splat radius, jittered by `rand` ∈ [0, 1] across the
  * SPLAT_SPRITE_JITTER band (rand 0.5 = the exact diameter). Pure. */
@@ -2669,11 +2690,17 @@ export function sprayPaint(world: GameWorld): boolean {
   // points first, then the hit) so the pass reads as one continuous filled
   // band. Coalescing may swallow the hit's stamp (held-trigger economy);
   // the ledger coat already landed either way.
-  splatNormalFor(target.grid, target.kind, _direction.x, _direction.y, _direction.z, _splatN)
-  for (const p of bridge) {
-    stampSplat(nodeId, p.x, p.y, p.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
+  if (paintNeedsCellClipping(nodeId)) {
+    // Any sprites from before the F edit were full discs too; retire them.
+    // The alive-cell tint is the clipped visual for this wall from now on.
+    releaseNodeSplats(nodeId)
+  } else {
+    splatNormalFor(target.grid, target.kind, _direction.x, _direction.y, _direction.z, _splatN)
+    for (const p of bridge) {
+      stampSplat(nodeId, p.x, p.y, p.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
+    }
+    stampSplat(nodeId, _point.x, _point.y, _point.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
   }
-  stampSplat(nodeId, _point.x, _point.y, _point.z, _splatN.x, _splatN.y, _splatN.z, radius, colorIndex)
   advanceStroke(nodeId, _point.x, _point.y, _point.z)
   return true
 }
@@ -2777,6 +2804,10 @@ export function drainPaintTints(scene: Object3D): void {
       releaseNodeSplats(nodeId)
       continue
     }
+    // A wall can be painted first and F-edited afterwards. Its target is
+    // replaced immediately, so the missing-target branch above may never see
+    // the transition; drop the old full-disc sprites from the live mask too.
+    if (paintNeedsCellClipping(nodeId)) releaseNodeSplats(nodeId)
     // FULLY-dead grid (island crumble / collapse): there is nothing left to
     // tint AND matchesTarget can never fingerprint it (no alive probe), so
     // resolving would full-scene-traverse every drain forever. Skip it —

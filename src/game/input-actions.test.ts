@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import { GAME_KEYS, MIC_KEY, takeAction } from './input'
+import { GAME_KEYS, MIC_KEY, MOVE_ITEM_KEY, takeAction } from './input'
 import { MIC_KEY as VOICE_MIC_KEY } from './voice-policy'
 
 /**
- * One-shot action claiming — the shared contract behind E (interact.tsx) and M
- * (voice-controls.tsx).
+ * One-shot action claiming — the shared contract behind E (interact.tsx), M
+ * (voice-controls.tsx), and L (item-place.tsx).
  *
  * Both run at frame priority -1 on the SAME array the viewmodel drains a few
  * priorities later, so the thing that has to hold is narrow and unforgiving:
@@ -79,6 +79,7 @@ describe('takeAction', () => {
     // the host editor and runs a tool mid-session.
     expect(GAME_KEYS.has('KeyE')).toBe(true)
     expect(GAME_KEYS.has('KeyM')).toBe(true)
+    expect(GAME_KEYS.has(MOVE_ITEM_KEY)).toBe(true)
   })
 })
 
@@ -95,5 +96,10 @@ describe('MIC_KEY', () => {
     expect(MIC_KEY).toBe('KeyM')
     expect(GAME_KEYS.has(MIC_KEY)).toBe(true)
     expect(VOICE_MIC_KEY).toBe(MIC_KEY)
+  })
+
+  test('furniture move has its own physical key', () => {
+    expect(MOVE_ITEM_KEY).toBe('KeyL')
+    expect(MOVE_ITEM_KEY).not.toBe(MIC_KEY)
   })
 })

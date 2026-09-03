@@ -195,6 +195,7 @@ export const BUTTONS: readonly ButtonSpec[] = [
   // there; the FIRST tap is also the permission prompt, which is why this has to
   // be a real touch and not something the session does on entry.
   { code: 'KeyM', label: 'M', sub: 'MIC', size: 42, place: `left:112px;${top(12)}`, mode: 'tap' },
+  { code: 'KeyL', label: 'L', sub: 'MOVE', size: 42, place: `left:162px;${top(12)}`, mode: 'tap' },
 ]
 
 /** The weapon hotbar, tappable. Digit codes are what viewmodel.tsx consumes. */

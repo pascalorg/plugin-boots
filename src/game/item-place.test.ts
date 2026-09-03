@@ -156,7 +156,7 @@ describe('useItems store', () => {
     expect(useItems.getState().armed).not.toBeNull()
   })
 
-  test('M lift is reversible and a drop keeps the runtime identity', () => {
+  test('L lift is reversible and a drop keeps the runtime identity', () => {
     const original = useItems.getState().addItem(asset(), [1, 0, 2], Math.PI / 2)
     expect(useItems.getState().beginMove(original.id)).toEqual(original)
     expect(useItems.getState().items).toEqual([])
@@ -181,7 +181,7 @@ describe('useItems store', () => {
   })
 })
 
-describe('M aim and blocking', () => {
+describe('L aim and blocking', () => {
   const collider = (nodeId: string, nodeType: string, min: [number, number, number], max: [number, number, number]) => ({
     nodeId,
     nodeType,

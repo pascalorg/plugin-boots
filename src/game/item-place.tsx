@@ -25,6 +25,7 @@ import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js'
 import { create } from 'zustand'
 import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
+import { MOVE_ITEM_KEY } from './input'
 import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
 import { collectWallOpenings, dropTarget, probeLandingY } from './destruction'
 import { groundSurfaceY } from './ground'
@@ -151,7 +152,7 @@ type ItemsState = {
   items: Placement[]
   /** Menu entry riding a ghost (furniture OR opening); null = stowed. */
   armed: MenuEntry | null
-  /** Furniture temporarily lifted by M; omitted from items so its old solid
+  /** Furniture temporarily lifted by L; omitted from items so its old solid
    * collider cannot obstruct its own grounded preview. */
   moving: PlacedItem | null
   arm: (asset: MenuEntry) => void
@@ -1176,6 +1177,7 @@ const _wallAim: WallAim = { frame: null, u: 0, v: 0, dist: 0 }
  * its one-shot key strips land BEFORE the viewmodel drains the queue.
  * Owns per frame, zero allocations:
  *  - 'KeyI' (stripped): toggle the catalog menu;
+ *  - 'KeyL' (stripped): lift/drop aimed furniture (`M` belongs to voice);
  *  - while armed: 'KeyR' (stripped) quarter-turns the ghost, RMB edge
  *    stows it, weapon switch stows it, LMB edge on a valid anchor places;
  *  - ghost follow: floor-plane anchor + probeLandingY snap (items stack
@@ -1391,7 +1393,7 @@ export function GameItems({ world }: { world: GameWorld }) {
       const action = actions[read]!
       if (action === 'KeyI') {
         toggleMenu = true
-      } else if (action === 'KeyM') {
+      } else if (action === MOVE_ITEM_KEY) {
         move = true
       } else if (action === 'KeyR' && armedNow) {
         rotate = true
@@ -1422,7 +1424,7 @@ export function GameItems({ world }: { world: GameWorld }) {
           yawTurns.current = 0
           sfx.weaponSwitch()
         } else {
-          session.hud.prompt('Aim at placed furniture, then press M', 'items')
+          session.hud.prompt('Aim at placed furniture, then press L', 'items')
         }
         return
       }
@@ -1490,7 +1492,7 @@ export function GameItems({ world }: { world: GameWorld }) {
           ? 'LMB place on a wall · RMB stow · I catalog'
           : state.moving
             ? 'LMB drop · R rotate · RMB cancel move'
-            : 'LMB place · R rotate · RMB stow · I catalog · M move aimed item',
+            : 'LMB place · R rotate · RMB stow · I catalog · L move aimed item',
         'items',
       )
     }

@@ -36,8 +36,9 @@ import {
   worldPerPixel,
 } from './far-lod'
 import { clampFrameDt } from './feel'
-import { gripToShoulder, holdFor, leftGripFor } from './hand-grips'
+import { gripQuaternion, gripToShoulder, holdFor, leftGripFor } from './hand-grips'
 import { AVATAR_SKIN_HEX } from './hand-pose'
+import { HandMesh } from './hand-rig'
 import { MOVE } from './movement'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
@@ -353,9 +354,11 @@ export const STRIDE = {
  * come through at full amplitude — 22/s lost a fifth of the stride), arms
  * and the trunk ease. */
 export const BLEND_RATE = { legs: 60, arms: 12, trunk: 9, hands: 14 } as const
-/** A hand holding something collapses to this scale (its fist mesh takes over). */
-/** Native model hands remain at full scale; there is exactly one pair. */
-export const HAND_COLLAPSE = 1
+/** A native hand holding something collapses out of sight while the correctly
+ * posed grip hand takes over. Non-zero avoids singular skinned matrices. */
+export const HAND_COLLAPSE = 0.001
+/** Procedural grip hands are camera-readable without dwarfing Pascaline arms. */
+export const AVATAR_GRIP_HAND_SCALE = 0.82
 /**
  * The arm the poses are solved for: shoulder half-width, upper arm, and the
  * reach from elbow to the grip in the palm. The mascot model's numbers (the box
@@ -821,10 +824,11 @@ export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): v
     fist: { current: Group | null } | undefined,
     grip: number,
   ) => {
-    if (bone?.current) bone.current.scale.setScalar(1)
-    // Older/fallback rigs may still expose a procedural replacement. Never
-    // show it over the Pascaline model's own hand.
-    if (fist?.current) fist.current.visible = false
+    const gripping = grip > 0.5
+    // Switch on one threshold: the replacement never overlaps a visible
+    // native hand, including during weapon-change interpolation.
+    if (bone?.current) bone.current.scale.setScalar(gripping ? HAND_COLLAPSE : 1)
+    if (fist?.current) fist.current.visible = gripping
   }
   hand(refs.handL, refs.fistL, a.gripL)
   hand(refs.handR, refs.fistR, a.gripR)
@@ -1564,8 +1568,8 @@ export type AvatarRigRefs = {
   kneeR?: { current: Group | null }
   /** The held weapon's group (HeldWeapon) — tilted per frame so the barrel tracks the aim. */
   weapon?: { current: Group | null }
-  /** Native hand bones. `fist*` remains optional for compatibility with an
-   * older mounted rig, but is forcibly hidden so hands are never doubled. */
+  /** Native hands and the posed grip replacements. The former collapse on
+   * the same threshold that the latter appear, so only one pair renders. */
   handL?: { current: Group | null }
   handR?: { current: Group | null }
   fistL?: { current: Group | null }
@@ -1676,7 +1680,9 @@ function PrimitiveRig({
             position={[0, -0.26, 0]}
             scale={[0.85, 0.7, 0.85]}
           />
-          <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
+          <group ref={refs.handL} position={[0, -0.5, 0]}>
+            <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} />
+          </group>
         </group>
         {/* Weapon (right) arm aims with the remote pitch; the held model
             hangs off the hand, barrel aligned down the arm. */}
@@ -1687,7 +1693,9 @@ function PrimitiveRig({
             position={[0, -0.26, 0]}
             scale={[0.85, 0.7, 0.85]}
           />
-          <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} position={[0, -0.5, 0]} />
+          <group ref={refs.handR} position={[0, -0.5, 0]}>
+            <mesh geometry={HAND_GEO} material={SKIN_MATERIAL} />
+          </group>
           <HeldWeapon refs={refs} weapon={weapon} />
         </group>
       </group>
@@ -1711,10 +1719,10 @@ export function twoHanded(weapon: string): boolean {
  * pascaline-model.ts), and the two agree on where a rifle is in space.
  * `reach` is shoulder → grip: the box rig's 0.52, the model's arm plus a hand.
  *
- * The model's native skinned hands terminate the arm IK at the grip points.
- * Do not add procedural hands here: doing so produces two complete pairs in
- * mirrors and during the primitive-to-model swap. Trigger articulation stays
- * first-person-only, where there is no avatar body underneath it.
+ * A correctly posed grip hand rides the weapon at the same grip-table point
+ * as first person. applyArticulation hides the native straight hand on the
+ * exact frame this replacement appears, so the knife sits inside a hand and
+ * mirrors never show both versions at once.
  */
 function HeldWeapon({
   reach = 0.52,
@@ -1728,6 +1736,9 @@ function HeldWeapon({
   const Weapon = WEAPON_COMPONENT[weapon]
   const muzzle = refs.fx ? remoteMuzzle(weapon) : null
   const hold = holdFor(weapon)
+  const support = twoHanded(weapon) ? hold.left : null
+  const qR = useMemo(() => gripQuaternion(hold.right, 'R', new Quaternion()), [hold])
+  const qL = useMemo(() => (support ? gripQuaternion(support, 'L', new Quaternion()) : null), [support])
   if (!Weapon) return null
   const r = hold.right.position
   return (
@@ -1758,6 +1769,19 @@ function HeldWeapon({
               material={TRACER_MATERIAL}
               position={[0, 0, -(TRACER_LEN / 2) - 0.1]}
             />
+          </group>
+        ) : null}
+        <group position={[r[0], r[1], r[2]]} quaternion={qR} ref={refs.fistR} visible={false}>
+          <HandMesh pose={hold.right.pose} side="R" scale={AVATAR_GRIP_HAND_SCALE} />
+        </group>
+        {support && qL ? (
+          <group
+            position={[support.position[0], support.position[1], support.position[2]]}
+            quaternion={qL}
+            ref={refs.fistL}
+            visible={false}
+          >
+            <HandMesh pose={support.pose} side="L" scale={AVATAR_GRIP_HAND_SCALE} />
           </group>
         ) : null}
       </group>
@@ -1848,9 +1872,8 @@ function PascalineRig({
       {/* Sleeve bands, a little below each shoulder, in the arm frame (hanging −y). */}
       {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.L)}
       {createPortal(<mesh geometry={geo.sleeve} material={vest} position={[0, -0.13, 0]} />, body.armFrames.R)}
-      {/* The gripping hands live on the weapon (HeldWeapon): applyArticulation
-          collapses the skinned hand that holds something and shows the
-          procedural one on the grip in its place. */}
+      {/* HeldWeapon supplies the posed grip hand; applyArticulation hides the
+          native straight hand on the same threshold, so there is one pair. */}
     </>
   )
 }
