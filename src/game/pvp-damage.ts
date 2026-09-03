@@ -3,7 +3,7 @@ import { EYE_HEIGHT } from './collision'
 import { localSessionId, type NetMessage, onFrame, publishFrame, registerFrameKind } from './net'
 import { damagePlayer, playerRig } from './player'
 import { getRemotes } from './presence'
-import { INTERP_DELAY_MS, sampleAt, type SampledPose } from './presence-interp'
+import { createSampledPose, INTERP_DELAY_MS, sampleAt, type SampledPose } from './presence-interp'
 import { type PlayerRayHit, registerPvpRoutes } from './shooting'
 
 /**
@@ -14,8 +14,10 @@ import { type PlayerRayHit, registerPvpRoutes } from './shooting'
  * (health floors into a 2.5 s stagger, never below).
  *
  * SHOOTER-AUTHORITATIVE. The shooter already owns the hitscan, the aim, and the
- * weapon damage, and sees each peer at the same interpolated pose it is drawing
- * — so "what you shoot is what you hit". On a hit it bumps a per-victim counter
+ * weapon damage, and tests each peer's capsule at the point its avatar is
+ * DRAWN this frame (remote-players.tsx publishes it on the RemotePlayer after
+ * the adaptive delay and the residual smoother) — so "what you shoot is what
+ * you hit", whatever delay that peer has earned. On a hit it bumps a per-victim counter
  * and broadcasts it; the VICTIM is the sole applier of its own hurt. Clean
  * split: shooter decides the hit, victim decides (and bounds) the effect.
  *
@@ -37,7 +39,7 @@ const PVP_KIND = 'boots/pvp-hit'
 export const PVP_DAMAGE = 10
 
 /** Player hit capsule radius: the movement capsule is 0.34; a touch wider here
- * for forgiving PvP hit-reg against a 150 ms-interpolated target. */
+ * for forgiving PvP hit-reg against a target drawn 150-320 ms in the past. */
 const HIT_RADIUS = 0.42
 
 /** Never let one coalesced frame (a hitch that merged many tags) burst more
@@ -95,23 +97,52 @@ export function consumeHits(
 }
 
 // ── Roster raycast ──────────────────────────────────────────────────────────
-const _sample: SampledPose = {
-  x: 0, y: 0, z: 0, yaw: 0, pitch: 0, w: 'knife', s: 0, g: true, st: false, f: 0, frozen: false,
-}
+const _sample: SampledPose = createSampledPose()
 
-function sampleRemoteNow(remote: {
+/**
+ * A drawn position older than this (ms) is not a picture anyone is looking at:
+ * the renderer writes drawnAt every frame it draws the peer, so a stale stamp
+ * means the avatar is unmounted, culled, or this page has no scene. ~3 frames
+ * at 12 fps — a hitching renderer keeps its drawn body; a dead one is ignored.
+ */
+export const DRAWN_FRESH_MS = 250
+
+/** What the raycast needs from a RemotePlayer (structural, so tests can hand
+ * in plain objects): the ring and clock for the fallback, the drawn eye. */
+export type HittablePeer = {
   ring: Parameters<typeof sampleAt>[0]
   clockOffset: number
-}): boolean {
-  const offset = Number.isNaN(remote.clockOffset) ? 0 : remote.clockOffset
-  return sampleAt(remote.ring, Date.now() - offset - INTERP_DELAY_MS, _sample)
+  drawnX: number
+  drawnY: number
+  drawnZ: number
+  drawnAt: number
 }
 
 /**
- * Ray vs the LIVE remote roster. Each GAME-PHASE peer is sampled exactly where
- * its avatar is drawn (same interpolation), tested as a vertical capsule from
- * feet (eye − EYE_HEIGHT) to eye. Nearest within maxDist wins. Spectators
- * (ph 'editor') are skipped — they have no avatar and cannot be shot.
+ * Where this peer's capsule IS right now, into `_sample` (only x/y/z are
+ * meaningful to the callers here). The DRAWN eye when the renderer stamped it
+ * within DRAWN_FRESH_MS — the one position that agrees with what the shooter
+ * sees, whatever adaptive delay (150-320 ms) and residual glide that peer is
+ * being drawn with. Otherwise (spectator page without a scene, a peer culled
+ * from the renderer, never drawn yet) the ring sampled at the floor delay, so
+ * a hit is still possible. False only when there is nothing to sample.
+ */
+function sampleRemoteNow(remote: HittablePeer, now = Date.now()): boolean {
+  if (remote.drawnAt > 0 && now - remote.drawnAt < DRAWN_FRESH_MS) {
+    _sample.x = remote.drawnX
+    _sample.y = remote.drawnY
+    _sample.z = remote.drawnZ
+    return true
+  }
+  const offset = Number.isNaN(remote.clockOffset) ? 0 : remote.clockOffset
+  return sampleAt(remote.ring, now - offset - INTERP_DELAY_MS, _sample)
+}
+
+/**
+ * Ray vs the LIVE remote roster. Each GAME-PHASE peer is tested exactly where
+ * its avatar is drawn (sampleRemoteNow), as a vertical capsule from feet
+ * (eye − EYE_HEIGHT) to eye. Nearest within maxDist wins. Spectators (ph
+ * 'editor') are skipped — they have no avatar and cannot be shot.
  */
 export function raycastRemotePlayers(
   origin: Vector3,

@@ -31,12 +31,30 @@
  * - Snapshots land in a ring (cap 24 ≈ 2 s at 12 Hz); out-of-order frames
  *   (by sentAt) are dropped — the bus gives no ordering guarantee.
  * - sampleAt(renderTime) renders REMOTES IN THE PAST: the caller passes
- *   now − INTERP_DELAY_MS (150 ms — ~2 network frames of cushion), so a
- *   bracketing snapshot pair almost always exists and motion is a lerp,
- *   never a guess. Yaw/pitch take the shortest arc.
+ *   now − delay, where the delay is PER PEER and ADAPTIVE (interpDelayFor):
+ *   the measured arrival spacing plus a jitter margin, clamped to
+ *   [INTERP_DELAY_MIN_MS, INTERP_DELAY_MAX_MS] and slewed so it never jumps.
+ *   Idle keep-alives (500 ms) and hidden-tab throttling (1 Hz) are classified
+ *   as GAPS by updateTiming, never as network spacing, so a quiet peer does
+ *   not inflate anyone's delay. A bracketing snapshot pair then almost always
+ *   exists and motion is a lerp, never a guess. Yaw/pitch take the shortest arc.
+ * - sampleAt also reports the VELOCITY it used (vx/vy/vz, m/s: the bracket
+ *   slope, or the last pair's slope while extrapolating; 0 when frozen,
+ *   snapped, clamped or lone) — the renderer's gait, landing detection and
+ *   residual smoother read it instead of the sender's wire `s`.
  * - Past the newest snapshot the pose extrapolates along the last pair's
  *   velocity for at most EXTRAPOLATE_MAX_MS (200 ms), then FREEZES — a
- *   stalled peer stands still instead of sliding into the sunset.
+ *   stalled peer stands still instead of sliding into the sunset. A peer whose
+ *   newest frame says it has STOPPED (wire s ≈ 0, grounded) holds at once:
+ *   the last pair is the deceleration, not where it is going. An AIRBORNE
+ *   peer extrapolates under WIRE_GRAVITY and never sinks more than
+ *   EXTRAP_SINK_M below its newest frame (the floor is at most a frame away).
+ * - smoothPose (pure) sits between sampleAt and the drawn root: the part of a
+ *   sample that the previous velocity did not predict — a late frame ending
+ *   an extrapolation, a stall catching up — is absorbed into a residual that
+ *   decays at SMOOTH_RATE, so corrections GLIDE instead of popping. Motion
+ *   that is merely fast (a fall, a knockback, a hard start) predicts itself
+ *   and passes untouched; a residual ≥ TELEPORT_SNAP_M snaps.
  * - Consecutive snapshots > TELEPORT_SNAP_M (3 m) apart read as a teleport
  *   (spawn, QA teleport, respawn): no lerp, no velocity — snap.
  * - A remote silent > STALE_MS (3 s) is despawn-ripe (isStale); presence.ts
@@ -66,10 +84,31 @@ export type PresenceFrame = {
 
 /** Ring capacity — 24 snapshots ≈ 2 s of history at the 12 Hz base rate. */
 export const RING_CAP = 24
-/** Render remotes this far in the past (ms) — the interpolation cushion. */
-export const INTERP_DELAY_MS = 150
+/** The SMALLEST interpolation cushion (ms) — ~2 network frames at 12 Hz. */
+export const INTERP_DELAY_MIN_MS = 150
+/** Kept for callers that want a fixed delay (PvP's roster raycast, tests). */
+export const INTERP_DELAY_MS = INTERP_DELAY_MIN_MS
+/** The LARGEST cushion a jittery peer can earn (ms) — visual latency cap. */
+export const INTERP_DELAY_MAX_MS = 320
+/** Delay margin per ms of measured arrival jitter (EMA of |offset deviation|). */
+export const INTERP_JITTER_GAIN = 3
+/** Fixed slack (ms) over the measured spacing before the clamp. */
+export const INTERP_SLACK_MS = 40
+/** The delay moves at most this fast (ms per second) — never a visible jump. */
+export const INTERP_DELAY_SLEW_MS_PER_S = 120
 /** Extrapolate at most this far past the newest snapshot, then freeze. */
 export const EXTRAPOLATE_MAX_MS = 200
+/** Gravity the extrapolator assumes for an airborne peer (m/s²) — MUST equal
+ * movement.MOVE.gravity (pinned by a test; not imported so this module stays
+ * free of the kinematics module). */
+export const WIRE_GRAVITY = 16
+/** An airborne peer past its newest frame never sinks more than this (m)
+ * below that frame — the ground is at most one network frame away. */
+export const EXTRAP_SINK_M = 0.15
+/** A newest frame whose wire speed `s` is at or under this is a peer that has
+ * STOPPED: past it the pose holds instead of sliding on the last pair's
+ * velocity — the stop is the one moment the last pair is always wrong about. */
+export const EXTRAP_STOPPED_S = 0.02
 /** Consecutive snapshots farther apart than this (m) snap, never lerp. */
 export const TELEPORT_SNAP_M = 3
 /** A remote silent longer than this (ms) is despawned by presence.ts. */
@@ -197,6 +236,13 @@ export type SampledPose = {
   f: number
   /** True once extrapolation hit its 200 ms cap — the pose is frozen. */
   frozen: boolean
+  /** The velocity (m/s) this sample MOVED with: the bracket slope in the lerp
+   * branch, the last pair's slope (gravity-integrated while airborne) when
+   * extrapolating; 0 when frozen, on a teleport pair, clamped to the oldest
+   * snapshot, or with a lone snapshot. */
+  vx: number
+  vy: number
+  vz: number
 }
 
 export function createSampledPose(): SampledPose {
@@ -212,6 +258,9 @@ export function createSampledPose(): SampledPose {
     st: false,
     f: 0,
     frozen: false,
+    vx: 0,
+    vy: 0,
+    vz: 0,
   }
 }
 
@@ -244,6 +293,9 @@ function copyPose(from: Snapshot, out: SampledPose): void {
   out.st = from.st
   out.f = from.f
   out.frozen = false
+  out.vx = 0
+  out.vy = 0
+  out.vz = 0
 }
 
 /** Logical-order slot access: index 0 = oldest, count-1 = newest. */
@@ -275,11 +327,43 @@ export function sampleAt(ring: SnapshotRing, renderTime: number, out: SampledPos
       const dy = newest.y - prev.y
       const dz = newest.z - prev.z
       const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
-      if (dtPair > 0 && dist <= TELEPORT_SNAP_M) {
-        const k = Math.min(ahead, EXTRAPOLATE_MAX_MS) / dtPair
-        out.x += dx * k
-        out.y += dy * k
-        out.z += dz * k
+      // A stopped sender (wire s ≈ 0, on the ground) holds: its last pair
+      // still carries the deceleration, and sliding a peer who has planted
+      // their feet — then gliding them back when the 500 ms keep-alive lands —
+      // was the most visible artifact of every stop.
+      const stopped = newest.g && newest.s <= EXTRAP_STOPPED_S
+      if (dtPair > 0 && dist <= TELEPORT_SNAP_M && !stopped) {
+        const t = Math.min(ahead, EXTRAPOLATE_MAX_MS) / 1000 // s
+        const vx = (dx / dtPair) * 1000
+        const vy = (dy / dtPair) * 1000
+        const vz = (dz / dtPair) * 1000
+        out.x += vx * t
+        out.z += vz * t
+        if (newest.g) {
+          out.y += vy * t
+          out.vy = vy
+        } else {
+          // Airborne: a ballistic guess, floored just under the newest frame.
+          // A falling peer whose next frame is late would otherwise sink
+          // through the floor (8 m/s × 200 ms = 1.6 m) before freezing.
+          const y = newest.y + vy * t - 0.5 * WIRE_GRAVITY * t * t
+          const floor = newest.y - EXTRAP_SINK_M
+          if (y > floor) {
+            out.y = y
+            out.vy = vy - WIRE_GRAVITY * t
+          } else {
+            out.y = floor
+            out.vy = 0
+          }
+        }
+        if (!out.frozen) {
+          out.vx = vx
+          out.vz = vz
+        } else {
+          out.vx = 0
+          out.vy = 0
+          out.vz = 0
+        }
       }
     }
     return true
@@ -306,10 +390,14 @@ export function sampleAt(ring: SnapshotRing, renderTime: number, out: SampledPos
         copyPose(b, out)
         return true
       }
-      const alpha = (renderTime - a.sentAt) / (b.sentAt - a.sentAt)
+      const span = b.sentAt - a.sentAt
+      const alpha = (renderTime - a.sentAt) / span
       out.x = a.x + dx * alpha
       out.y = a.y + dy * alpha
       out.z = a.z + dz * alpha
+      out.vx = (dx / span) * 1000
+      out.vy = (dy / span) * 1000
+      out.vz = (dz / span) * 1000
       out.yaw = lerpAngle(a.yaw, b.yaw, alpha)
       out.pitch = lerpAngle(a.pitch, b.pitch, alpha)
       out.s = a.s + (b.s - a.s) * alpha
@@ -337,6 +425,213 @@ export function sampleAt(ring: SnapshotRing, renderTime: number, out: SampledPos
 /** Staleness reducer — presence.ts despawns remotes this predicate flags. */
 export function isStale(lastReceivedAt: number, now: number): boolean {
   return now - lastReceivedAt > STALE_MS
+}
+
+// ── Arrival timing (pure) ────────────────────────────────────────────────────
+
+/**
+ * What a peer's frames actually look like when they get here. Fed by
+ * presence.ingestPoseFrame with every accepted frame; read by interpDelayFor
+ * and dumped through presenceDebug so a real relay can be measured from a
+ * prod session before any constant is tuned.
+ */
+export type ArrivalTiming = {
+  /** EMA of the sender-clock spacing between consecutive frames (ms). */
+  spacingEma: number
+  /** EMA of |arrival offset − offset EMA| (ms) — the jitter the delay must cover. */
+  jitterEma: number
+  /** sentAt of the last frame folded in (NaN before the first). */
+  lastSentAt: number
+  /** Frames that arrived after a gap > TIMING_GAP_MS (idle/hidden, not network). */
+  gaps: number
+  /** The most recent such gap (ms); 0 if none yet. */
+  lastGapMs: number
+}
+
+/** Spacing beyond this (ms) is an idle keep-alive (500 ms) or a throttled
+ * hidden tab (1 Hz), never the network — it is counted, not sampled. */
+export const TIMING_GAP_MS = 250
+/** EMA gain for both timing averages (~7 frames to settle). */
+export const TIMING_GAIN = 0.15
+/** Spacing samples are clamped into this window (ms) before averaging. */
+export const TIMING_SPACING_MIN_MS = 30
+
+export function createTiming(): ArrivalTiming {
+  return { spacingEma: 84, jitterEma: 0, lastSentAt: Number.NaN, gaps: 0, lastGapMs: 0 }
+}
+
+/**
+ * Fold one accepted frame in. `offsetDeviationMs` is |(now − sentAt) − the
+ * peer's clock-offset EMA| as the caller measured it (0 for a first frame).
+ */
+export function updateTiming(t: ArrivalTiming, sentAt: number, offsetDeviationMs: number): void {
+  if (Number.isFinite(t.lastSentAt)) {
+    const spacing = sentAt - t.lastSentAt
+    if (spacing > TIMING_GAP_MS) {
+      t.gaps++
+      t.lastGapMs = spacing
+    } else if (spacing > 0) {
+      const clamped = spacing < TIMING_SPACING_MIN_MS ? TIMING_SPACING_MIN_MS : spacing
+      t.spacingEma += (clamped - t.spacingEma) * TIMING_GAIN
+      const dev = offsetDeviationMs > 0 ? offsetDeviationMs : 0
+      t.jitterEma += (dev - t.jitterEma) * TIMING_GAIN
+    }
+  }
+  t.lastSentAt = sentAt
+}
+
+/** The interpolation delay (ms) a peer with this timing has earned. */
+export function interpDelayFor(t: ArrivalTiming): number {
+  const raw = t.spacingEma + INTERP_JITTER_GAIN * t.jitterEma + INTERP_SLACK_MS
+  return raw < INTERP_DELAY_MIN_MS ? INTERP_DELAY_MIN_MS : raw > INTERP_DELAY_MAX_MS ? INTERP_DELAY_MAX_MS : raw
+}
+
+/** Move the live delay toward its target by at most the slew for this dt (s). */
+export function slewDelay(current: number, target: number, dt: number): number {
+  const step = INTERP_DELAY_SLEW_MS_PER_S * (dt > 0 ? dt : 0)
+  const d = target - current
+  if (d > step) return current + step
+  if (d < -step) return current - step
+  return target
+}
+
+// ── Residual smoother (pure) ─────────────────────────────────────────────────
+
+/**
+ * Between the sampled pose and the drawn root. `drawn = target + err`, where
+ * `err` is whatever part of a new target the previous velocity did NOT
+ * predict — beyond a small deadband — and it decays exponentially. A late
+ * frame that ends an extrapolation, a stall catching up, a coalesced burst:
+ * all glide. Continuous motion of any speed (a fall, a shove) predicts itself
+ * exactly and is never touched, which is why this compares against the
+ * ring's own velocity and not against a speed cap.
+ */
+export type PoseSmoother = {
+  primed: boolean
+  /** The residual currently added to the target (m). */
+  ex: number
+  ey: number
+  ez: number
+  /** Last target and its velocity — the prediction basis. */
+  px: number
+  py: number
+  pz: number
+  pvx: number
+  pvy: number
+  pvz: number
+  /** Last drawn point (for maxStepM). */
+  ox: number
+  oy: number
+  oz: number
+  /** How many samples needed a correction (QA). */
+  corrections: number
+  /** Largest drawn step (m) since the last debug read (QA; reset by the reader). */
+  maxStepM: number
+}
+
+/** Residual decay rate (1/s): a 30 cm pop is under 1 cm in ~0.3 s. */
+export const SMOOTH_RATE = 12
+/** Residuals up to this (m) are not corrections — wire rounding, a bracket edge. */
+export const SMOOTH_DEADBAND_M = 0.03
+/** The residual never exceeds this (m) — a peer is never drawn a metre off. */
+export const SMOOTH_MAX_ERR_M = 1.0
+
+export function createSmoother(): PoseSmoother {
+  return {
+    primed: false,
+    ex: 0,
+    ey: 0,
+    ez: 0,
+    px: 0,
+    py: 0,
+    pz: 0,
+    pvx: 0,
+    pvy: 0,
+    pvz: 0,
+    ox: 0,
+    oy: 0,
+    oz: 0,
+    corrections: 0,
+    maxStepM: 0,
+  }
+}
+
+/**
+ * One frame. `wallDt` is the REAL time since the last call (s) — the
+ * prediction budget — so a 100 ms hitch is not misread as a 0.6 m pop; `dt`
+ * is the game loop's clamped dt, which paces the decay like every other
+ * blend. Writes the drawn point into `out`.
+ */
+export function smoothPose(
+  sm: PoseSmoother,
+  x: number,
+  y: number,
+  z: number,
+  vx: number,
+  vy: number,
+  vz: number,
+  wallDt: number,
+  dt: number,
+  out: { x: number; y: number; z: number },
+): void {
+  if (!sm.primed) {
+    sm.primed = true
+    sm.ex = 0
+    sm.ey = 0
+    sm.ez = 0
+    out.x = x
+    out.y = y
+    out.z = z
+  } else {
+    // Yesterday's residual decays first; then whatever this sample did that
+    // the last velocity did not predict is absorbed whole (beyond the
+    // deadband) — so the frame OF a pop moves the drawn point by exactly
+    // v·dt + deadband, and the glide starts the frame after.
+    const decay = Math.exp(-SMOOTH_RATE * (dt > 0 ? dt : 0))
+    sm.ex *= decay
+    sm.ey *= decay
+    sm.ez *= decay
+    const w = wallDt > 0 ? wallDt : 0
+    const rx = x - (sm.px + sm.pvx * w)
+    const ry = y - (sm.py + sm.pvy * w)
+    const rz = z - (sm.pz + sm.pvz * w)
+    const r = Math.sqrt(rx * rx + ry * ry + rz * rz)
+    if (r >= TELEPORT_SNAP_M) {
+      sm.ex = 0
+      sm.ey = 0
+      sm.ez = 0
+    } else if (r > SMOOTH_DEADBAND_M) {
+      const k = 1 - SMOOTH_DEADBAND_M / r
+      sm.ex -= rx * k
+      sm.ey -= ry * k
+      sm.ez -= rz * k
+      sm.corrections++
+    }
+    const e = Math.sqrt(sm.ex * sm.ex + sm.ey * sm.ey + sm.ez * sm.ez)
+    if (e > SMOOTH_MAX_ERR_M) {
+      const c = SMOOTH_MAX_ERR_M / e
+      sm.ex *= c
+      sm.ey *= c
+      sm.ez *= c
+    }
+    out.x = x + sm.ex
+    out.y = y + sm.ey
+    out.z = z + sm.ez
+    const sx = out.x - sm.ox
+    const sy = out.y - sm.oy
+    const sz = out.z - sm.oz
+    const step = Math.sqrt(sx * sx + sy * sy + sz * sz)
+    if (step > sm.maxStepM) sm.maxStepM = step
+  }
+  sm.px = x
+  sm.py = y
+  sm.pz = z
+  sm.pvx = vx
+  sm.pvy = vy
+  sm.pvz = vz
+  sm.ox = out.x
+  sm.oy = out.y
+  sm.oz = out.z
 }
 
 const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)

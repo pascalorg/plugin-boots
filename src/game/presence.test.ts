@@ -31,9 +31,12 @@ import {
   presenceDebug,
   presenceTick,
   publishIntervalMs,
+  registerPresenceDebugSource,
   shouldPublish,
   startPresence,
   stopPresence,
+  TICK_MS,
+  TICK_TOLERANCE_MS,
   wrapAngle,
   wrapShots,
 } from './presence'
@@ -283,6 +286,18 @@ describe('publish policy — cadence, idle skip, keep-alive', () => {
     )
   })
 
+  test(`rate gate tolerance: the qualifying tick a hair early (${TICK_MS * 4 - 1} ms) passes, three ticks never`, () => {
+    // 21 ms ticks: the 4th lands at 84 ms — or 83 when the timer runs a
+    // millisecond early. Without the half-tick tolerance that publish slipped
+    // to the 5th tick, and 25 ms ticks could only ever hit 100 ms (10 Hz).
+    expect(TICK_TOLERANCE_MS).toBe(TICK_MS / 2)
+    expect(shouldPublish({ now: 1083, lastPublishAt: 1000, remoteCount: 0, changed: true })).toBe(true)
+    expect(shouldPublish({ now: 1063, lastPublishAt: 1000, remoteCount: 0, changed: true })).toBe(false)
+    // Crowded (100 ms gate): four ticks (84) no, five (105) yes.
+    expect(shouldPublish({ now: 1084, lastPublishAt: 1000, remoteCount: 5, changed: true })).toBe(false)
+    expect(shouldPublish({ now: 1105, lastPublishAt: 1000, remoteCount: 5, changed: true })).toBe(true)
+  })
+
   test('idle skip: an unchanged pose is not re-sent inside 500 ms', () => {
     expect(shouldPublish({ now: 1100, lastPublishAt: 1000, remoteCount: 0, changed: false })).toBe(
       false,
@@ -397,6 +412,45 @@ describe('publish loop — sent, deferred-skip, idle keep-alive', () => {
     expect(bus.publishes.length).toBe(1)
     presenceTick(1090)
     expect(bus.publishes.length).toBe(2)
+  })
+
+  test(`a moving pose publishes ~12 Hz over 10 s of ${TICK_MS} ms ticks (118-121, not 101)`, () => {
+    const bus = installBus()
+    let x = 0
+    startPresence(() => localPose({ x }))
+    for (let t = TICK_MS; t <= 10000; t += TICK_MS) {
+      x += 0.1 // always changed
+      presenceTick(t)
+    }
+    expect(bus.publishes.length).toBeGreaterThanOrEqual(118)
+    expect(bus.publishes.length).toBeLessThanOrEqual(121)
+  })
+
+  test('…and still 115-125 times when every tick lands 0-8 ms or 0-16 ms LATE (a loaded main thread)', () => {
+    // setInterval never fires early but fires late under load — a 60 fps game
+    // loop delays a 21 ms timer by up to a frame. The half-tick tolerance is
+    // measured from the ACTUAL last publish, so a late publishing tick makes
+    // the next 4th tick read short; this pins that the cadence survives it
+    // (a 3 ms tolerance measured 11.4 / 10.9 Hz here — see TICK_TOLERANCE_MS).
+    for (const lateMax of [8, 16]) {
+      stopPresence()
+      stopNet()
+      resetNetKinds()
+      const bus = installBus()
+      let x = 0
+      startPresence(() => localPose({ x }))
+      let seed = 987654321 + lateMax
+      const rnd = () => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        return seed / 0x7fffffff
+      }
+      for (let t = TICK_MS; t <= 10000; t += TICK_MS) {
+        x += 0.1
+        presenceTick(t + rnd() * lateMax) // 21 ms grid, each tick 0..lateMax late
+      }
+      expect(bus.publishes.length).toBeGreaterThanOrEqual(115)
+      expect(bus.publishes.length).toBeLessThanOrEqual(125)
+    }
   })
 
   test("'deferred' is a skip, not a queue — and does not count as published", () => {
@@ -529,6 +583,29 @@ describe('remote registry — join and leave', () => {
     const remote = getRemotes().get('session-a')!
     expect(latestSnapshot(remote.ring)!.x).toBe(5) // late frame dropped by the ring
     expect(remote.lastReceivedAt).toBe(5100) // ...but the peer is clearly alive
+  })
+
+  test('an out-of-order frame feeds neither the arrival timing nor the clock offset', () => {
+    installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg({ sentAt: 1000 }), 5000)
+    ingestPoseFrame(poseMsg({ sentAt: 1084 }), 5084)
+    ingestPoseFrame(poseMsg({ sentAt: 1168 }), 5168)
+    const remote = getRemotes().get('session-a')!
+    const before = { ...remote.timing }
+    const offsetBefore = remote.clockOffset
+    // A reordered frame (older than the newest) arriving late.
+    ingestPoseFrame(poseMsg({ sentAt: 1126 }), 5300)
+    expect(remote.timing).toEqual(before) // lastSentAt not rewound, no spacing/jitter/gap sample
+    expect(remote.clockOffset).toBe(offsetBefore)
+    expect(remote.lastReceivedAt).toBe(5300) // liveness still counts it
+    // A duplicate of the newest is refused the same way.
+    ingestPoseFrame(poseMsg({ sentAt: 1168 }), 5310)
+    expect(remote.timing).toEqual(before)
+    // The next in-order frame samples its true 84 ms spacing, not 1252 − 1126.
+    ingestPoseFrame(poseMsg({ sentAt: 1252 }), 5252)
+    expect(remote.timing.spacingEma).toBeCloseTo(84, 6)
+    expect(remote.timing.gaps).toBe(0)
   })
 })
 
@@ -706,5 +783,68 @@ describe('presenceDebug — plain copies for __boots', () => {
     expect(entry.ageMs).toBeGreaterThanOrEqual(0)
     const remote = getRemotes().get('session-a')!
     expect(entry.p).not.toBe(latestSnapshot(remote.ring)) // plain data
+  })
+})
+
+describe('presenceDebug — timing, delay, drawn pose, extra sources', () => {
+  test('ingest feeds the arrival timing: 84 ms frames sample spacing, a 500 ms keep-alive is a gap', () => {
+    installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg({ sentAt: 1000 }), 5000)
+    ingestPoseFrame(poseMsg({ sentAt: 1084 }), 5084)
+    ingestPoseFrame(poseMsg({ sentAt: 1168 }), 5168)
+    const remote = getRemotes().get('session-a')!
+    expect(remote.timing.spacingEma).toBeCloseTo(84, 6)
+    expect(remote.timing.gaps).toBe(0)
+    ingestPoseFrame(poseMsg({ sentAt: 1668 }), 5668)
+    expect(remote.timing.gaps).toBe(1)
+    expect(remote.timing.lastGapMs).toBe(500)
+    expect(remote.timing.spacingEma).toBeCloseTo(84, 6)
+    // A late frame (offset 40 ms over the EMA) registers as jitter.
+    ingestPoseFrame(poseMsg({ sentAt: 1752 }), 5792)
+    expect(remote.timing.jitterEma).toBeGreaterThan(0)
+  })
+
+  test('the dump carries spacing/jitter/gaps, the renderer delay, the drawn eye, net drops, the tick', () => {
+    installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg({ data: gameFrame({ p: [3, 1, -2] }) }), Date.now())
+    let dump = presenceDebug()
+    let entry = dump.remotes[0]!
+    expect(entry.spacingMs).toBe(84)
+    expect(entry.jitterMs).toBe(0)
+    expect(entry.gaps).toBe(0)
+    expect(entry.lastGapMs).toBe(0)
+    expect(entry.delayMs).toBe(0) // nothing has drawn this peer on this page
+    expect(entry.drawn).toBeNull()
+    expect(entry.drawnAgeMs).toBe(-1)
+    expect(typeof dump.netDropped).toBe('number')
+    expect(dump.tickMs).toBe(TICK_MS)
+    expect(dump.extra).toEqual(expect.any(Object))
+    // The renderer writes where it drew the peer; consumers read it when fresh.
+    const remote = getRemotes().get('session-a')!
+    remote.drawnX = 3.1
+    remote.drawnY = 1.02
+    remote.drawnZ = -2.05
+    remote.drawnAt = Date.now()
+    remote.delayMs = 150
+    dump = presenceDebug()
+    entry = dump.remotes[0]!
+    expect(entry.drawn).toEqual([3.1, 1.02, -2.05])
+    expect(entry.drawnAgeMs).toBeGreaterThanOrEqual(0)
+    expect(entry.delayMs).toBe(150)
+  })
+
+  test('registered debug sources ride along under extra.<name>, plain data, and unregister cleanly', () => {
+    const off = registerPresenceDebugSource('probe', () => ({ a: 1 }))
+    expect(presenceDebug().extra.probe).toEqual({ a: 1 })
+    const offBad = registerPresenceDebugSource('bad', () => {
+      throw new Error('boom')
+    })
+    expect(presenceDebug().extra.bad).toBeNull() // a broken source never breaks the dump
+    off()
+    offBad()
+    expect(presenceDebug().extra.probe).toBeUndefined()
+    expect(presenceDebug().extra.bad).toBeUndefined()
   })
 })

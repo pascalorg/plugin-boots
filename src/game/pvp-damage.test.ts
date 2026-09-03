@@ -1,5 +1,10 @@
-import { describe, expect, test } from 'bun:test'
-import { consumeHits, rayHitsCapsule, validatePvpFrame } from './pvp-damage'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { Vector3 } from 'three'
+import { EYE_HEIGHT } from './collision'
+import { type CollabBus, type NetMessage, resetNetKinds, stopNet } from './net'
+import { getRemotes, ingestPoseFrame, POSE_KIND, startPresence, stopPresence } from './presence'
+import type { PresenceFrame } from './presence-interp'
+import { consumeHits, DRAWN_FRESH_MS, raycastRemotePlayers, rayHitsCapsule, validatePvpFrame } from './pvp-damage'
 
 /**
  * PvP hit damage — the two pure cores that decide a hit and de-dup the wire.
@@ -112,5 +117,107 @@ describe('validatePvpFrame', () => {
 
   test('an empty hits map is valid', () => {
     expect(validatePvpFrame({ hits: {} })).toEqual({ hits: {} })
+  })
+})
+
+// ── The roster raycast hits the DRAWN body ───────────────────────────────────
+
+/** The smallest host bus that lets presence start (the transport is
+ * feature-detected off globalThis.__pascalCollabBus). */
+function installBus(): void {
+  const bus: CollabBus = {
+    version: 1,
+    projectId: 'project-1',
+    sessionId: 'session-me',
+    clientId: 'client-me',
+    userId: 'user-me',
+    publish: () => 'sent',
+    subscribe: () => () => {},
+    getParticipants: () => [],
+    onParticipants: () => () => {},
+  }
+  ;(globalThis as { __pascalCollabBus?: CollabBus }).__pascalCollabBus = bus
+}
+
+function poseMsg(sentAt: number, p: [number, number, number]): NetMessage<PresenceFrame> {
+  return {
+    kind: POSE_KIND,
+    data: { v: 1, ph: 'game', p, yaw: 0, pitch: 0, w: 'rifle', s: 0, g: true, st: false, f: 0 },
+    seq: 1,
+    skipped: 0,
+    part: 1,
+    parts: 1,
+    sessionId: 'session-a',
+    clientId: 'client-a',
+    userId: 'user-a',
+    sentAt,
+  }
+}
+
+afterEach(() => {
+  stopPresence()
+  stopNet()
+  resetNetKinds()
+  delete (globalThis as { __pascalCollabBus?: CollabBus }).__pascalCollabBus
+})
+
+describe('raycastRemotePlayers — the capsule is where the peer is DRAWN, the ring only as a fallback', () => {
+  /** A level shot along −z at chest height from x = `x`, z = 5. */
+  const shoot = (x: number) => raycastRemotePlayers(new Vector3(x, 1.2, 5), new Vector3(0, 0, -1), 100)
+
+  /** One peer standing at the origin on the wire (eye at EYE_HEIGHT). */
+  function standingPeer() {
+    installBus()
+    expect(startPresence(() => ({ ph: 'game', x: 0, y: EYE_HEIGHT, z: 20, yaw: 0, pitch: 0, w: 'rifle', s: 0, g: true, st: false, f: 0 }))).toBe(true)
+    const t0 = Date.now() - 1000
+    ingestPoseFrame(poseMsg(t0, [0, EYE_HEIGHT, 0]), t0)
+    ingestPoseFrame(poseMsg(t0 + 100, [0, EYE_HEIGHT, 0]), t0 + 100)
+    return getRemotes().get('session-a')!
+  }
+
+  test('never drawn on this page → the ring at the floor delay decides', () => {
+    const remote = standingPeer()
+    expect(remote.drawnAt).toBe(0)
+    const hit = shoot(0)
+    expect(hit).not.toBeNull()
+    expect(hit!.sessionId).toBe('session-a')
+    expect(hit!.distance).toBeCloseTo(5, 1)
+    expect(shoot(2)).toBeNull()
+  })
+
+  test('drawn fresh 2 m to the side: shooting where you SEE them hits, shooting the wire position misses', () => {
+    const remote = standingPeer()
+    remote.drawnX = 2
+    remote.drawnY = EYE_HEIGHT
+    remote.drawnZ = 0
+    remote.drawnAt = Date.now()
+    const hit = shoot(2)
+    expect(hit).not.toBeNull()
+    expect(hit!.point.x).toBeCloseTo(2, 6)
+    expect(shoot(0)).toBeNull() // the ring says x = 0; nobody is drawn there
+  })
+
+  test(`a drawn stamp older than DRAWN_FRESH_MS (${DRAWN_FRESH_MS} ms — unmounted, culled, no scene) falls back to the ring`, () => {
+    const remote = standingPeer()
+    remote.drawnX = 2
+    remote.drawnY = EYE_HEIGHT
+    remote.drawnZ = 0
+    remote.drawnAt = Date.now() - DRAWN_FRESH_MS - 1
+    expect(shoot(2)).toBeNull()
+    expect(shoot(0)).not.toBeNull()
+    // …and one drawn a frame ago is still the picture.
+    remote.drawnAt = Date.now() - 40
+    expect(shoot(2)).not.toBeNull()
+    expect(DRAWN_FRESH_MS).toBe(250)
+  })
+
+  test('a spectator (ph editor) has no capsule even with a drawn stamp', () => {
+    const remote = standingPeer()
+    remote.drawnX = 0
+    remote.drawnY = EYE_HEIGHT
+    remote.drawnZ = 0
+    remote.drawnAt = Date.now()
+    remote.ph = 'editor'
+    expect(shoot(0)).toBeNull()
   })
 })

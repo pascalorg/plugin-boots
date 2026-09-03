@@ -1,9 +1,18 @@
 import { describe, expect, test } from 'bun:test'
+import { MOVE } from './movement'
 import {
   angleDist,
   createRing,
   createSampledPose,
+  createSmoother,
+  createTiming,
+  EXTRAP_SINK_M,
   EXTRAPOLATE_MAX_MS,
+  INTERP_DELAY_MAX_MS,
+  INTERP_DELAY_MIN_MS,
+  INTERP_DELAY_MS,
+  INTERP_DELAY_SLEW_MS_PER_S,
+  interpDelayFor,
   isStale,
   latestSnapshot,
   lerpAngle,
@@ -14,9 +23,17 @@ import {
   sampleAt,
   SHOT_COUNTER_MOD,
   shotsFired,
+  slewDelay,
+  SMOOTH_DEADBAND_M,
+  SMOOTH_RATE,
+  smoothPose,
   STALE_MS,
   TELEPORT_SNAP_M,
+  TIMING_GAP_MS,
+  TIMING_SPACING_MIN_MS,
+  updateTiming,
   validateFrame,
+  WIRE_GRAVITY,
 } from './presence-interp'
 
 /** A well-formed wire frame; tests override single fields to break it. */
@@ -321,6 +338,33 @@ describe('sampleAt — extrapolate ≤200ms, then freeze', () => {
   })
 })
 
+describe('sampleAt — a stopped sender holds instead of sliding', () => {
+  test('newest frame with s = 0 on the ground: no extrapolation, zero velocity', () => {
+    const ring = createRing()
+    push(ring, 1000, { p: [0, 0, 0], s: 0.6 })
+    push(ring, 1100, { p: [0.4, 0, 0], s: 0 }) // the deceleration pair; the sender has planted its feet
+    const out = createSampledPose()
+    sampleAt(ring, 1200, out)
+    expect(out.x).toBe(0.4) // not 0.8
+    expect(out.vx).toBe(0)
+    expect(out.frozen).toBe(false)
+  })
+
+  test('…but a moving sender (s > 0) still extrapolates, and an airborne one still falls', () => {
+    const moving = createRing()
+    push(moving, 1000, { p: [0, 0, 0], s: 0.6 })
+    push(moving, 1100, { p: [0.4, 0, 0], s: 0.5 })
+    const out = createSampledPose()
+    sampleAt(moving, 1200, out)
+    expect(out.x).toBeCloseTo(0.8)
+    const air = createRing()
+    push(air, 1000, { p: [0, 2, 0], s: 0, g: false })
+    push(air, 1100, { p: [0, 1.8, 0], s: 0, g: false })
+    sampleAt(air, 1150, out)
+    expect(out.y).toBeLessThan(1.8) // s is horizontal speed; a straight-down fall still guesses the fall
+  })
+})
+
 describe('sampleAt — teleport snap', () => {
   test(`brackets farther than ${TELEPORT_SNAP_M}m apart snap, never tween`, () => {
     const ring = createRing()
@@ -352,5 +396,305 @@ describe('staleness + angle helpers', () => {
     expect(angleDist(3.1, -3.1)).toBeCloseTo(2 * Math.PI - 6.2)
     expect(angleDist(-3.1, 3.1)).toBeCloseTo(2 * Math.PI - 6.2)
     expect(angleDist(0.5, 0.5)).toBe(0)
+  })
+})
+
+// ── Arrival timing + adaptive delay ──────────────────────────────────────────
+
+describe('arrival timing — what the relay actually delivers', () => {
+  test('steady 100 ms frames with zero deviation converge spacingEma, jitterEma stays 0', () => {
+    const t = createTiming()
+    expect(t.spacingEma).toBe(84) // the design rate, before any evidence
+    for (let i = 0; i < 60; i++) updateTiming(t, 1000 + i * 100, 0)
+    expect(t.spacingEma).toBeCloseTo(100, 0)
+    expect(t.jitterEma).toBe(0)
+    expect(t.gaps).toBe(0)
+    expect(t.lastSentAt).toBe(1000 + 59 * 100)
+  })
+
+  test(`a keep-alive gap (> ${TIMING_GAP_MS} ms) is COUNTED, never sampled as spacing`, () => {
+    const t = createTiming()
+    for (let i = 0; i < 40; i++) updateTiming(t, 1000 + i * 84, 0)
+    const before = t.spacingEma
+    const last = 1000 + 39 * 84
+    updateTiming(t, last + 500, 0) // idle keep-alive
+    expect(t.gaps).toBe(1)
+    expect(t.lastGapMs).toBe(500)
+    expect(t.spacingEma).toBe(before) // a quiet peer does not look like a slow network
+    expect(t.lastSentAt).toBe(last + 500)
+    updateTiming(t, last + 500 + 1000, 0) // a hidden tab at 1 Hz
+    expect(t.gaps).toBe(2)
+    expect(t.lastGapMs).toBe(1000)
+    // The next normal frame samples normally again.
+    updateTiming(t, last + 1500 + 84, 0)
+    expect(t.spacingEma).toBeCloseTo(before, 6)
+  })
+
+  test('offset deviation feeds the jitter average; spacing clamps at the floor', () => {
+    const t = createTiming()
+    for (let i = 0; i < 60; i++) updateTiming(t, 1000 + i * 84, 20)
+    expect(t.jitterEma).toBeCloseTo(20, 0)
+    const fast = createTiming()
+    for (let i = 0; i < 60; i++) updateTiming(fast, 1000 + i * 5, 0) // a burst
+    expect(fast.spacingEma).toBeCloseTo(TIMING_SPACING_MIN_MS, 0)
+    // Duplicate / out-of-order sentAt (spacing ≤ 0) is not a sample either.
+    const dup = createTiming()
+    updateTiming(dup, 1000, 0)
+    updateTiming(dup, 1000, 0)
+    updateTiming(dup, 900, 0)
+    expect(dup.spacingEma).toBe(84)
+    expect(dup.gaps).toBe(0)
+  })
+})
+
+describe('interpDelayFor / slewDelay — the cushion a peer earns', () => {
+  test(`a clean 84 ms stream sits on the floor (${INTERP_DELAY_MIN_MS} ms); jitter lifts it; the ceiling is ${INTERP_DELAY_MAX_MS}`, () => {
+    const clean = createTiming()
+    expect(interpDelayFor(clean)).toBe(INTERP_DELAY_MIN_MS)
+    expect(INTERP_DELAY_MS).toBe(INTERP_DELAY_MIN_MS) // the legacy alias
+    const jittery = createTiming()
+    jittery.jitterEma = 20
+    expect(interpDelayFor(jittery)).toBeGreaterThanOrEqual(180)
+    expect(interpDelayFor(jittery)).toBeLessThan(INTERP_DELAY_MAX_MS)
+    const awful = createTiming()
+    awful.jitterEma = 200
+    awful.spacingEma = 250
+    expect(interpDelayFor(awful)).toBe(INTERP_DELAY_MAX_MS)
+  })
+
+  test(`slewDelay moves at most ${INTERP_DELAY_SLEW_MS_PER_S} ms per second, either way, and lands exactly`, () => {
+    expect(slewDelay(150, 320, 1 / 60)).toBeCloseTo(152, 9)
+    expect(slewDelay(320, 150, 0.5)).toBeCloseTo(260, 9)
+    expect(slewDelay(150, 151, 1)).toBe(151)
+    expect(slewDelay(200, 200, 1)).toBe(200)
+    expect(slewDelay(200, 150, 0)).toBe(200) // no time, no move
+  })
+})
+
+// ── Sampled velocity ─────────────────────────────────────────────────────────
+
+describe('sampleAt — exposes the velocity it moved with', () => {
+  test('the bracket slope in the lerp branch (m/s)', () => {
+    const ring = createRing()
+    push(ring, 1000, { p: [0, 0, 0] })
+    push(ring, 1100, { p: [2, 0.5, -1] })
+    const out = createSampledPose()
+    sampleAt(ring, 1050, out)
+    expect(out.vx).toBeCloseTo(20)
+    expect(out.vy).toBeCloseTo(5)
+    expect(out.vz).toBeCloseTo(-10)
+  })
+
+  test('the pair slope while extrapolating; 0 once frozen', () => {
+    const ring = createRing()
+    push(ring, 1000, { p: [0, 0, 0] })
+    push(ring, 1100, { p: [1, 0, 0] })
+    const out = createSampledPose()
+    sampleAt(ring, 1150, out)
+    expect(out.x).toBeCloseTo(1.5)
+    expect(out.vx).toBeCloseTo(10)
+    expect(out.frozen).toBe(false)
+    sampleAt(ring, 1100 + EXTRAPOLATE_MAX_MS + 1, out)
+    expect(out.frozen).toBe(true)
+    expect(out.vx).toBe(0)
+    expect(out.vy).toBe(0)
+    expect(out.vz).toBe(0)
+  })
+
+  test('0 on a teleport pair, clamped to the oldest, or a lone snapshot', () => {
+    const tele = createRing()
+    push(tele, 1000, { p: [0, 0, 0] })
+    push(tele, 1100, { p: [20, 0, 0] })
+    const out = createSampledPose()
+    sampleAt(tele, 1050, out)
+    expect(out.vx).toBe(0)
+    sampleAt(tele, 1200, out) // extrapolating past a teleport pair
+    expect(out.vx).toBe(0)
+    sampleAt(tele, 500, out) // before the oldest
+    expect(out.vx).toBe(0)
+    const lone = createRing()
+    push(lone, 1000, { p: [3, 1, 2] })
+    sampleAt(lone, 1050, out)
+    expect(out.vx).toBe(0)
+    expect(out.vy).toBe(0)
+  })
+})
+
+describe('sampleAt — airborne extrapolation is ballistic and floor-clamped', () => {
+  test('WIRE_GRAVITY matches the kinematics the sender runs', () => {
+    expect(WIRE_GRAVITY).toBe(MOVE.gravity)
+  })
+
+  test('a rising pair follows gravity toward its apex, not a straight line', () => {
+    const ring = createRing()
+    push(ring, 1000, { p: [0, 0, 0], g: false })
+    push(ring, 1100, { p: [0, 0.5, 0], g: false }) // 5 m/s up
+    const out = createSampledPose()
+    sampleAt(ring, 1300, out) // 200 ms past
+    // y = 0.5 + 5·0.2 − ½·16·0.2² = 1.18, under the linear 1.5
+    expect(out.y).toBeCloseTo(1.18, 6)
+    expect(out.vy).toBeCloseTo(5 - WIRE_GRAVITY * 0.2, 6)
+  })
+
+  test(`a falling pair never goes below newest.y − ${EXTRAP_SINK_M} m`, () => {
+    const ring = createRing()
+    push(ring, 1000, { p: [0, 2, 0], g: false })
+    push(ring, 1100, { p: [0, 1.5, 0], g: false }) // 5 m/s down
+    const out = createSampledPose()
+    sampleAt(ring, 1300, out)
+    expect(out.y).toBeCloseTo(1.5 - EXTRAP_SINK_M, 9) // not 0.18
+    expect(out.vy).toBe(0) // resting on the guessed floor
+    sampleAt(ring, 1120, out) // 20 ms past: still above the floor
+    expect(out.y).toBeGreaterThan(1.5 - EXTRAP_SINK_M)
+    expect(out.y).toBeLessThan(1.5)
+    expect(out.vy).toBeLessThan(-5)
+  })
+
+  test('a grounded pair stays linear (stairs and ramps have real slopes)', () => {
+    const ring = createRing()
+    push(ring, 1000, { p: [0, 0, 0], g: true })
+    push(ring, 1100, { p: [0, 0.5, 0], g: true })
+    const out = createSampledPose()
+    sampleAt(ring, 1300, out)
+    expect(out.y).toBeCloseTo(1.5, 9)
+    expect(out.vy).toBeCloseTo(5, 9)
+  })
+})
+
+// ── Residual smoother ────────────────────────────────────────────────────────
+
+describe('smoothPose — corrections glide, motion passes', () => {
+  const DT = 1 / 60
+  const out = { x: 0, y: 0, z: 0 }
+
+  test('continuous 6.5 m/s: zero corrections, drawn == target', () => {
+    const sm = createSmoother()
+    for (let i = 0; i < 120; i++) {
+      const x = 6.5 * i * DT
+      smoothPose(sm, x, 1.58, 0, 6.5, 0, 0, DT, DT, out)
+      expect(out.x).toBeCloseTo(x, 12)
+    }
+    expect(sm.corrections).toBe(0)
+  })
+
+  test('a 60 Hz velocity ramp (0 → 6.5 m/s over 5 frames) is motion, not error', () => {
+    const sm = createSmoother()
+    let x = 0
+    let v = 0
+    for (let i = 0; i < 30; i++) {
+      smoothPose(sm, x, 0, 0, v, 0, 0, DT, DT, out)
+      expect(out.x).toBeCloseTo(x, 12)
+      v = Math.min(6.5, v + 1.3)
+      x += v * DT
+    }
+    expect(sm.corrections).toBe(0)
+    // A fall at 9 m/s and a shove at 12.5 m/s are continuous too.
+    const fall = createSmoother()
+    for (let i = 0; i < 30; i++) smoothPose(fall, 12.5 * i * DT, 5 - 9 * i * DT, 0, 12.5, -9, 0, DT, DT, out)
+    expect(fall.corrections).toBe(0)
+  })
+
+  test('a 12 Hz velocity STEP (the ring\'s bracket slope jumps 0 → 6.5 m/s in one frame) is ONE small glide', () => {
+    // This is what a real hard start / hard stop / sharp turn looks like to the
+    // smoother: the bracket velocity changes in one render frame, so that
+    // frame's residual is ~v·dt (0.108 m) — above the deadband. The contract:
+    // exactly one correction, the residual is bounded by v·dt, the drawn point
+    // never moves backwards, and it converges well under 300 ms.
+    const sm = createSmoother()
+    for (let i = 0; i < 12; i++) smoothPose(sm, 0, 1.58, 0, 0, 0, 0, DT, DT, out)
+    expect(sm.corrections).toBe(0)
+    let x = 6.5 * DT
+    let prevOut = out.x
+    smoothPose(sm, x, 1.58, 0, 6.5, 0, 0, DT, DT, out)
+    expect(sm.corrections).toBe(1)
+    const residual = x - out.x
+    expect(residual).toBeGreaterThan(0)
+    expect(residual).toBeLessThanOrEqual(6.5 * DT)
+    expect(out.x - prevOut).toBeCloseTo(SMOOTH_DEADBAND_M, 9) // the step frame shows the deadband's worth
+    prevOut = out.x
+    let converged = -1
+    for (let i = 1; i <= 30; i++) {
+      x += 6.5 * DT
+      smoothPose(sm, x, 1.58, 0, 6.5, 0, 0, DT, DT, out)
+      expect(out.x).toBeGreaterThan(prevOut) // never backwards
+      prevOut = out.x
+      if (converged < 0 && x - out.x < 0.01) converged = i * DT
+    }
+    expect(sm.corrections).toBe(1) // continuous motion afterwards is never a correction
+    expect(converged).toBeGreaterThan(0)
+    expect(converged).toBeLessThan(0.3)
+    // The mirror image — a hard stop — is the same single glide.
+    const stop = createSmoother()
+    for (let i = 0; i < 12; i++) smoothPose(stop, 6.5 * i * DT, 1.58, 0, 6.5, 0, 0, DT, DT, out)
+    const held = 6.5 * 11 * DT
+    smoothPose(stop, held, 1.58, 0, 0, 0, 0, DT, DT, out) // the ring says: stopped here
+    expect(stop.corrections).toBe(1)
+    expect(out.x).toBeGreaterThan(held) // overshoots by the unpredicted 6.5·dt − deadband …
+    expect(out.x - held).toBeLessThanOrEqual(6.5 * DT)
+    for (let i = 0; i < 18; i++) smoothPose(stop, held, 1.58, 0, 0, 0, 0, DT, DT, out)
+    expect(Math.abs(out.x - held)).toBeLessThan(0.01) // … and settles within 300 ms
+    expect(stop.corrections).toBe(1)
+  })
+
+  test('a 0.4 m pop glides: one correction, the pop frame moves v·dt + deadband, converged < 400 ms', () => {
+    const sm = createSmoother()
+    const v = 2
+    let x = 0
+    let prevOut = 0
+    for (let i = 0; i < 30; i++) {
+      x = v * i * DT
+      smoothPose(sm, x, 0, 0, v, 0, 0, DT, DT, out)
+      prevOut = out.x
+    }
+    // The late frame lands: the target is suddenly 0.4 m further on.
+    x += v * DT + 0.4
+    smoothPose(sm, x, 0, 0, v, 0, 0, DT, DT, out)
+    expect(sm.corrections).toBe(1)
+    expect(out.x - prevOut).toBeCloseTo(v * DT + SMOOTH_DEADBAND_M, 9)
+    prevOut = out.x
+    const glideCap = 0.4 * (1 - Math.exp(-SMOOTH_RATE * DT)) + 0.01
+    let converged = -1
+    for (let i = 1; i <= 30; i++) {
+      x += v * DT
+      smoothPose(sm, x, 0, 0, v, 0, 0, DT, DT, out)
+      const step = out.x - prevOut
+      expect(step).toBeGreaterThan(0) // never backwards
+      expect(step).toBeLessThanOrEqual(v * DT + glideCap) // never the whole pop at once
+      prevOut = out.x
+      if (converged < 0 && Math.abs(out.x - x) < 0.01) converged = i * DT
+    }
+    expect(sm.corrections).toBe(1) // the glide itself is not a correction
+    expect(converged).toBeGreaterThan(0)
+    expect(converged).toBeLessThan(0.4)
+    expect(sm.maxStepM).toBeLessThan(0.4)
+  })
+
+  test(`a ${TELEPORT_SNAP_M} m+ jump snaps — no glide across the map`, () => {
+    const sm = createSmoother()
+    for (let i = 0; i < 10; i++) smoothPose(sm, i * 0.1, 0, 0, 6, 0, 0, DT, DT, out)
+    smoothPose(sm, 50, 0, 0, 0, 0, 0, DT, DT, out)
+    expect(out.x).toBe(50)
+    expect(sm.corrections).toBe(0)
+  })
+
+  test('a 100 ms wall hitch at 6.5 m/s is budgeted on WALL dt — not misread as a pop', () => {
+    const sm = createSmoother()
+    let x = 0
+    for (let i = 0; i < 30; i++) {
+      x = 6.5 * i * DT
+      smoothPose(sm, x, 0, 0, 6.5, 0, 0, DT, DT, out)
+    }
+    x += 6.5 * 0.1 // the game loop stalled 100 ms; the peer kept running
+    smoothPose(sm, x, 0, 0, 6.5, 0, 0, 0.1, 1 / 30, out)
+    expect(sm.corrections).toBe(0)
+    expect(out.x).toBeCloseTo(x, 9)
+  })
+
+  test('the first call primes: drawn == target, nothing counted', () => {
+    const sm = createSmoother()
+    smoothPose(sm, 7, 8, 9, 100, 100, 100, DT, DT, out)
+    expect(out).toEqual({ x: 7, y: 8, z: 9 })
+    expect(sm.corrections).toBe(0)
+    expect(sm.maxStepM).toBe(0)
   })
 })

@@ -20,6 +20,7 @@ import {
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js'
 import { type RemoteShotKind, sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
+import { MOVE } from './movement'
 import { localUserId } from './net'
 import { SprayerModel } from './paint'
 import {
@@ -32,17 +33,24 @@ import {
 } from './pascaline-model'
 import {
   createSampledPose,
-  INTERP_DELAY_MS,
+  createSmoother,
+  INTERP_DELAY_MIN_MS,
+  interpDelayFor,
   sampleAt,
   type SampledPose,
   shotsFired,
+  slewDelay,
+  smoothPose,
 } from './presence-interp'
 import {
   getRemotes,
   getRosterVersion,
   participantName,
+  registerPresenceDebugSource,
   type RemotePlayer,
+  wrapAngle,
 } from './presence'
+import { footPlants, remoteFootstep } from './remote-footsteps'
 import { getSession } from './session'
 import { isPeerTalking } from './voice'
 import {
@@ -107,6 +115,15 @@ import {
  * root is tagged userData.__boots so identifyAim attributes them. Peers
  * cannot block doorways, eat bullets, or brace a collapsing build; each
  * client's game stays exactly as solo, plus ghosts.
+ *
+ * THEY MOVE LIKE PEOPLE (2026-09-02 motion pass): the gait is a stride length
+ * paced by the speed the body is DRAWN moving at (never the wire `s`), the root
+ * drops so the stance foot plants, a strafe steps sideways and a backpedal runs
+ * the cycle backwards, the legs lag the aim while the torso carries the whole
+ * view yaw (the gun stays on the peer's true aim), landings squash, shots kick
+ * the arm, and each foot plant voices a footstep at the peer's bearing. Between
+ * the wire and the root: a per-peer adaptive interpolation delay and a residual
+ * smoother (presence-interp.ts), so late frames glide instead of popping.
  *
  * Zero per-frame allocations: one module-level SampledPose + quaternions
  * are reused across every avatar; geometries/materials are module caches.
@@ -179,10 +196,81 @@ export function assignPalette(userIds: readonly string[]): Map<string, number> {
 
 // ── Articulation (pure, tested) ──────────────────────────────────────────────
 
+/**
+ * THE GAIT IS A STRIDE LENGTH, NOT A CADENCE. A leg of LEG_LEN_M swung ±θ
+ * covers 2·L·sin θ of ground per step, so for the feet to PLANT rather than
+ * slide the phase must advance π per stepLength(s) of DISPLAYED travel:
+ * gaitRate(s) = v·π / stepLength(s). The old fixed cadence (7 rad/s at full
+ * speed, 0.55 rad swing) covered 2.9 m of ground per 0.87 m foot arc — the
+ * treadmill everyone saw. The renderer feeds these the speed the avatar is
+ * actually drawn moving at (updateMotion), never the sender's wire `s`, so an
+ * extrapolating or frozen peer's legs stop with its body.
+ */
+/** Hip to sole (m) — the mascot's thigh + shin. */
+export const LEG_LEN_M = DEFAULT_DIMS.thighLen + DEFAULT_DIMS.shinLen
+/** Full normalized speed in m/s (the wire's s = 1). */
+export const RUN_SPEED_M_S = MOVE.runSpeed
+/** The normalized speed of a walk. */
+export const WALK_S = MOVE.walkSpeed / MOVE.runSpeed
+/** Below this normalized speed nobody takes a step: the legs settle. */
+export const GAIT_MIN_S = 0.08
+/** Peak hip swing (rad) at a full run — geometry, not taste: past this the
+ * stiff-legged body would bounce more than 15 cm. */
+export const LEG_SWING_CAP = 0.6
+/** Ground covered per step (m) at a walk … */
+export const STEP_LEN_WALK_M = 0.75
+/** … and at a full run (what LEG_SWING_CAP reaches). */
+export const STEP_LEN_RUN_M = 2 * LEG_LEN_M * Math.sin(LEG_SWING_CAP)
+/** Fastest cadence (rad/s of phase; 5.6 steps/s). Above ~4.8 m/s the feet
+ * slide the remainder rather than blur — ~20 % at a full sprint. */
+export const GAIT_RATE_MAX = 17.5
+/** How fast the legs come together once the body has stopped (rad/s). */
+export const GAIT_SETTLE_RATE = 10
+/** Lateral hip swing per rad of what a forward step would have been, when the
+ * displacement is sideways (strafing): rotation.z of both hip pivots. */
+export const LATERAL_SWING = 0.8
+
+/**
+ * THE FOOT PLANT (m). With both legs straight at the stride's extremes and the
+ * hips split ±θ (fore-aft, lateral, or both — the hypot), both soles hang
+ * L·(1 − cos θ) above the ground; the root must drop by exactly that for the
+ * straight stance leg's foot to touch at every phase. articulate folds it
+ * into bobY, so EVERY consumer of the articulation — the peers' rigs and the
+ * depot mirror's reflection of the local player alike — stands on the ground
+ * without knowing about it. Exported so the geometry is pinned once.
+ */
+export function footPlantDrop(a: { legSwing: number; legSide: number }): number {
+  const split = Math.sqrt(a.legSwing * a.legSwing + a.legSide * a.legSide)
+  return LEG_LEN_M * (1 - Math.cos(split))
+}
+
+/** Step length for a normalized speed: a walk's below WALK_S, then lengthening
+ * linearly to the run's at s = 1. */
+export function stepLength(s: number): number {
+  if (s <= WALK_S) return STEP_LEN_WALK_M
+  const k = (Math.min(1, s) - WALK_S) / (1 - WALK_S)
+  return STEP_LEN_WALK_M + (STEP_LEN_RUN_M - STEP_LEN_WALK_M) * k
+}
+
+/** Phase advance (rad/s) that plants the feet at normalized speed s. */
+export function gaitRate(s: number): number {
+  if (s < GAIT_MIN_S) return 0
+  const rate = (Math.min(1, s) * RUN_SPEED_M_S * Math.PI) / stepLength(s)
+  return rate > GAIT_RATE_MAX ? GAIT_RATE_MAX : rate
+}
+
+/** Peak hip swing (rad) at normalized speed s — the half-angle whose chord is
+ * the step; fades to 0 continuously below GAIT_MIN_S so a stop never snaps. */
+export function legSwingFor(s: number): number {
+  const c = s / GAIT_MIN_S
+  const fade = c < 0 ? 0 : c > 1 ? 1 : c
+  return Math.asin(stepLength(s) / (2 * LEG_LEN_M)) * fade
+}
+
 /** Gait phase advance per second at full speed (rad/s of the swing sine). */
-export const GAIT_RATE = 7
+export const GAIT_RATE = GAIT_RATE_MAX
 /** Peak leg swing (rad) at full normalized speed. */
-export const LEG_SWING_MAX = 0.55
+export const LEG_SWING_MAX = legSwingFor(1)
 /** Peak knee flexion (rad) mid-swing at full speed — the lifted knee of a run. */
 export const KNEE_LIFT_MAX = 1.0
 /** Counter-swing of the free arm, fraction of the leg swing. */
@@ -228,8 +316,10 @@ export const STRIDE = {
   /** A free arm swinging forward bends its elbow this much more (per rad of swing). */
   elbowPerSwing: 0.6,
 } as const
-/** Pose blending rates (1/s): legs stay crisp, arms and the trunk ease. */
-export const BLEND_RATE = { legs: 22, arms: 12, trunk: 9, hands: 14 } as const
+/** Pose blending rates (1/s): legs stay crisp (a 17.5 rad/s run swing must
+ * come through at full amplitude — 22/s lost a fifth of the stride), arms
+ * and the trunk ease. */
+export const BLEND_RATE = { legs: 60, arms: 12, trunk: 9, hands: 14 } as const
 /** A hand holding something collapses to this scale (its fist mesh takes over). */
 export const HAND_COLLAPSE = 0.02
 /**
@@ -350,6 +440,8 @@ export function gripFor(weapon: string): Grip {
 export type AvatarArticulation = {
   /** rotation.x of the LEFT hip pivot (right leg mirrors with -legSwing). */
   legSwing: number
+  /** rotation.z of BOTH hip pivots — the lateral stepping of a strafe. */
+  legSide: number
   /** Knee flexion per leg (rad, ≥ 0) — applied as −rotation.x on the knee pivot. */
   kneeL: number
   kneeR: number
@@ -389,6 +481,7 @@ export type AvatarArticulation = {
 export function createArticulation(): AvatarArticulation {
   return {
     legSwing: 0,
+    legSide: 0,
     kneeL: 0,
     kneeR: 0,
     armSwing: 0,
@@ -410,10 +503,25 @@ export function createArticulation(): AvatarArticulation {
   }
 }
 
-/** Advance the walk-cycle phase: stride cadence scales with normalized
- * speed (a stopped or airborne player's legs settle, never treadmill). */
+/**
+ * Advance the walk-cycle phase by the stride-length cadence for normalized
+ * speed s (gaitRate). Below GAIT_MIN_S the phase SETTLES toward the nearest
+ * k·π — legs together — at GAIT_SETTLE_RATE, never rewinding past it, so a
+ * stop ends with the feet under the body instead of mid-stride. Hostile or
+ * NaN speeds read as 0.
+ */
 export function advanceGait(phase: number, s: number, dt: number): number {
-  return phase + dt * GAIT_RATE * (s < 0 ? 0 : s)
+  const sp = s > 1 ? 1 : s > 0 ? s : 0
+  const step = dt > 0 ? dt : 0
+  if (sp < GAIT_MIN_S) {
+    const target = Math.round(phase / Math.PI) * Math.PI
+    const d = target - phase
+    const max = GAIT_SETTLE_RATE * step
+    if (d > max) return phase + max
+    if (d < -max) return phase - max
+    return target
+  }
+  return phase + step * gaitRate(sp)
 }
 
 /**
@@ -443,27 +551,38 @@ export function articulate(
   t = 0,
   arms: ArmDims = MODEL_ARMS,
   seed = 0,
+  moveRel = 0,
 ): AvatarArticulation {
   const clampedPitch = clamp(pitch, -PITCH_CLAMP, PITCH_CLAMP)
   // How much of the idle layer applies: all of it standing, none at a jog.
   const idle = grounded ? clamp(1 - s / IDLE_FADE_S, 0, 1) : 0
+  // The stride's hip amplitude — a stride LENGTH, so nearly constant above a
+  // creep and fading to nothing only under GAIT_MIN_S (legSwingFor).
+  const amp = legSwingFor(s)
 
-  // Legs, and the trunk's stride and idle layers.
+  // Legs, and the trunk's stride and idle layers. `moveRel` is the angle from
+  // the body's facing to its displacement: 0 forward, ±π/2 a strafe, π a
+  // backpedal — the fore-aft swing takes cos, the lateral step takes sin, so a
+  // strafing peer steps sideways and a backpedaling one runs the cycle in
+  // reverse instead of moonwalking.
   const shift = Math.sin(t * IDLE.shiftRate + seed) // slow weight shift, −1..1
   if (grounded) {
-    const swing = Math.sin(phase) * LEG_SWING_MAX * s
+    const swing = Math.sin(phase) * amp * Math.cos(moveRel)
     out.legSwing = staggered ? swing * 0.5 : swing
+    out.legSide = staggered ? 0 : Math.sin(phase) * amp * Math.sin(moveRel) * LATERAL_SWING
     const lift = KNEE_LIFT_MAX * s
     const soft = staggered ? SLUMP_KNEE : 0
     // Standing, the weight sits on one leg and the other knee softens.
     out.kneeL = Math.max(0, Math.cos(phase)) * lift + soft + idle * IDLE.shiftKnee * (0.5 + 0.5 * shift)
     out.kneeR = Math.max(0, -Math.cos(phase)) * lift + soft + idle * IDLE.shiftKnee * (0.5 - 0.5 * shift)
-    out.bobY = Math.abs(Math.cos(phase)) * 0.04 * s
+    // The stride's bob, minus the foot plant: the hips split, the root drops.
+    out.bobY = Math.abs(Math.cos(phase)) * 0.04 * s - footPlantDrop(out)
     out.swayX = Math.sin(phase) * STRIDE.sway * s + idle * IDLE.shiftLean * shift
     out.torsoYaw = -Math.sin(phase) * STRIDE.twist * s + idle * IDLE.swayYaw * Math.sin(t * IDLE.swayRate + seed * 2)
     out.torsoRoll = Math.sin(phase) * STRIDE.roll * s + idle * IDLE.shiftRoll * shift
   } else {
     out.legSwing = AIR_LEG_SPLIT
+    out.legSide = 0
     out.kneeL = AIR_KNEE
     out.kneeR = AIR_KNEE
     out.bobY = 0
@@ -473,8 +592,10 @@ export function articulate(
   }
   // What an arm does when it has nothing to hold: counter-swings the stride,
   // and at rest drifts a little so it never hangs like a rope.
+  // (The arm follows the stride's amplitude whatever its direction, and swings
+  // wider the faster the body goes.)
   const freeSwing = grounded
-    ? -Math.sin(phase) * LEG_SWING_MAX * ARM_SWING_RATIO * s + idle * IDLE.armDrift * Math.sin(t * 0.9 + seed)
+    ? -Math.sin(phase) * amp * ARM_SWING_RATIO * (0.5 + 0.5 * s) + idle * IDLE.armDrift * Math.sin(t * 0.9 + seed)
     : AIR_ARM_SWING
   const freeElbow = FREE_ELBOW + STRIDE.elbowPerSwing * Math.max(0, freeSwing)
 
@@ -551,7 +672,7 @@ export function articulate(
   return out
 }
 
-const LEG_FIELDS = ['legSwing', 'kneeL', 'kneeR', 'bobY', 'swayX'] as const
+const LEG_FIELDS = ['legSwing', 'legSide', 'kneeL', 'kneeR', 'bobY', 'swayX'] as const
 const ARM_FIELDS = ['armSwing', 'armLYaw', 'elbowL', 'armAim', 'armRYaw', 'elbowR', 'weaponTilt'] as const
 const TRUNK_FIELDS = ['torsoPitch', 'torsoYaw', 'torsoRoll', 'headPitch', 'headYaw'] as const
 const HAND_FIELDS = ['gripL', 'gripR'] as const
@@ -588,6 +709,9 @@ export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): v
   }
   setX(refs.legL, a.legSwing)
   setX(refs.legR, -a.legSwing)
+  // Both hips swing the same way sideways: a strafe shuffles, it never crosses.
+  if (refs.legL.current) refs.legL.current.rotation.z = a.legSide
+  if (refs.legR.current) refs.legR.current.rotation.z = a.legSide
   setX(refs.kneeL, -a.kneeL)
   setX(refs.kneeR, -a.kneeR)
   const armL = refs.armL.current
@@ -640,6 +764,364 @@ export function placeRoot(
 ): void {
   root.position.set(feetX + a.swayX * Math.cos(yaw), feetY + a.bobY, feetZ - a.swayX * Math.sin(yaw))
 }
+
+// ── Motion layer (pure, tested) ──────────────────────────────────────────────
+
+/**
+ * WHAT THE WIRE DOES NOT CARRY, DERIVED FROM WHAT IT DOES. The pose is a
+ * position, a view yaw and a few flags at 12 Hz; a body is what happens
+ * between them. This layer keeps, per avatar, the state that makes the drawn
+ * position read as a person:
+ * - DISPLAYED speed and its direction in the body's frame (the gait's input —
+ *   never the sender's `s`, which keeps cycling while a stalled peer is frozen);
+ * - a BODY YAW that lags the view: standing, the body holds until the head has
+ *   turned past a dead zone (with hysteresis), then follows; moving, it
+ *   follows closely; the torso carries the WHOLE remaining difference, so the
+ *   gun, the muzzle flash and the tracer always point exactly where the peer
+ *   is aiming (shooter-authoritative PvP depends on it) while the legs and
+ *   feet stay planted;
+ * - a LANDING squash gated on a real fall speed (the local sfx.land threshold,
+ *   so a stair-step blip does nothing);
+ * - a RECOIL kick per shot the gun arm springs back from.
+ * updateMotion advances it from the drawn position; layerMotion adds it onto
+ * the blended articulation. Both are allocation-free.
+ */
+export type AvatarMotion = {
+  primed: boolean
+  /** Last drawn eye position fed in. */
+  lx: number
+  ly: number
+  lz: number
+  /** Displayed horizontal speed (m/s, smoothed; snaps to 0 under SPEED_DISP_ZERO). */
+  speedDisp: number
+  /** Displacement in the body's frame (m/s, smoothed): along the facing, along +x. */
+  fwd: number
+  right: number
+  /** Angle from the body's facing to the displacement (rad; 0 forward, ±π/2 strafe, π back). */
+  moveRel: number
+  /** Where the LEGS face (root rotation.y). */
+  bodyYaw: number
+  /** Smoothed body turn rate (rad/s) — the lean. */
+  yawRate: number
+  /** Standing dead-zone state: is the body currently chasing the view? */
+  turning: boolean
+  wasGrounded: boolean
+  /** Most negative vertical speed seen this airborne spell (m/s). */
+  minVy: number
+  /** Highest eye Y seen this airborne spell (the apex) — the drop from it is
+   * the robust impact-speed estimate at 12 Hz (see updateMotion). */
+  airTopY: number
+  /** Landing squash: time left (s) and its strength (0.4..1.2). */
+  landT: number
+  landPower: number
+  /** Recoil spring on the gun arm (rad, rad/s). */
+  recoilX: number
+  recoilV: number
+}
+
+/** Displayed-speed EMA rate (1/s): ~70 ms to follow, so a stop is a settle. */
+export const SPEED_DISP_SMOOTH = 14
+/** Under this displayed speed (m/s) the EMA snaps to exactly 0. */
+export const SPEED_DISP_ZERO = 0.05
+/** Displayed speed is clamped here (m/s) — a snap is never read as a sprint. */
+export const SPEED_DISP_MAX = RUN_SPEED_M_S * 1.15
+/** One drawn step beyond this (m) is a teleport/snap and is not a speed sample. */
+export const SPEED_DISP_SNAP_M = 1.0
+/** Body-follows-view rules. */
+export const TURN = {
+  /** Standing: the body holds until the view is this far off it (rad) … */
+  deadzone: 0.35,
+  /** … and keeps chasing until it is back within this (rad). */
+  release: 0.1,
+  /** Chase rates (1/s) standing and moving. */
+  rateStanding: 8,
+  rateMoving: 12,
+  /** Displayed speed (m/s) above which the body is "moving" and always follows. */
+  movingSpeed: 0.8,
+  /** The torso twist limit (rad): past it the legs snap round to keep the aim honest. */
+  torsoMax: 0.6,
+  /** Lean into a turn: torso roll per rad/s of body yaw rate, capped. */
+  leanPerRadS: 0.025,
+  leanMax: 0.12,
+  /** Yaw-rate smoothing (1/s). */
+  rateSmooth: 10,
+} as const
+/** Landing squash: duration (s), knee bend, torso pitch, root dip (m) at full
+ * power; minFall is the local player's sfx.land threshold (player.tsx), so a
+ * hop or a stair blip never squashes; fullFall gives power 1. */
+export const LAND = { squashS: 0.22, knee: 0.45, pitch: 0.16, dip: 0.06, minFall: 4, fullFall: 8 } as const
+/** Recoil spring (rad): stiffness, damping, and how much of the arm's kick the
+ * torso and head take. ω ≈ 20 rad/s, ζ ≈ 0.73 — back in ~200 ms. */
+export const RECOIL = { k: 420, damp: 30, torsoShare: 0.3, headShare: 0.35 } as const
+/** Arm kick per round (rad) by weapon; anything else kicks nothing. */
+export const AVATAR_RECOIL: Record<string, number> = { pistol: 0.18, rifle: 0.11, minigun: 0.05 }
+
+export function createMotion(): AvatarMotion {
+  return {
+    primed: false,
+    lx: 0,
+    ly: 0,
+    lz: 0,
+    speedDisp: 0,
+    fwd: 0,
+    right: 0,
+    moveRel: 0,
+    bodyYaw: 0,
+    yawRate: 0,
+    turning: false,
+    wasGrounded: true,
+    minVy: 0,
+    airTopY: 0,
+    landT: 0,
+    landPower: 0,
+    recoilX: 0,
+    recoilV: 0,
+  }
+}
+
+/**
+ * Advance the motion state from this frame's DRAWN eye position and the sampled
+ * pose flags. `vy` is the sampled vertical velocity (m/s), `shots` the rounds
+ * read this frame, `weapon` the wire id. Returns the displayed speed
+ * NORMALIZED (speedDisp / RUN_SPEED_M_S) — the gait's `s`. The first call
+ * primes (body faces the view) and returns 0.
+ */
+export function updateMotion(
+  m: AvatarMotion,
+  x: number,
+  y: number,
+  z: number,
+  viewYaw: number,
+  grounded: boolean,
+  staggered: boolean,
+  shots: number,
+  weapon: string,
+  vy: number,
+  dt: number,
+): number {
+  if (!m.primed) {
+    m.primed = true
+    m.lx = x
+    m.ly = y
+    m.lz = z
+    m.bodyYaw = wrapAngle(viewYaw)
+    m.wasGrounded = grounded
+    return 0
+  }
+  const step = dt > 0 ? dt : 0
+  const k = 1 - Math.exp(-SPEED_DISP_SMOOTH * step)
+  const dx = x - m.lx
+  const dz = z - m.lz
+  m.lx = x
+  m.ly = y
+  m.lz = z
+  const d = Math.sqrt(dx * dx + dz * dz)
+
+  // ── displayed speed + direction in the body frame ──
+  if (step > 0 && d <= SPEED_DISP_SNAP_M) {
+    let v = d / step
+    if (v > SPEED_DISP_MAX) v = SPEED_DISP_MAX
+    m.speedDisp += (v - m.speedDisp) * k
+    // facing = (−sin yaw, −cos yaw), right = (cos yaw, −sin yaw) — placeRoot's frame.
+    const sy = Math.sin(m.bodyYaw)
+    const cy = Math.cos(m.bodyYaw)
+    const fwd = (-dx * sy - dz * cy) / step
+    const right = (dx * cy - dz * sy) / step
+    m.fwd += (fwd - m.fwd) * k
+    m.right += (right - m.right) * k
+  } else {
+    // A snap (teleport, spawn) is not motion: let the speed settle toward 0
+    // (the legs come together, never a sprint read off a jump cut) and keep
+    // the direction — moveRel below only refreshes from real motion.
+    m.speedDisp += (0 - m.speedDisp) * k
+  }
+  if (m.speedDisp < SPEED_DISP_ZERO) {
+    m.speedDisp = 0
+    m.fwd = 0
+    m.right = 0
+  }
+  // The direction only updates while there is real motion to read it from; a
+  // stopping body keeps its last direction so the legs settle, not swivel.
+  if (Math.sqrt(m.fwd * m.fwd + m.right * m.right) > TURN.movingSpeed * 0.5) {
+    m.moveRel = Math.atan2(m.right, m.fwd)
+  }
+
+  // ── body yaw: lags the view standing, follows it moving, never twists past torsoMax ──
+  const moving = m.speedDisp > TURN.movingSpeed
+  const before = m.bodyYaw
+  let diff = wrapAngle(viewYaw - m.bodyYaw)
+  if (diff > TURN.torsoMax) {
+    m.bodyYaw = wrapAngle(viewYaw - TURN.torsoMax)
+    diff = TURN.torsoMax
+  } else if (diff < -TURN.torsoMax) {
+    m.bodyYaw = wrapAngle(viewYaw + TURN.torsoMax)
+    diff = -TURN.torsoMax
+  }
+  const ad = diff < 0 ? -diff : diff
+  if (moving || staggered) m.turning = true
+  else if (m.turning) m.turning = ad > TURN.release
+  else m.turning = ad > TURN.deadzone
+  if (m.turning) {
+    const rate = moving ? TURN.rateMoving : TURN.rateStanding
+    m.bodyYaw = wrapAngle(m.bodyYaw + diff * (1 - Math.exp(-rate * step)))
+  }
+  const turned = wrapAngle(m.bodyYaw - before)
+  const rateInst = step > 0 ? turned / step : 0
+  m.yawRate += (rateInst - m.yawRate) * (1 - Math.exp(-TURN.rateSmooth * step))
+
+  // ── landing: the impact speed of the airborne spell, judged on the grounded edge ──
+  // Two estimates, the larger wins. The sampled slope (minVy) is exact for a
+  // long fall but at 12 Hz it AVERAGES the last 84 ms — a plain jump's 5.4 m/s
+  // impact reads as 2.7-5 depending on where the frames fell — so the drop from
+  // the spell's apex (√(2·g·h), the same kinematics the sender ran) is the one
+  // that catches every jump; a stair blip has no apex to speak of.
+  if (!grounded) {
+    if (!m.wasGrounded) {
+      if (vy < m.minVy) m.minVy = vy
+      if (y > m.airTopY) m.airTopY = y
+    } else {
+      m.minVy = vy < 0 ? vy : 0
+      m.airTopY = y
+    }
+  } else {
+    if (!m.wasGrounded) {
+      // The landing bracket itself reads grounded (discrete fields ride the
+      // newer snapshot) but carries the fall's final slope — count it.
+      const slope = vy < m.minVy ? -vy : -m.minVy
+      const drop = m.airTopY - y
+      const fromApex = drop > 0 ? Math.sqrt(2 * MOVE.gravity * drop) : 0
+      const fall = slope > fromApex ? slope : fromApex
+      if (fall >= LAND.minFall) {
+        m.landT = LAND.squashS
+        const power = fall / LAND.fullFall
+        m.landPower = power < 0.4 ? 0.4 : power > 1.2 ? 1.2 : power
+      }
+    }
+    m.minVy = 0
+  }
+  m.wasGrounded = grounded
+  if (m.landT > 0) m.landT = m.landT - step < 0 ? 0 : m.landT - step
+
+  // ── recoil: an instant kick per round, sprung back ──
+  if (shots > 0) {
+    const kick = AVATAR_RECOIL[weapon] ?? 0
+    m.recoilX += shots * kick
+  }
+  if (m.recoilX !== 0 || m.recoilV !== 0) {
+    m.recoilV += (-RECOIL.k * m.recoilX - RECOIL.damp * m.recoilV) * step
+    m.recoilX += m.recoilV * step
+    if (Math.abs(m.recoilX) < 1e-4 && Math.abs(m.recoilV) < 1e-3) {
+      m.recoilX = 0
+      m.recoilV = 0
+    }
+  }
+
+  return m.speedDisp / RUN_SPEED_M_S
+}
+
+const ARTIC_FIELDS = [
+  'legSwing',
+  'legSide',
+  'kneeL',
+  'kneeR',
+  'armSwing',
+  'armLYaw',
+  'elbowL',
+  'armAim',
+  'armRYaw',
+  'elbowR',
+  'weaponTilt',
+  'gripL',
+  'gripR',
+  'torsoPitch',
+  'torsoYaw',
+  'torsoRoll',
+  'headPitch',
+  'headYaw',
+  'bobY',
+  'swayX',
+] as const
+
+/**
+ * Layer the motion state onto the blended articulation: `out` = `live` plus
+ * - the torso twist that makes up the WHOLE difference between the view yaw
+ *   and the body yaw (the upper body aims; the head is left alone — it already
+ *   tracks the view pitch and counters the stride twist);
+ * - a lean into the turn;
+ * - the landing squash (knees, torso, root dip) on a 4u(1−u) envelope;
+ * - the recoil kick on the gun arm, shared into the torso and head.
+ * (The foot plant is NOT here: articulate folds it into bobY, so a consumer
+ * without a motion layer — the depot mirror — stands on the ground too.)
+ * `live` is untouched; `out` is caller-owned scratch. At rest it is the
+ * identity.
+ */
+export function layerMotion(
+  out: AvatarArticulation,
+  live: AvatarArticulation,
+  m: AvatarMotion,
+  viewYaw: number,
+): AvatarArticulation {
+  for (const f of ARTIC_FIELDS) out[f] = live[f]
+  out.torsoYaw += wrapAngle(viewYaw - m.bodyYaw)
+  const lean = -m.yawRate * TURN.leanPerRadS
+  out.torsoRoll += lean < -TURN.leanMax ? -TURN.leanMax : lean > TURN.leanMax ? TURN.leanMax : lean
+  if (m.landT > 0) {
+    const u = m.landT / LAND.squashS
+    const env = 4 * u * (1 - u) * m.landPower
+    out.kneeL += LAND.knee * env
+    out.kneeR += LAND.knee * env
+    out.torsoPitch += LAND.pitch * env
+    out.bobY -= LAND.dip * env
+  }
+  if (m.recoilX !== 0) {
+    out.armAim += m.recoilX
+    out.torsoPitch -= m.recoilX * RECOIL.torsoShare
+    out.headPitch += m.recoilX * RECOIL.headShare
+  }
+  return out
+}
+
+// ── Per-avatar QA stats (plain numbers, copied out) ──────────────────────────
+
+export type AvatarStats = {
+  /** Displayed speed (m/s) the gait is running at. */
+  speedDisp: number
+  /** Interpolation delay in use (ms). */
+  delayMs: number
+  /** Smoother corrections so far, and the largest drawn step since the last read (m). */
+  corrections: number
+  maxStepM: number
+  bodyYaw: number
+  /** Torso twist = view − body (rad). */
+  twist: number
+  moveRel: number
+  landT: number
+  recoilX: number
+  frozen: boolean
+  /** The smoother's residual this frame (m): drawn − sampled target. Non-zero
+   * only while a late/popped sample is gliding in — the exact amount by which
+   * the picture (and the PvP capsule) differs from the raw ring sample. */
+  resX: number
+  resY: number
+  resZ: number
+}
+
+const avatarStats = new Map<string, AvatarStats>()
+const smootherOf = new Map<string, { maxStepM: number }>()
+
+/** Plain copies of every mounted avatar's motion numbers, keyed by sessionId.
+ * Reading resets each maxStepM (a running max between reads). */
+export function avatarDebug(): Record<string, AvatarStats> {
+  const out: Record<string, AvatarStats> = {}
+  for (const [id, st] of avatarStats) {
+    out[id] = { ...st }
+    const sm = smootherOf.get(id)
+    if (sm) sm.maxStepM = 0
+  }
+  return out
+}
+
+registerPresenceDebugSource('avatars', avatarDebug)
 
 // ── Join scale-in + name-tag gate (pure, tested) ─────────────────────────────
 
@@ -923,6 +1405,8 @@ function driveChip(count: number): void {
 
 const _pose: SampledPose = createSampledPose()
 const _artic: AvatarArticulation = createArticulation()
+const _layered: AvatarArticulation = createArticulation()
+const _drawn = { x: 0, y: 0, z: 0 }
 const _worldQuat = new Quaternion()
 
 // ── The rig itself (shared: peers AND the depot mirror) ─────────────────────
@@ -1317,6 +1801,35 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
   }).current
   const flashT = useRef(0)
   const lastShots = useRef(-1)
+  // Motion: displayed speed/direction, body yaw, landing, recoil (updateMotion);
+  // the residual smoother between the sample and the root; the per-peer
+  // adaptive interpolation delay, slewed. All plain objects, allocated once.
+  const motion = useRef(createMotion())
+  const smoother = useRef(createSmoother())
+  const delay = useRef(INTERP_DELAY_MIN_MS)
+  const stats = useRef<AvatarStats>({
+    speedDisp: 0,
+    delayMs: INTERP_DELAY_MIN_MS,
+    corrections: 0,
+    maxStepM: 0,
+    bodyYaw: 0,
+    twist: 0,
+    moveRel: 0,
+    landT: 0,
+    recoilX: 0,
+    frozen: false,
+    resX: 0,
+    resY: 0,
+    resZ: 0,
+  })
+  useEffect(() => {
+    avatarStats.set(remote.sessionId, stats.current)
+    smootherOf.set(remote.sessionId, smoother.current)
+    return () => {
+      avatarStats.delete(remote.sessionId)
+      smootherOf.delete(remote.sessionId)
+    }
+  }, [remote.sessionId])
   // Change-gated React state: weapon swaps and late-resolving names are
   // EVENTS (a handful per session), so a state write from useFrame is fine.
   const [weapon, setWeapon] = useState(remote.w)
@@ -1336,25 +1849,47 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
     if (!root) return
     const now = Date.now()
     const offset = Number.isFinite(remote.clockOffset) ? remote.clockOffset : 0
-    if (!sampleAt(remote.ring, now - offset - INTERP_DELAY_MS, _pose)) return
 
     // Capped dt like every game loop here (a hitch never teleports a limb).
     const dt = Math.min(rawDt, 1 / 30)
 
-    // ONE distance, spent three ways: the gunfire mix, the tag fade, the LOD.
+    // The interpolation delay this peer has earned from its measured arrival
+    // timing, slewed so it never steps; then the sample at that point in the
+    // past, then the residual smoother between the sample and the root.
+    delay.current = slewDelay(delay.current, interpDelayFor(remote.timing), dt)
+    if (!sampleAt(remote.ring, now - offset - delay.current, _pose)) return
+    smoothPose(smoother.current, _pose.x, _pose.y, _pose.z, _pose.vx, _pose.vy, _pose.vz, rawDt, dt, _drawn)
+    // Published for the consumers that must agree with the picture (PvP, voice).
+    remote.drawnX = _drawn.x
+    remote.drawnY = _drawn.y
+    remote.drawnZ = _drawn.z
+    remote.drawnAt = now
+    remote.delayMs = delay.current
+
+    // ONE distance, spent four ways: gunfire and footsteps, the tag fade, the LOD.
     const camera = rootState.camera
-    const dx = camera.position.x - _pose.x
-    const dy = camera.position.y - _pose.y
-    const dz = camera.position.z - _pose.z
+    const dx = camera.position.x - _drawn.x
+    const dy = camera.position.y - _drawn.y
+    const dz = camera.position.z - _drawn.z
     const distSq = dx * dx + dy * dy + dz * dz
 
-    gaitPhase.current = advanceGait(gaitPhase.current, _pose.g ? _pose.s : 0, dt)
+    // Gunfire counter FIRST — the recoil kick belongs to this frame's pose.
+    const shots = shotsFired(lastShots.current, _pose.f)
+    lastShots.current = _pose.f
+
+    // The motion state runs off the DRAWN position: the gait is paced by the
+    // speed the body is actually seen moving at, so an extrapolating or frozen
+    // peer's legs stop with it instead of treadmilling on the wire's `s`.
+    const m = motion.current
+    const sDisp = updateMotion(m, _drawn.x, _drawn.y, _drawn.z, _pose.yaw, _pose.g, _pose.st, shots, _pose.w, _pose.vy, dt)
+    const prevPhase = gaitPhase.current
+    gaitPhase.current = advanceGait(prevPhase, _pose.g && !_pose.frozen ? sDisp : 0, dt)
     // The peer's own clock drives their breathing, so a lobby does not breathe
     // in unison; the wire weapon decides the hold.
     articulate(
       _artic,
       gaitPhase.current,
-      _pose.s,
+      sDisp,
       _pose.pitch,
       _pose.g,
       _pose.st,
@@ -1362,32 +1897,64 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
       (now - remote.joinedAt) / 1000,
       MODEL_ARMS,
       idleSeed,
+      m.moveRel,
     )
     blendArticulation(pose.current, _artic, dt)
+    layerMotion(_layered, pose.current, m, _pose.yaw)
 
-    // Wire positions are EYE positions — plant the feet.
-    placeRoot(root, _pose.x, _pose.y - EYE_HEIGHT, _pose.z, _pose.yaw, pose.current)
-    root.rotation.y = _pose.yaw
+    // Wire positions are EYE positions — plant the feet. The ROOT faces where
+    // the body faces; the torso carries the rest of the view yaw (layerMotion).
+    placeRoot(root, _drawn.x, _drawn.y - EYE_HEIGHT, _drawn.z, m.bodyYaw, _layered)
+    root.rotation.y = m.bodyYaw
     const scale = spawnScale(now - remote.joinedAt)
     if (scale !== lastScale.current) {
       lastScale.current = scale
       root.scale.setScalar(scale)
     }
-    applyArticulation(rigRefs, pose.current)
+    applyArticulation(rigRefs, _layered)
+
+    // QA numbers (plain fields on a long-lived object — no allocation).
+    const st = stats.current
+    st.speedDisp = m.speedDisp
+    st.delayMs = delay.current
+    st.corrections = smoother.current.corrections
+    st.maxStepM = smoother.current.maxStepM
+    st.bodyYaw = m.bodyYaw
+    st.twist = wrapAngle(_pose.yaw - m.bodyYaw)
+    st.moveRel = m.moveRel
+    st.landT = m.landT
+    st.recoilX = m.recoilX
+    st.frozen = _pose.frozen
+    st.resX = smoother.current.ex
+    st.resY = smoother.current.ey
+    st.resZ = smoother.current.ez
 
     // Weapon swap — change-gated, so per-frame calls are free while held.
     if (_pose.w !== weapon) setWeapon(_pose.w)
+
+    // Footsteps: one per k·π crossing of the gait phase — exactly the instant
+    // the drawn foot plants — while grounded and actually stepping.
+    const plants = _pose.g && sDisp >= GAIT_MIN_S ? footPlants(prevPhase, gaitPhase.current) : 0
+    // Distance and bearing, computed once and only on a frame that needs them.
+    let dist = 0
+    let pan = 0
+    if (shots > 0 || plants > 0) {
+      dist = Math.sqrt(distSq)
+      // Bearing: how far along the camera's own right axis (column 0 of its
+      // world matrix) the peer sits, normalized to ±1 — so a sound from behind
+      // your left shoulder arrives in the left ear.
+      const e = camera.matrixWorld.elements
+      pan = dist > 0.001 ? (-dx * e[0]! - dy * e[1]! - dz * e[2]!) / dist : 0
+    }
+    if (plants > 0) remoteFootstep(dist, pan)
 
     // Gunfire: every round this peer has fired since the last sample becomes a
     // flash at their muzzle and a report voiced at their distance and bearing.
     // The fx group only exists while they hold a gun, so `fx` IS the melee and
     // spray-can guard — a knife swing can never bloom a muzzle flash.
-    const shots = shotsFired(lastShots.current, _pose.f)
-    lastShots.current = _pose.f
     const fx = fxRef.current
     if (fx) {
       if (shots > 0) {
-        const dist = Math.sqrt(distSq)
         fx.visible = true
         flashT.current = FLASH_LIFE_S
         const flash = flashRef.current
@@ -1398,11 +1965,6 @@ function RemoteAvatar({ paletteIndex, remote }: { paletteIndex: number; remote: 
           flash.rotation.z = Math.random() * Math.PI * 2
           flash.scale.setScalar(flashScale(dist) * (0.85 + Math.random() * 0.3))
         }
-        // Bearing: how far along the camera's own right axis (column 0 of its
-        // world matrix) the shooter sits, normalized to ±1 — so a shot from
-        // behind your left shoulder arrives in the left ear.
-        const e = camera.matrixWorld.elements
-        const pan = dist > 0.001 ? (-dx * e[0]! - dy * e[1]! - dz * e[2]!) / dist : 0
         const kind = shotKindFor(weapon)
         for (let n = 0; n < shots; n++) {
           sfx.remoteShot(kind, dist, pan, n * BURST_STAGGER_S)

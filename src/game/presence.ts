@@ -3,6 +3,7 @@ import {
   forgetSender,
   type NetMessage,
   netAvailable,
+  netCounters,
   onFrame,
   onParticipants,
   participantName as netParticipantName,
@@ -12,7 +13,9 @@ import {
   stopNet,
 } from './net'
 import {
+  type ArrivalTiming,
   createRing,
+  createTiming,
   SHOT_COUNTER_MOD,
   isStale,
   latestSnapshot,
@@ -21,6 +24,7 @@ import {
   type PresencePhase,
   pushSnapshot,
   type SnapshotRing,
+  updateTiming,
   validateFrame,
 } from './presence-interp'
 
@@ -44,12 +48,18 @@ import {
  *
  * Publish policy (pure, test-pinned):
  * - 12 Hz base; 10 Hz once MORE THAN 4 remotes are live (crowd back-off).
+ *   The adapter ticks every TICK_MS (21 ms) and the rate gate allows half a
+ *   tick of tolerance, so the 4th tick (84 ms) publishes even when the timer
+ *   lands a millisecond early — a 25 ms tick with no tolerance silently
+ *   quantized the 83 ms gate to 100 ms (10 Hz) for the first week.
  * - Idle skip: an unchanged pose (beyond epsilons) is not re-sent — but
  *   never stay silent longer than 500 ms (the keep-alive that feeds the
  *   peers' staleness clocks).
- * - A 'deferred' publish result is a SKIP, not a queue: the frame is
- *   dropped and the next tick builds a fresh one (stale poses are worse
- *   than missing ones).
+ * - A 'deferred' publish result is treated as NOT SENT: the host queues and
+ *   later sends the latest value per event (plugin-collab-bus.ts, 66 ms
+ *   slot), but this side conservatively re-offers a fresh frame at the next
+ *   rate tick rather than trusting the queue. At 12 Hz against a 66 ms slot
+ *   it does not occur.
  *
  * Remote registry: Map<sessionId, RemotePlayer> fed by the bus
  * subscription. Join = first 'game'-phase frame from a session; leave =
@@ -80,8 +90,24 @@ export const POS_EPSILON = 0.015
 export const ANGLE_EPSILON = 0.0015
 /** Speed change epsilon (normalized 0..1). */
 export const SPEED_EPSILON = 0.02
-/** Adapter tick — policy gating makes the actual publish rate 12/10 Hz. */
-const TICK_MS = 25
+/** Adapter tick (ms) — policy gating makes the actual publish rate 12/10 Hz.
+ * Four ticks = 84 ms, the first multiple that clears the 83.3 ms gate with the
+ * half-tick tolerance below; 25 ms ticks could only ever hit 100 ms. */
+export const TICK_MS = 21
+/** The rate gate forgives this much (ms) — a timer that fires a hair early
+ * on the qualifying tick must not push the publish a whole tick later.
+ *
+ * Half a tick, deliberately, because `since` is measured from the ACTUAL time
+ * of the last publish and timers fire LATE under load (a 60 fps game loop
+ * delays a 21 ms timer by 0-16 ms): a late publishing tick followed by a
+ * punctual 4th tick reads 84 − δ ms, and a tolerance small enough to refuse
+ * the 3rd tick at its latest (3 ms) refuses those too — simulated over 60 s
+ * with ticks 0-8 / 0-16 ms late that is 11.4 / 10.9 Hz. Half a tick holds
+ * 11.9 Hz across the same range, at the price of a 3rd-tick publish (73 ms)
+ * in the ~2 % of cases where a tick lands ≥ 10 ms later than the one that
+ * published — the host's 66 ms slot carries it, and the mean is unchanged.
+ * (presence.test.ts pins the cadence under regular AND late ticks.) */
+export const TICK_TOLERANCE_MS = TICK_MS / 2
 
 export function publishIntervalMs(remoteCount: number): number {
   return 1000 / (remoteCount > CROWDED_REMOTES ? PUBLISH_HZ_CROWDED : PUBLISH_HZ_BASE)
@@ -126,7 +152,7 @@ export function shouldPublish(args: {
   changed: boolean
 }): boolean {
   const since = args.now - args.lastPublishAt
-  if (since < publishIntervalMs(args.remoteCount)) return false
+  if (since + TICK_TOLERANCE_MS < publishIntervalMs(args.remoteCount)) return false
   if (!args.changed && since < IDLE_MAX_SILENCE_MS) return false
   return true
 }
@@ -279,6 +305,20 @@ export type RemotePlayer = {
   nick: string
   /** Local clock when this session entered 'game' (drives the scale-in). */
   joinedAt: number
+  /** Measured arrival timing (spacing / jitter / idle gaps) — the adaptive
+   * interpolation delay's input, and the QA dump's. */
+  timing: ArrivalTiming
+  /** The EYE position this peer was last DRAWN at (remote-players.tsx writes
+   * it every frame after interpolation + smoothing), and the local clock of
+   * that write (0 = never drawn on this page — a spectator with no scene, or
+   * a peer culled from the renderer). Consumers that must agree with the
+   * picture (PvP hit capsule, voice range) read these when fresh. */
+  drawnX: number
+  drawnY: number
+  drawnZ: number
+  drawnAt: number
+  /** The interpolation delay (ms) the renderer currently uses for this peer. */
+  delayMs: number
 }
 
 export type PresenceEvent = {
@@ -429,16 +469,18 @@ export function ingestPoseFrame(msg: NetMessage<PresenceFrame>, now: number): vo
       w: frame.w,
       nick: frame.nm ?? '',
       joinedAt: now,
+      timing: createTiming(),
+      drawnX: 0,
+      drawnY: 0,
+      drawnZ: 0,
+      drawnAt: 0,
+      delayMs: 0,
     }
     state.remotes.set(msg.sessionId, remote)
   }
   remote.lastReceivedAt = now
   remote.w = frame.w
   remote.nick = frame.nm ?? ''
-  const offset = now - msg.sentAt
-  remote.clockOffset = Number.isFinite(remote.clockOffset)
-    ? remote.clockOffset + (offset - remote.clockOffset) * 0.1
-    : offset
   const wasInGame = remote.ph === 'game'
   remote.ph = 'game'
   if (!wasInGame) {
@@ -446,7 +488,24 @@ export function ingestPoseFrame(msg: NetMessage<PresenceFrame>, now: number): vo
     state.rosterVersion++
     emit('join', remote)
   }
-  pushSnapshot(remote.ring, msg.sentAt, frame)
+  // The ring's order guard decides whether this frame is a SAMPLE at all. A
+  // reordered or duplicate frame (sentAt ≤ newest) keeps the peer alive above
+  // but must feed neither the timing nor the clock offset: a rewound lastSentAt
+  // would read the next accepted frame as a too-wide spacing (or a phantom
+  // gap) and lift the adaptive delay for nothing, and a late frame's offset is
+  // exactly the sample the offset EMA should not learn from.
+  if (!pushSnapshot(remote.ring, msg.sentAt, frame)) return
+  const offset = now - msg.sentAt
+  // Arrival timing BEFORE the offset EMA moves: the deviation is this frame's
+  // offset against the smoothed one, i.e. how early/late it landed.
+  updateTiming(
+    remote.timing,
+    msg.sentAt,
+    Number.isFinite(remote.clockOffset) ? Math.abs(offset - remote.clockOffset) : 0,
+  )
+  remote.clockOffset = Number.isFinite(remote.clockOffset)
+    ? remote.clockOffset + (offset - remote.clockOffset) * 0.1
+    : offset
 }
 
 /** Squared distance from a wire frame to the local eye; Infinity with no
@@ -681,30 +740,54 @@ export function stopSpectating(): void {
   stopNet()
 }
 
+/**
+ * Extra plain-data sources folded into presenceDebug() under `extra.<name>`.
+ * The renderer (remote-players.tsx) registers its per-avatar motion stats
+ * here so `__boots.presence()` carries them without game-root knowing — and
+ * without this module importing the React side (which imports this one).
+ */
+const debugSources = new Map<string, () => unknown>()
+
+export function registerPresenceDebugSource(name: string, source: () => unknown): () => void {
+  debugSources.set(name, source)
+  return () => {
+    if (debugSources.get(name) === source) debugSources.delete(name)
+  }
+}
+
+export type PresenceDebugRemote = {
+  sessionId: string
+  name: string
+  p: [number, number, number]
+  w: string
+  f: number
+  ageMs: number
+  /** Arrival timing (ArrivalTiming) — measure the relay before tuning. */
+  spacingMs: number
+  jitterMs: number
+  gaps: number
+  lastGapMs: number
+  /** The renderer's current interpolation delay for this peer (0 = not drawn). */
+  delayMs: number
+  /** Where this peer was last drawn (eye), or null if never drawn here. */
+  drawn: [number, number, number] | null
+  drawnAgeMs: number
+}
+
 /** Plain-data QA dump for `__boots.presence()` — copies, never live refs. */
 export function presenceDebug(): {
-  remotes: Array<{
-    sessionId: string
-    name: string
-    p: [number, number, number]
-    w: string
-    f: number
-    ageMs: number
-  }>
+  remotes: PresenceDebugRemote[]
   published: number
   received: number
   culled: number
+  /** Frames the transport refused (envelope, order, validation) — net.ts. */
+  netDropped: number
   cap: number
+  tickMs: number
+  extra: Record<string, unknown>
 } {
   const now = Date.now()
-  const remotes: Array<{
-    sessionId: string
-    name: string
-    p: [number, number, number]
-    w: string
-    f: number
-    ageMs: number
-  }> = []
+  const remotes: PresenceDebugRemote[] = []
   for (const remote of state.remotes.values()) {
     const snap = latestSnapshot(remote.ring)
     remotes.push({
@@ -717,13 +800,31 @@ export function presenceDebug(): {
       // lasts 50 ms and a report cannot be read out of a headless browser.
       f: snap ? snap.f : 0,
       ageMs: now - remote.lastReceivedAt,
+      spacingMs: remote.timing.spacingEma,
+      jitterMs: remote.timing.jitterEma,
+      gaps: remote.timing.gaps,
+      lastGapMs: remote.timing.lastGapMs,
+      delayMs: remote.delayMs,
+      drawn: remote.drawnAt > 0 ? [remote.drawnX, remote.drawnY, remote.drawnZ] : null,
+      drawnAgeMs: remote.drawnAt > 0 ? now - remote.drawnAt : -1,
     })
+  }
+  const extra: Record<string, unknown> = {}
+  for (const [name, source] of debugSources) {
+    try {
+      extra[name] = source()
+    } catch {
+      extra[name] = null
+    }
   }
   return {
     remotes,
     published: state.published,
     received: state.received,
     culled: state.culled,
+    netDropped: netCounters().dropped,
     cap: MAX_REMOTE_AVATARS,
+    tickMs: TICK_MS,
+    extra,
   }
 }

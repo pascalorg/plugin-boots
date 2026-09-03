@@ -46,7 +46,31 @@ import {
   applyArticulation,
   BLEND_RATE,
   IDLE_FADE_S,
+  avatarDebug,
+  AVATAR_RECOIL,
+  createMotion,
+  footPlantDrop,
+  GAIT_MIN_S,
+  GAIT_RATE,
+  GAIT_RATE_MAX,
+  GAIT_SETTLE_RATE,
+  gaitRate,
+  LAND,
+  LATERAL_SWING,
+  layerMotion,
+  LEG_LEN_M,
+  LEG_SWING_CAP,
+  legSwingFor,
+  RUN_SPEED_M_S,
+  SPEED_DISP_ZERO,
+  STEP_LEN_RUN_M,
+  STEP_LEN_WALK_M,
+  stepLength,
+  TURN,
+  updateMotion,
+  WALK_S,
 } from './remote-players'
+import { presenceDebug, wrapAngle } from './presence'
 
 /**
  * The pure half of the avatar renderer: palette assignment, articulation
@@ -179,7 +203,7 @@ describe('articulation — gait, airborne, slump', () => {
     expect(out.legSwing).toBeCloseTo(LEG_SWING_MAX)
     expect(out.armSwing).toBeLessThan(0) // counter-phase (default grip: a tool, so the left arm is free)
     articulate(out, Math.PI / 2, 0.5, 0, true, false)
-    expect(out.legSwing).toBeCloseTo(LEG_SWING_MAX * 0.5)
+    expect(out.legSwing).toBeCloseTo(legSwingFor(0.5)) // a stride LENGTH: ~constant above a creep
     articulate(out, Math.PI / 2, 0, 0, true, false)
     expect(out.legSwing).toBe(0) // standing still — no treadmill
     expect(out.bobY).toBe(0)
@@ -502,10 +526,446 @@ describe('articulation — gait, airborne, slump', () => {
     expect(root.position.z).toBeCloseTo(3 - 0.02, 12)
   })
 
-  test('gait phase advances with speed and settles when stopped', () => {
-    expect(advanceGait(1, 1, 0.1)).toBeCloseTo(1.7)
-    expect(advanceGait(1, 0, 0.1)).toBe(1)
-    expect(advanceGait(1, -5, 0.1)).toBe(1) // hostile s never rewinds
+  test('gait phase advances at the stride cadence and SETTLES to legs-together when stopped', () => {
+    expect(advanceGait(1, 1, 0.1)).toBeCloseTo(1 + 0.1 * GAIT_RATE_MAX)
+    expect(GAIT_RATE).toBe(GAIT_RATE_MAX)
+    expect(advanceGait(1, 0, 0.1)).toBe(0) // toward the nearest k·π (0), 1 rad of travel allowed
+    expect(advanceGait(2, 0, 0.1)).toBe(3) // toward π, capped at GAIT_SETTLE_RATE·dt
+    expect(advanceGait(3.1, 0, 0.1)).toBe(Math.round(3.1 / Math.PI) * Math.PI) // lands exactly, never past
+    expect(advanceGait(1, -5, 0.1)).toBe(0) // hostile s reads as stopped
+    expect(advanceGait(1, Number.NaN, 0.1)).toBe(0)
+  })
+})
+
+/**
+ * THE GAIT IS A STRIDE LENGTH. Feet plant when the phase advances π per step
+ * of ground; these pin the geometry that makes a remote runner's feet stick
+ * instead of skating, and the settle that ends a stop with the feet together.
+ */
+describe('gait model — stride length, not cadence', () => {
+  test('step length: the walk\'s up to WALK_S, lengthening to the run\'s at s = 1, monotone', () => {
+    expect(stepLength(0)).toBe(STEP_LEN_WALK_M)
+    expect(stepLength(WALK_S)).toBe(STEP_LEN_WALK_M)
+    expect(stepLength(1)).toBeCloseTo(STEP_LEN_RUN_M, 12)
+    expect(STEP_LEN_RUN_M).toBeCloseTo(2 * LEG_LEN_M * Math.sin(LEG_SWING_CAP), 12)
+    let previous = 0
+    for (let s = 0; s <= 1.0001; s += 0.05) {
+      expect(stepLength(s)).toBeGreaterThanOrEqual(previous - 1e-12)
+      previous = stepLength(s)
+    }
+    expect(LEG_LEN_M).toBeCloseTo(0.829, 3)
+  })
+
+  test('gaitRate plants the feet: rate·stepLength/π equals the speed, up to the cadence cap', () => {
+    for (const v of [0.6, 1, 1.5, 3, 4.5]) {
+      const s = v / RUN_SPEED_M_S
+      expect((gaitRate(s) * stepLength(s)) / Math.PI).toBeCloseTo(v, 9)
+    }
+    expect(gaitRate(GAIT_MIN_S / 2)).toBe(0) // nobody steps at a creep
+    expect(gaitRate(1)).toBe(GAIT_RATE_MAX)
+    // At a full sprint the cap bites: the feet cover ~80 % and slide the rest.
+    const covered = (GAIT_RATE_MAX * stepLength(1)) / Math.PI
+    expect(1 - covered / RUN_SPEED_M_S).toBeLessThanOrEqual(0.25)
+    expect(1 - covered / RUN_SPEED_M_S).toBeGreaterThan(0.1)
+  })
+
+  test('integrating advanceGait for 10 s at 1.5 / 3 / 4.5 m/s covers the distance within 3 %', () => {
+    for (const v of [1.5, 3, 4.5]) {
+      const s = v / RUN_SPEED_M_S
+      let phase = 0.37
+      const start = phase
+      for (let i = 0; i < 600; i++) phase = advanceGait(phase, s, 1 / 60)
+      const distance = ((phase - start) / Math.PI) * stepLength(s)
+      expect(Math.abs(distance - v * 10) / (v * 10)).toBeLessThan(0.03)
+    }
+  })
+
+  test('legSwingFor: 0 at rest, fades in under GAIT_MIN_S, the walk\'s half-angle above it, the cap at a run', () => {
+    expect(legSwingFor(0)).toBe(0)
+    const walkAngle = Math.asin(STEP_LEN_WALK_M / (2 * LEG_LEN_M))
+    expect(legSwingFor(GAIT_MIN_S / 2)).toBeCloseTo(walkAngle / 2, 9)
+    expect(legSwingFor(GAIT_MIN_S)).toBeCloseTo(walkAngle, 9)
+    expect(legSwingFor(WALK_S)).toBeCloseTo(walkAngle, 9)
+    expect(legSwingFor(1)).toBeCloseTo(LEG_SWING_CAP, 9)
+    expect(LEG_SWING_MAX).toBe(legSwingFor(1))
+    expect(legSwingFor(-1)).toBe(0)
+  })
+
+  test('legs settle: from any phase at s = 0 the legs are together within 300 ms at 60 fps, monotone', () => {
+    for (const start of [0.3, 1.2, 2.0, 2.9, -1.1, 7.5, 100.4]) {
+      let phase = start
+      const target = Math.round(start / Math.PI) * Math.PI
+      let previousDist = Math.abs(target - start)
+      for (let i = 0; i < 18; i++) {
+        phase = advanceGait(phase, 0, 1 / 60)
+        const dist = Math.abs(target - phase)
+        expect(dist).toBeLessThanOrEqual(previousDist + 1e-12) // never past, never back
+        previousDist = dist
+      }
+      expect(Math.abs(Math.sin(phase))).toBeLessThan(0.05)
+      const out = createArticulation()
+      articulate(out, phase, 0, 0, true, false)
+      expect(out.legSwing).toBeCloseTo(0, 6)
+    }
+    expect(GAIT_SETTLE_RATE * 0.3).toBeGreaterThan(Math.PI / 2) // the worst case fits
+  })
+})
+
+describe('articulation — strafe and backpedal decomposition', () => {
+  const amp = legSwingFor(1)
+
+  test('a strafe steps sideways: legSwing 0, |legSide| = amp·LATERAL_SWING', () => {
+    const out = createArticulation()
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0, MODEL_ARMS, 0, Math.PI / 2)
+    expect(out.legSwing).toBeCloseTo(0, 9)
+    expect(out.legSide).toBeCloseTo(amp * LATERAL_SWING, 9)
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0, MODEL_ARMS, 0, -Math.PI / 2)
+    expect(out.legSide).toBeCloseTo(-amp * LATERAL_SWING, 9)
+  })
+
+  test('a backpedal runs the cycle in reverse (legSwing flips); forward has no lateral step', () => {
+    const out = createArticulation()
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0, MODEL_ARMS, 0, 0)
+    const forward = out.legSwing
+    expect(forward).toBeCloseTo(amp, 9)
+    expect(out.legSide).toBe(0)
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0, MODEL_ARMS, 0, Math.PI)
+    expect(out.legSwing).toBeCloseTo(-forward, 9)
+    expect(out.legSide).toBeCloseTo(0, 9)
+    // The free arm keeps swinging with the STRIDE, whatever its direction.
+    expect(out.armSwing).not.toBeCloseTo(0, 3)
+  })
+
+  test('no lateral step while staggered or airborne', () => {
+    const out = createArticulation()
+    articulate(out, Math.PI / 2, 1, 0, true, true, 'tool', 0, MODEL_ARMS, 0, Math.PI / 2)
+    expect(out.legSide).toBe(0)
+    articulate(out, Math.PI / 2, 1, 0, false, false, 'tool', 0, MODEL_ARMS, 0, Math.PI / 2)
+    expect(out.legSide).toBe(0)
+  })
+
+  test('the leg blend passes a full-speed stride: 1 s of a 17.5 rad/s swing reaches ≥ 95 % amplitude', () => {
+    const live = createArticulation()
+    const target = createArticulation()
+    let peak = 0
+    for (let i = 0; i < 60; i++) {
+      const t = i / 60
+      target.legSwing = Math.sin(GAIT_RATE_MAX * t) * amp
+      blendArticulation(live, target, 1 / 60)
+      if (t > 0.5) peak = Math.max(peak, Math.abs(live.legSwing))
+    }
+    expect(peak).toBeGreaterThanOrEqual(0.95 * amp)
+    expect(BLEND_RATE.legs).toBeGreaterThanOrEqual(60)
+  })
+
+  test('applyArticulation writes legSide as rotation.z on BOTH hips, same sign (a shuffle, never a cross)', () => {
+    const mk = () => ({ current: new Group() })
+    const refs = {
+      torso: mk(), head: mk(), armL: mk(), armR: mk(), legL: mk(), legR: mk(),
+      headDetail: mk(), bodyDetail: mk(),
+    }
+    const a = createArticulation()
+    a.legSide = 0.3
+    applyArticulation(refs, a)
+    expect(refs.legL.current.rotation.z).toBeCloseTo(0.3, 12)
+    expect(refs.legR.current.rotation.z).toBeCloseTo(0.3, 12)
+  })
+})
+
+/**
+ * The motion layer: what the wire does not carry, derived from the drawn
+ * position. These pin the four things a player notices — the gait paced by
+ * DISPLAYED speed, a body that lags the aim without ever pointing the gun
+ * wrong, a landing that squashes only on a real fall, a shot that kicks.
+ */
+describe('motion layer — displayed speed, body yaw, landing, recoil', () => {
+  const DT = 1 / 60
+  const prime = (yaw = 0) => {
+    const m = createMotion()
+    updateMotion(m, 0, 1.58, 0, yaw, true, false, 0, 'rifle', 0, DT)
+    return m
+  }
+
+  test('updateMotion follows displacement, not wire s, and snaps to exactly 0 under 5 cm/s', () => {
+    const m = prime()
+    let z = 0
+    let s = 0
+    for (let i = 0; i < 60; i++) {
+      z -= 6.5 * DT // running along −z (the facing at yaw 0)
+      s = updateMotion(m, 0, 1.58, z, 0, true, false, 0, 'rifle', 0, DT)
+    }
+    expect(m.speedDisp).toBeCloseTo(6.5, 1)
+    expect(s).toBeCloseTo(1, 1)
+    expect(Math.abs(wrapAngle(m.moveRel))).toBeLessThan(0.05) // forward
+    // The body stops dead (a frozen or stalled peer): the speed settles and snaps to 0.
+    let settled = -1
+    for (let i = 1; i <= 60; i++) {
+      s = updateMotion(m, 0, 1.58, z, 0, true, false, 0, 'rifle', 0, DT)
+      if (settled < 0 && m.speedDisp === 0) settled = i * DT
+    }
+    expect(settled).toBeGreaterThan(0)
+    expect(settled).toBeLessThan(0.5)
+    expect(s).toBe(0)
+    expect(SPEED_DISP_ZERO).toBe(0.05)
+    // The legs stop with it: below GAIT_MIN_S the gait settles.
+    expect(6.5 * Math.exp(-14 * 0.2)).toBeLessThan(GAIT_MIN_S * RUN_SPEED_M_S) // within 200 ms of the stop
+  })
+
+  test('moveRel reads the displacement in the BODY frame: right strafe +π/2, backpedal π', () => {
+    const strafe = prime()
+    let x = 0
+    for (let i = 0; i < 40; i++) {
+      x += 3 * DT // +x is the body\'s right at yaw 0
+      updateMotion(strafe, x, 1.58, 0, 0, true, false, 0, 'rifle', 0, DT)
+    }
+    expect(Math.abs(wrapAngle(strafe.moveRel - Math.PI / 2))).toBeLessThan(0.05)
+    const back = prime()
+    let z = 0
+    for (let i = 0; i < 40; i++) {
+      z += 3 * DT
+      updateMotion(back, 0, 1.58, z, 0, true, false, 0, 'rifle', 0, DT)
+    }
+    expect(Math.abs(wrapAngle(back.moveRel - Math.PI))).toBeLessThan(0.05)
+    // A teleport-sized step is not a speed sample.
+    const tele = prime()
+    updateMotion(tele, 40, 1.58, 0, 0, true, false, 0, 'rifle', 0, DT)
+    expect(tele.speedDisp).toBe(0)
+  })
+
+  test('gun-points-at-aim invariant: bodyYaw + torso twist == viewYaw and |twist| ≤ torsoMax, standing and moving, under a random view walk', () => {
+    let seed = 12345
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff
+      return seed / 0x7fffffff
+    }
+    for (const moving of [false, true]) {
+      const m = prime(0.4)
+      const live = createArticulation()
+      const out = createArticulation()
+      let view = 0.4
+      let x = 0
+      let maxTwist = 0
+      for (let i = 0; i < 600; i++) {
+        view += (rand() - 0.5) * 0.4 // up to ±0.2 rad per frame — a whip
+        if (moving) x += 5 * DT
+        updateMotion(m, x, 1.58, 0, view, true, false, 0, 'rifle', 0, DT)
+        live.torsoYaw = (rand() - 0.5) * 0.1 // whatever the stride/idle gave
+        layerMotion(out, live, m, view)
+        const twist = out.torsoYaw - live.torsoYaw
+        // The upper body carries EXACTLY the rest of the view yaw.
+        expect(Math.abs(wrapAngle(m.bodyYaw + twist - view))).toBeLessThan(1e-9)
+        maxTwist = Math.max(maxTwist, Math.abs(twist))
+      }
+      expect(maxTwist).toBeLessThanOrEqual(TURN.torsoMax + 1e-9)
+      // The lean is bounded too.
+      expect(Math.abs(out.torsoRoll - live.torsoRoll)).toBeLessThanOrEqual(TURN.leanMax + 1e-9)
+    }
+  })
+
+  test('standing dead zone with hysteresis: 0.3 rad holds, 0.4 turns, the chase stops inside 0.1', () => {
+    const m = prime(0)
+    for (let i = 0; i < 60; i++) updateMotion(m, 0, 1.58, 0, 0.3, true, false, 0, 'rifle', 0, DT)
+    expect(m.bodyYaw).toBe(0) // the head looked around; the feet stayed
+    expect(m.turning).toBe(false)
+    for (let i = 0; i < 60; i++) updateMotion(m, 0, 1.58, 0, 0.4, true, false, 0, 'rifle', 0, DT)
+    expect(m.bodyYaw).toBeGreaterThan(0.25) // it followed …
+    expect(Math.abs(wrapAngle(0.4 - m.bodyYaw))).toBeLessThanOrEqual(TURN.release + 1e-9) // … until inside the release
+    expect(m.turning).toBe(false)
+    const settled = m.bodyYaw
+    for (let i = 0; i < 60; i++) updateMotion(m, 0, 1.58, 0, settled + 0.34, true, false, 0, 'rifle', 0, DT)
+    expect(m.bodyYaw).toBe(settled) // 0.34 off: inside the dead zone again, holds
+    // Moving, the body always follows, closely.
+    let x = 0
+    for (let i = 0; i < 90; i++) {
+      x += 3 * DT
+      updateMotion(m, x, 1.58, 0, settled + 0.34, true, false, 0, 'rifle', 0, DT)
+    }
+    expect(Math.abs(wrapAngle(settled + 0.34 - m.bodyYaw))).toBeLessThan(0.01)
+    // A whip past the twist limit: the body snaps round at once, so the torso
+    // is never asked to carry more than torsoMax — the aim stays honest.
+    const before = m.bodyYaw
+    const whip = before + 2.5
+    updateMotion(m, x, 1.58, 0, whip, true, false, 0, 'rifle', 0, DT)
+    expect(m.bodyYaw).not.toBe(before)
+    expect(Math.abs(wrapAngle(whip - m.bodyYaw))).toBeLessThanOrEqual(TURN.torsoMax + 1e-9)
+  })
+
+  test('landing: a grounded edge after a −6 m/s fall squashes once and decays within squashS; a −1 m/s blip does nothing', () => {
+    const m = prime()
+    for (let i = 0; i < 5; i++) updateMotion(m, 0, 1.58 - i * 0.1, 0, 0, false, false, 0, 'rifle', -6, DT)
+    expect(m.landT).toBe(0) // still in the air
+    updateMotion(m, 0, 1.0, 0, 0, true, false, 0, 'rifle', -6, DT) // the landing bracket reads grounded
+    expect(m.landT).toBeGreaterThan(0)
+    expect(m.landPower).toBeCloseTo(6 / LAND.fullFall, 9)
+    const live = createArticulation()
+    const out = createArticulation()
+    let peakKnee = 0
+    let minBob = 0
+    let frames = 0
+    while (m.landT > 0 && frames < 60) {
+      layerMotion(out, live, m, 0)
+      peakKnee = Math.max(peakKnee, out.kneeL - live.kneeL)
+      minBob = Math.min(minBob, out.bobY - live.bobY)
+      expect(out.kneeR - live.kneeR).toBeCloseTo(out.kneeL - live.kneeL, 12) // both knees
+      updateMotion(m, 0, 1.0, 0, 0, true, false, 0, 'rifle', 0, DT)
+      frames++
+    }
+    expect(frames * DT).toBeLessThanOrEqual(LAND.squashS + DT + 1e-9)
+    expect(peakKnee).toBeGreaterThan(0.2)
+    expect(peakKnee).toBeLessThanOrEqual(LAND.knee * m.landPower + 1e-9)
+    expect(minBob).toBeLessThan(-0.03)
+    // Staying grounded never re-fires it.
+    for (let i = 0; i < 30; i++) updateMotion(m, 0, 1.0, 0, 0, true, false, 0, 'rifle', 0, DT)
+    expect(m.landT).toBe(0)
+    // A stair-step blip: airborne for a frame at −1 m/s → nothing.
+    updateMotion(m, 0, 1.0, 0, 0, false, false, 0, 'rifle', -1, DT)
+    updateMotion(m, 0, 1.0, 0, 0, true, false, 0, 'rifle', -1, DT)
+    expect(m.landT).toBe(0)
+    expect(LAND.minFall).toBe(4) // == the local sfx.land threshold (player.tsx)
+  })
+
+  test('landing from the APEX: a plain jump whose 12 Hz slopes never reach −4 m/s still lands (√(2gh)); a 20 cm hop does not', () => {
+    // A 5.4 m/s jump: apex 0.91 m. Sampled at 12 Hz the wire slopes average
+    // the fall and the last bracket is truncated by the landing, so no slope
+    // reads the true impact speed — but the drop from the apex does.
+    const g = 16
+    const v0 = 5.4
+    const airtime = (2 * v0) / g
+    const dtWire = 1 / 12
+    // Whatever the frame phase relative to the takeoff, the landing registers.
+    for (const phase of [0, 0.02, 0.04, 0.06, 0.08]) {
+      const m = prime()
+      let t = phase
+      let prevY = 1.58
+      let steepest = 0
+      while (t + dtWire < airtime) {
+        t += dtWire
+        const y = 1.58 + v0 * t - 0.5 * g * t * t
+        const slope = (y - prevY) / dtWire
+        steepest = Math.min(steepest, slope)
+        updateMotion(m, 0, y, 0, 0, false, false, 0, 'rifle', slope, dtWire)
+        prevY = y
+      }
+      // The landing bracket: grounded, back at 1.58, a slope truncated by the landing.
+      const last = (1.58 - prevY) / dtWire
+      steepest = Math.min(steepest, last)
+      updateMotion(m, 0, 1.58, 0, 0, true, false, 0, 'rifle', last, dtWire)
+      expect(m.landT).toBeGreaterThan(0)
+      expect(m.landPower).toBeGreaterThan(0.6)
+      // …and the apex estimate is what carried it whenever the slopes fell short.
+      if (-steepest < LAND.minFall) {
+        expect(m.landPower).toBeCloseTo(Math.sqrt(2 * g * (m.airTopY - 1.58)) / LAND.fullFall, 6)
+      }
+    }
+    // A 20 cm hop (stair top, a curb): apex speed 2.5 m/s — no squash.
+    const hop = prime()
+    updateMotion(hop, 0, 1.68, 0, 0, false, false, 0, 'rifle', 1, DT)
+    updateMotion(hop, 0, 1.78, 0, 0, false, false, 0, 'rifle', 0, DT)
+    updateMotion(hop, 0, 1.58, 0, 0, true, false, 0, 'rifle', -2, DT)
+    expect(hop.landT).toBe(0)
+  })
+
+  test('recoil: one rifle shot kicks the gun arm by ≥ 0.05 rad, shares into torso and head, settles under 400 ms; a knife kicks nothing', () => {
+    const m = prime()
+    updateMotion(m, 0, 1.58, 0, 0, true, false, 1, 'rifle', 0, DT)
+    expect(m.recoilX).toBeGreaterThanOrEqual(0.05)
+    expect(m.recoilX).toBeLessThanOrEqual(AVATAR_RECOIL.rifle!)
+    const live = createArticulation()
+    const out = createArticulation()
+    layerMotion(out, live, m, 0)
+    expect(out.armAim - live.armAim).toBeCloseTo(m.recoilX, 12)
+    expect(out.torsoPitch).toBeLessThan(live.torsoPitch) // the shoulder rocks back
+    expect(out.headPitch).toBeGreaterThan(live.headPitch)
+    let settled = -1
+    for (let i = 1; i <= 60; i++) {
+      updateMotion(m, 0, 1.58, 0, 0, true, false, 0, 'rifle', 0, DT)
+      if (settled < 0 && Math.abs(m.recoilX) < 0.005) settled = i * DT
+    }
+    expect(settled).toBeGreaterThan(0)
+    expect(settled).toBeLessThan(0.4)
+    const knife = prime()
+    updateMotion(knife, 0, 1.58, 0, 0, true, false, 2, 'knife', 0, DT)
+    expect(knife.recoilX).toBe(0)
+    // A burst stacks (bounded by shotsFired's cap upstream).
+    const mg = prime()
+    updateMotion(mg, 0, 1.58, 0, 0, true, false, 3, 'minigun', 0, DT)
+    expect(mg.recoilX).toBeGreaterThan(AVATAR_RECOIL.minigun! * 2)
+  })
+
+  test('layerMotion is the identity at rest — the foot plant is articulate\'s, so it never drops a split it did not make', () => {
+    const m = prime(0.3)
+    const live = createArticulation()
+    live.armAim = 0.7
+    live.torsoYaw = 0.05
+    live.headPitch = -0.2
+    live.legSwing = 0.5 // a blended mid-stride: bobY already carries its plant
+    live.legSide = 0.2
+    live.bobY = -0.07
+    const out = createArticulation()
+    layerMotion(out, live, m, 0.3)
+    for (const key of Object.keys(live) as Array<keyof typeof live>) {
+      expect(out[key]).toBeCloseTo(live[key], 12)
+    }
+  })
+
+  test('the foot plant lives in articulate: bobY drops L(1 − cos split) so EVERY consumer (peers, the depot mirror) stands on the ground', () => {
+    // The geometry, once.
+    expect(footPlantDrop({ legSwing: 0, legSide: 0 })).toBe(0)
+    expect(footPlantDrop({ legSwing: 0.5, legSide: 0 })).toBeCloseTo(LEG_LEN_M * (1 - Math.cos(0.5)), 12)
+    expect(footPlantDrop({ legSwing: 0, legSide: 0.4 })).toBeCloseTo(LEG_LEN_M * (1 - Math.cos(0.4)), 12)
+    expect(footPlantDrop({ legSwing: 0.3, legSide: 0.4 })).toBeCloseTo(LEG_LEN_M * (1 - Math.cos(0.5)), 12)
+    const out = createArticulation()
+    // Stride extreme at a run (sin = 1): the hips are split by the cap, the
+    // bob is 0 (cos = 0) and the root sits exactly the plant lower.
+    articulate(out, Math.PI / 2, 1, 0, true, false, 'tool', 0, MODEL_ARMS, 0, 0)
+    expect(out.legSwing).toBeCloseTo(LEG_SWING_MAX, 12)
+    expect(out.bobY).toBeCloseTo(-LEG_LEN_M * (1 - Math.cos(LEG_SWING_MAX)), 9)
+    expect(-out.bobY).toBeGreaterThan(0.1) // ~14.5 cm — the number the mirror used to float by
+    // Mid-swing (legs passing): no split, only the stride bob remains.
+    articulate(out, 0, 1, 0, true, false, 'tool', 0, MODEL_ARMS, 0, 0)
+    expect(out.legSwing).toBeCloseTo(0, 12)
+    expect(out.bobY).toBeCloseTo(0.04, 9)
+    // A strafe splits the hips sideways: the same plant off legSide.
+    articulate(out, Math.PI / 2, WALK_S, 0, true, false, 'tool', 0, MODEL_ARMS, 0, Math.PI / 2)
+    expect(Math.abs(out.legSwing)).toBeLessThan(1e-9)
+    expect(out.bobY).toBeCloseTo(-LEG_LEN_M * (1 - Math.cos(Math.abs(out.legSide))), 9)
+    // Standing and airborne: nothing to plant.
+    articulate(out, Math.PI / 2, 0, 0, true, false)
+    expect(out.bobY).toBe(0)
+    articulate(out, Math.PI / 2, 1, 0, false, false)
+    expect(out.bobY).toBe(0)
+  })
+
+  test('FK: the straight (knee-0) leg\'s foot is within 5 cm of the ground across 64 phases × 3 speeds, exactly 0 at the stride extremes — with AND without the motion layer', () => {
+    const m = prime(0)
+    const art = createArticulation()
+    const out = createArticulation()
+    const footOf = (a: typeof art) => {
+      // Whichever knee is straight, that leg hangs |legSwing| off vertical.
+      const straight = a.kneeL <= 1e-9 || a.kneeR <= 1e-9
+      expect(straight).toBe(true)
+      return LEG_LEN_M + a.bobY - LEG_LEN_M * Math.cos(a.legSwing)
+    }
+    for (const s of [0.3, WALK_S, 1]) {
+      for (let i = 0; i < 64; i++) {
+        const phase = (i / 64) * Math.PI * 2
+        articulate(art, phase, s, 0, true, false, 'tool', 0, MODEL_ARMS, 0, 0)
+        layerMotion(out, art, m, 0)
+        // The depot mirror's path (articulate only) and the peers' (layered): the same plant.
+        for (const foot of [footOf(art), footOf(out)]) {
+          expect(foot).toBeGreaterThanOrEqual(-1e-9)
+          expect(foot).toBeLessThan(0.05)
+          if (i === 16 || i === 48) expect(foot).toBeCloseTo(0, 9) // sin = ±1: both feet down, both legs straight
+        }
+      }
+    }
+  })
+
+  test('avatarDebug returns plain copies (empty with nothing mounted) and rides presenceDebug().extra.avatars', () => {
+    const a = avatarDebug()
+    expect(a).toEqual({})
+    expect(avatarDebug()).not.toBe(a)
+    expect(presenceDebug().extra.avatars).toEqual({})
   })
 })
 
