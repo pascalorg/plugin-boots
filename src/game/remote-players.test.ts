@@ -73,6 +73,7 @@ import {
   rosterNames,
   SPEAK_SCALE_X,
   twoHanded,
+  usesPosedGripHands,
 } from './remote-players'
 import { presenceDebug, wrapAngle } from './presence'
 import { gripToShoulder, leftGripFor } from './hand-grips'
@@ -515,6 +516,21 @@ describe('articulation — gait, airborne, slump', () => {
     expect(refs.torso.current.rotation.y).toBeCloseTo(0.1, 12)
     expect(refs.torso.current.rotation.z).toBeCloseTo(-0.05, 12)
     expect(refs.head.current.rotation.y).toBeCloseTo(0.2, 12)
+  })
+
+  test('a heavy weapon can keep native hands when no posed replacement is mounted', () => {
+    const mk = () => ({ current: new Group() })
+    const refs = {
+      torso: mk(), head: mk(), armL: mk(), armR: mk(), legL: mk(), legR: mk(),
+      headDetail: mk(), bodyDetail: mk(), handL: mk(), handR: mk(),
+      fistL: { current: null }, fistR: { current: null },
+    }
+    const a = createArticulation()
+    a.gripR = 1
+    a.gripL = 1
+    applyArticulation(refs, a)
+    expect(refs.handR.current.scale.x).toBe(1)
+    expect(refs.handL.current.scale.x).toBe(1)
   })
 
   test('placeRoot lifts by the bob and sways along the body\'s own +x, whatever the yaw', () => {
@@ -1141,6 +1157,11 @@ describe('avatar hands — the first-person grip table on the third-person arms'
   test('twoHanded: guns take the support hand, tools ride one-handed (the warhammer too), strangers and empty hands do not', () => {
     for (const w of ['rifle', 'minigun', 'pistol']) expect(twoHanded(w)).toBe(true)
     for (const w of ['knife', 'hammer', 'builder', 'paint', '', 'laser-of-the-future']) expect(twoHanded(w)).toBe(false)
+  })
+
+  test('minigun retains its centered native-hand carry; the knife gets its exact posed grip', () => {
+    expect(usesPosedGripHands('minigun')).toBe(false)
+    expect(usesPosedGripHands('knife')).toBe(true)
   })
 
   test('the speaking halo encloses the 0.72 × 0.18 tag with a margin and its inner edge clears the tag', () => {

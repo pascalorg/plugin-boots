@@ -1566,6 +1566,12 @@ function applyEditExitTransform(id: number): void {
   sfx.place()
 }
 
+/** The item catalog and builder share LMB and world-preview space. Once an
+ * item ghost is active it owns both, even if the hammer is still selected. */
+export function builderPreviewActive(weapon: string, itemPreview: boolean): boolean {
+  return weapon === 'builder' && !itemPreview
+}
+
 export function Builder() {
   const ghostRef = useRef<Group>(null)
   const [ghost, setGhost] = useState<GhostState | null>(null)
@@ -1633,10 +1639,14 @@ export function Builder() {
     if (!session) return
     placeCooldown.current -= dt
 
-    if (!active) {
+    // Catalog placement owns the world preview completely. In particular,
+    // moving furniture with L while the builder is the underlying weapon must
+    // not leave a wall ghost between the player and the furniture ghost.
+    if (!builderPreviewActive(weapon, itemGhostActive())) {
       if (ghost) setGhost(null)
       if (edit) {
-        // Weapon-switch closes the edit too — same exit-time confirm.
+        // A weapon switch or catalog placement closes edit mode with the same
+        // exit-time confirmation.
         applyEditExitTransform(edit.id)
         setEdit(null)
       }

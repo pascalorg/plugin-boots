@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { FULL_MASK, type PlacedPiece, useBoots } from '../store'
 import {
+  builderPreviewActive,
   builderDebug,
   cancelPieceClad,
   CELLS,
@@ -97,6 +98,14 @@ function placed(
 ): PlacedPiece {
   return { id: nextId++, piece, position: [x, y, z], yaw, mask }
 }
+
+describe('builder preview ownership', () => {
+  test('the wall ghost yields while catalog furniture is being placed or moved', () => {
+    expect(builderPreviewActive('builder', false)).toBe(true)
+    expect(builderPreviewActive('builder', true)).toBe(false)
+    expect(builderPreviewActive('minigun', false)).toBe(false)
+  })
+})
 
 // --- Slot-locked ghost: grid targeting × piece-slots authority ---------------
 

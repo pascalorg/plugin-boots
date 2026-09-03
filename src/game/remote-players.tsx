@@ -824,7 +824,9 @@ export function applyArticulation(refs: AvatarRigRefs, a: AvatarArticulation): v
     fist: { current: Group | null } | undefined,
     grip: number,
   ) => {
-    const gripping = grip > 0.5
+    // A native hand is hidden only when a mounted replacement can take its
+    // place. Some heavy weapons deliberately use the model hands instead.
+    const gripping = grip > 0.5 && fist?.current != null
     // Switch on one threshold: the replacement never overlaps a visible
     // native hand, including during weapon-change interpolation.
     if (bone?.current) bone.current.scale.setScalar(gripping ? HAND_COLLAPSE : 1)
@@ -1711,6 +1713,14 @@ export function twoHanded(weapon: string): boolean {
   return grip !== 'none' && GRIPS[grip].foregrip > 0 && leftGripFor(weapon) !== null
 }
 
+/** The minigun reads better with the Pascaline model's native hands: its
+ * broad two-arm carry already lands both wrists on the grips, while the small
+ * procedural hands make the heavy body look offset to one side. Thin tools
+ * such as the knife still need a posed hand wrapped around their handle. */
+export function usesPosedGripHands(weapon: string): boolean {
+  return weapon !== 'minigun'
+}
+
 /**
  * The held weapon, in THE ARM FRAME: hanging −y from the shoulder, barrel down
  * the arm (weapon-models contract: grip at the origin, barrel down −Z), muzzle
@@ -1737,6 +1747,7 @@ function HeldWeapon({
   const muzzle = refs.fx ? remoteMuzzle(weapon) : null
   const hold = holdFor(weapon)
   const support = twoHanded(weapon) ? hold.left : null
+  const posedHands = usesPosedGripHands(weapon)
   const qR = useMemo(() => gripQuaternion(hold.right, 'R', new Quaternion()), [hold])
   const qL = useMemo(() => (support ? gripQuaternion(support, 'L', new Quaternion()) : null), [support])
   if (!Weapon) return null
@@ -1771,10 +1782,12 @@ function HeldWeapon({
             />
           </group>
         ) : null}
-        <group position={[r[0], r[1], r[2]]} quaternion={qR} ref={refs.fistR} visible={false}>
-          <HandMesh pose={hold.right.pose} side="R" scale={AVATAR_GRIP_HAND_SCALE} />
-        </group>
-        {support && qL ? (
+        {posedHands ? (
+          <group position={[r[0], r[1], r[2]]} quaternion={qR} ref={refs.fistR} visible={false}>
+            <HandMesh pose={hold.right.pose} side="R" scale={AVATAR_GRIP_HAND_SCALE} />
+          </group>
+        ) : null}
+        {posedHands && support && qL ? (
           <group
             position={[support.position[0], support.position[1], support.position[2]]}
             quaternion={qL}
