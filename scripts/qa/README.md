@@ -22,6 +22,7 @@ cd ~/Documents/GitHub/plugin-boots
 MODE=play     node scripts/qa/mp-harness.mjs                                  # A and B both Jump in
 MODE=spectate SHOT_PREFIX=/tmp/mp-spectate node scripts/qa/mp-harness.mjs     # A plays, B watches from the editor
 MODE=voice    SHOT_PREFIX=/tmp/mp-voice    node scripts/qa/mp-harness.mjs     # play + WebRTC voice mesh
+MODE=listen   SHOT_PREFIX=/tmp/mp-listen   node scripts/qa/listen-harness.mjs # A plays, B HEARS A from the editor, then drops in
 ```
 
 Each run takes ~20 s, prints a one-line JSON summary followed by `PASS` or
@@ -45,7 +46,7 @@ coalescing · `ALLOW_CAPTURE=1` keep native pointer lock / fullscreen ·
 | `positionsChanged`, `moved` | A holds **W** for 1.5 s; the `p:[x,y,z]` of A's last pose as received by B must move > 0.2 m. `moved.source` is `KeyW`, or `teleport-fallback` if walking produced nothing (then the wire is still proven, the walk is not). |
 | `avatarsSeenOnA/B`, `avatars` | three.js objects named `boots-remote-<sessionId>` (remote-players.tsx) in each page's R3F scene, with mesh count, world position, NDC and an `onScreen` frustum flag. In `spectate`, A sees 0 (the spectator publishes no avatar). |
 | `presence` | `__boots.presence()` on in-game pages: roster with names (`Alice`/`Bob` from the stub roster), positions, counters. `null` on a page that is not in the game. |
-| `voice` | `MODE=voice`: `connectedBothWays` + per-peer `state/connection/ice/hasTrack` from `__boots.voice()` and raw `voiceInternals()` (transceivers/receivers/senders). Other modes: a one-line read of A's voice layer. |
+| `voice` | `MODE=voice`: `connectedBothWays` + per-peer `state/connection/ice/hasTrack` from `__boots.voice()` and raw `voiceInternals()` (transceivers/receivers/senders). The mic is NOT pressed on: the veil's JUMP IN acquires it (`mic-gate.ts` `beginEntry` — Chrome's fake UI reports the permission granted, so the plan is `enter-with-mic`) and both pages read `mic: 'live'` on entry; the harness only presses **M** as a fallback if a page did not. Other modes: a one-line read of A's voice layer. |
 | `bus` | stub stats per page: `published / deferred / coalesced / suppressed / delivered`. |
 | `screenshots` | look at them. In `play`/`voice` the two stand 3 m apart facing each other; in `spectate` A is teleported onto the surface under B's editor-camera centre ray (`spectatorTarget` names it, e.g. `merged-roof` 3.8 m away) so the avatar cannot be occluded from B. `onScreen` is a frustum test only — it does not see occlusion, the screenshot does. |
 
@@ -87,7 +88,81 @@ coalescing · `ALLOW_CAPTURE=1` keep native pointer lock / fullscreen ·
 - The plugin must already be installed on the project for the spectator page (the
   install recipe is only run on A; the project `65fbacdc1faf` has it).
 - The mic is Chrome's fake device (`--use-fake-device-for-media-stream`), so
-  `talking` flags reflect a synthetic tone, not speech.
+  `talking` flags reflect a synthetic tone, not speech. It is acquired by the veil
+  (JUMP IN → `beginEntry`), not by a key press; `--use-fake-ui-for-media-stream`
+  answers the permission read as granted, so the one-click `enter-with-mic` path is
+  what runs. The ask-first path (permission `prompt`) is covered separately by
+  `docs/qa/qa-boots-sidebar-jump.mjs` below.
 - `voiceInternals` on the answerer can show one stopped transceiver + one ended
   receiver next to the live pair (an early renegotiation epoch). The live pair is
   what the pass criterion reads.
+
+## `listen-harness.mjs` — hearing the game from the editor (voice lane)
+
+`mp-harness.mjs` plus `MODE=listen`: A jumps in, B stays in the EDITOR (like
+`spectate`) and must HEAR A without ever being in the game, then drops in through
+the spectator hint pill and the SAME connection must survive the handover.
+
+```sh
+cd ~/Documents/GitHub/plugin-boots
+MODE=listen SHOT_PREFIX=/tmp/mp-listen node scripts/qa/listen-harness.mjs   # ~45 s; same knobs as mp-harness
+```
+
+Page hooks: the spectator page installs `globalThis.__bootsListen`
+(`spectator.tsx`, while the listen effect is up) with `debug()`, `internals()`,
+`stats()`, `pill()`, `resume()`, `localEcho(on)`; the player page has
+`__boots.voice()` / `__bootsVoice.pill()` / `__bootsVoice.stats()` as in `voice`.
+
+| `summary.listen.*` | proof |
+| --- | --- |
+| `handle` | `__bootsListen` appeared on B once a live player name was seen (`WATCH_POLL_MS`) — `startVoiceListen` ran. |
+| `recvonlyLink` | B's `debug().listen` is true and its link to A is connected with a `recvonly` transceiver. |
+| `playerSendonly` | A's link to B is marked `listener` and its transceiver reads `sendonly` (the answer to a recvonly offer). |
+| `rtpBytes`, `bytesReceived` | `getStats` on B: inbound RTP bytes from A > 0. |
+| `elementPlaying` | B's audio element holds a stream and is not paused. |
+| `listenFlagOnWire` | B's outbound `boots/voice` frames carry `listen: true` (a soft field: older pins ignore it and still answer). |
+| `pillListening`, `pill` | the body-level listen pill reads `🔈 LISTENING · N ON VOICE`; `🔇 SOUND BLOCKED — CLICK TO HEAR THE PLAYERS` is the autoplay-refused state (a button → `resumeVoiceOutputs`). |
+| `micNeverAsked` | `getUserMedia` was called 0 times on B and its mic reads `off`. |
+| `playerPillNamesListener`, `playerPill` | A's mic pill says `1 LISTENING FROM THE EDITOR` — the only trace a listener leaves for the players. |
+| `handover.*` | after B clicks the hint pill and enters: `listenOffB` (B's session is a game session now), `sameLinkB` (no restart, nothing reaped on B), `noRestartA` (A's link stayed connected, `listener` cleared), `sendrecvA` (A's m-line flipped), `bytesAtA` (B's mic RTP arriving at A). |
+
+Audibility is NOT asserted and cannot be here: both pages share one browser, so
+`voice.ts` mutes the pair as SAME DEVICE (gain 0). Bytes, directions and element
+state are the proof; `__bootsListen.localEcho(true)` un-mutes for a human listening
+in `HEADFUL=1`. Screenshots: `<prefix>-B-listening.png`, `<prefix>-B-dropped-in.png`.
+
+## `docs/qa/qa-boots-sidebar-jump.mjs` — the sidebar Jump in runs through the mic gate
+
+One page, permission read forced to `prompt` (the branch `--use-fake-ui` hides):
+click 1 on the left-rail `⏵ Jump in` must NOT enter — it becomes the permission
+prompt (`ALLOW THE MIC ↑`, disabled, then `⏵ PLAY`) and calls `getUserMedia` once;
+click 2 enters with `mic: 'live'` and no second `getUserMedia`. Prints one JSON line
+(`labels`, `enteredOnFirstClick`, `gumCalls`, `micAfterEntry`) + `PASS`/`FAIL`;
+screenshots `/tmp/sidebar-play.png`, `/tmp/sidebar-ingame.png`.
+
+## `see-swap-harness.mjs` — the bus is not forever (presence lane)
+
+`scripts/qa/see-harness.mjs` (three pages, held/late bus, drop-in, Escape) plus
+step 3b/3c: the three things the host's awareness runtime does to
+`__pascalCollabBus` (`use-project-awareness.ts` + `plugin-collab-bus.ts`), first
+on the SPECTATOR page B, then on the PLAYER page A.
+
+```sh
+cd ~/Documents/GitHub/plugin-boots
+node scripts/qa/see-swap-harness.mjs            # ~45 s; same knobs as see-harness (HEADFUL, KEEP_OPEN, SHOT_PREFIX=/tmp/see-swap, SCENE, BASE, BUS_RAW)
+```
+
+Stub hooks (installed by `installQaBus` on every bus page, callable from
+`page.evaluate`):
+
+| hook | what the host does that it mirrors | pass criterion |
+| --- | --- | --- |
+| `__bootsQaSwapBus(over?)` | channel restart: the bus object is uninstalled (handler sets cleared) and a NEW object with the SAME identity is installed synchronously (`over` re-keys it) | followed by object identity on the next tick — transport + roster re-subscribed on the new object, registry intact (`rosterVersion` unchanged), fresh frames heard (`remotes[].lastSeenMs` advances), `presence().swaps/rebinds ≥ 1`; on the PLAYER side the outbound seq continues (B's `netDropped` does not climb, Alice never despawns) |
+| `__bootsQaBlipRoster(laterMs)` | the awareness reset: an EMPTY participant list pushed now, the real one `laterMs` later | nobody despawns, `rosterVersion` holds, `rosterMissingMs` never expires |
+| `__bootsQaOutage(gapMs)` | teardown → later re-install: NO bus at all for `gapMs` | `presence().bound` false meanwhile, peers stay listed, bound again after, frames flow, no leave/join |
+
+Summary fields: `steps.busSwap`, `steps.rosterBlip`, `steps.busOutage` (spectator
+side) and `steps.playerBusSwap`, `steps.playerBusOutage` (player side). Against the
+pre-fix `presence.ts` the spectator steps report the deaf new bus and Alice
+despawning; against a `net.ts` that reset `outSeq` on start the player steps report
+"no fresh frames from Alice after HER bus swap" (B refuses the rewound stream).

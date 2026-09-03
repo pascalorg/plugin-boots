@@ -945,6 +945,85 @@ describe('the installed bus is not forever', () => {
     expect(netCounters().swaps).toBe(0)
   })
 
+  /**
+   * The host keeps OUR sessionId across a channel restart (use-project-awareness
+   * recreates the bus from the same input.sessionId on a CLOSED channel), and
+   * every peer's ordered tracker is keyed `sessionId|kind`. Had the outbound
+   * counter restarted at 1 on the new bus, each peer would have refused our
+   * frames as a rewind until its staleness sweep despawned us — a leave/join
+   * toast for a network blip. So the counters are the PAGE's, not the wire's.
+   */
+  test('our outbound seq is page-monotonic: it carries across a swap, an outage and a stop/start of the same session', () => {
+    const bus = installBus()
+    registerFrameKind('pose', echo)
+    startNet()
+    publishFrame('pose', { x: 1 })
+    publishFrame('pose', { x: 2 })
+    expect((bus.publishes[1]!.data as BootsEnvelope).seq).toBe(2)
+
+    // A channel restart: a NEW bus object carrying the SAME sessionId.
+    const next = makeBus()
+    g.__pascalCollabBus = next
+    expect(resyncNet()).toBe(true)
+    publishFrame('pose', { x: 3 })
+    expect((next.publishes[0]!.data as BootsEnvelope).seq).toBe(3) // not 1
+
+    // An outage spends no numbers (nothing was attempted on a wire)…
+    delete g.__pascalCollabBus
+    expect(resyncNet()).toBe(true)
+    expect(publishFrame('pose', { x: 4 })).toBe('unavailable')
+    // …and the bus that returns continues the numbering (the transport is
+    // CLOSED after an outage, so the rebind is a startNet — presence.ts's
+    // rebindTransport takes exactly that cold path).
+    const back = makeBus()
+    g.__pascalCollabBus = back
+    expect(startNet()).toBe(true)
+    publishFrame('pose', { x: 4 })
+    expect((back.publishes[0]!.data as BootsEnvelope).seq).toBe(4)
+
+    // Even an explicit stop/start on this page (Esc, then Jump In again) keeps
+    // counting: a peer that missed our goodbye still accepts the first frame.
+    stopNet()
+    expect(startNet()).toBe(true)
+    publishFrame('pose', { x: 5 })
+    expect((back.publishes[1]!.data as BootsEnvelope).seq).toBe(5)
+    // Per kind, as before: another kind's counter is its own.
+    registerFrameKind('boots/world', echo)
+    publishFrame('boots/world', { d: 1 })
+    expect((back.publishes[2]!.data as BootsEnvelope).seq).toBe(1)
+  })
+
+  test('what the PEER does with a rewound stream — the reason the counter must not restart', () => {
+    installBus()
+    registerFrameKind('pose', echo)
+    startNet()
+    const { got } = collect('pose')
+    // Alice's transport counted 1, 2 on her first bus…
+    ingestBusMessage(inbound(frame('pose', 1, 'a')))
+    ingestBusMessage(inbound(frame('pose', 2, 'b')))
+    // …a restart that zeroed her counter would send this — and we would refuse
+    // it, and every frame after it, until our staleness sweep despawned her.
+    ingestBusMessage(inbound(frame('pose', 1, 'rewound')))
+    expect(got.map((m) => m.data)).toEqual(['a', 'b'])
+    expect(netCounters().dropped).toBe(1)
+    // A page-monotonic counter is accepted at once.
+    ingestBusMessage(inbound(frame('pose', 3, 'continued')))
+    expect(got.map((m) => m.data)).toEqual(['a', 'b', 'continued'])
+  })
+
+  test('resetNetIdentity (test-only) is the one thing that restarts the outbound counters', () => {
+    const bus = installBus()
+    registerFrameKind('pose', echo)
+    startNet()
+    publishFrame('pose', { x: 1 })
+    publishFrame('pose', { x: 2 })
+    stopNet()
+    resetNetIdentity()
+    startNet()
+    publishFrame('pose', { x: 3 })
+    expect((bus.publishes[2]!.data as BootsEnvelope).seq).toBe(1)
+  })
+
   test('a bus that vanished leaves us stopped rather than bound to a corpse', () => {
     installBus()
     startNet()

@@ -1,14 +1,18 @@
 import {
+  type CollabBus,
   type CollabParticipant,
   forgetSender,
+  getCollabBus,
   type NetMessage,
   netAvailable,
+  netBus,
   netCounters,
   onFrame,
   onParticipants,
   participantName as netParticipantName,
   publishFrame,
   registerFrameKind,
+  resyncNet,
   startNet,
   stopNet,
 } from './net'
@@ -64,8 +68,18 @@ import {
  * Remote registry: Map<sessionId, RemotePlayer> fed by the bus
  * subscription. Join = first 'game'-phase frame from a session; leave =
  * explicit 'editor'-phase frame (instant — the peer pressed Esc),
- * staleness (>3 s silent), or a roster drop from onParticipants. Leave
- * removes the entry; remote-players.tsx re-renders off rosterVersion.
+ * staleness (>3 s silent), or a roster drop from onParticipants that OUTLASTS
+ * ROSTER_GRACE_MS (see reconcileRoster: the host's roster goes empty for a
+ * beat on every channel restart, and a roster that is merely unsynced must
+ * not despawn people who are still sending frames). Leave removes the entry;
+ * remote-players.tsx re-renders off rosterVersion.
+ *
+ * The bus is not forever: the host installs one bus per awareness runtime and
+ * swaps it (or removes it) on a channel restart / session re-key. Every tick
+ * re-checks the installed bus by OBJECT identity (rebindTransport) and moves
+ * the transport AND the roster subscription onto the new one — a spectator
+ * used to go deaf after a host restart until the phase flipped. The registry
+ * survives a rebind untouched (nobody re-joins, no toasts).
  *
  * Crowd ceiling: the registry is HARD-CAPPED at MAX_REMOTE_AVATARS. A
  * public lobby is unbounded — a hostile or merely popular one must cost a
@@ -108,6 +122,29 @@ export const TICK_MS = 21
  * published — the host's 66 ms slot carries it, and the mean is unchanged.
  * (presence.test.ts pins the cadence under regular AND late ticks.) */
 export const TICK_TOLERANCE_MS = TICK_MS / 2
+
+/**
+ * How long a peer may be MISSING FROM THE ROSTER before that alone despawns
+ * it (ms). A roster drop is the fallback leave signal (tab closed, socket
+ * gone — the peer had no chance to send its ph:'editor' goodbye), and the
+ * host's roster is not a clean signal: every awareness channel restart pushes
+ * an empty list first and a fresh bus starts with whatever the runtime had —
+ * usually nothing — until the next presence sync. A frame from the peer in
+ * the meantime clears the flag (host-stamped frames are the stronger
+ * evidence), so the window must OUTLAST the longest gap between two frames of
+ * a peer who is still there: a background tab's timers are throttled to 1 Hz,
+ * which stretches the 500 ms keep-alive to ~1000-1100 ms, and one second of
+ * grace expired exactly between two such keep-alives — a roster still catching
+ * up after a restart would have dropped a peer who was still sending, and the
+ * next frame re-joined them. Two seconds holds that with margin, is still
+ * invisible next to a real crash despawn, and stays shorter than STALE_MS
+ * because an explicit roster drop is still a stronger hint than plain silence.
+ */
+export const ROSTER_GRACE_MS = 2000
+/** The slowest a LIVE peer's keep-alive gets (ms): Chrome's background-tab
+ * timer throttle (1 Hz) stretching IDLE_MAX_SILENCE_MS. ROSTER_GRACE_MS must
+ * clear it with margin (test-pinned). */
+export const BACKGROUND_KEEPALIVE_MS = 1100
 
 export function publishIntervalMs(remoteCount: number): number {
   return 1000 / (remoteCount > CROWDED_REMOTES ? PUBLISH_HZ_CROWDED : PUBLISH_HZ_BASE)
@@ -319,6 +356,10 @@ export type RemotePlayer = {
   drawnAt: number
   /** The interpolation delay (ms) the renderer currently uses for this peer. */
   delayMs: number
+  /** Local clock when the host roster FIRST stopped listing this session
+   * (0 = listed, or never checked). Past ROSTER_GRACE_MS the sweep drops the
+   * peer; a fresh frame or a roster that lists it again resets it to 0. */
+  rosterMissingSince: number
 }
 
 export type PresenceEvent = {
@@ -344,6 +385,11 @@ type PresenceState = {
   received: number
   /** Valid frames refused by the crowd ceiling (QA observability). */
   culled: number
+  /** The bus object our ROSTER subscription is bound to (identity only) —
+   * compared against the installed bus every tick; null while unbound. */
+  boundBus: CollabBus | null
+  /** Times the tick moved us onto a different (or returned) bus. */
+  rebinds: number
 }
 
 const emptyFrame = (): PresenceFrame => ({
@@ -373,6 +419,8 @@ const state: PresenceState = {
   published: 0,
   received: 0,
   culled: 0,
+  boundBus: null,
+  rebinds: 0,
 }
 
 /** Reused publish scratch — the tick never allocates while idle. */
@@ -391,9 +439,28 @@ function emit(type: 'join' | 'leave', remote: RemotePlayer): void {
     type,
     sessionId: remote.sessionId,
     userId: remote.userId,
-    name: remote.nick || participantName(remote.userId),
+    name: remoteLabel(remote),
   }
   for (const handler of eventHandlers) handler(event)
+}
+
+/**
+ * THE one label rule for a remote player, shared by every surface that prints
+ * WHO is here (join/leave toasts, the spectator pill, the in-game roster chip,
+ * the QA dump): the peer's CHOSEN nickname (rides their pose frame, `nm`)
+ * wins; otherwise the host roster's display name for their userId; otherwise
+ * 'builder'. Open-lobby strangers are unprofiled, so a surface built off the
+ * roster name alone would read "builder is playing" — the nick is what makes
+ * the copy true. roster-names.ts re-exports it.
+ *
+ * Known inline copies of this rule (`remote.nick || participantName(...)`)
+ * still live in remote-players.tsx (the name tag's useState seed and its
+ * refresh) and voice.ts (the speaking-peer label) — owned by the avatar and
+ * voice lanes; behaviour is identical today, fold them onto this export when
+ * those files are next touched so the three cannot drift.
+ */
+export function remoteLabel(remote: Pick<RemotePlayer, 'nick' | 'userId'>): string {
+  return remote.nick || participantName(remote.userId)
 }
 
 /** Display name for a userId off the live roster; 'builder' when unknown. */
@@ -475,10 +542,14 @@ export function ingestPoseFrame(msg: NetMessage<PresenceFrame>, now: number): vo
       drawnZ: 0,
       drawnAt: 0,
       delayMs: 0,
+      rosterMissingSince: 0,
     }
     state.remotes.set(msg.sessionId, remote)
   }
   remote.lastReceivedAt = now
+  // A host-stamped frame is proof of presence: whatever the roster said, this
+  // session is here. Clears a pending roster-grace countdown.
+  remote.rosterMissingSince = 0
   remote.w = frame.w
   remote.nick = frame.nm ?? ''
   const wasInGame = remote.ph === 'game'
@@ -543,17 +614,115 @@ function crowdSlots(): CrowdSlot[] {
   return crowdScratch
 }
 
-/** Roster reconciliation (exported for tests): a remote whose sessionId no
- * longer appears in the participant list dropped without a goodbye frame. */
-export function reconcileRoster(participants: CollabParticipant[]): void {
+/** Reused by reconcileRoster — a roster push allocates nothing. */
+const rosterScratch = new Set<string>()
+
+/**
+ * Roster reconciliation (exported for tests; the bus's onParticipants calls it
+ * with Date.now()): a remote whose sessionId no longer appears in the
+ * participant list probably dropped without a goodbye frame — but NOT
+ * necessarily, so it is not despawned here. It is marked missing, and the tick
+ * drops it only once it has been missing for ROSTER_GRACE_MS with no frame
+ * heard in between (rosterGraceExpired). A roster that lists it again clears
+ * the mark.
+ *
+ * An EMPTY roster is ignored outright: a list that does not even contain OUR
+ * session is not a statement about who left, it is the host mid-restart
+ * (use-project-awareness resets to [] on every channel teardown and a fresh
+ * bus is born with that same empty list). Acting on it despawned the whole
+ * lobby on every reconnect.
+ */
+export function reconcileRoster(participants: CollabParticipant[], now: number = Date.now()): void {
   if (state.remotes.size === 0) return
-  const live = new Set<string>()
+  let listed = 0
+  for (const participant of participants) listed += participant.sessions.length
+  if (listed === 0) return
+  const live = rosterScratch
+  live.clear()
   for (const participant of participants) {
     for (const session of participant.sessions) live.add(session.sessionId)
   }
-  for (const remote of [...state.remotes.values()]) {
-    if (!live.has(remote.sessionId)) dropRemote(remote, true)
+  for (const remote of state.remotes.values()) {
+    if (live.has(remote.sessionId)) {
+      remote.rosterMissingSince = 0
+    } else if (remote.rosterMissingSince === 0) {
+      remote.rosterMissingSince = now
+    }
+    // Already missing: the countdown keeps its original start; the sweep
+    // (presenceTick) is the one place a peer is dropped for it.
   }
+}
+
+/** Pure: has this peer been missing from the roster past the grace window? */
+export function rosterGraceExpired(
+  remote: Pick<RemotePlayer, 'rosterMissingSince'>,
+  now: number,
+): boolean {
+  return remote.rosterMissingSince > 0 && now - remote.rosterMissingSince > ROSTER_GRACE_MS
+}
+
+// ── Bus rebinding ────────────────────────────────────────────────────────────
+
+/** (Re)subscribe the roster on the bus the transport currently holds. */
+function bindRoster(): void {
+  state.offParticipants?.()
+  state.offParticipants = onParticipants((participants) => reconcileRoster(participants, Date.now()))
+  state.boundBus = netBus()
+}
+
+/**
+ * Keep the transport and the roster subscription on the bus the host has
+ * INSTALLED (exported for tests; presenceTick calls it first thing). Returns
+ * true when anything moved.
+ *
+ * Steady state is one global read and two identity compares — no allocation,
+ * no host call. Three ways out of it:
+ *  - the host SWAPPED the bus (session re-key, channel restart): resyncNet
+ *    moves the transport (kinds and handlers survive; INBOUND trackers reset
+ *    so a peer's stream is accepted from its first frame on the new wire,
+ *    while our OUTBOUND counters carry on — the host keeps our sessionId
+ *    across a restart, and a peer's ordered tracker would refuse a counter
+ *    that restarted at 1 until its staleness sweep despawned us), then the
+ *    roster is re-subscribed on the new object — our old onParticipants
+ *    closure died with the old bus (the host clears its handler sets on
+ *    uninstall), so without this the roster went deaf for good;
+ *  - the bus is GONE (collab torn down, or the gap between uninstall and the
+ *    next install): the transport closes honestly (publishFrame reads
+ *    'unavailable'), the dead roster subscription is released, and the adapter
+ *    stays active with its registry intact — peers age out through the normal
+ *    staleness sweep if nobody comes back, and are adopted as-is if a bus
+ *    returns within STALE_MS;
+ *  - a bus APPEARED while we were unbound: start the transport on it and bind.
+ *
+ * Nothing in the registry is touched: a rebind is not a leave, so no toasts,
+ * no roster bump, no avatar re-scales in.
+ */
+export function rebindTransport(): boolean {
+  if (!state.active) return false
+  const installed = getCollabBus()
+  const bound = netBus()
+  if (installed === bound && installed === state.boundBus) return false
+  if (installed === null) {
+    if (bound !== null) resyncNet() // closes the transport (no bus to rebind to)
+    state.offParticipants?.()
+    state.offParticipants = null
+    if (state.boundBus !== null) state.rebinds++
+    state.boundBus = null
+    return true
+  }
+  if (bound !== installed) {
+    // resyncNet is the swap path (net active on another object); startNet the
+    // cold one (net closed by an earlier outage). Either lands on `installed`.
+    if (bound !== null) resyncNet()
+    else if (!startNet()) return false
+  }
+  bindRoster()
+  state.rebinds++
+  // First tick on the new wire publishes at once (rate gate permitting): a
+  // re-keyed bus may carry a session id nobody has heard from yet, and the
+  // 500 ms keep-alive is a long time to be invisible.
+  state.lastSentFrame = null
+  return true
 }
 
 /**
@@ -563,9 +732,18 @@ export function reconcileRoster(participants: CollabParticipant[]): void {
 export function presenceTick(now: number): void {
   if (!state.active) return
 
-  // Staleness: a peer silent >3s despawns (crash, tab close, network gone).
+  // The host may have swapped or removed the bus since the last tick: follow
+  // it BEFORE sweeping, so a peer whose frames were waiting on the new bus is
+  // heard on this very tick rather than aged out on it.
+  rebindTransport()
+
+  // Staleness: a peer silent >3s despawns (crash, tab close, network gone);
+  // so does one the roster stopped listing ROSTER_GRACE_MS ago with no frame
+  // since (reconcileRoster only marks — this is the one place it drops).
   for (const remote of state.remotes.values()) {
-    if (isStale(remote.lastReceivedAt, now)) dropRemote(remote, true)
+    if (isStale(remote.lastReceivedAt, now) || rosterGraceExpired(remote, now)) {
+      dropRemote(remote, true)
+    }
   }
 
   const getLocal = state.getLocal
@@ -632,13 +810,22 @@ function copyFrame(from: PresenceFrame, to: PresenceFrame): void {
  * (never despawns the live registry or re-announces the local player).
  */
 export function startPresence(getLocal: () => LocalPose): boolean {
+  if (state.active) {
+    // ADOPT FIRST, ask about the bus second. A spectator's receive-only
+    // adapter (or a remount) is already running: the game session takes it
+    // over by installing the pose sampler — even during a bus outage, so the
+    // moment the bus is back the tick rebinds and publishing simply starts,
+    // and stopPresence's goodbye path owns the adapter from here on. The
+    // return value still tells the truth ("co-presence is live"), so a caller
+    // retrying on it (untilNet) keeps retrying until the transport is up.
+    state.getLocal = getLocal
+    rebindTransport()
+    return netAvailable()
+  }
   // The transport decides whether co-presence exists at all (no bus = the
   // host flag is off) — nothing below runs when it says no.
   if (!startNet()) return false
-  if (state.active) {
-    state.getLocal = getLocal
-    return true
-  }
+  resyncNet() // startNet is idempotent: if net still held a stale bus, move
   state.active = true
   state.getLocal = getLocal
   state.lastPublishAt = 0
@@ -646,10 +833,11 @@ export function startPresence(getLocal: () => LocalPose): boolean {
   state.published = 0
   state.received = 0
   state.culled = 0
+  state.rebinds = 0
   // Our payload validator IS the pose trust boundary (presence-interp).
   registerFrameKind(POSE_KIND, validateFrame)
   state.unsubscribe = onFrame<PresenceFrame>(POSE_KIND, (msg) => ingestPoseFrame(msg, Date.now()))
-  state.offParticipants = onParticipants((participants) => reconcileRoster(participants))
+  bindRoster()
   state.timer = setInterval(() => presenceTick(Date.now()), TICK_MS)
   return true
 }
@@ -663,6 +851,9 @@ export function startPresence(getLocal: () => LocalPose): boolean {
  */
 export function stopPresence(): void {
   if (!state.active) return
+  // A bus that came back between ticks still gets the goodbye: rebind first,
+  // so peers despawn us now instead of waiting out their staleness clocks.
+  rebindTransport()
   if (netAvailable()) {
     const local = state.getLocal?.()
     if (local) buildFrame(local, scratchFrame)
@@ -678,6 +869,7 @@ export function stopPresence(): void {
   state.unsubscribe = null
   state.offParticipants?.()
   state.offParticipants = null
+  state.boundBus = null
   state.remotes.clear()
   state.rosterVersion++
   state.active = false
@@ -708,13 +900,15 @@ export function startSpectating(): boolean {
   if (!startNet()) return false
   // A live game session (or an existing spectate) already owns the adapter.
   if (state.active) return true
+  resyncNet() // startNet is idempotent: if net still held a stale bus, move
   state.active = true
   state.getLocal = null // receive-only: presenceTick sweeps but never publishes
   state.lastPublishAt = 0
   state.lastSentFrame = null
+  state.rebinds = 0
   registerFrameKind(POSE_KIND, validateFrame)
   state.unsubscribe = onFrame<PresenceFrame>(POSE_KIND, (msg) => ingestPoseFrame(msg, Date.now()))
-  state.offParticipants = onParticipants((participants) => reconcileRoster(participants))
+  bindRoster()
   state.timer = setInterval(() => presenceTick(Date.now()), TICK_MS)
   return true
 }
@@ -733,6 +927,7 @@ export function stopSpectating(): void {
   state.unsubscribe = null
   state.offParticipants?.()
   state.offParticipants = null
+  state.boundBus = null
   state.remotes.clear()
   state.rosterVersion++
   state.active = false
@@ -757,11 +952,21 @@ export function registerPresenceDebugSource(name: string, source: () => unknown)
 
 export type PresenceDebugRemote = {
   sessionId: string
+  /** The label every surface prints (remoteLabel: nick || roster || 'builder'). */
   name: string
+  /** The chosen nickname off their pose frame ('' = none). */
+  nick: string
+  /** The host roster's display name for their userId, or 'builder'. */
+  rosterName: string
   p: [number, number, number]
   w: string
   f: number
   ageMs: number
+  /** Local clock (ms epoch) of the last accepted frame — ageMs' basis. */
+  lastSeenMs: number
+  /** How long (ms) the host roster has NOT listed this session (0 = listed);
+   * past ROSTER_GRACE_MS with no frame heard, the sweep drops the peer. */
+  rosterMissingMs: number
   /** Arrival timing (ArrivalTiming) — measure the relay before tuning. */
   spacingMs: number
   jitterMs: number
@@ -784,6 +989,12 @@ export function presenceDebug(): {
   netDropped: number
   cap: number
   tickMs: number
+  /** Transport live right now (a bus is installed and we are bound to it). */
+  bound: boolean
+  /** Host bus swaps the transport followed (net.ts) / rebinds this adapter did. */
+  swaps: number
+  rebinds: number
+  rosterGraceMs: number
   extra: Record<string, unknown>
 } {
   const now = Date.now()
@@ -792,7 +1003,9 @@ export function presenceDebug(): {
     const snap = latestSnapshot(remote.ring)
     remotes.push({
       sessionId: remote.sessionId,
-      name: participantName(remote.userId),
+      name: remoteLabel(remote),
+      nick: remote.nick,
+      rosterName: participantName(remote.userId),
       p: snap ? [snap.x, snap.y, snap.z] : [0, 0, 0],
       w: remote.w,
       // Their fire counter as last received — the ONE number a two-client QA run
@@ -800,6 +1013,8 @@ export function presenceDebug(): {
       // lasts 50 ms and a report cannot be read out of a headless browser.
       f: snap ? snap.f : 0,
       ageMs: now - remote.lastReceivedAt,
+      lastSeenMs: remote.lastReceivedAt,
+      rosterMissingMs: remote.rosterMissingSince > 0 ? now - remote.rosterMissingSince : 0,
       spacingMs: remote.timing.spacingEma,
       jitterMs: remote.timing.jitterEma,
       gaps: remote.timing.gaps,
@@ -825,6 +1040,10 @@ export function presenceDebug(): {
     netDropped: netCounters().dropped,
     cap: MAX_REMOTE_AVATARS,
     tickMs: TICK_MS,
+    bound: netAvailable() && state.boundBus !== null && state.boundBus === netBus(),
+    swaps: netCounters().swaps,
+    rebinds: state.rebinds,
+    rosterGraceMs: ROSTER_GRACE_MS,
     extra,
   }
 }

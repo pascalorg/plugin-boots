@@ -6,13 +6,17 @@ import {
   type CollabParticipant,
   getCollabBus,
   NET_PROTOCOL,
+  netAvailable,
+  netBus,
   type NetMessage,
   PLUGIN_ID,
+  resetNetIdentity,
   resetNetKinds,
   stopNet,
 } from './net'
 import {
   admitRemote,
+  BACKGROUND_KEEPALIVE_MS,
   buildFrame,
   CROWD_SWAP_MARGIN_M,
   CROWDED_REMOTES,
@@ -31,10 +35,17 @@ import {
   presenceDebug,
   presenceTick,
   publishIntervalMs,
+  rebindTransport,
+  reconcileRoster,
   registerPresenceDebugSource,
+  remoteLabel,
+  ROSTER_GRACE_MS,
+  rosterGraceExpired,
   shouldPublish,
   startPresence,
+  startSpectating,
   stopPresence,
+  stopSpectating,
   TICK_MS,
   TICK_TOLERANCE_MS,
   wrapAngle,
@@ -190,10 +201,17 @@ function publishedFrame(bus: FakeBus, i: number): PresenceFrame {
   return (bus.publishes[i]!.data as BootsEnvelope).data as PresenceFrame
 }
 
+/** The transport's sequence number on published frame `i`. */
+function publishedSeq(bus: FakeBus, i: number): number {
+  return (bus.publishes[i]!.data as BootsEnvelope).seq
+}
+
 afterEach(() => {
   stopPresence()
+  stopSpectating() // a receive-only adapter left by a spectate test
   stopNet() // in case a test opened the transport without presence
   resetNetKinds() // registered kinds are module-global — do not bleed
+  resetNetIdentity() // the bus-swap history outlives stopNet by design
   delete g.__pascalCollabBus
 })
 
@@ -534,16 +552,39 @@ describe('remote registry — join and leave', () => {
     off()
   })
 
-  test('roster drop via onParticipants removes ghosts', () => {
+  test(`roster drop via onParticipants removes ghosts — after ${ROSTER_GRACE_MS} ms of grace, on the tick`, () => {
     const bus = installBus()
     startPresence(() => localPose())
     const events: PresenceEvent[] = []
     const off = onPresenceEvent((e) => events.push(e))
-    ingestPoseFrame(poseMsg(), 5000)
-    // Alice vanishes from the roster (tab closed, socket dropped).
+    const t0 = Date.now()
+    ingestPoseFrame(poseMsg(), t0)
+    // Alice vanishes from the roster (tab closed, socket dropped) — through
+    // the real bus subscription, which stamps the live clock.
     bus.rosterHandler?.([bus.participants[0]!])
+    expect(getRemotes().size).toBe(1) // not yet: the roster alone is a hint
+    const marked = getRemotes().get('session-a')!.rosterMissingSince
+    expect(marked).toBeGreaterThanOrEqual(t0)
+    expect(presenceDebug().remotes[0]!.rosterMissingMs).toBeGreaterThanOrEqual(0)
+    presenceTick(marked + ROSTER_GRACE_MS) // at the bound — still here
+    expect(getRemotes().size).toBe(1)
+    presenceTick(marked + ROSTER_GRACE_MS + 1)
     expect(getRemotes().size).toBe(0)
     expect(events.map((e) => e.type)).toEqual(['join', 'leave'])
+    off()
+  })
+
+  test('the join event carries the chosen nick when the frame has one (remoteLabel)', () => {
+    installBus()
+    startPresence(() => localPose())
+    const events: PresenceEvent[] = []
+    const off = onPresenceEvent((e) => events.push(e))
+    ingestPoseFrame(poseMsg({ data: gameFrame({ nm: 'Zed' }) }), 5000)
+    expect(events[0]!.name).toBe('Zed')
+    // The same rule, exported: nick, then roster, then 'builder'.
+    expect(remoteLabel({ nick: 'Zed', userId: 'user-a' })).toBe('Zed')
+    expect(remoteLabel({ nick: '', userId: 'user-a' })).toBe('Alice')
+    expect(remoteLabel({ nick: '', userId: 'user-nobody' })).toBe('builder')
     off()
   })
 
@@ -846,5 +887,352 @@ describe('presenceDebug — timing, delay, drawn pose, extra sources', () => {
     offBad()
     expect(presenceDebug().extra.probe).toBeUndefined()
     expect(presenceDebug().extra.bad).toBeUndefined()
+  })
+})
+
+// ── Roster grace ─────────────────────────────────────────────────────────────
+
+describe('roster grace — a roster drop is a hint, not a despawn', () => {
+  /** The roster with Alice gone: only our own session listed. */
+  const meOnly = (bus: FakeBus): CollabParticipant[] => [bus.participants[0]!]
+
+  test(`missing from the roster: marked at once, dropped by the tick after ${ROSTER_GRACE_MS} ms, with a leave`, () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    const events: PresenceEvent[] = []
+    const off = onPresenceEvent((e) => events.push(e))
+    ingestPoseFrame(poseMsg(), 5000)
+    const v = getRosterVersion()
+    reconcileRoster(meOnly(bus), 5000)
+    const remote = getRemotes().get('session-a')!
+    expect(remote.rosterMissingSince).toBe(5000)
+    expect(getRosterVersion()).toBe(v) // no roster bump for a mark
+    presenceTick(5000 + ROSTER_GRACE_MS)
+    expect(getRemotes().size).toBe(1)
+    presenceTick(5000 + ROSTER_GRACE_MS + 1)
+    expect(getRemotes().size).toBe(0)
+    expect(events.map((e) => e.type)).toEqual(['join', 'leave'])
+    off()
+  })
+
+  test('an EMPTY roster is the host mid-restart — ignored, nobody is even marked', () => {
+    installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg(), 5000)
+    reconcileRoster([], 5000)
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBe(0)
+    // A roster with participants but no sessions at all is the same non-statement.
+    reconcileRoster([{ userId: 'user-me', name: 'Me', sessions: [] }], 5100)
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBe(0)
+    presenceTick(5000 + ROSTER_GRACE_MS + 1) // past the grace, inside STALE_MS
+    expect(getRemotes().size).toBe(1)
+  })
+
+  test('listed again inside the grace → the mark clears, no leave', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    const events: PresenceEvent[] = []
+    const off = onPresenceEvent((e) => events.push(e))
+    ingestPoseFrame(poseMsg(), 5000)
+    reconcileRoster(meOnly(bus), 5000)
+    reconcileRoster(bus.participants, 5500) // presence sync caught up
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBe(0)
+    presenceTick(5000 + ROSTER_GRACE_MS + 1)
+    expect(getRemotes().size).toBe(1)
+    expect(events.map((e) => e.type)).toEqual(['join'])
+    off()
+  })
+
+  test('a frame from a roster-missing peer clears the mark — host-stamped frames outrank the roster', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg(), 5000)
+    reconcileRoster(meOnly(bus), 5000)
+    ingestPoseFrame(poseMsg({ sentAt: 1100 }), 5500)
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBe(0)
+    presenceTick(5000 + ROSTER_GRACE_MS + 1)
+    expect(getRemotes().size).toBe(1)
+    // A roster that STILL omits it restarts the countdown from now, not from 5000.
+    reconcileRoster(meOnly(bus), 6000)
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBe(6000)
+  })
+
+  test('repeated roster pushes keep the ORIGINAL start of the countdown', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg(), 5000)
+    reconcileRoster(meOnly(bus), 5000)
+    reconcileRoster(meOnly(bus), 5900)
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBe(5000)
+    presenceTick(5000 + ROSTER_GRACE_MS + 1)
+    expect(getRemotes().size).toBe(0)
+  })
+
+  test('rosterGraceExpired (pure): 0 never expires; past the window it does', () => {
+    expect(rosterGraceExpired({ rosterMissingSince: 0 }, 1e9)).toBe(false)
+    expect(rosterGraceExpired({ rosterMissingSince: 5000 }, 5000 + ROSTER_GRACE_MS)).toBe(false)
+    expect(rosterGraceExpired({ rosterMissingSince: 5000 }, 5000 + ROSTER_GRACE_MS + 1)).toBe(true)
+    expect(ROSTER_GRACE_MS).toBeLessThan(STALE_MS) // an explicit drop is still the stronger hint
+    // …but it must OUTLAST a live peer's slowest keep-alive: a background tab
+    // (1 Hz timer throttle) sends every ~1000-1100 ms, and a grace that expired
+    // between two of those dropped someone who was still there.
+    expect(BACKGROUND_KEEPALIVE_MS).toBeGreaterThan(IDLE_MAX_SILENCE_MS * 2)
+    expect(ROSTER_GRACE_MS).toBeGreaterThanOrEqual(BACKGROUND_KEEPALIVE_MS + IDLE_MAX_SILENCE_MS)
+  })
+
+  test('a background-tab peer (keep-alive every ~1.1 s) that a lagging roster keeps omitting is never dropped', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    const events: PresenceEvent[] = []
+    const off = onPresenceEvent((e) => events.push(e))
+    let sentAt = 1000
+    ingestPoseFrame(poseMsg({ sentAt }), 5000)
+    // Alice's tab is in the background: one frame every BACKGROUND_KEEPALIVE_MS
+    // (a hair over the throttle). The host roster, half-synced after a restart,
+    // omits her on every push (every 300 ms) for ten seconds straight.
+    let nextFrameAt = 5000 + BACKGROUND_KEEPALIVE_MS + 50
+    let nextRosterAt = 5300
+    for (let t = 5000 + TICK_MS; t < 15000; t += TICK_MS) {
+      if (t >= nextFrameAt) {
+        sentAt += BACKGROUND_KEEPALIVE_MS + 50
+        ingestPoseFrame(poseMsg({ sentAt }), t)
+        nextFrameAt += BACKGROUND_KEEPALIVE_MS + 50
+      }
+      if (t >= nextRosterAt) {
+        reconcileRoster(meOnly(bus), t)
+        nextRosterAt += 300
+      }
+      presenceTick(t)
+    }
+    expect(getRemotes().size).toBe(1) // never dropped: her frames outrank the roster every time
+    expect(events.map((e) => e.type)).toEqual(['join']) // and so no leave/join churn
+    off()
+  })
+
+  test('the spectating adapter reconciles with the same grace', () => {
+    const bus = installBus()
+    expect(startSpectating()).toBe(true)
+    ingestPoseFrame(poseMsg(), 5000)
+    reconcileRoster(meOnly(bus), 5000)
+    presenceTick(5000 + ROSTER_GRACE_MS)
+    expect(getRemotes().size).toBe(1)
+    presenceTick(5000 + ROSTER_GRACE_MS + 1)
+    expect(getRemotes().size).toBe(0)
+  })
+})
+
+// ── Bus rebinding ────────────────────────────────────────────────────────────
+
+describe('bus rebinding — the host may swap or remove the bus under a running adapter', () => {
+  test('a swapped bus is followed on the next tick: transport + roster move, the registry survives untouched', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    ingestPoseFrame(poseMsg(), 5000)
+    presenceTick(5000) // one publish on the first bus
+    expect(bus.publishes.length).toBe(1)
+    const events: PresenceEvent[] = []
+    const off = onPresenceEvent((e) => events.push(e))
+    const v = getRosterVersion()
+    expect(presenceDebug().rebinds).toBe(0)
+
+    const next = makeBus()
+    g.__pascalCollabBus = next
+    presenceTick(5100)
+
+    expect(netBus()).toBe(next)
+    expect(bus.unsubscribed).toBe(1) // the old wire is released…
+    expect(bus.rosterHandler).toBeNull() // …and so is the old roster subscription
+    expect(next.handler).not.toBeNull()
+    expect(next.rosterHandler).not.toBeNull()
+    // Nobody left, nobody joined, nothing to re-render.
+    expect(getRemotes().size).toBe(1)
+    expect(getRosterVersion()).toBe(v)
+    expect(events).toEqual([])
+    const dump = presenceDebug()
+    expect(dump.rebinds).toBe(1)
+    expect(dump.swaps).toBe(1)
+    expect(dump.bound).toBe(true)
+    // Frames on the NEW bus reach the registry — from seq 1, because the
+    // transport's per-sender trackers were reset with the swap.
+    const received = presenceCounters().received
+    next.handler!(busMsg(gameFrame({ p: [7, 0, 0] }), 1, { sentAt: 1200 }))
+    expect(presenceCounters().received).toBe(received + 1)
+    expect(latestSnapshot(getRemotes().get('session-a')!.ring)!.x).toBe(7)
+    // …and our own frames went out on it AT ONCE — the tick that rebound also
+    // published (the idle gate is reset by a rebind), no 500 ms of invisibility.
+    expect(next.publishes.length).toBe(1)
+    expect(bus.publishes.length).toBe(1) // only the pre-swap publish
+    presenceTick(5200) // unchanged pose → the normal idle skip applies again
+    expect(next.publishes.length).toBe(1)
+    // The new roster subscription is live: a drop there starts the grace clock.
+    next.rosterHandler!([next.participants[0]!])
+    expect(getRemotes().get('session-a')!.rosterMissingSince).toBeGreaterThan(0)
+    off()
+  })
+
+  test('our frames on a new bus CONTINUE the sequence — a peer whose tracker knows us never sees a rewind', () => {
+    // The host keeps our sessionId across a channel restart (use-project-awareness
+    // recreates the bus from the same input.sessionId), so every peer still holds
+    // an ordered tracker for `session-me|pose` at our last seq. A counter that
+    // restarted at 1 on the new bus would be refused as a rewind until their
+    // 3 s staleness sweep despawned us, and the next accepted frame re-joined us —
+    // a leave/join for a blip. net.ts keeps the counter page-monotonic; this is
+    // the adapter-level pin that a rebind rides on it.
+    const bus = installBus()
+    startPresence(() => localPose())
+    presenceTick(1000)
+    presenceTick(1000 + IDLE_MAX_SILENCE_MS + 1) // the keep-alive
+    expect(bus.publishes.length).toBe(2)
+    expect(publishedSeq(bus, 1)).toBe(2)
+
+    const next = makeBus() // same sessionId: a restart, not a re-key
+    g.__pascalCollabBus = next
+    presenceTick(1100 + IDLE_MAX_SILENCE_MS) // rebinds and publishes at once
+    expect(next.publishes.length).toBe(1)
+    expect(publishedSeq(next, 0)).toBe(3) // not 1
+
+    // An outage spends no numbers; the bus that returns continues from 3.
+    delete g.__pascalCollabBus
+    presenceTick(2200)
+    presenceTick(2200 + IDLE_MAX_SILENCE_MS + 1) // publish ticks with nowhere to go
+    const back = makeBus()
+    g.__pascalCollabBus = back
+    presenceTick(3000)
+    expect(back.publishes.length).toBe(1)
+    expect(publishedSeq(back, 0)).toBe(4)
+  })
+
+  test('the bus goes away: the transport closes, the registry holds, and the peer is adopted when a bus returns', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    presenceTick(1000) // one publish on the first bus
+    ingestPoseFrame(poseMsg(), 1000)
+    const events: PresenceEvent[] = []
+    const off = onPresenceEvent((e) => events.push(e))
+
+    delete g.__pascalCollabBus
+    presenceTick(1100)
+    expect(netAvailable()).toBe(false)
+    expect(presenceDebug().bound).toBe(false)
+    expect(bus.rosterHandler).toBeNull() // the dead roster subscription is released
+    expect(getRemotes().size).toBe(1) // an outage is not a leave
+    presenceTick(1100 + IDLE_MAX_SILENCE_MS + 1) // a publish tick with nowhere to go
+    expect(bus.publishes.length).toBe(1)
+    expect(presenceDebug().rebinds).toBe(1)
+
+    const next = makeBus()
+    g.__pascalCollabBus = next
+    presenceTick(1700)
+    expect(netBus()).toBe(next)
+    expect(presenceDebug().bound).toBe(true)
+    expect(presenceDebug().rebinds).toBe(2)
+    expect(next.rosterHandler).not.toBeNull()
+    // The peer's stream picks up where the wire left off: accepted, no re-join.
+    next.handler!(busMsg(gameFrame(), 41, { sentAt: 1700 }))
+    expect(getRemotes().get('session-a')!.lastReceivedAt).toBeGreaterThan(1000)
+    expect(events).toEqual([])
+    // Publishing resumed on the returned bus with the tick that rebound (the
+    // rate gate was clear: the last attempt was the dead-wire one at 1601).
+    expect(next.publishes.length).toBe(1)
+    presenceTick(1800) // unchanged → idle skip
+    expect(next.publishes.length).toBe(1)
+    off()
+  })
+
+  test('startPresence during an outage ADOPTS the spectating registry and reports false until the bus is back', () => {
+    installBus()
+    expect(startSpectating()).toBe(true)
+    ingestPoseFrame(poseMsg(), 5000)
+    delete g.__pascalCollabBus
+    presenceTick(5100)
+    expect(netAvailable()).toBe(false)
+
+    // JUMP IN while the host is between buses.
+    expect(startPresence(() => localPose())).toBe(false) // honest: not live yet…
+    expect(getRemotes().size).toBe(1) // …but the registry is adopted, not rebuilt
+    stopSpectating() // the editor layer's cleanup on the phase flip: a no-op now — the game owns it
+    expect(getRemotes().size).toBe(1)
+
+    const next = makeBus()
+    g.__pascalCollabBus = next
+    expect(startPresence(() => localPose())).toBe(true) // the retry that lands
+    expect(netBus()).toBe(next)
+    presenceTick(5200)
+    expect(next.publishes.length).toBe(1) // publishing began on the first tick with a bus
+    expect(getRemotes().size).toBe(1)
+  })
+
+  test('stopPresence says goodbye on a bus that returned between ticks', () => {
+    installBus()
+    startPresence(() => localPose())
+    presenceTick(1000)
+    delete g.__pascalCollabBus
+    presenceTick(1100)
+    const next = makeBus()
+    g.__pascalCollabBus = next
+    stopPresence() // no tick has run since the bus came back
+    expect(next.publishes.length).toBe(1)
+    expect(publishedFrame(next, 0).ph).toBe('editor')
+    expect(next.unsubscribed).toBe(1)
+    expect(next.rosterHandler).toBeNull()
+  })
+
+  test('steady state is not a rebind; an inactive adapter never rebinds', () => {
+    expect(rebindTransport()).toBe(false) // nothing running
+    installBus()
+    startPresence(() => localPose())
+    for (let t = 1000; t < 3000; t += TICK_MS) presenceTick(t)
+    expect(rebindTransport()).toBe(false)
+    expect(presenceDebug().rebinds).toBe(0)
+    expect(presenceDebug().swaps).toBe(0)
+  })
+
+  test('a stale transport left by an earlier session is moved onto the installed bus at start', () => {
+    // The transport is opened (by us, in a previous life) on bus X…
+    const stale = installBus()
+    startPresence(() => localPose())
+    stopSpectating() // not the owner — a no-op that proves nothing leaks
+    // …then the host installs Y while the adapter is down but net is not
+    // restarted through presence: startNet would idle on X.
+    stopPresence()
+    expect(netBus()).toBeNull()
+    g.__pascalCollabBus = stale // X back so startNet has something to bind to
+    startSpectating()
+    const fresh = makeBus()
+    g.__pascalCollabBus = fresh
+    // The tick follows it, as always; but a game start finding net on X must too.
+    expect(startPresence(() => localPose())).toBe(true)
+    expect(netBus()).toBe(fresh)
+    expect(fresh.rosterHandler).not.toBeNull()
+  })
+})
+
+describe('presenceDebug — roster truth fields', () => {
+  test('name is the label rule; nick, rosterName, lastSeenMs and rosterMissingMs ride along', () => {
+    const bus = installBus()
+    startPresence(() => localPose())
+    const t0 = Date.now()
+    ingestPoseFrame(poseMsg({ data: gameFrame({ nm: 'Zed' }) }), t0)
+    let entry = presenceDebug().remotes[0]!
+    expect(entry.name).toBe('Zed') // what the tag, the toasts and the pill print
+    expect(entry.nick).toBe('Zed')
+    expect(entry.rosterName).toBe('Alice')
+    expect(entry.lastSeenMs).toBe(t0)
+    expect(entry.ageMs).toBe(Date.now() - t0)
+    expect(entry.rosterMissingMs).toBe(0)
+    // Without a nick the label falls back to the roster name.
+    ingestPoseFrame(poseMsg({ sentAt: 1100 }), t0 + 84)
+    entry = presenceDebug().remotes[0]!
+    expect(entry.name).toBe('Alice')
+    expect(entry.nick).toBe('')
+    expect(entry.lastSeenMs).toBe(t0 + 84)
+    // A roster drop shows as a running rosterMissingMs.
+    reconcileRoster([bus.participants[0]!], Date.now() - 300)
+    expect(presenceDebug().remotes[0]!.rosterMissingMs).toBeGreaterThanOrEqual(300)
+    const dump = presenceDebug()
+    expect(dump.bound).toBe(true)
+    expect(dump.swaps).toBe(0)
+    expect(dump.rebinds).toBe(0)
+    expect(dump.rosterGraceMs).toBe(ROSTER_GRACE_MS)
   })
 })

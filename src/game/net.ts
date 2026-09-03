@@ -269,7 +269,14 @@ type NetState = {
   bus: CollabBus | null
   unsubscribe: (() => void) | null
   kinds: Map<BootsFrameKind, KindEntry>
-  /** Outbound per-kind counters. */
+  /** Outbound per-kind counters — PAGE-monotonic, on purpose. They survive
+   * stopNet/startNet/resyncNet: every receiver keys its ordered tracker by
+   * `sessionId|kind`, and the host keeps OUR sessionId across a channel
+   * restart (use-project-awareness recreates the bus from the same
+   * input.sessionId on a CLOSED channel), so a counter that restarted at 1 on
+   * the new bus would be refused by every peer as a rewind until their
+   * staleness sweep despawned us — a leave/join toast for a network blip.
+   * Only resetNetIdentity (test-only) clears them. */
   outSeq: Map<BootsFrameKind, number>
   /** Inbound newest-accepted seq, keyed `sessionId|kind` (insertion-ordered
    * so recycling the oldest is a Map.keys() step). */
@@ -631,8 +638,7 @@ export function startNet(): boolean {
   if (state.active) return true
   state.active = true
   state.bus = bus
-  state.outSeq.clear()
-  state.inSeq.clear()
+  state.inSeq.clear() // inbound trackers only — outSeq is page-monotonic (NetState)
   state.published = 0
   state.received = 0
   state.dropped = 0
@@ -641,14 +647,17 @@ export function startNet(): boolean {
 }
 
 /** Close the transport. Registered kinds/handlers survive (they belong to
- * their modules); only the wire and the sequence state are torn down. */
+ * their modules); only the wire and the INBOUND sequence state are torn down.
+ * The outbound counters stay: the next session on this page keeps numbering
+ * from the high mark, so a peer who never heard our goodbye — or who sees the
+ * same sessionId come back after a host channel restart — accepts our first
+ * frame instead of dropping it as a rewind. */
 export function stopNet(): void {
   if (!state.active) return
   state.unsubscribe?.()
   state.unsubscribe = null
   state.active = false
   state.bus = null
-  state.outSeq.clear()
   state.inSeq.clear()
 }
 
@@ -684,6 +693,7 @@ export function resyncNet(): boolean {
   if (installed === state.bus) return false
   // startNet zeroes the traffic counters; a rebind is not a fresh session, so
   // the history carries across or a swap would erase the evidence of itself.
+  // (The outbound seq counters never reset at all — see NetState.outSeq.)
   const carried = { published: state.published, received: state.received, dropped: state.dropped }
   stopNet()
   // A bus that is simply gone (collab turned off, editor teardown) leaves us
@@ -727,9 +737,11 @@ export function resetNetKinds(): void {
   registerBuiltinKinds()
 }
 
-/** Test-only: forget the swap history. `swaps` deliberately outlives stopNet —
- * it is the page's history, not the session's — so a suite that exercises
- * re-keys has to clear it explicitly. */
+/** Test-only: forget the page's history — the swap count AND the outbound
+ * sequence counters. Both deliberately outlive stopNet (they are the page's,
+ * not the session's), so a suite that exercises re-keys or reads envelope
+ * seqs has to clear them explicitly. */
 export function resetNetIdentity(): void {
   state.swaps = 0
+  state.outSeq.clear()
 }
