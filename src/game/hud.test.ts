@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   builderKeybarText,
+  CHIP_NAME_CAP,
   hotbarModel,
   hotbarSignature,
   Hud,
@@ -232,8 +233,58 @@ describe('co-presence chip + toasts', () => {
     expect(() => hud.presenceChip(2)).not.toThrow()
     expect(() => hud.presenceChip(2)).not.toThrow() // change-gated repeat
     expect(() => hud.presenceChip(0)).not.toThrow()
+    expect(() => hud.presenceChip(2, ['Alice', 'Bob'])).not.toThrow()
     expect(() => hud.presenceToast('Alice joined')).not.toThrow()
     expect(() => hud.unmount()).not.toThrow()
+  })
+})
+
+/**
+ * In-game ROSTER chip (see-each-other, 2026-09-02): with names the chip lists
+ * who is in — the same label rule the spectator pill and the toasts use — and
+ * past CHIP_NAME_CAP the rest is a "+N". The count-only copy is untouched
+ * (remote-players.tsx still drives that on roster edges).
+ */
+describe('roster chip with names', () => {
+  test('count-only copy is unchanged', () => {
+    expect(presenceChipText(1, undefined)).toBe('1 builder here')
+    expect(presenceChipText(2, [])).toBe('2 builders here')
+  })
+
+  test('one, a few, and the cap', () => {
+    expect(CHIP_NAME_CAP).toBe(4)
+    expect(presenceChipText(1, ['Alice'])).toBe('1 player: Alice')
+    expect(presenceChipText(3, ['Alice', 'Bob', 'Carol'])).toBe('3 players: Alice, Bob, Carol')
+    expect(presenceChipText(4, ['A', 'B', 'C', 'D'])).toBe('4 players: A, B, C, D')
+    expect(presenceChipText(6, ['A', 'B', 'C', 'D', 'E', 'F'])).toBe('6 players: A, B, C, D +2')
+  })
+
+  test('the count is the truth when names lag behind it', () => {
+    // A roster edge the names caller has not reported yet: the count says 3,
+    // the names say 2 → the missing one is a "+1", never a lie of omission.
+    expect(presenceChipText(3, ['Alice', 'Bob'])).toBe('3 players: Alice, Bob +1')
+    expect(presenceChipText(0, ['Ghost'])).toBeNull()
+  })
+
+  test('Hud merge rule: a count-only call never downgrades a named chip at the same count', () => {
+    // Drive the gate through a stub element: the class only touches
+    // textContent + style.opacity.
+    const hud = new Hud()
+    const el = { textContent: '', style: { opacity: '0' } }
+    ;(hud as unknown as { presenceChipEl: unknown }).presenceChipEl = el
+    hud.presenceChip(1, ['Alice'])
+    expect(el.textContent).toBe('1 player: Alice')
+    hud.presenceChip(1) // remote-players' count-only edge, same count
+    expect(el.textContent).toBe('1 player: Alice')
+    hud.presenceChip(2) // an edge the names caller has not reported yet
+    expect(el.textContent).toBe('2 builders here')
+    hud.presenceChip(2, ['Alice', 'Bob'])
+    expect(el.textContent).toBe('2 players: Alice, Bob')
+    hud.presenceChip(0)
+    expect(el.textContent).toBe('')
+    expect(el.style.opacity).toBe('0')
+    hud.presenceChip(1) // names were forgotten at 0
+    expect(el.textContent).toBe('1 builder here')
   })
 })
 

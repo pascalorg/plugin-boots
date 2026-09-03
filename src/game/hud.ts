@@ -75,8 +75,8 @@ import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
  *   subscription, change-gated on hotbarSignature(hotbarModel(state)) so
  *   per-render calls are free while reality holds. The WHOLE BAR brightens
  *   to HOTBAR_BRIGHT_OPACITY on a weapon switch, then eases back to the
- *   discreet HOTBAR_IDLE_OPACITY after HOTBAR_BRIGHT_MS (the CS-style
- *   flash married to the Minecraft-style persistence). hotbarModel /
+ *   discreet HOTBAR_IDLE_OPACITY after HOTBAR_BRIGHT_MS (the shooter-style
+ *   flash married to the sandbox-builder-style persistence). hotbarModel /
  *   hotbarSignature are the pure, pinnable halves.
  * - hint(id, text) — contextual micro-hints (owner: "it needs to be
  *   discreet"): a tiny low-contrast line just above the keybar, fade-in
@@ -97,9 +97,10 @@ import { barPercent, LOADING_CAP_MS, shouldWriteBar } from './loading'
  * - waveCleared() — one-shot "WAVE CLEARED" center banner (fade in, hold
  *   ~1.8s, fade out). Driven by enemies.tsx when the last live bot of a
  *   wave dies; feature-detected there, so integration order can't crash.
- * - presenceChip(count) — co-presence "N builders here" chip, top-left,
- *   muted, change-gated, hidden at 0 (remote-players.tsx drives it on
- *   roster edges). presenceToast(text) — one queued muted join/leave line
+ * - presenceChip(count, names?) — co-presence chip, top-left, muted,
+ *   change-gated, hidden at 0: "N builders here" count-only (remote-players.tsx
+ *   drives it on roster edges) or the roster "2 players: Alice, Bob" when the
+ *   presence effect hands it names. presenceToast(text) — one queued muted join/leave line
  *   under it; unlike hint() there is NO once-gate (peers come and go).
  * - loadingProgress(p, pending?) — the entry veil's REAL progress feed
  *   (game-root's LoadingDriver, weights in loading.ts). The veil mounts
@@ -260,14 +261,26 @@ const HOTBAR_IDLE_OPACITY = '0.4'
 const HOTBAR_BRIGHT_OPACITY = '0.9'
 const HOTBAR_BRIGHT_MS = 2500
 
+/** Names spelled out in the roster chip before the rest becomes "+N". */
+export const CHIP_NAME_CAP = 4
+
 /**
  * Co-presence chip text — pure so the copy + pluralization are pinnable
  * headless. null = no chip (solo). The count is REMOTE players only (the
  * local player is not a ghost to themselves).
+ *
+ * With `names` (the in-game roster, see-each-other 2026-09-02) the chip is a
+ * ROSTER: '1 player: Alice', '3 players: Alice, Bob, Carol', and past
+ * CHIP_NAME_CAP '6 players: A, B, C, D +2'. Without names the count-only copy
+ * is unchanged ('1 builder here' / 'N builders here').
  */
-export function presenceChipText(count: number): string | null {
+export function presenceChipText(count: number, names?: readonly string[]): string | null {
   if (count <= 0) return null
-  return count === 1 ? '1 builder here' : `${count} builders here`
+  if (!names || names.length === 0) return count === 1 ? '1 builder here' : `${count} builders here`
+  const shown = names.slice(0, CHIP_NAME_CAP)
+  const more = count - shown.length
+  const list = more > 0 ? `${shown.join(', ')} +${more}` : shown.join(', ')
+  return `${count === 1 ? '1 player' : `${count} players`}: ${list}`
 }
 
 /** Presence toast pacing — join/leave lines, muted, short-lived. */
@@ -451,10 +464,12 @@ export class Hud {
    * drops its loading input gate here. Cleared on unmount, never called by
    * teardown (an Esc mid-load exits without a reveal). */
   onReveal: (() => void) | null = null
-  /** Co-presence chip ("N builders here") — see presenceChip(). */
+  /** Co-presence chip ("N builders here" / "2 players: Alice, Bob") — see presenceChip(). */
   private presenceChipEl: HTMLDivElement | null = null
-  /** Last presenceChip() count written (change gate; -1 = never). */
-  private presenceCount = -1
+  /** Last presenceChip() TEXT rendered (change gate, the voiceChip idiom). */
+  private presenceChipText = ''
+  /** Last roster names a names-caller handed us; null = count-only chip. */
+  private presenceNames: readonly string[] | null = null
   /** Presence toast line + its queue (join/leave events can burst). */
   private presenceToastEl: HTMLDivElement | null = null
   private presenceToastQueue: string[] = []
@@ -1343,18 +1358,29 @@ export class Hud {
   }
 
   /**
-   * Co-presence chip: "N builders here" while remote players share the
-   * session's project (remote-players.tsx drives it on roster edges, and
-   * defensively per frame — the change gate makes repeats free). 0 hides
-   * the chip. Muted styling on purpose: ambient info, not combat chrome.
+   * Co-presence chip: "N builders here" — or, with names, the ROSTER
+   * "2 players: Alice, Bob" — while remote players share the session's
+   * project. Two callers feed it: remote-players.tsx drives the COUNT on
+   * roster edges (and defensively per frame), game-root's presence effect
+   * drives count + NAMES on join/leave and at bind. Merge rule: a names call
+   * enriches; a count-only call refreshes the count and never downgrades a
+   * named chip while its count still agrees with the names held (a
+   * disagreeing count means an edge the names caller has not reported yet, so
+   * the chip falls back to count-only until it does). Gated on the rendered
+   * TEXT (the voiceChip idiom), so repeats are free. 0 hides the chip and
+   * forgets the names. Muted styling on purpose: ambient info, not combat
+   * chrome.
    */
-  presenceChip(count: number): void {
-    if (count === this.presenceCount) return
-    this.presenceCount = count
+  presenceChip(count: number, names?: readonly string[]): void {
+    if (count <= 0) this.presenceNames = null
+    else if (names) this.presenceNames = names
+    else if (this.presenceNames && this.presenceNames.length !== count) this.presenceNames = null
+    const text = presenceChipText(count, this.presenceNames ?? undefined) ?? ''
+    if (text === this.presenceChipText) return
+    this.presenceChipText = text
     const el = this.presenceChipEl
     if (!el) return
-    const text = presenceChipText(count)
-    el.textContent = text ?? ''
+    el.textContent = text
     el.style.opacity = text ? '1' : '0'
   }
 
@@ -1479,7 +1505,8 @@ export class Hud {
     this.presenceChipEl = null
     this.voiceChipEl = null
     this.voiceChipText = ''
-    this.presenceCount = -1
+    this.presenceChipText = ''
+    this.presenceNames = null
     // Veil teardown — Esc during loading exits cleanly: the veil rides the
     // root removal below; onReveal is deliberately NOT fired (the session
     // is over, there is nothing to un-gate).
