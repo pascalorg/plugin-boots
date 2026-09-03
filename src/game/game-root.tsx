@@ -70,7 +70,7 @@ import { startPvpSync, stopPvpSync } from './pvp-damage'
 import { localPaletteIndex, RemotePlayers } from './remote-players'
 import { livePlayerNames } from './roster-names'
 import { exitGame, getSession, hideForGame, getSessionSerial } from './session'
-import { sharedBuildDebug } from './shared-build'
+import { reconcileSharedPieces, sharedBuildDebug } from './shared-build'
 import { ShellLayer, shellCensus } from './shell-layer'
 import { aimDirection, fire } from './shooting'
 import { pendingToneCount, toneAuditReport } from './skin-tone'
@@ -87,7 +87,7 @@ import {
   voiceDebug,
   voiceInternals,
 } from './voice'
-import { VoiceControls } from './voice-controls'
+import { type VoiceQa, VoiceControls } from './voice-controls'
 import { dormantPrimeQueueSize, VoxelWalls } from './voxel-walls'
 import { WEAPONS } from './weapons'
 import {
@@ -108,6 +108,36 @@ import {
  * In-canvas game orchestrator, mounted through the plugin's `def.system`
  * slot (so it exists whenever Boots is installed in the scene) and inert
  * until the panel flips the store into game phase.
+ *
+ * TRANSPORT BINDING IS RETRIED, AND A LATE BIND IS A REAL CASE. The host
+ * installs the collab bus asynchronously (after realtime auth), so ActiveGame's
+ * co-presence effect binds through untilNet (net-retry.ts): one pass when the
+ * bus is already there, otherwise a 1 s retry until it lands. Everything on
+ * the transport starts at THAT moment — presence, world-sync, PvP, voice — and
+ * nothing before it is buffered: the session runs as a plain solo game until
+ * the bind, then joins the room. What that means in practice:
+ *
+ *  - Poses, shots and damage dealt before the bind were never on a wire and
+ *    are simply gone; the room learns our current pose on the first 12 Hz
+ *    tick after the bind.
+ *  - Pieces PLACED before the bind are in the boots store but not in the
+ *    shared world. The pieces lane journals by diffing the store against its
+ *    records (shared-build reconcileSharedPieces) and PlacedPieces runs that
+ *    diff only on a store change — so a pre-bind wall used to stay off the
+ *    wire until the player's NEXT placement or undo. The bind now runs the
+ *    diff itself once world-sync is attached (2026-09-02), and the minted
+ *    records go out as an ordinary delta on the next 66 ms tick. Items,
+ *    doors/windows and paint strokes publish at placement time and have no
+ *    such diff: made before the bind, they stay local to this client (they
+ *    still render, collide and save).
+ *  - The room's own state arrives the same way on every bind, late or not:
+ *    startWorldSync asks for a snapshot (requestState) as its last step and
+ *    the peers answer within a few hundred ms; the 15 s heal covers any loss.
+ *  - The grid stamp is a RETAINED fact (shared-build publishGridStamp) that
+ *    attachBuildSync re-publishes, so a late bind never speaks a stale lattice.
+ *  - The mic follows the same rule: the veil (mic-gate.ts) decided it at the
+ *    click, when there may have been no bus yet — so the bind re-applies the
+ *    no-prompt half of that decision (see the backstop in the effect).
  */
 
 /**
@@ -796,7 +826,16 @@ function ActiveGame() {
         // idempotent, and it refuses to start if the host cannot name us with an id
         // we could author records under. exitGame owns the stop, before
         // stopPresence closes the transport.
-        startWorldSync()
+        //
+        // …and once attached, publish what was BUILT BEFORE THE BIND (see the
+        // file docblock): the pieces lane journals by diffing the store against
+        // its records, and PlacedPieces runs that diff only on a store change,
+        // so a wall placed in the solo seconds before a late bind stayed off
+        // the wire until the player's next placement or undo. Idempotent (a
+        // no-op with nothing placed; the child's own re-runs are guarded), and
+        // the next 66 ms tick carries the minted records as an ordinary delta.
+        // startWorldSync itself asks the room for ITS snapshot on every bind.
+        if (startWorldSync()) reconcileSharedPieces()
         // PvP hit damage rides the same transport (a per-victim counter). Game
         // phase only; inert without a bus or with an empty roster.
         startPvpSync()
@@ -807,12 +846,22 @@ function ActiveGame() {
         startVoice({
           getLocalPosition: () => [playerRig.position.x, playerRig.position.y, playerRig.position.z],
         })
-        // Turn the mic on ONLY if this browser already granted it. Prompting here
-        // would put a permission dialog in front of someone who just dropped into a
-        // firefight, and a dialog answered by reflex is denied for good; the HUD
-        // offers the key instead. Second session onward this is seamless. Armed
-        // only once a transport exists: with no bus there is nobody to talk to,
-        // and a stream acquired while voice is inactive would outlive stopVoice.
+        // MIC BACKSTOP — deliberately KEPT after the veil took over the mic
+        // (mic-gate.ts, 2026-09-02; the helper is marked deprecated for that
+        // reason). The veil decides the mic AT THE CLICK, and three entries
+        // reach this point without that decision having been able to say yes:
+        // the sidebar's "Jump in" (panel.tsx) and the spectator pill
+        // (spectator.tsx) call enterGame() directly with no veil, and a veil
+        // click BEFORE the bus landed planned 'enter-silent' (mic-gate's
+        // voicePossible() needs a bus) — exactly the late bind this retry
+        // exists for. For all three: turn the mic on now, WITHOUT a prompt, iff
+        // the browser already granted it and the player's MIC toggle is on.
+        // Idempotent against a mic the veil already brought up (enableMic
+        // returns the live track), a no-op with MIC OFF. A prompt here would
+        // land in a firefight and be denied by reflex, so asking stays on the M
+        // key. Armed only once a transport exists: a stream acquired while
+        // voice is inactive would outlive stopVoice. Delete this once every
+        // entry runs through beginEntry AND the plan re-runs on a late bind.
         void enableMicIfAlreadyPermitted()
         driveRosterChip()
       },
@@ -1109,6 +1158,13 @@ function ActiveGame() {
       // finished; this is the only thing that can say why a finished handshake
       // still has somebody hearing nothing.
       voiceInternals: () => voiceInternals(),
+      // The voice CONTROLS' own QA surface (voice-controls.tsx installs it as
+      // globalThis.__bootsVoice while mounted: pill text, getStats sampling,
+      // the debug dump, same-device local echo). Re-exported so a harness has
+      // ONE handle; read live rather than captured — the child mounts and
+      // unmounts it, and a Fast Refresh remount swaps the object.
+      voiceQa: () =>
+        ((globalThis as Record<string, unknown>).__bootsVoice as VoiceQa | undefined) ?? null,
       // Host post-tuning census (host-post.ts, perf fix 5): is the shadow
       // throttle + outline guard live, how many lights are frozen, how
       // often the outline guard had to re-clear. Plain data.

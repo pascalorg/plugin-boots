@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { GAME_KEYS, takeAction } from './input'
+import { GAME_KEYS, MIC_KEY, takeAction } from './input'
+import { MIC_KEY as VOICE_MIC_KEY } from './voice-policy'
 
 /**
  * One-shot action claiming — the shared contract behind E (interact.tsx) and M
@@ -78,5 +79,21 @@ describe('takeAction', () => {
     // the host editor and runs a tool mid-session.
     expect(GAME_KEYS.has('KeyE')).toBe(true)
     expect(GAME_KEYS.has('KeyM')).toBe(true)
+  })
+})
+
+/**
+ * MIC_KEY lives in input.ts (the set that claims the code) and voice-policy.ts
+ * carries a copy for the labels the mic pill and the hints print. The two are
+ * pinned equal here: a rebind on one side only would either print a key that
+ * does nothing or leave the real key unclaimed — and an unclaimed code reaches
+ * the host editor and runs a tool mid-session.
+ */
+
+describe('MIC_KEY', () => {
+  test('is the physical M, claimed by the game, and the code voice-policy labels', () => {
+    expect(MIC_KEY).toBe('KeyM')
+    expect(GAME_KEYS.has(MIC_KEY)).toBe(true)
+    expect(VOICE_MIC_KEY).toBe(MIC_KEY)
   })
 })

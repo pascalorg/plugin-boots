@@ -16,6 +16,13 @@ export type GameInputState = {
   actions: string[]
 }
 
+/** The mic toggle's physical code. voice-controls.tsx claims the tap with
+ * takeAction, and voice-policy.ts carries its own copy for the labels the pill
+ * and the hints print — input-actions.test.ts pins that the two agree, so a
+ * rebind on one side only can never print a key that does nothing (or leave
+ * the real key unclaimed for the host editor to run a tool on). */
+export const MIC_KEY = 'KeyM'
+
 /** Every physical code the game claims. Exported so touch.ts's button table
  * can be proved to press codes that actually exist (a typo'd code is a button
  * that silently does nothing). */
@@ -39,10 +46,11 @@ export const GAME_KEYS = new Set([
   'KeyV',
   'KeyU',
   'KeyI',
-  // Mic toggle (voice.ts). Claimed here even though voice may be unavailable:
-  // an unclaimed code reaches the host editor, and a keystroke that runs an
-  // editor tool mid-session is the one thing this plugin promises never happens.
-  'KeyM',
+  // Mic toggle (voice-controls.tsx). Claimed here even though voice may be
+  // unavailable: an unclaimed code reaches the host editor, and a keystroke
+  // that runs an editor tool mid-session is the one thing this plugin promises
+  // never happens.
+  MIC_KEY,
   'Digit1',
   'Digit2',
   'Digit3',
