@@ -6,6 +6,7 @@ import {
   aimWallPoint,
   aimedPlacedItemId,
   anchorOnFloor,
+  anchorOnSupport,
   apertureFits,
   apertureRect,
   configureItemModelLoader,
@@ -111,6 +112,45 @@ describe('anchorOnFloor', () => {
     const out = anchor()
     expect(anchorOnFloor(out, 0, 1.58, 0, 0, -Math.PI / 2 + 0.05, 0)).toBe(false)
     expect(anchorOnFloor(out, 0, 1.58, 0, 0, Math.PI / 2 - 0.05, 0)).toBe(false)
+  })
+})
+
+describe('anchorOnSupport: editor-like surface placement', () => {
+  const collider = (
+    nodeId: string,
+    nodeType: string,
+    min: [number, number, number],
+    max: [number, number, number],
+  ) =>
+    ({
+      nodeId,
+      nodeType,
+      worldBox: new Box3(new Vector3(...min), new Vector3(...max)),
+    }) as never
+
+  test('aiming down at a counter anchors on its top instead of the floor behind it', () => {
+    const out = anchor()
+    const counter = collider('counter-1', 'counter', [-1, 0, -2.5], [1, 0.9, -1])
+    expect(anchorOnSupport(out, [counter], 0, 1.58, 0, 0, -0.35)).toBe(true)
+    expect(out.y).toBeCloseTo(0.9)
+    expect(out.z).toBeGreaterThanOrEqual(-2.5)
+    expect(out.z).toBeLessThanOrEqual(-1)
+  })
+
+  test('open air and upward gaze keep the floor fallback in charge', () => {
+    const out = anchor()
+    expect(anchorOnSupport(out, [], 0, 1.58, 0, 0, -0.35)).toBe(false)
+    expect(anchorOnSupport(out, [], 0, 1.58, 0, 0, 0.2)).toBe(false)
+  })
+
+  test('disabled and terrain AABBs are never mistaken for tabletop surfaces', () => {
+    const out = anchor()
+    const site = collider('site-1', 'site', [-20, -2, -20], [20, 5, 20])
+    const disabled = collider('counter-1', 'counter', [-1, 0, -2.5], [1, 0.9, -1]) as {
+      disabled?: boolean
+    }
+    disabled.disabled = true
+    expect(anchorOnSupport(out, [site as never, disabled as never], 0, 1.58, 0, 0, -0.35)).toBe(false)
   })
 })
 

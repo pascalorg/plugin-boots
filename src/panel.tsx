@@ -886,7 +886,7 @@ export default function BootsPanel() {
           Controls
         </p>
         <p>WASD move · Space jump · Shift walk</p>
-        <p>Mouse shoot · E gear up · E enters/exits the Cybertruck · WASD drives</p>
+        <p>Mouse shoot · E gear up · E enters/exits the Cybertruck · WASD drives · Tab changes camera</p>
         <p>
           Peaceful for as long as you like — grab guns, build, nothing comes. Face the breaker on
           the depot's end wall from outside and press E: the countdown starts and the machines come
@@ -900,8 +900,8 @@ export default function BootsPanel() {
           them, U undo, G grenade.
         </p>
         <p>
-          I opens the item catalog — place couches and appliances in your fort; the openings tab
-          snaps doors and windows onto real walls.
+          I opens the item catalog — aim at floors, counters, shelves, or furniture to place with
+          smart surface snapping; the openings tab snaps doors and windows onto real walls.
         </p>
         <p>
           F edits a placed piece — 3×3 cells on walls and floors (pocket the middle for a window),

@@ -44,6 +44,7 @@ export const convoyPose: ConvoyPose = {
 /** The seat position Player follows while this browser is driving. */
 export const vehicleRig = {
   driving: false,
+  view: 'first' as 'first' | 'third',
   seatX: 0,
   seatY: 0,
   seatZ: 0,
@@ -61,6 +62,7 @@ export function resetConvoyPose(x: number, y: number, z: number, yaw: number): v
   convoyPose.remoteDriver = null
   convoyPose.remoteAt = 0
   vehicleRig.driving = false
+  vehicleRig.view = 'first'
   vehicleRig.speed = 0
 }
 
@@ -70,6 +72,7 @@ export function clearConvoyPose(): void {
   convoyPose.remoteDriver = null
   convoyPose.remoteAt = 0
   vehicleRig.driving = false
+  vehicleRig.view = 'first'
   vehicleRig.speed = 0
 }
 

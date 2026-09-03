@@ -118,7 +118,7 @@ export type PlacedItem = {
   /** The catalog asset payload, verbatim — Keep hands it to the host's
    * item schema untouched (item-keep.ts). */
   asset: CatalogEntry
-  /** Bottom-center anchor on the floor (world == level coords). */
+  /** Bottom-center anchor on its supporting floor/counter/object surface. */
   position: [number, number, number]
   /** Yaw around Y, snapped to 90°. */
   yaw: number
@@ -369,6 +369,54 @@ export function anchorOnFloor(
   out.z = eyeZ + dz * inv
   out.valid = true
   return true
+}
+
+/**
+ * Prefer the horizontal surface the crosshair is actually pointing at. The
+ * old furniture lane projected every aim all the way to the feet plane, so
+ * aiming at a microwave-sized patch of countertop put the XZ anchor on the
+ * floor *behind* the counter. This top-plane pass makes counters, shelves,
+ * placed furniture and build voxels behave like editor surfaces; the floor
+ * projection remains the fallback when the ray sees open air or terrain.
+ *
+ * AABB tops are deliberate here. They are the same conservative surfaces the
+ * landing/collision systems use, and unlike triangle normals they keep GLB,
+ * primitive and voxel-backed catalog items on one predictable snap lane.
+ */
+export function anchorOnSupport(
+  out: ItemAnchor,
+  colliders: readonly ColliderEntry[],
+  eyeX: number,
+  eyeY: number,
+  eyeZ: number,
+  yaw: number,
+  pitch: number,
+  reach = ITEM_REACH,
+): boolean {
+  const cp = Math.cos(pitch)
+  if (cp < MIN_HORIZONTAL) return false
+  const dx = -Math.sin(yaw) * cp
+  const dy = Math.sin(pitch)
+  const dz = -Math.cos(yaw) * cp
+  if (dy >= -0.02) return false
+  const horizontalRate = Math.hypot(dx, dz)
+  let nearest = Number.POSITIVE_INFINITY
+  for (const collider of colliders) {
+    if (collider.disabled || collider.walkOnly || collider.nodeType === 'site') continue
+    const box = collider.worldBox
+    const t = (box.max.y - eyeY) / dy
+    if (t <= 0.05 || t >= nearest || t * horizontalRate > reach) continue
+    const x = eyeX + dx * t
+    const z = eyeZ + dz * t
+    if (x < box.min.x - 0.02 || x > box.max.x + 0.02) continue
+    if (z < box.min.z - 0.02 || z > box.max.z + 0.02) continue
+    nearest = t
+    out.x = x
+    out.y = box.max.y
+    out.z = z
+    out.valid = true
+  }
+  return Number.isFinite(nearest)
 }
 
 const HALF_PI = Math.PI / 2
@@ -1212,7 +1260,17 @@ export function GameItems({ world }: { world: GameWorld }) {
    * grid and is documented "never per frame"; re-probe only when the
    * quantized (1 cm) anchor, floor plane or collider census moves, with a
    * 10-frame fallback so destruction under a frozen aim still settles. */
-  const probeCache = useRef({ qx: NaN, qz: NaN, qf: NaN, colliders: -1, frame: -1e9, y: 0 })
+  const probeCache = useRef({
+    qx: NaN,
+    qz: NaN,
+    qf: NaN,
+    qyaw: NaN,
+    surface: false,
+    colliders: -1,
+    frame: -1e9,
+    y: 0,
+    supported: true,
+  })
   /** Session-lifetime wall frames (host walls never move during play);
    * built lazily on the first aperture aim, dropped on world swap. */
   const wallFramesRef = useRef<Map<string, WallFrame> | null>(null)
@@ -1584,18 +1642,30 @@ export function GameItems({ world }: { world: GameWorld }) {
     }
     if (apGhost) apGhost.visible = false
 
-    // Anchor on the player's floor plane, then snap onto whatever the
-    // landing probe finds under the aim point (slabs, placed floors…).
+    // Prefer the horizontal surface under the crosshair (countertops,
+    // shelves, placed furniture and build voxels), then fall back to the
+    // player's floor plane when the aim sees open air or terrain.
     const floorY = playerRig.position.y - EYE_HEIGHT
-    const found = anchorOnFloor(
+    const supportAimed = anchorOnSupport(
       _anchor,
+      world.colliders,
       playerRig.position.x,
       playerRig.position.y,
       playerRig.position.z,
       playerRig.yaw,
       playerRig.pitch,
-      floorY,
     )
+    const found =
+      supportAimed ||
+      anchorOnFloor(
+        _anchor,
+        playerRig.position.x,
+        playerRig.position.y,
+        playerRig.position.z,
+        playerRig.yaw,
+        playerRig.pitch,
+        floorY,
+      )
     if (!found) {
       ghost.visible = false
       session.hud.ghostStatus?.(null, 'items')
@@ -1605,23 +1675,54 @@ export function GameItems({ world }: { world: GameWorld }) {
     const probe = probeCache.current
     // Probe origin: over the player's feet, and over the ground at the anchor
     // when the aim points uphill (see ITEM_PROBE_MAX_RISE).
-    const probeFrom = itemProbeFromY(floorY, _anchor.x, _anchor.z)
+    const probeFrom = supportAimed
+      ? Math.max(itemProbeFromY(floorY, _anchor.x, _anchor.z), _anchor.y + 0.08)
+      : itemProbeFromY(floorY, _anchor.x, _anchor.z)
     const qx = Math.round(_anchor.x * 100)
     const qz = Math.round(_anchor.z * 100)
     const qf = Math.round(probeFrom * 100)
+    // A moved item keeps its old orientation until R is pressed. New catalog
+    // items continue to face the player on first appearance.
+    const yaw = state.moving
+      ? ghostYaw(state.moving.yaw - Math.PI, yawTurns.current)
+      : ghostYaw(playerRig.yaw, yawTurns.current)
+    const qyaw = Math.round(yaw / HALF_PI)
     if (
       probe.qx !== qx ||
       probe.qz !== qz ||
       probe.qf !== qf ||
+      probe.qyaw !== qyaw ||
+      probe.surface !== supportAimed ||
       probe.colliders !== world.colliders.length ||
       frame.current - probe.frame >= 10
     ) {
       probe.qx = qx
       probe.qz = qz
       probe.qf = qf
+      probe.qyaw = qyaw
+      probe.surface = supportAimed
       probe.colliders = world.colliders.length
       probe.frame = frame.current
       probe.y = probeLandingY(world, _anchor.x, probeFrom, _anchor.z)
+      probe.supported = true
+      // Elevated placements need a real patch of support, not one lucky
+      // center pixel. Probe just inside the rotated footprint's four corners;
+      // every corner must meet the same top within 6 cm. Ground placement
+      // keeps its slope-friendly center probe unchanged.
+      if (supportAimed && probe.y > floorY + 0.06) {
+        const fp = armedFootprint.current
+        const swapped = Math.round(yaw / HALF_PI) & 1
+        const halfW = (swapped ? fp[2] : fp[0]) / 2
+        const halfD = (swapped ? fp[0] : fp[2]) / 2
+        const sx = Math.max(0, halfW - Math.min(0.05, halfW * 0.2))
+        const sz = Math.max(0, halfD - Math.min(0.05, halfD * 0.2))
+        for (const ox of [-sx, sx]) {
+          for (const oz of [-sz, sz]) {
+            const corner = probeLandingY(world, _anchor.x + ox, probeFrom, _anchor.z + oz)
+            if (Math.abs(corner - probe.y) > 0.06) probe.supported = false
+          }
+        }
+      }
     }
     const snapped = probe.y
     // Downhill, the probed surface is BELOW the player's own floor plane —
@@ -1631,11 +1732,6 @@ export function GameItems({ world }: { world: GameWorld }) {
     // aiming into a hole in the floor you stand on must not place the item on
     // the ground a storey below.
     const y = itemDropY(_anchor.y, snapped)
-    // A moved item keeps its old orientation until R is pressed. New catalog
-    // items continue to face the player on first appearance.
-    const yaw = state.moving
-      ? ghostYaw(state.moving.yaw - Math.PI, yawTurns.current)
-      : ghostYaw(playerRig.yaw, yawTurns.current)
     ghost.visible = true
     ghost.position.set(_anchor.x, y, _anchor.z)
     ghost.rotation.set(0, yaw, 0)
@@ -1645,6 +1741,7 @@ export function GameItems({ world }: { world: GameWorld }) {
     // The session budget refuses the same way once the cap is hit.
     const blocked =
       ownPlacementCount(state.items) >= MAX_PLACED_ITEMS ||
+      !probe.supported ||
       itemOverlapsPlayer(
         _anchor.x,
         y,

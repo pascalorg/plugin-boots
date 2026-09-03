@@ -5,7 +5,7 @@
  * is the truck's ground-plane center, its nose points down -Z, and +X is right.
  */
 
-export const CYBER_TRUCK_SIZE: readonly [number, number, number] = [2.0, 1.9, 5.7]
+export const CYBER_TRUCK_SIZE: readonly [number, number, number] = [2.24, 1.9, 5.7]
 export const CYBER_TRUCK_WHEELBASE = 3.6
 
 const BODY = '#c8ccd0'
@@ -13,12 +13,14 @@ const GLASS = '#20262b'
 const TYRE = '#141518'
 const TRIM = '#2b2e33'
 const LIGHT = '#ffd27a'
+const TAIL_LIGHT = '#ef3c32'
+const CABIN = '#30363b'
 
 const WHEEL_POSITIONS: ReadonlyArray<readonly [number, number]> = [
-  [-0.82, -CYBER_TRUCK_WHEELBASE / 2],
-  [0.82, -CYBER_TRUCK_WHEELBASE / 2],
-  [-0.82, CYBER_TRUCK_WHEELBASE / 2],
-  [0.82, CYBER_TRUCK_WHEELBASE / 2],
+  [-0.94, -CYBER_TRUCK_WHEELBASE / 2],
+  [0.94, -CYBER_TRUCK_WHEELBASE / 2],
+  [-0.94, CYBER_TRUCK_WHEELBASE / 2],
+  [0.94, CYBER_TRUCK_WHEELBASE / 2],
 ]
 
 const SIDE_WINDOW_POSITIONS: ReadonlyArray<readonly [number, number]> = [
@@ -113,6 +115,48 @@ export function CyberTruckModel() {
         />
       </mesh>
 
+      {/* A visible cabin matters in both chase view and through the glazing:
+          two seats, dash and steering wheel replace the former empty box. */}
+      {[-0.48, 0.48].map((x) => (
+        <group key={`seat:${x}`} position={[x, 1.2, 0.25]}>
+          <mesh position={[0, 0, 0.14]} rotation={[-0.12, 0, 0]}>
+            <boxGeometry args={[0.46, 0.12, 0.48]} />
+            <meshStandardMaterial color={CABIN} roughness={0.82} />
+          </mesh>
+          <mesh position={[0, 0.25, 0.34]} rotation={[-0.12, 0, 0]}>
+            <boxGeometry args={[0.44, 0.52, 0.11]} />
+            <meshStandardMaterial color={CABIN} roughness={0.82} />
+          </mesh>
+        </group>
+      ))}
+      <mesh position={[0, 1.24, -0.48]} rotation={[-0.14, 0, 0]}>
+        <boxGeometry args={[1.58, 0.13, 0.42]} />
+        <meshStandardMaterial color={TRIM} metalness={0.2} roughness={0.7} />
+      </mesh>
+      <mesh position={[-0.5, 1.4, -0.58]} rotation={[-0.2, 0, 0]}>
+        <torusGeometry args={[0.17, 0.026, 8, 18]} />
+        <meshStandardMaterial color="#17191c" roughness={0.85} />
+      </mesh>
+
+      {/* Mirrors, door shut-lines and handles give the broad slab sides
+          scale without adding a texture payload. */}
+      {[-1, 1].map((side) => (
+        <group key={`side-detail:${side}`}>
+          <mesh position={[side * 1.06, 1.47, -0.43]}>
+            <boxGeometry args={[0.16, 0.13, 0.28]} />
+            <meshStandardMaterial color={GLASS} metalness={0.35} roughness={0.28} />
+          </mesh>
+          <mesh position={[side * 0.988, 1.05, 0.25]}>
+            <boxGeometry args={[0.014, 0.48, 1.48]} />
+            <meshStandardMaterial color={TRIM} roughness={0.65} />
+          </mesh>
+          <mesh position={[side * 0.999, 1.22, 0.22]}>
+            <boxGeometry args={[0.018, 0.035, 0.24]} />
+            <meshStandardMaterial color={TRIM} metalness={0.45} roughness={0.45} />
+          </mesh>
+        </group>
+      ))}
+
       {/* Open rear-third pickup bed: dark floor, raised rails, and tailgate. */}
       <mesh position={[0, 1.16, 1.83]}>
         <boxGeometry args={[1.56, 0.08, 1.68]} />
@@ -134,6 +178,12 @@ export function CyberTruckModel() {
         <boxGeometry args={[1.72, 0.055, 0.018]} />
         <meshStandardMaterial color={TRIM} metalness={0.35} roughness={0.5} />
       </mesh>
+      {[-0.7, 0.7].map((x) => (
+        <mesh key={`tail-light:${x}`} position={[x, 1.09, 2.802]}>
+          <boxGeometry args={[0.42, 0.07, 0.018]} />
+          <meshBasicMaterial color={TAIL_LIGHT} toneMapped={false} />
+        </mesh>
+      ))}
       <mesh position={[0, 0.49, 2.75]}>
         <boxGeometry args={[1.94, 0.18, 0.2]} />
         <meshStandardMaterial color={TRIM} metalness={0.35} roughness={0.5} />
@@ -160,6 +210,14 @@ export function CyberTruckModel() {
         <mesh key={`hub:${x}:${z}`} position={[x, 0.42, z]} rotation={[0, 0, Math.PI / 2]}>
           <cylinderGeometry args={[0.19, 0.19, 0.315, 10]} />
           <meshStandardMaterial color={TRIM} metalness={0.55} roughness={0.38} />
+        </mesh>
+      ))}
+      {/* Faceted fender rings keep the stainless body visibly clear of the
+          tyres and make the wheel wells read from a chase camera. */}
+      {WHEEL_POSITIONS.map(([x, z]) => (
+        <mesh key={`fender:${x}:${z}`} position={[Math.sign(x) * 1.005, 0.43, z]} rotation={[0, Math.PI / 2, 0]}>
+          <torusGeometry args={[0.47, 0.035, 6, 16]} />
+          <meshStandardMaterial color={TRIM} metalness={0.35} roughness={0.55} />
         </mesh>
       ))}
     </group>

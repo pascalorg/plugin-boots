@@ -104,6 +104,7 @@ const GAME_FOV = 92
 /** Full aim-down-sights FOV; playerRig.ads lerps GAME_FOV→ADS_FOV. */
 const ADS_FOV = 60
 const MAX_PITCH = Math.PI / 2 - 0.02
+const _vehicleLookAt = new Vector3()
 
 const REGEN_DELAY = 4 // s after last damage before regen kicks in
 const REGEN_RATE = 12 // hp/s
@@ -547,9 +548,29 @@ export function Player({ world }: { world: GameWorld }) {
         if (Math.abs(camera.fov - GAME_FOV) < 0.1) camera.fov = GAME_FOV
         camera.updateProjectionMatrix()
       }
-      camera.position.copy(playerRig.position)
-      camera.rotation.order = 'YXZ'
-      camera.rotation.set(playerRig.pitch, playerRig.yaw, 0)
+      if (vehicleRig.view === 'third') {
+        // Stable chase/orbit view: mouse yaw circles the convoy and pitch
+        // lifts the boom, while the target remains the live cab. Keeping the
+        // true playerRig position in the seat preserves every interaction and
+        // network invariant; only the cosmetic camera moves.
+        const distance = 6.2
+        const lift = 2.6 + Math.sin(playerRig.pitch) * 2.1
+        camera.position.set(
+          playerRig.position.x + Math.sin(playerRig.yaw) * distance,
+          playerRig.position.y + lift,
+          playerRig.position.z + Math.cos(playerRig.yaw) * distance,
+        )
+        _vehicleLookAt.set(
+          playerRig.position.x,
+          playerRig.position.y + 0.25,
+          playerRig.position.z,
+        )
+        camera.lookAt(_vehicleLookAt)
+      } else {
+        camera.position.copy(playerRig.position)
+        camera.rotation.order = 'YXZ'
+        camera.rotation.set(playerRig.pitch, playerRig.yaw, 0)
+      }
       return
     }
 

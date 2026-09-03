@@ -16,6 +16,7 @@ import { useBoots } from '../store'
 import { sfx } from './audio'
 import { CyberTruckModel } from './cyber-truck'
 import { DepotMirror } from './depot-mirror'
+import { damageTarget } from './destruction'
 import { armWaves, disarmWaves, waveState } from './enemies-state'
 import { takeAction } from './input'
 import { clearScatterInRadius } from './nature'
@@ -33,6 +34,7 @@ import {
 } from './net'
 import { playerDebug, playerRig } from './player'
 import { getSession } from './session'
+import { ramTreesAt } from './trees-destruct'
 import {
   clearConvoyPose,
   convoyLocalToWorld,
@@ -339,6 +341,10 @@ export const DRIVER_DOOR_LOCAL: readonly [number, number] = [-5.7, 1.45]
 export const DRIVER_SEAT_LOCAL: readonly [number, number] = [-5.72, 0.45]
 export const DRIVER_EXIT_LOCAL: readonly [number, number] = [-5.7, 1.65]
 export const VEHICLE_ENTER_RANGE = 2.25
+/** Container floor height above the trailer frame. Wheel tops are y=.76, so
+ * this leaves visible suspension/deck clearance instead of drawing tyres
+ * through the cargo box. */
+export const TRAILER_DECK_LIFT = 0.84
 
 const VEHICLE_MAX_FORWARD = 10
 const VEHICLE_MAX_REVERSE = 4
@@ -360,19 +366,40 @@ const DRIVE_SAMPLES: ReadonlyArray<readonly [number, number, number]> = [
 ]
 
 const DRIVE_OVER_TYPES = new Set(['site'])
+const DRIVE_BREAK_TYPES = new Set([
+  'wall',
+  'door',
+  'window',
+  'item',
+  'shelf',
+  'cabinet',
+  'cabinet-module',
+  'counter',
+  'kitchen-unit',
+  'block',
+  'column',
+  'stair',
+  'stair-segment',
+  'fence',
+])
+const _impactBlockers: ColliderEntry[] = []
+const _impactPoint = new Vector3()
+const _impactDirection = new Vector3()
 
 /** Broad, conservative convoy sweep. Ground-like surfaces below axle height
  * are driveable; walls, furniture and other vertical solids block before the
  * rendered truck or trailer can cross them. */
-export function convoyCanOccupy(
+function collectConvoyBlockers(
   colliders: readonly ColliderEntry[],
   x: number,
   y: number,
   z: number,
   yaw: number,
+  out?: ColliderEntry[],
 ): boolean {
   const cos = Math.cos(yaw)
   const sin = Math.sin(yaw)
+  let blocked = false
   for (const collider of colliders) {
     if (collider.disabled || collider.nodeId === DEPOT_NODE_ID) continue
     if (DRIVE_OVER_TYPES.has(collider.nodeType)) continue
@@ -385,10 +412,23 @@ export function convoyCanOccupy(
       const pz = z - lx * sin + lz * cos
       const dx = px < box.min.x ? box.min.x - px : px > box.max.x ? px - box.max.x : 0
       const dz = pz < box.min.z ? box.min.z - pz : pz > box.max.z ? pz - box.max.z : 0
-      if (dx * dx + dz * dz < radius * radius) return false
+      if (dx * dx + dz * dz >= radius * radius) continue
+      blocked = true
+      if (out && !out.some((entry) => entry.nodeId === collider.nodeId)) out.push(collider)
+      break
     }
   }
-  return true
+  return blocked
+}
+
+export function convoyCanOccupy(
+  colliders: readonly ColliderEntry[],
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+): boolean {
+  return !collectConvoyBlockers(colliders, x, y, z, yaw)
 }
 
 function convoyGroundY(world: GameWorld, x: number, z: number, yaw: number): number {
@@ -601,6 +641,9 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     const remotelyOccupied = convoyPose.remoteDriver !== null
 
     if (vehicleRig.driving) {
+      if (takeAction(session.input.state.actions, 'Tab')) {
+        vehicleRig.view = vehicleRig.view === 'first' ? 'third' : 'first'
+      }
       if (takeAction(session.input.state.actions, 'KeyE')) {
         vehicleRig.driving = false
         vehicleRig.speed = 0
@@ -642,11 +685,54 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         const nx = convoyPose.x - Math.cos(convoyPose.yaw) * convoyPose.speed * dt
         const nz = convoyPose.z + Math.sin(convoyPose.yaw) * convoyPose.speed * dt
         const ny = convoyGroundY(world, nx, nz, convoyPose.yaw)
-        if (convoyCanOccupy(world.colliders, nx, ny, nz, convoyPose.yaw)) {
+        const direction = convoyPose.speed >= 0 ? 1 : -1
+        const impactX = direction > 0 ? -8.75 : 2.55
+        const nose = convoyLocalToWorld(impactX, 0, {
+          x: nx,
+          z: nz,
+          yaw: convoyPose.yaw,
+        })
+        if (Math.abs(convoyPose.speed) > 1.1) ramTreesAt(nose.x, nose.z, 1.25)
+
+        _impactBlockers.length = 0
+        let blocked = collectConvoyBlockers(
+          world.colliders,
+          nx,
+          ny,
+          nz,
+          convoyPose.yaw,
+          _impactBlockers,
+        )
+        // A moving Cybertruck is a demolition tool. Break only vertical
+        // structures/props (never the road or floor carrying it), then retry
+        // the sweep in the same frame so a successful impact carries through.
+        if (blocked && Math.abs(convoyPose.speed) > 1.1) {
+          _impactDirection.set(
+            -Math.cos(convoyPose.yaw) * direction,
+            0,
+            Math.sin(convoyPose.yaw) * direction,
+          )
+          for (const collider of _impactBlockers) {
+            if (!DRIVE_BREAK_TYPES.has(collider.nodeType)) continue
+            const box = collider.worldBox
+            _impactPoint.set(
+              Math.max(box.min.x, Math.min(box.max.x, nose.x)),
+              Math.max(box.min.y, Math.min(box.max.y, ny + 1.0)),
+              Math.max(box.min.z, Math.min(box.max.z, nose.z)),
+            )
+            damageTarget(world, collider.nodeId, _impactPoint, 1.45, _impactDirection)
+          }
+          blocked = collectConvoyBlockers(world.colliders, nx, ny, nz, convoyPose.yaw)
+        }
+        if (!blocked) {
           convoyPose.x = convoyPose.targetX = nx
           convoyPose.y = convoyPose.targetY = ny
           convoyPose.z = convoyPose.targetZ = nz
           convoyPose.targetYaw = convoyPose.yaw
+          // Preserve the driver's look offset while the cab turns beneath
+          // them. Without this, both first-person and chase cameras kept
+          // staring along the old world heading after steering a corner.
+          playerRig.yaw += shortestYawDelta(oldYaw, convoyPose.yaw)
         } else {
           convoyPose.yaw = convoyPose.targetYaw = oldYaw
           convoyPose.speed = 0
@@ -668,6 +754,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     } else {
       if (nearDoor && !remotelyOccupied && takeAction(session.input.state.actions, 'KeyE')) {
         vehicleRig.driving = true
+        vehicleRig.view = 'first'
         convoyPose.occupied = true
         convoyPose.speed = 0
         convoyPose.remoteDriver = null
@@ -695,7 +782,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     vehicleRig.speed = convoyPose.speed
 
     const prompt = vehicleRig.driving
-      ? 'W/S — throttle · A/D — steer · E — exit Cybertruck'
+      ? `W/S throttle · A/D steer · Tab ${vehicleRig.view === 'first' ? 'third-person' : 'first-person'} · E exit`
       : nearDoor
         ? remotelyOccupied
           ? 'Cybertruck occupied'
@@ -754,6 +841,19 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         <boxGeometry args={[2.0, 0.75, 1.8]} />
         <meshBasicMaterial />
       </mesh>
+      {/* Loading ramp reaches the lifted deck without hiding the shop behind
+          a full-width cosmetic skirt. Its real mesh is a walk collider. */}
+      <mesh
+        castShadow
+        receiveShadow
+        position={[0, 0.43, 1.88]}
+        rotation={[0.49, 0, 0]}
+        ref={solid(12)}
+      >
+        <boxGeometry args={[5.55, 0.1, 1.72]} />
+        <meshStandardMaterial color={CASTING} metalness={0.35} roughness={0.72} />
+      </mesh>
+      <group position={[0, TRAILER_DECK_LIFT, 0]}>
       {/* ── the armored shell (all colliders) ─────────────────────────── */}
       {/* floor plate — the interior deck the player steps onto */}
       <mesh castShadow receiveShadow position={[0, 0.06, 0]} ref={solid(0)}>
@@ -954,6 +1054,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       ))}
       <SirenBeacon position={[3.12, 2.2, -0.45]} primary />
       <SirenBeacon position={[3.12, 2.2, 0.45]} />
+      </group>
     </group>
   )
 }
@@ -990,6 +1091,20 @@ function TrailerRunningGear() {
         <boxGeometry args={[5.7, 0.16, 1.65]} />
         <meshStandardMaterial color={CASTING} metalness={0.45} roughness={0.62} />
       </mesh>
+      {/* Visible longitudinal frame rails and suspension blocks make the
+          container read as cargo carried above a chassis, not pierced by it. */}
+      {[-0.72, 0.72].map((z) => (
+        <mesh key={`rail:${z}`} position={[0, 0.57, z]}>
+          <boxGeometry args={[5.75, 0.18, 0.12]} />
+          <meshStandardMaterial color={CASTING} metalness={0.5} roughness={0.58} />
+        </mesh>
+      ))}
+      {[-2.05, 1.85].map((x) => (
+        <mesh key={`spring:${x}`} position={[x, 0.64, 0]}>
+          <boxGeometry args={[0.72, 0.12, 1.78]} />
+          <meshStandardMaterial color="#25282d" metalness={0.4} roughness={0.7} />
+        </mesh>
+      ))}
     </group>
   )
 }

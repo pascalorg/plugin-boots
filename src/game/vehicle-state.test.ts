@@ -2,8 +2,11 @@ import { describe, expect, test } from 'bun:test'
 import {
   convoyLocalToWorld,
   convoyWorldToLocal,
+  clearConvoyPose,
   readVehicleFrame,
+  resetConvoyPose,
   shortestYawDelta,
+  vehicleRig,
   wrapVehicleYaw,
 } from './vehicle-state'
 
@@ -40,5 +43,16 @@ describe('convoy transform', () => {
   test('heading interpolation crosses the ±π seam by the short route', () => {
     expect(shortestYawDelta(Math.PI - 0.1, -Math.PI + 0.1)).toBeCloseTo(0.2, 10)
     expect(wrapVehicleYaw(Math.PI * 5)).toBe(Math.PI)
+  })
+})
+
+describe('driver camera mode', () => {
+  test('a new or cleared convoy always starts in first person', () => {
+    vehicleRig.view = 'third'
+    resetConvoyPose(0, 0, 0, 0)
+    expect(String(vehicleRig.view)).toBe('first')
+    vehicleRig.view = 'third'
+    clearConvoyPose()
+    expect(String(vehicleRig.view)).toBe('first')
   })
 })

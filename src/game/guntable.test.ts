@@ -9,6 +9,7 @@ import {
   buildStationPosition,
   DEPOT_NODE_ID,
   DEPOT_NODE_TYPE,
+  TRAILER_DECK_LIFT,
   DEPOT_OFFSET,
   DEPOT_SIZE,
   depotLocalToWorld,
@@ -54,6 +55,11 @@ function spawnFrame(world: GameWorld, pos: Vector3): [number, number] {
  * ON the +x end wall).
  */
 describe('spawn depot layout', () => {
+  test('the supply container rides above the trailer tyres', () => {
+    const wheelTop = 0.38 + 0.38
+    expect(TRAILER_DECK_LIFT).toBeGreaterThan(wheelTop)
+  })
+
   test('the depot is set back behind spawn — nothing prompts at spawn', () => {
     for (const yaw of YAWS) {
       const world = fakeWorld(new Vector3(3, 0, -2), yaw)

@@ -387,6 +387,39 @@ export function updateBurning(trees: CombatTree[], dt: number, out: number[]): n
 
 let liveTrees: CombatTree[] = []
 let revision = 0
+const _ramPoint = new Vector3()
+
+/** Fell every live trunk touched by a vehicle-sized XZ circle. The regular
+ * damage wrapper owns debris, dust, sound and renderer revision, so ramming a
+ * tree looks exactly like finishing it with a weapon instead of silently
+ * deleting an instance. Returns the number newly felled. */
+export function ramTreesAt(x: number, z: number, radius: number, damage = TREE_HP * 2): number {
+  let felled = 0
+  for (const tree of liveTrees) {
+    if (tree.state === 'stump') continue
+    const reach = radius + Math.max(0.18, tree.params.trunkR * tree.scale)
+    const dx = tree.x - x
+    const dz = tree.z - z
+    if (dx * dx + dz * dz > reach * reach) continue
+    _ramPoint.set(tree.x, tree.y + Math.min(1.1, tree.params.trunkH * tree.scale * 0.45), tree.z)
+    let event = applyTreeDamage(
+      liveTrees,
+      { distance: Math.hypot(dx, dz), point: _ramPoint, treeId: tree.id, part: 'trunk' },
+      damage,
+    )
+    // Charred trunks normally fall over three dramatic branch snaps. A truck
+    // impact completes that short state machine immediately.
+    while (event === 'charHit') {
+      event = applyTreeDamage(
+        liveTrees,
+        { distance: 0, point: _ramPoint, treeId: tree.id, part: 'trunk' },
+        damage,
+      )
+    }
+    if (event === 'fell' || event === 'collapse') felled++
+  }
+  return felled
+}
 
 export const treesDebug = {
   dump: (): Array<Record<string, unknown>> =>
@@ -553,9 +586,9 @@ const _dustPos = new Vector3()
 const PUFF = { kind: 'puff' } as const
 
 /** Route-side damage wrapper: state machine + all the audiovisual fallout. */
-function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): void {
+function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): TreeDamageEvent {
   const tree = trees[hit.treeId]
-  if (!tree) return
+  if (!tree) return 'none'
   const wasBurning = tree.state === 'burning'
   const event = damageTree(tree, hit.part, damage)
   switch (event) {
@@ -611,6 +644,7 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): voi
     case 'none':
       break
   }
+  return event
 }
 
 // --- Rendering -------------------------------------------------------------

@@ -256,8 +256,9 @@ export function setCatalog(items: readonly CatalogEntry[] | null): void {
 }
 
 /**
- * v1 scope filter — pure, exported for tests: floor-standing GLB items
- * only. `attachTo` items (wall/ceiling/wall-side) need host attachment
+ * Scope filter — pure, exported for tests: free-standing GLB items only.
+ * Their bottom anchor can snap to floors, counters, shelves, or other solid
+ * surfaces. `attachTo` items (wall/ceiling/wall-side) need host attachment
  * frames the game does not model, and `tool` rows are editor affordances,
  * not placeable assets.
  */
