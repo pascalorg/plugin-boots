@@ -11,7 +11,7 @@ import type { GameSession } from './session'
  * thumbnail + GLB URLs). Press I in-game (any tool) to open; pick a couch,
  * an appliance, a planter — item-place.tsx arms an aim-anchored ghost and
  * clicking drops GAME-ONLY copies; item-keep.ts converts them into real
- * `item` nodes only from the sidebar Save button. A last 'openings' tab
+ * `item` nodes only from the sidebar Save button. A pinned 'openings' tab
  * (OPENING_ENTRIES, not catalog rows) offers doors and windows instead:
  * those arm item-place's WALL-SNAP ghost and Save creates real host
  * `door`/`window` nodes on the aimed wall.
@@ -277,6 +277,18 @@ export function catalogCategories(items: ReadonlyArray<{ category: string }>): s
   return seen
 }
 
+/** Menu order keeps doors/windows permanently discoverable even when the
+ * live API contributes dozens of furniture categories. Furniture can still
+ * be the initially selected page; this only pins the openings button first. */
+export function catalogMenuCategories(items: ReadonlyArray<{ category: string }>): string[] {
+  const categories = catalogCategories(items)
+  const opening = categories.indexOf(OPENINGS_CATEGORY)
+  if (opening <= 0) return categories
+  categories.splice(opening, 1)
+  categories.unshift(OPENINGS_CATEGORY)
+  return categories
+}
+
 /** One tab's visible cards (first CAP of the category, catalog order). */
 export function categoryPage<T extends { category: string }>(
   items: readonly T[],
@@ -360,11 +372,9 @@ export function openItemMenu(
   onPick: (item: MenuEntry) => void,
 ): boolean {
   if (menu || typeof document === 'undefined') return false
-  // Furniture tabs first (catalog order), then the openings tab — doors
-  // and windows the wall-snap ghost places (always present: they need no
-  // bundled catalog, so even a stub host build offers them).
-  const items: MenuEntry[] = [...placeableCatalog(), ...OPENING_ENTRIES]
-  const categories = catalogCategories(items)
+  const catalog = placeableCatalog()
+  const items: MenuEntry[] = [...catalog, ...OPENING_ENTRIES]
+  const categories = catalogMenuCategories(items)
 
   // Latch input FIRST (flag before the lock release, so the session's
   // pointerlockchange guard already reads the menu as open when it fires).
@@ -403,14 +413,15 @@ export function openItemMenu(
   titleText.textContent = 'ITEM CATALOG'
   titleText.style.cssText = 'font-size:14px;letter-spacing:0.18em'
   const titleHint = document.createElement('span')
-  titleHint.textContent = `click or arrows + Enter · 1-${Math.min(categories.length, 9)} tabs · I close`
+  titleHint.textContent = 'click or arrows + Enter · Q/E tabs · I close'
   titleHint.style.cssText = 'font-size:11px;color:rgba(255,255,255,0.45)'
   title.appendChild(titleText)
   title.appendChild(titleHint)
   panel.appendChild(title)
 
   const tabs = document.createElement('div')
-  tabs.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap'
+  tabs.style.cssText =
+    'display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;flex-shrink:0;padding-bottom:4px'
   panel.appendChild(tabs)
 
   const grid = document.createElement('div')
@@ -429,7 +440,7 @@ export function openItemMenu(
     tab.type = 'button'
     tab.textContent = `${index + 1} ${category}`
     tab.style.cssText =
-      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;` +
+      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;white-space:nowrap;` +
       'background:transparent;color:rgba(255,255,255,0.75);border:1px solid rgba(255,255,255,0.2)'
     tab.addEventListener('click', () => setCategory(index))
     tabs.appendChild(tab)
@@ -454,7 +465,9 @@ export function openItemMenu(
     selected: 0,
     onPick,
   }
-  setCategory(0)
+  const defaultCategory = catalog[0]?.category
+  const defaultIndex = defaultCategory ? categories.indexOf(defaultCategory) : -1
+  setCategory(defaultIndex >= 0 ? defaultIndex : 0)
 
   // Render the bundled fallback immediately, then replace it in-place when
   // the API responds. The menu never flashes closed or steals pointer lock.
@@ -471,20 +484,20 @@ function refreshOpenMenuCatalog(): void {
   if (!open) return
   const previousCategory = open.categories[open.category]
   open.items = [...placeableCatalog(), ...OPENING_ENTRIES]
-  open.categories = catalogCategories(open.items)
+  open.categories = catalogMenuCategories(open.items)
   open.tabsEl.replaceChildren()
   open.tabEls = open.categories.map((category, index) => {
     const tab = document.createElement('button')
     tab.type = 'button'
     tab.textContent = `${index + 1} ${category}`
     tab.style.cssText =
-      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;` +
+      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;white-space:nowrap;` +
       'background:transparent;color:rgba(255,255,255,0.75);border:1px solid rgba(255,255,255,0.2)'
     tab.addEventListener('click', () => setCategory(index))
     open.tabsEl.appendChild(tab)
     return tab
   })
-  open.titleHintEl.textContent = `click or arrows + Enter · 1-${Math.min(open.categories.length, 9)} tabs · I close`
+  open.titleHintEl.textContent = 'click or arrows + Enter · Q/E tabs · I close'
   const preserved = previousCategory ? open.categories.indexOf(previousCategory) : -1
   setCategory(preserved >= 0 ? preserved : 0)
 }
@@ -519,6 +532,7 @@ function setCategory(index: number): void {
     tab.style.background = on ? 'rgba(120,255,160,0.16)' : 'transparent'
     tab.style.color = on ? '#fff' : 'rgba(255,255,255,0.75)'
     tab.style.borderColor = on ? 'rgba(120,255,160,0.7)' : 'rgba(255,255,255,0.2)'
+    if (on) tab.scrollIntoView({ block: 'nearest', inline: 'nearest' })
   }
   rebuildGrid()
 }

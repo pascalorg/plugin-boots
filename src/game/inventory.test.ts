@@ -3,6 +3,7 @@ import { DoorNode, WindowNode } from '@pascal-app/core'
 import {
   type CatalogEntry,
   catalogCategories,
+  catalogMenuCategories,
   categoryPage,
   isItemMenuOpen,
   isOpeningEntry,
@@ -109,9 +110,10 @@ describe('menu state (headless)', () => {
 })
 
 describe('OPENING_ENTRIES (the doors/windows tab)', () => {
-  test('one openings category, appended after the furniture tabs', () => {
+  test('one openings category, pinned first in the visible menu tabs', () => {
     const items = [entry('couch'), entry('fridge', { category: 'appliance' }), ...OPENING_ENTRIES]
     expect(catalogCategories(items)).toEqual(['furniture', 'appliance', OPENINGS_CATEGORY])
+    expect(catalogMenuCategories(items)).toEqual([OPENINGS_CATEGORY, 'furniture', 'appliance'])
     expect(categoryPage(items, OPENINGS_CATEGORY)).toHaveLength(OPENING_ENTRIES.length)
   })
 

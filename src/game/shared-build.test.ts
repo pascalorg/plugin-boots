@@ -45,6 +45,7 @@ import {
   isForeignPiece,
   isForeignPlacement,
   isOurRecord,
+  moveSharedAperture,
   moveSharedItem,
   onGridStampChange,
   pieceRecordOf,
@@ -707,6 +708,31 @@ describe('what this player builds goes out once, quantized', () => {
     expect(h.sent.at(-1)).toMatchObject({
       deadItems: [first],
       items: [expect.objectContaining({ id: second })],
+    })
+  })
+
+  test('moving an aperture replaces its wall-relative record in one update', () => {
+    const h = boot()
+    const first = publishAperture(9002, 'opening-door-hinged', 'wall-1', 1.5, 1.05, 0.9, 2.1)!
+    const second = moveSharedAperture(
+      9002,
+      'opening-door-hinged',
+      'wall-1',
+      3.25,
+      1.05,
+      0.9,
+      2.1,
+    )!
+
+    expect(second).not.toBe(first)
+    expect(placementRecordOf(9002)).toBe(second)
+    expect(h.mine.apertures.dead.has(first)).toBe(true)
+    expect(liveRecords(h.mine.apertures)).toEqual([
+      expect.objectContaining({ id: second, host: 'wall-1', u: 3.25, v: 1.05 }),
+    ])
+    expect(h.sent.at(-1)).toMatchObject({
+      deadApertures: [first],
+      apertures: [expect.objectContaining({ id: second })],
     })
   })
 })

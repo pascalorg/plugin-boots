@@ -1,12 +1,15 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
-import { Box3, BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three'
+import { Box3, BoxGeometry, Group, Matrix4, Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three'
 import { PLAYER_CAPSULE } from './collision'
+import { ensureVoxelTarget, resetDestruction } from './destruction'
 import { type CatalogEntry, OPENING_ENTRIES } from './inventory'
 import {
   aimWallPoint,
+  aimedPlacedApertureId,
   aimedPlacedItemId,
   anchorOnFloor,
   anchorOnSupport,
+  anchorOnWorldSupport,
   apertureFits,
   apertureRect,
   configureItemModelLoader,
@@ -17,6 +20,7 @@ import {
   itemFootprint,
   itemBlockedByWorld,
   itemGhostActive,
+  itemPlacementActive,
   itemModelLoader,
   itemOverlapsPlayer,
   pendingApertureRects,
@@ -26,6 +30,7 @@ import {
   type WallAim,
   wallPlacementFrame,
 } from './item-place'
+import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
  * Placement-store math + ghost anchoring (pure halves of item-place.tsx).
@@ -45,6 +50,7 @@ const asset = (over: Partial<CatalogEntry> = {}): CatalogEntry => ({
 const anchor = (): ItemAnchor => ({ x: 0, y: 0, z: 0, valid: false })
 
 beforeEach(() => {
+  resetDestruction()
   useItems.getState().resolveItems()
   useItems.getState().disarm()
 })
@@ -154,6 +160,67 @@ describe('anchorOnSupport: editor-like surface placement', () => {
   })
 })
 
+function supportWorld(): GameWorld {
+  const root = new Group()
+  const mesh = new Mesh(new BoxGeometry(2, 0.9, 1.5), new MeshStandardMaterial())
+  mesh.position.set(0, 0.45, -2)
+  root.add(mesh)
+  root.updateMatrixWorld(true)
+  const entry: ColliderEntry = {
+    mesh,
+    bvh: bvhFor(mesh),
+    inverse: new Matrix4().copy(mesh.matrixWorld).invert(),
+    worldBox: new Box3().setFromObject(mesh),
+    root,
+    nodeId: 'island-1',
+    nodeType: 'item',
+  }
+  return {
+    colliders: [entry],
+    walls: new Map(),
+    glass: [],
+    doors: [],
+    overlayRoots: [],
+    buildingAabb: entry.worldBox.clone(),
+    spawn: new Vector3(),
+    spawnYaw: 0,
+    levelId: null,
+  }
+}
+
+describe('anchorOnWorldSupport: visible geometry and live voxels', () => {
+  const pitch = Math.atan2(0.9 - 1.58, 1.8)
+
+  test('uses the actual countertop triangle under the crosshair', () => {
+    const world = supportWorld()
+    const out = anchor()
+    expect(anchorOnWorldSupport(out, world, 0, 1.58, 0, 0, pitch)).toBe(true)
+    expect(out.x).toBeCloseTo(0)
+    expect(out.y).toBeCloseTo(0.9)
+    expect(out.z).toBeCloseTo(-1.8)
+  })
+
+  test('a front face occludes the floor fallback instead of placing behind it', () => {
+    const world = supportWorld()
+    const out = anchor()
+    expect(anchorOnWorldSupport(out, world, 0, 1.58, 0, 0, -0.65)).toBe(false)
+    expect(out.blocked).toBe(true)
+  })
+
+  test('keeps a pure voxel island placeable after its host collider is disabled', () => {
+    const world = supportWorld()
+    expect(ensureVoxelTarget(world, 'island-1')).not.toBeNull()
+    expect(world.colliders[0]!.disabled).toBe(true)
+    const out = anchor()
+    expect(anchorOnWorldSupport(out, world, 0, 1.58, 0, 0, pitch)).toBe(true)
+    // The combat voxel skin is slightly proud of the 0.9 m source mesh;
+    // placement follows the visible live cells, not the hidden source.
+    expect(out.y).toBeGreaterThan(0.9)
+    expect(out.y).toBeLessThan(1.1)
+    expect(out.z).toBeLessThan(-1.4)
+  })
+})
+
 describe('ghostYaw', () => {
   test('faces the player (yaw + π), wrapped to [-π, π)', () => {
     expect(ghostYaw(0, 0)).toBeCloseTo(-Math.PI)
@@ -219,6 +286,14 @@ describe('useItems store', () => {
     useItems.getState().disarm()
     expect(itemGhostActive()).toBe(false)
   })
+
+  test('itemPlacementActive covers an armed or lifted placement', () => {
+    expect(itemPlacementActive()).toBe(false)
+    useItems.getState().arm(asset())
+    expect(itemPlacementActive()).toBe(true)
+    useItems.getState().disarm()
+    expect(itemPlacementActive()).toBe(false)
+  })
 })
 
 describe('L aim and blocking', () => {
@@ -233,6 +308,24 @@ describe('L aim and blocking', () => {
     expect(aimedPlacedItemId([couch], { x: 0, y: 0.5, z: 0 }, 0, 0)).toBe(17)
     const wall = collider('wall-1', 'wall', [-1, 0, -2], [1, 2.5, -1.9])
     expect(aimedPlacedItemId([couch, wall], { x: 0, y: 0.5, z: 0 }, 0, 0)).toBeNull()
+  })
+
+  test('selects a Boots-placed opening only inside its wall rectangle', () => {
+    const opening = useItems.getState().addAperture(OPENING_ENTRIES[0]!, 'wall-1', 2, 1.05)
+    const frame = {
+      wallId: 'wall-1',
+      originX: -2,
+      originY: 0,
+      originZ: -3,
+      ux: 1,
+      uz: 0,
+      length: 4,
+      height: 2.5,
+      thickness: 0.15,
+      yaw: 0,
+    }
+    expect(aimedPlacedApertureId([opening], [frame], { x: 0, y: 1.58, z: 0 }, 0, 0)).toBe(opening.id)
+    expect(aimedPlacedApertureId([opening], [frame], { x: 1.8, y: 1.58, z: 0 }, 0, 0)).toBeNull()
   })
 
   test('ground contact is allowed, but a wall in the volume or sightline blocks', () => {
@@ -521,6 +614,17 @@ describe('useItems aperture round-trip', () => {
     useItems.getState().addAperture(fixedWindow, 'wall_a', 2, 1.65)
     useItems.getState().resolveItems()
     expect(useItems.getState().items).toEqual([])
+  })
+
+  test('L moves an aperture while preserving its runtime id and dimensions', () => {
+    const original = useItems.getState().addAperture(hingedDoor, 'wall_a', 1.2, 1.05)
+    expect(useItems.getState().beginMove(original.id)).toEqual(original)
+    expect(useItems.getState().items).toEqual([])
+    expect(useItems.getState().armed?.id).toBe(hingedDoor.id)
+    const moved = useItems.getState().finishApertureMove('wall_a', 3.25, 1.05)
+    expect(moved).toMatchObject({ id: original.id, wallId: 'wall_a', u: 3.25, v: 1.05 })
+    expect(moved?.width).toBe(original.width)
+    expect(moved?.height).toBe(original.height)
   })
 
   test('an armed opening entry owns the trigger like furniture does', () => {

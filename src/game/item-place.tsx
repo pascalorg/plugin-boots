@@ -10,6 +10,7 @@ import {
   BoxGeometry,
   CanvasTexture,
   Group,
+  Matrix3,
   Matrix4,
   Mesh,
   MeshStandardMaterial,
@@ -27,7 +28,13 @@ import { useBoots, type WeaponId } from '../store'
 import { sfx } from './audio'
 import { MOVE_ITEM_KEY } from './input'
 import { EYE_HEIGHT, PLAYER_CAPSULE } from './collision'
-import { collectWallOpenings, dropTarget, probeLandingY } from './destruction'
+import {
+  collectWallOpenings,
+  dropTarget,
+  probeLandingY,
+  raycastVoxelTargets,
+  useDestruction,
+} from './destruction'
 import { groundSurfaceY } from './ground'
 import {
   type CatalogEntry,
@@ -48,6 +55,7 @@ import {
   buildSyncOn,
   forgetSharedPlacements,
   isForeignPlacement,
+  moveSharedAperture,
   moveSharedItem,
   publishAperture,
   publishItem,
@@ -152,14 +160,15 @@ type ItemsState = {
   items: Placement[]
   /** Menu entry riding a ghost (furniture OR opening); null = stowed. */
   armed: MenuEntry | null
-  /** Furniture temporarily lifted by L; omitted from items so its old solid
-   * collider cannot obstruct its own grounded preview. */
-  moving: PlacedItem | null
+  /** Placement temporarily lifted by L; omitted from items so its previous
+   * collider/rectangle cannot obstruct its own constrained preview. */
+  moving: Placement | null
   arm: (asset: MenuEntry) => void
   disarm: () => void
-  beginMove: (id: number) => PlacedItem | null
+  beginMove: (id: number) => Placement | null
   cancelMove: () => void
   finishMove: (position: [number, number, number], yaw: number) => PlacedItem | null
+  finishApertureMove: (wallId: string, u: number, v: number) => PlacedAperture | null
   addItem: (asset: CatalogEntry, position: [number, number, number], yaw: number) => PlacedItem
   /** `size` overrides the entry's nominal dimensions — a REMOTE aperture is
    * materialized from its record, not re-derived from the local catalog. */
@@ -186,11 +195,11 @@ export const useItems = create<ItemsState>((set, get) => ({
   arm: (armed) => set({ armed, moving: null }),
   disarm: () => set({ armed: null }),
   beginMove: (id) => {
-    const moving = get().items.find((item): item is PlacedItem => item.kind === 'item' && item.id === id) ?? null
+    const moving = get().items.find((item) => item.id === id) ?? null
     if (!moving) return null
     set((state) => ({
       items: state.items.filter((item) => item.id !== id),
-      armed: moving.asset,
+      armed: moving.kind === 'item' ? moving.asset : moving.def,
       moving,
     }))
     return moving
@@ -205,8 +214,15 @@ export const useItems = create<ItemsState>((set, get) => ({
   },
   finishMove: (position, yaw) => {
     const moving = get().moving
-    if (!moving) return null
+    if (!moving || moving.kind !== 'item') return null
     const placed: PlacedItem = { ...moving, position, yaw }
+    set((state) => ({ items: [...state.items, placed], armed: null, moving: null }))
+    return placed
+  },
+  finishApertureMove: (wallId, u, v) => {
+    const moving = get().moving
+    if (!moving || moving.kind !== 'aperture') return null
+    const placed: PlacedAperture = { ...moving, wallId, u, v }
     set((state) => ({ items: [...state.items, placed], armed: null, moving: null }))
     return placed
   },
@@ -237,6 +253,15 @@ export const useItems = create<ItemsState>((set, get) => ({
  * viewmodel.tsx's fire gate reads this (manager wiring). */
 export function itemGhostActive(): boolean {
   return useItems.getState().armed !== null && !isItemMenuOpen()
+}
+
+/** True for the entire placement interaction, including the catalog itself.
+ * The builder uses this broader gate for its wall ghost: opening I must not
+ * leave a large hammer wall preview behind the catalog, and L-move keeps it
+ * hidden until the placement is dropped or cancelled. */
+export function itemPlacementActive(): boolean {
+  const state = useItems.getState()
+  return isItemMenuOpen() || state.armed !== null || state.moving !== null
 }
 
 /** Placement budget — every other lane has one (turbo clad FIFO, debris
@@ -298,7 +323,15 @@ const ITEM_MAX_STEP_DOWN = 2.2
  * keeps a room's ceiling out of the running. */
 const ITEM_PROBE_MAX_RISE = 1.8
 
-export type ItemAnchor = { x: number; y: number; z: number; valid: boolean }
+export type ItemAnchor = {
+  x: number
+  y: number
+  z: number
+  valid: boolean
+  /** The aim ray met a real non-supporting surface. The live caller must not
+   * fall through that wall/front face to a floor point hidden behind it. */
+  blocked?: boolean
+}
 
 /**
  * Where the landing probe starts for a ghost anchored at (x, z) while the
@@ -417,6 +450,99 @@ export function anchorOnSupport(
     out.valid = true
   }
   return Number.isFinite(nearest)
+}
+
+const _supportOrigin = new Vector3()
+const _supportDirection = new Vector3()
+const _supportRay = new Ray()
+const _supportPoint = new Vector3()
+const _supportNormal = new Vector3()
+const _supportNormalMatrix = new Matrix3()
+
+/**
+ * Exact crosshair support hit used by the live placement lane.
+ *
+ * Unlike the legacy AABB-top helper above, this ray first resolves the
+ * nearest visible triangle (so a counter cannot be selected through its
+ * front, a wall, or another prop). It also races the active destruction
+ * grids against those triangles. That second lane is what makes a pure
+ * voxel island remain a usable countertop after its host collider has been
+ * disabled: the live cells, not the now-hidden source mesh, own the ray.
+ */
+export function anchorOnWorldSupport(
+  out: ItemAnchor,
+  world: GameWorld,
+  eyeX: number,
+  eyeY: number,
+  eyeZ: number,
+  yaw: number,
+  pitch: number,
+  reach = ITEM_REACH,
+): boolean {
+  out.blocked = false
+  const cp = Math.cos(pitch)
+  if (cp < MIN_HORIZONTAL) return false
+  _supportOrigin.set(eyeX, eyeY, eyeZ)
+  _supportDirection.set(-Math.sin(yaw) * cp, Math.sin(pitch), -Math.cos(yaw) * cp)
+  const maxDistance = reach / Math.max(1e-4, Math.hypot(_supportDirection.x, _supportDirection.z))
+
+  let nearestDistance = Number.POSITIVE_INFINITY
+  let supportDistance = Number.POSITIVE_INFINITY
+  let supportX = 0
+  let supportY = 0
+  let supportZ = 0
+
+  for (const collider of world.colliders) {
+    if (collider.disabled || collider.walkOnly || collider.nodeType === 'site') continue
+    _supportRay.origin.copy(_supportOrigin).applyMatrix4(collider.inverse)
+    _supportRay.direction.copy(_supportDirection).transformDirection(collider.inverse)
+    const hit = collider.bvh.raycastFirst(_supportRay, 2)
+    if (!hit) continue
+    _supportPoint.copy(hit.point).applyMatrix4(collider.mesh.matrixWorld)
+    const distance = _supportPoint.distanceTo(_supportOrigin)
+    if (distance <= 0.05 || distance > maxDistance || distance >= nearestDistance) continue
+    nearestDistance = distance
+    if (!hit.face) continue
+    _supportNormalMatrix.getNormalMatrix(collider.mesh.matrixWorld)
+    _supportNormal.copy(hit.face.normal).applyNormalMatrix(_supportNormalMatrix)
+    // A tabletop/floor must genuinely face upward. Vertical cabinet fronts,
+    // walls and undersides occlude what is behind them but are not supports.
+    if (_supportNormal.y < 0.55) continue
+    supportDistance = distance
+    supportX = _supportPoint.x
+    supportY = _supportPoint.y
+    supportZ = _supportPoint.z
+  }
+
+  const voxelHit = raycastVoxelTargets(_supportOrigin, _supportDirection, maxDistance)
+  if (voxelHit && voxelHit.distance < nearestDistance) {
+    nearestDistance = voxelHit.distance
+    const target = useDestruction.getState().targets.get(voxelHit.nodeId)
+    if (target && target.kind !== 'wall' && _supportDirection.y < -0.02) {
+      const cellY = target.grid.cellY
+      const probeFrom = voxelHit.point.y + cellY * 1.6 + 0.03
+      const top = probeLandingY(world, voxelHit.point.x, probeFrom, voxelHit.point.z)
+      // A top-face hit resolves back to essentially the same height. A ray
+      // entering low through a voxel's vertical side must not jump the ghost
+      // onto a surface the crosshair did not actually point at.
+      if (top >= voxelHit.point.y - 0.03 && top - voxelHit.point.y <= cellY * 0.7 + 0.03) {
+        supportDistance = voxelHit.distance
+        supportX = voxelHit.point.x
+        supportY = top
+        supportZ = voxelHit.point.z
+      }
+    }
+  }
+
+  if (!Number.isFinite(supportDistance) || supportDistance > nearestDistance + 1e-4) {
+    out.blocked = Number.isFinite(nearestDistance)
+    return false
+  }
+  out.x = supportX
+  out.y = supportY
+  out.z = supportZ
+  out.valid = Math.hypot(supportX - eyeX, supportZ - eyeZ) <= reach
+  return true
 }
 
 const HALF_PI = Math.PI / 2
@@ -944,7 +1070,7 @@ const _itemRayDirection = new Vector3()
 const _itemRayHit = new Vector3()
 
 /** Nearest solid under the crosshair, but only returns a game-placed item.
- * A wall or another prop in front wins the ray and prevents through-wall M. */
+ * A wall or another prop in front wins the ray and prevents through-wall L. */
 export function aimedPlacedItemId(
   colliders: readonly ColliderEntry[],
   eye: { x: number; y: number; z: number },
@@ -971,7 +1097,42 @@ export function aimedPlacedItemId(
   return target !== null && Number.isFinite(target) ? target : null
 }
 
-/** Candidate-volume + line-of-sight guard for both fresh placement and M.
+const _aperturePickAim: WallAim = { frame: null, u: 0, v: 0, dist: 0 }
+
+/** Select a Boots-placed door/window from the exact wall point under the
+ * crosshair. The nearest wall plane wins first, so an opening can never be
+ * grabbed through a nearer wall. */
+export function aimedPlacedApertureId(
+  items: readonly Placement[],
+  frames: Iterable<WallFrame>,
+  eye: { x: number; y: number; z: number },
+  yaw: number,
+  pitch: number,
+  reach = ITEM_REACH,
+): number | null {
+  if (!aimWallPoint(_aperturePickAim, frames, eye.x, eye.y, eye.z, yaw, pitch, reach)) return null
+  const frame = _aperturePickAim.frame
+  if (!frame) return null
+  for (let i = items.length - 1; i >= 0; i--) {
+    const placed = items[i]!
+    if (placed.kind !== 'aperture' || placed.wallId !== frame.wallId) continue
+    const rect = apertureRect(
+      placed.u,
+      placed.v - placed.height / 2,
+      placed.width,
+      placed.height,
+    )
+    if (
+      _aperturePickAim.u >= rect.u0 &&
+      _aperturePickAim.u <= rect.u1 &&
+      _aperturePickAim.v >= rect.v0 &&
+      _aperturePickAim.v <= rect.v1
+    ) return placed.id
+  }
+  return null
+}
+
+/** Candidate-volume + line-of-sight guard for both fresh placement and L.
  * The surface whose top supports the item is ignored, but walls, furniture
  * and every raised blocking surface refuse the drop. */
 export function itemBlockedByWorld(
@@ -1470,19 +1631,38 @@ export function GameItems({ world }: { world: GameWorld }) {
         return
       }
       if (!state.armed) {
-        const id = aimedPlacedItemId(
+        const itemId = aimedPlacedItemId(
           world.colliders,
           playerRig.position,
           playerRig.yaw,
           playerRig.pitch,
         )
+        let frames = wallFramesRef.current
+        if (!frames) {
+          frames = new Map()
+          for (const [id, wall] of world.walls) {
+            const wallFrame = wallPlacementFrame(wall)
+            if (wallFrame) frames.set(id, wallFrame)
+          }
+          wallFramesRef.current = frames
+        }
+        const apertureId = itemId === null
+          ? aimedPlacedApertureId(
+              state.items,
+              frames.values(),
+              playerRig.position,
+              playerRig.yaw,
+              playerRig.pitch,
+            )
+          : null
+        const id = itemId ?? apertureId
         const picked = id === null ? null : state.beginMove(id)
         if (picked) {
           armedWeapon.current = useBoots.getState().weapon
           yawTurns.current = 0
           sfx.weaponSwitch()
         } else {
-          session.hud.prompt('Aim at placed furniture, then press L', 'items')
+          session.hud.prompt('Aim at placed furniture, door, or window, then press L', 'items')
         }
         return
       }
@@ -1547,7 +1727,9 @@ export function GameItems({ world }: { world: GameWorld }) {
       promptShown.current = true
       session.hud.prompt(
         openingArmed
-          ? 'LMB place on a wall · RMB stow · I catalog'
+          ? state.moving
+            ? 'LMB drop along this wall · RMB cancel move'
+            : 'LMB place on a wall · RMB stow · I catalog · L move aimed opening'
           : state.moving
             ? 'LMB drop · R rotate · RMB cancel move'
             : 'LMB place · R rotate · RMB stow · I catalog · L move aimed item',
@@ -1568,9 +1750,16 @@ export function GameItems({ world }: { world: GameWorld }) {
         }
         wallFramesRef.current = frames
       }
+      const movingAperture = state.moving?.kind === 'aperture' ? state.moving : null
+      const eligibleFrames = movingAperture
+        ? (() => {
+            const original = frames.get(movingAperture.wallId)
+            return original ? [original] : []
+          })()
+        : frames.values()
       const aimed = aimWallPoint(
         _wallAim,
-        frames.values(),
+        eligibleFrames,
         playerRig.position.x,
         playerRig.position.y,
         playerRig.position.z,
@@ -1584,11 +1773,14 @@ export function GameItems({ world }: { world: GameWorld }) {
         return
       }
       const wall = _wallAim.frame
+      const width = movingAperture?.width ?? def.width
+      const height = movingAperture?.height ?? def.height
+      const sill = movingAperture ? movingAperture.v - movingAperture.height / 2 : def.sill
       // Snap along the u-axis; a wall too short for the aperture still
       // shows the ghost (clamped to its center) — just blocked.
-      const snappedU = snapApertureU(_wallAim.u, def.width, wall.length)
+      const snappedU = snapApertureU(_wallAim.u, width, wall.length)
       const u = snappedU ?? wall.length / 2
-      const rect = apertureRect(u, def.sill, def.width, def.height)
+      const rect = apertureRect(u, sill, width, height)
       const obstacles = apObstacles.current
       if (obstacles.wallId !== wall.wallId || obstacles.count !== state.items.length) {
         obstacles.wallId = wall.wallId
@@ -1606,7 +1798,7 @@ export function GameItems({ world }: { world: GameWorld }) {
         apGhost.visible = true
         apGhost.position.set(
           wall.originX + wall.ux * u,
-          wall.originY + def.sill,
+          wall.originY + sill,
           wall.originZ + wall.uz * u,
         )
         apGhost.rotation.set(0, wall.yaw, 0)
@@ -1628,13 +1820,35 @@ export function GameItems({ world }: { world: GameWorld }) {
       session.hud.ghostStatus?.(blocked ? 'occupied' : null, 'items')
       const apFiring = session.input.state.firing
       if (apFiring && !prevFire.current && !blocked && !useBoots.getState().staggered) {
-        const stored = useItems
-          .getState()
-          .addAperture(def, wall.wallId, u, def.sill + def.height / 2)
+        const stored = movingAperture
+          ? useItems.getState().finishApertureMove(wall.wallId, u, sill + height / 2)
+          : useItems.getState().addAperture(def, wall.wallId, u, sill + height / 2)
         // Wall-RELATIVE on the wire (host id + u,v + size), so it lands on the
         // same wall for a peer whose build grid is a different frame entirely
         // — an opening belongs to its wall, not to the lot.
-        publishAperture(stored.id, def.id, wall.wallId, stored.u, stored.v, stored.width, stored.height)
+        if (stored) {
+          if (movingAperture) {
+            moveSharedAperture(
+              stored.id,
+              def.id,
+              wall.wallId,
+              stored.u,
+              stored.v,
+              stored.width,
+              stored.height,
+            )
+          } else {
+            publishAperture(
+              stored.id,
+              def.id,
+              wall.wallId,
+              stored.u,
+              stored.v,
+              stored.width,
+              stored.height,
+            )
+          }
+        }
         sfx.place()
       }
       prevFire.current = apFiring
@@ -1646,9 +1860,9 @@ export function GameItems({ world }: { world: GameWorld }) {
     // shelves, placed furniture and build voxels), then fall back to the
     // player's floor plane when the aim sees open air or terrain.
     const floorY = playerRig.position.y - EYE_HEIGHT
-    const supportAimed = anchorOnSupport(
+    const supportAimed = anchorOnWorldSupport(
       _anchor,
-      world.colliders,
+      world,
       playerRig.position.x,
       playerRig.position.y,
       playerRig.position.z,
@@ -1657,7 +1871,7 @@ export function GameItems({ world }: { world: GameWorld }) {
     )
     const found =
       supportAimed ||
-      anchorOnFloor(
+      (!_anchor.blocked && anchorOnFloor(
         _anchor,
         playerRig.position.x,
         playerRig.position.y,
@@ -1665,7 +1879,7 @@ export function GameItems({ world }: { world: GameWorld }) {
         playerRig.yaw,
         playerRig.pitch,
         floorY,
-      )
+      ))
     if (!found) {
       ghost.visible = false
       session.hud.ghostStatus?.(null, 'items')
@@ -1683,8 +1897,9 @@ export function GameItems({ world }: { world: GameWorld }) {
     const qf = Math.round(probeFrom * 100)
     // A moved item keeps its old orientation until R is pressed. New catalog
     // items continue to face the player on first appearance.
-    const yaw = state.moving
-      ? ghostYaw(state.moving.yaw - Math.PI, yawTurns.current)
+    const movingItem = state.moving?.kind === 'item' ? state.moving : null
+    const yaw = movingItem
+      ? ghostYaw(movingItem.yaw - Math.PI, yawTurns.current)
       : ghostYaw(playerRig.yaw, yawTurns.current)
     const qyaw = Math.round(yaw / HALF_PI)
     if (
@@ -1783,13 +1998,13 @@ export function GameItems({ world }: { world: GameWorld }) {
       // bridge all inherit the exact orientation the player clicked.
       const previewYaw = ghost.rotation.y
       const destination: [number, number, number] = [_anchor.x, y, _anchor.z]
-      const stored = state.moving
+      const stored = movingItem
         ? useItems.getState().finishMove(destination, previewYaw)
         : useItems.getState().addItem(asset, destination, previewYaw)
       if (stored) {
         // The wire carries the catalog id, not the asset: every peer runs the
         // same published API catalog, and a row is ~1 KB against 5 numbers.
-        if (state.moving) moveSharedItem(stored.id, asset.id, stored.position, stored.yaw)
+        if (movingItem) moveSharedItem(stored.id, asset.id, stored.position, stored.yaw)
         else publishItem(stored.id, asset.id, stored.position, stored.yaw)
       }
       sfx.place()

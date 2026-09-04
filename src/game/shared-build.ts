@@ -894,6 +894,32 @@ export function publishAperture(
   return rec.id
 }
 
+/** Replace an immutable shared aperture record after L slides a Boots-placed
+ * door/window along its original wall. Old tombstone + new wall-relative
+ * pose travel in one delta, matching furniture movement semantics. */
+export function moveSharedAperture(
+  runtimeId: number,
+  catalogId: string,
+  host: string,
+  u: number,
+  v: number,
+  width: number,
+  height: number,
+): RecordId | null {
+  const s = sync
+  if (!s) return null
+  const next = addLocalAperture(s.world, { catalogId, host, u, v, width, height })
+  if (!next) return null
+  const previous = unbindPlacement(runtimeId)
+  if (previous !== null && killRecord(s.world, 'apertures', previous)) {
+    outgoing().deadApertures.push(previous)
+  }
+  bindPlacement(runtimeId, next.id, false)
+  outgoing().apertures.push(next)
+  flushBuildSync()
+  return next.id
+}
+
 /**
  * Save/Discard resolved the catalog placements — same reasoning as
  * forgetSharedPieces: the records outlive this screen's stand-ins.

@@ -47,7 +47,7 @@ import {
   worldToGrid,
 } from './grid'
 import { groundSurfaceY } from './ground'
-import { itemGhostActive } from './item-place'
+import { itemGhostActive, itemPlacementActive } from './item-place'
 import { perfEvent } from './perf-monitor'
 import {
   isDeathLocked,
@@ -1642,7 +1642,7 @@ export function Builder() {
     // Catalog placement owns the world preview completely. In particular,
     // moving furniture with L while the builder is the underlying weapon must
     // not leave a wall ghost between the player and the furniture ghost.
-    if (!builderPreviewActive(weapon, itemGhostActive())) {
+    if (!builderPreviewActive(weapon, itemPlacementActive())) {
       if (ghost) setGhost(null)
       if (edit) {
         // A weapon switch or catalog placement closes edit mode with the same
