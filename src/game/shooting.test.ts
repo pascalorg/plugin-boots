@@ -3,6 +3,7 @@ import { Box3, BoxGeometry, Matrix4, Mesh, Vector3 } from 'three'
 import { resetDestruction, useDestruction } from './destruction'
 import { playerRig } from './player'
 import { fire, isMetalHit, isMetalTarget } from './shooting'
+import { vehicleRig } from './vehicle-state'
 import { WEAPONS, type WeaponDef } from './weapons'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
@@ -109,6 +110,9 @@ afterEach(() => {
   // door-repose under `bun test --randomize`).
   playerRig.position.set(0, 0, 0)
   playerRig.shotTarget.set(0, 0, -1)
+  playerRig.viewOrigin.set(0, 0, 0)
+  playerRig.viewDirection.set(0, 0, -1)
+  vehicleRig.view = 'first'
 })
 
 describe('third-person tracer target', () => {
@@ -118,6 +122,20 @@ describe('third-person tracer target', () => {
     aimFrom(0, 1.35, 5)
     expect(fire(world, GUN)).toBe('wall')
     expect(playerRig.shotTarget.x).toBeCloseTo(0)
+    expect(playerRig.shotTarget.y).toBeCloseTo(1.35)
+    expect(playerRig.shotTarget.z).toBeCloseTo(0.06)
+  })
+
+  test('the center-camera ray, not a parallel eye ray, owns shoulder-view hits', () => {
+    resetDestruction()
+    const world = makeWorld()
+    aimFrom(3, 1.35, 5) // the eye's parallel ray misses the 2 m-wide wall
+    playerRig.viewOrigin.set(0.8, 1.35, 5)
+    playerRig.viewDirection.set(0, 0, -1)
+    vehicleRig.view = 'third'
+
+    expect(fire(world, GUN)).toBe('wall')
+    expect(playerRig.shotTarget.x).toBeCloseTo(0.8)
     expect(playerRig.shotTarget.y).toBeCloseTo(1.35)
     expect(playerRig.shotTarget.z).toBeCloseTo(0.06)
   })

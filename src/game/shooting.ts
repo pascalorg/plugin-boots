@@ -18,6 +18,7 @@ import type { HitmarkerKind } from './hud'
 import { playerRig } from './player'
 import { getSession } from './session'
 import { beginDamageBatch, endDamageBatch } from './shared-damage'
+import { vehicleRig } from './vehicle-state'
 import type { WeaponDef } from './weapons'
 import type { GameWorld } from './world'
 
@@ -478,8 +479,29 @@ export function fire(world: GameWorld, weapon: WeaponDef): FireOutcome {
 }
 
 function fireShot(world: GameWorld, weapon: WeaponDef): FireOutcome {
-  _origin.copy(playerRig.position)
-  aimDirection(_direction, weapon.spread)
+  if (vehicleRig.view === 'third') {
+    // A shoulder camera is offset from the character by several metres. A
+    // parallel ray from the eye therefore lands left/below the center cursor.
+    // Cast the authoritative hit through the actual center-screen ray; the
+    // local/remote avatar FX then connects its real muzzle to shotTarget.
+    _origin.copy(playerRig.viewOrigin)
+    _direction.copy(playerRig.viewDirection)
+    if (weapon.spread > 0) {
+      const ads = playerRig.ads < 0 ? 0 : playerRig.ads > 1 ? 1 : playerRig.ads
+      const total =
+        weapon.spread *
+        (1 + playerRig.speed * 0.25) *
+        (playerRig.grounded ? 1 : 1.8) *
+        (1 - 0.75 * ads)
+      _direction.x += (Math.random() - 0.5) * 2 * total
+      _direction.y += (Math.random() - 0.5) * 2 * total
+      _direction.z += (Math.random() - 0.5) * 2 * total
+      _direction.normalize()
+    }
+  } else {
+    _origin.copy(playerRig.position)
+    aimDirection(_direction, weapon.spread)
+  }
 
   // Candidates are cast in ascending class priority, each culled at the
   // current winner's distance + TIE. Any hit a later cast returns is either

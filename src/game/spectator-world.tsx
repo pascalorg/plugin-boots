@@ -10,6 +10,7 @@ import {
   placeableCatalog,
 } from './inventory'
 import type { PlacedAperture, PlacedItem } from './item-place'
+import { EndlessRoad } from './endless-road'
 import {
   localSessionId,
   onFrame,
@@ -236,6 +237,7 @@ export function SpectatorWorld() {
   return (
     <>
       <SpectatorBuilds />
+      <EndlessRoad world={world} />
       <Nature world={world} />
       <TreesDestruct spectator world={world} />
       <GunTable spectator world={world} />

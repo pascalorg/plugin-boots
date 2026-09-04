@@ -3,6 +3,7 @@
 import { useFrame } from '@react-three/fiber'
 import { type ComponentType, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  Box3,
   CanvasTexture,
   type Color,
   type Group,
@@ -23,9 +24,11 @@ import { DepotMirror } from './depot-mirror'
 import { damageTarget, useDestruction } from './destruction'
 import { bots, damageBot, waveState } from './enemies-state'
 import { groundSurfaceY } from './ground'
+import { shatterPane, useGlass } from './glass'
 import { isHordeAuthority, setSharedWaves } from './horde-sync'
 import { takeAction } from './input'
 import { clearScatterInRadius } from './nature'
+import { isRoadWrapJump, roadLoopFrame, roadWrapOffset } from './road-loop'
 import {
   getParticipants,
   localSessionId,
@@ -441,6 +444,11 @@ const DRIVE_BREAK_TYPES = new Set([
   'wall',
   'door',
   'window',
+  'slab',
+  'floor',
+  'ceiling',
+  'roof',
+  'roof-segment',
   'item',
   'shelf',
   'cabinet',
@@ -457,7 +465,10 @@ const _impactBlockers: ColliderEntry[] = []
 const _impactPoint = new Vector3()
 const _impactDirection = new Vector3()
 const VEHICLE_RAM_RADIUS = 1.9
+const VEHICLE_TRAILER_RAM_RADIUS = 2.25
 const VEHICLE_MAX_SUPPORT_RISE = 0.45
+const TRUCK_COLLISION_HEIGHT = 2.25
+const TRAILER_COLLISION_HEIGHT = TRAILER_DECK_LIFT + DEPOT_SIZE[1] + 0.12
 
 /** A heavy road vehicle follows terrain, roads and shallow curbs, never the
  * highest walkable surface in the column (upper floors and roofs). */
@@ -524,6 +535,7 @@ function collectBodyBlockers(
   z: number,
   yaw: number,
   samples: ReadonlyArray<readonly [number, number, number]>,
+  bodyHeight: number,
   out?: ColliderEntry[],
 ): boolean {
   const cos = Math.cos(yaw)
@@ -538,7 +550,7 @@ function collectBodyBlockers(
     if ((collider.disabled && !voxelized) || collider.nodeId === DEPOT_NODE_ID) continue
     if (DRIVE_OVER_TYPES.has(collider.nodeType)) continue
     const box = collider.worldBox
-    if (box.max.y <= y + 0.34 || box.min.y >= y + 1.9) continue
+    if (box.max.y <= y + 0.34 || box.min.y >= y + bodyHeight) continue
     for (const [lx, lz, radius] of samples) {
       const px = x + lx * cos + lz * sin
       const pz = z - lx * sin + lz * cos
@@ -567,6 +579,7 @@ export function collectArticulatedBlockers(
     trailer.z,
     trailer.yaw,
     TRAILER_DRIVE_SAMPLES,
+    TRAILER_COLLISION_HEIGHT,
     out,
   )
   const truckBlocked = collectBodyBlockers(
@@ -576,9 +589,128 @@ export function collectArticulatedBlockers(
     truck.z,
     truck.yaw,
     TRUCK_DRIVE_SAMPLES,
+    TRUCK_COLLISION_HEIGHT,
     out,
   )
   return trailerBlocked || truckBlocked
+}
+
+type ConvoyBodyPose = { x: number; z: number; yaw: number }
+
+function bodyTouchesBox(
+  box: Box3,
+  groundY: number,
+  pose: ConvoyBodyPose,
+  samples: ReadonlyArray<readonly [number, number, number]>,
+  height: number,
+): boolean {
+  if (box.max.y <= groundY + 0.34 || box.min.y >= groundY + height) return false
+  const cos = Math.cos(pose.yaw)
+  const sin = Math.sin(pose.yaw)
+  for (const [lx, lz, radius] of samples) {
+    const x = pose.x + lx * cos + lz * sin
+    const z = pose.z - lx * sin + lz * cos
+    const dx = x < box.min.x ? box.min.x - x : x > box.max.x ? x - box.max.x : 0
+    const dz = z < box.min.z ? box.min.z - z : z > box.max.z ? z - box.max.z : 0
+    if (dx * dx + dz * dz < radius * radius) return true
+  }
+  return false
+}
+
+/** Choose the body that actually reached a collider and return a carve point
+ * centered through that body's full vertical envelope. This replaces the old
+ * truck-nose-only point, which let the tall trailer ghost through the upper
+ * half of walls and left anything struck by its flank untouched. */
+export function convoyImpactPoint(
+  collider: Pick<ColliderEntry, 'worldBox'>,
+  groundY: number,
+  trailer: ConvoyBodyPose,
+  truck: ConvoyBodyPose,
+  out = new Vector3(),
+): { point: Vector3; body: 'truck' | 'trailer' } {
+  const box = collider.worldBox
+  const clampX = (x: number) => Math.max(box.min.x, Math.min(box.max.x, x))
+  const clampZ = (z: number) => Math.max(box.min.z, Math.min(box.max.z, z))
+  const tx = clampX(truck.x)
+  const tz = clampZ(truck.z)
+  const qx = clampX(trailer.x)
+  const qz = clampZ(trailer.z)
+  const truckDist = (truck.x - tx) ** 2 + (truck.z - tz) ** 2
+  const trailerDist = (trailer.x - qx) ** 2 + (trailer.z - qz) ** 2
+  const truckTouches = bodyTouchesBox(
+    box,
+    groundY,
+    truck,
+    TRUCK_DRIVE_SAMPLES,
+    TRUCK_COLLISION_HEIGHT,
+  )
+  const trailerTouches = bodyTouchesBox(
+    box,
+    groundY,
+    trailer,
+    TRAILER_DRIVE_SAMPLES,
+    TRAILER_COLLISION_HEIGHT,
+  )
+  const body = trailerTouches && (!truckTouches || trailerDist < truckDist) ? 'trailer' : 'truck'
+  const height = body === 'trailer' ? TRAILER_COLLISION_HEIGHT : TRUCK_COLLISION_HEIGHT
+  const x = body === 'trailer' ? qx : tx
+  const z = body === 'trailer' ? qz : tz
+  out.set(x, Math.max(box.min.y, Math.min(box.max.y, groundY + height * 0.52)), z)
+  return { point: out, body }
+}
+
+function ramTreesWithConvoy(trailer: ConvoyBodyPose, truck: ConvoyBodyPose): number {
+  let felled = 0
+  for (const [lx, lz, radius] of TRAILER_DRIVE_SAMPLES) {
+    const point = convoyLocalToWorld(lx, lz, trailer)
+    felled += ramTreesAt(point.x, point.z, radius)
+  }
+  for (const [lx, lz, radius] of TRUCK_DRIVE_SAMPLES) {
+    const point = convoyLocalToWorld(lx, lz, truck)
+    felled += ramTreesAt(point.x, point.z, radius)
+  }
+  return felled
+}
+
+const _ramGlassBox = new Box3()
+
+/** Glass panes live outside world.colliders, so the structural sweep cannot
+ * discover them. The elected simulator shatters any pane touched anywhere by
+ * the tractor or the trailer and glass-sync distributes that one event. */
+function ramGlassWithConvoy(
+  world: GameWorld,
+  groundY: number,
+  trailer: ConvoyBodyPose,
+  truck: ConvoyBodyPose,
+): number {
+  if (!isHordeAuthority()) return 0
+  const shattered = useGlass.getState().shattered
+  let count = 0
+  for (const pane of world.glass) {
+    if (shattered.has(pane.mesh)) continue
+    const geometry = pane.mesh.geometry
+    if (!geometry.boundingBox) geometry.computeBoundingBox()
+    _ramGlassBox.copy(geometry.boundingBox!).applyMatrix4(pane.mesh.matrixWorld)
+    if (
+      !bodyTouchesBox(
+        _ramGlassBox,
+        groundY,
+        trailer,
+        TRAILER_DRIVE_SAMPLES,
+        TRAILER_COLLISION_HEIGHT,
+      ) &&
+      !bodyTouchesBox(
+        _ramGlassBox,
+        groundY,
+        truck,
+        TRUCK_DRIVE_SAMPLES,
+        TRUCK_COLLISION_HEIGHT,
+      )
+    ) continue
+    shatterPane(pane)
+    count++
+  }
+  return count
 }
 
 export function convoyCanOccupy(
@@ -735,6 +867,7 @@ const RUST_PATCHES: Array<{
  */
 function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean }) {
   const center = useMemo(() => depotPosition(world), [world])
+  const roadFrame = useMemo(() => roadLoopFrame(world), [world])
   // Seat the container on whatever actually stands under its footprint —
   // the same probe that settles the player (spawnGroundY skips '__boots'
   // colliders, so the depot never stands on itself). On lots whose yard
@@ -814,6 +947,23 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
       convoyPose.targetTruckX = frame.truckX ?? legacyTruck.x
       convoyPose.targetTruckZ = frame.truckZ ?? legacyTruck.z
       convoyPose.targetTruckYaw = frame.truckYaw ?? frame.yaw
+      // A road-loop wrap is an intentional topology change, not 840 metres
+      // of travel to interpolate through. Snap both articulated bodies on the
+      // receiving frame so peers never watch the convoy streak across town.
+      if (
+        isRoadWrapJump(
+          convoyPose.targetTruckX - convoyPose.truckX,
+          convoyPose.targetTruckZ - convoyPose.truckZ,
+        )
+      ) {
+        convoyPose.x = convoyPose.targetX
+        convoyPose.y = convoyPose.targetY
+        convoyPose.z = convoyPose.targetZ
+        convoyPose.yaw = convoyPose.targetYaw
+        convoyPose.truckX = convoyPose.targetTruckX
+        convoyPose.truckZ = convoyPose.targetTruckZ
+        convoyPose.truckYaw = convoyPose.targetTruckYaw
+      }
       convoyPose.speed = frame.speed
       convoyPose.targetSteer = frame.steer ?? 0
       convoyPose.occupied = frame.occupied
@@ -969,9 +1119,9 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
             nextTruckYaw + truckYawRate(convoyPose.speed, convoyPose.steer) * dt,
           )
         }
-        const nextTruckX =
+        let nextTruckX =
           convoyPose.truckX - Math.cos(nextTruckYaw) * convoyPose.speed * dt
-        const nextTruckZ =
+        let nextTruckZ =
           convoyPose.truckZ + Math.sin(nextTruckYaw) * convoyPose.speed * dt
         const nextTrailerYaw = stepTrailerYaw(
           convoyPose.yaw,
@@ -985,6 +1135,17 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
           nextTruckYaw,
           nextTrailerYaw,
         )
+        // Toroidal road seam: translate both articulated bodies by the exact
+        // same period after the tractor crosses an end. Articulation, velocity,
+        // and steering are untouched, so this is invisible from the cab and is
+        // published as one authoritative pose for every other player.
+        const roadShift = roadWrapOffset(roadFrame, nextTruckX, nextTruckZ)
+        if (roadShift.x !== 0 || roadShift.z !== 0) {
+          nextTruckX += roadShift.x
+          nextTruckZ += roadShift.z
+          nextTrailer.x += roadShift.x
+          nextTrailer.z += roadShift.z
+        }
         const candidateTruck = { x: nextTruckX, z: nextTruckZ, yaw: nextTruckYaw }
         const candidateTrailer = { ...nextTrailer, yaw: nextTrailerYaw }
         const ny = articulatedGroundY(world, candidateTrailer, candidateTruck)
@@ -996,7 +1157,7 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
           yaw: nextTruckYaw,
         })
         const felledTrees = Math.abs(convoyPose.speed) > 1.1
-          ? ramTreesAt(nose.x, nose.z, 1.45)
+          ? ramTreesWithConvoy(candidateTrailer, candidateTruck)
           : 0
 
         _impactBlockers.length = 0
@@ -1019,17 +1180,18 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
           )
           for (const collider of _impactBlockers) {
             if (!DRIVE_BREAK_TYPES.has(collider.nodeType)) continue
-            const box = collider.worldBox
-            _impactPoint.set(
-              Math.max(box.min.x, Math.min(box.max.x, nose.x)),
-              Math.max(box.min.y, Math.min(box.max.y, ny + 1.0)),
-              Math.max(box.min.z, Math.min(box.max.z, nose.z)),
+            const impact = convoyImpactPoint(
+              collider,
+              ny,
+              candidateTrailer,
+              candidateTruck,
+              _impactPoint,
             )
             removedVoxels += damageTarget(
               world,
               collider.nodeId,
               _impactPoint,
-              VEHICLE_RAM_RADIUS,
+              impact.body === 'trailer' ? VEHICLE_TRAILER_RAM_RADIUS : VEHICLE_RAM_RADIUS,
               _impactDirection,
             )
           }
@@ -1153,12 +1315,14 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
     if (!spectator) refreshConvoyColliders(world)
 
     if (!spectator && Math.abs(convoyPose.speed) > 1.1) {
-      const currentNose = convoyLocalToWorld(-3.0, 0, {
+      const trailerBody = { x: convoyPose.x, z: convoyPose.z, yaw: convoyPose.yaw }
+      const truckBody = {
         x: convoyPose.truckX,
         z: convoyPose.truckZ,
         yaw: convoyPose.truckYaw,
-      })
-      ramTreesAt(currentNose.x, currentNose.z, 1.45)
+      }
+      ramTreesWithConvoy(trailerBody, truckBody)
+      ramGlassWithConvoy(world, convoyPose.y, trailerBody, truckBody)
       ramBotsWithConvoy()
     }
 

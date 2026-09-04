@@ -6,6 +6,7 @@ import {
   breakerEngageable,
   breakerPosition,
   collectArticulatedBlockers,
+  convoyImpactPoint,
   convoyCanOccupy,
   buildStationPosition,
   DEPOT_NODE_ID,
@@ -307,6 +308,19 @@ describe('Cybertruck convoy collision envelope', () => {
       ),
     ).toBe(false)
     expect(impacts).toEqual([wall])
+  })
+
+  test('the trailer catches and carves obstacles across its full container height', () => {
+    const highWall = box('upper-wall', 'wall', [0.3, 0.5, 2], [0, 3.2, 0])
+    const impacts: ColliderEntry[] = []
+    const trailer = { x: 0, z: 0, yaw: 0 }
+    const truck = { x: 20, z: 20, yaw: 0 }
+
+    expect(collectArticulatedBlockers([highWall], 0, trailer, truck, impacts)).toBe(true)
+    expect(impacts).toEqual([highWall])
+    const impact = convoyImpactPoint(highWall, 0, trailer, truck)
+    expect(impact.body).toBe('trailer')
+    expect(impact.point.y).toBeGreaterThan(1.8)
   })
 
   test('heavy support follows road grade but rejects an upper floor or roof', () => {

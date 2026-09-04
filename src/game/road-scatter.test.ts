@@ -195,8 +195,10 @@ describe('collectRoadFootprints — streetscape road networks', () => {
 })
 
 describe('scatter road rejection', () => {
-  // An 80 × 4 m road strip crossing the scatter ring (z in [3, 7]).
-  const strip = footprintFromTriangles(meshFootprintTriangles(flatQuad(80, 4, [0, 0.1, 5])))!
+  // An 80 × 4 m HOST road strip crossing the scatter ring (z in [18, 22]).
+  // It is intentionally separate from Boots' generated depot road, whose own
+  // footprint is now always rejected as well.
+  const strip = footprintFromTriangles(meshFootprintTriangles(flatQuad(80, 4, [0, 0.1, 20])))!
   const color = new Color('#79b054')
 
   function run(world: GameWorld): Array<[number, number]> {

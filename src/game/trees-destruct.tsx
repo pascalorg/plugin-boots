@@ -18,7 +18,13 @@ import { spawnDebris } from './debris'
 import { spawnDust } from './dust'
 import { groundSurfaceY } from './ground'
 import { isHordeAuthority } from './horde-sync'
-import { scatter } from './nature'
+import { scatter, scatterGroundY } from './nature'
+import {
+  ROAD_RENDER_HALF_LENGTH,
+  ROAD_WIDTH,
+  roadLocalPoint,
+  roadLoopFrame,
+} from './road-loop'
 import { hideForGame } from './session'
 import { registerTreeRoutes } from './shooting'
 import { MAX_BLOBS, MAX_TIERS, type TreeParams, treeParamsAt } from './tree-species'
@@ -864,6 +870,40 @@ function treePlacements(world: GameWorld): TreePlacement[] {
     })
     return _canopyColor.setRGB(params.color[0], params.color[1], params.color[2]).clone()
   })
+  // The long road gets two deterministic rows of trees. They join the SAME
+  // five instanced combat meshes and tree-sync state as the near grove, so
+  // extending the landscape adds no draw calls and a remote truck fells the
+  // same roadside tree for every player. Keep a broad clear bay around the
+  // initial tractor/trailer and reject the authored building footprint.
+  const road = roadLoopFrame(world)
+  const building = world.buildingAabb
+  // 24 divides the 840 m wrap period exactly, so spacing continues across
+  // the seam instead of betraying the teleport with one oversized gap.
+  for (let along = -408; along <= 408; along += 24) {
+    if (Math.abs(along) < 30) continue
+    for (const side of [-1, 1]) {
+      const hash = Math.abs(Math.sin(along * 12.9898 + side * 78.233))
+      const across = side * (ROAD_WIDTH / 2 + 5.2 + hash * 3.8)
+      const p = roadLocalPoint(road, along, across)
+      if (
+        !building.isEmpty() &&
+        p.x > building.min.x - 2 &&
+        p.x < building.max.x + 2 &&
+        p.z > building.min.z - 2 &&
+        p.z < building.max.z + 2
+      ) continue
+      const params = treeParamsAt(p.x, p.z)
+      placements.push({
+        x: p.x,
+        y: scatterGroundY(world, p.x, p.z),
+        z: p.z,
+        scale: 0.75 + hash * 0.8,
+        yaw: hash * Math.PI * 2,
+        color: params.color,
+        params,
+      })
+    }
+  }
   return placements
 }
 

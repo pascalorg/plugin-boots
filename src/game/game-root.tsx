@@ -36,6 +36,7 @@ import {
 import { clearDust, dustDebug, DustSystem, setDustFloorProbe } from './dust'
 import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
+import { EndlessRoad } from './endless-road'
 import { frameOk, reportFrameCrash } from './frame-guard'
 import { PlacedFittings } from './fittings'
 import {
@@ -1239,6 +1240,7 @@ function ActiveGame() {
       <GameItems world={world} />
       <Builder />
       <Enemies world={world} />
+      <EndlessRoad world={world} />
       <Nature world={world} />
       <PipelineWarmup world={world} />
       <LoadingDriver world={world} />

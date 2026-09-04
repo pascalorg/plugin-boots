@@ -37,6 +37,7 @@ import {
   skirtGeometry,
   lawnGeometry,
 } from './horizon'
+import { pointOnEndlessRoad } from './road-loop'
 import { type GameWorld, pointInPolygonXZ, pointOnRoad, siteGroundYAt } from './world'
 
 /**
@@ -497,7 +498,10 @@ export function scatter(
     }
     // No flora on pavement: roads, driveways, parking pads (default margin
     // keeps blades clear of the kerb line, not just the centerline).
-    if (pointOnRoad(world.roadFootprints, position.x, position.z)) continue
+    if (
+      pointOnRoad(world.roadFootprints, position.x, position.z) ||
+      pointOnEndlessRoad(world, position.x, position.z)
+    ) continue
     // On-lot only when a host site exists (see the doc block above). A
     // degenerate polygon (< 3 points — "inside" is meaningless) skips the
     // clamp rather than rejecting the entire field.

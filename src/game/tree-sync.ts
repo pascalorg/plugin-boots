@@ -16,7 +16,10 @@ import {
  * the resulting grove at 5 Hz and answers late joiners. */
 export const TREE_KIND = 'boots/trees' as const
 export const TREE_COMMAND_KIND = 'boots/tree-command' as const
-export const TREE_SYNC_CAP = 128
+// 46 near-lot trees + the repeated road's two sparse rows + authored trees.
+// A higher bound keeps every destructible roadside tree authoritative while
+// remaining a small fixed-size validation ceiling for hostile frames.
+export const TREE_SYNC_CAP = 256
 const TREE_PUBLISH_HZ = 5
 
 export type TreeStateWire = 0 | 1 | 2 | 3

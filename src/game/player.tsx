@@ -198,6 +198,11 @@ export const playerRig = {
    * effects converge from the offset gun barrel to this point, so the visible
    * tracer and the crosshair never disagree. */
   shotTarget: new Vector3(0, 0, -1),
+  /** Actual center-screen camera ray. In shoulder view the camera is behind
+   * and to the right of the eye, so a parallel eye ray is visibly wrong even
+   * when yaw/pitch match. Shooting uses this origin/direction in third person. */
+  viewOrigin: new Vector3(),
+  viewDirection: new Vector3(0, 0, -1),
   /** Knockback: queue an XZ impulse (m/s); consumed into velocity next frame. */
   shove(dirX: number, dirZ: number, power: number): void {
     const len = Math.hypot(dirX, dirZ)
@@ -840,6 +845,12 @@ export function Player({ world }: { world: GameWorld }) {
         swayRoll + roll + feel.hurtRoll * shakeK,
       )
     }
+
+    // Capture after the final camera transform, including the shoulder boom.
+    // Viewmodel's frame runs after Player and can therefore resolve the shot
+    // through the exact center pixel the user saw when clicking.
+    playerRig.viewOrigin.copy(camera.position)
+    camera.getWorldDirection(playerRig.viewDirection)
 
     // Fall off the world guard. Re-settle: the ground at the spawn XZ may
     // have changed since the snapshot (voxelized away, pieces placed). The
