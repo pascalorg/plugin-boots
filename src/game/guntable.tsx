@@ -20,8 +20,9 @@ import {
   CyberTruckModel,
 } from './cyber-truck'
 import { DepotMirror } from './depot-mirror'
-import { damageTarget } from './destruction'
+import { damageTarget, useDestruction } from './destruction'
 import { bots, damageBot, waveState } from './enemies-state'
+import { groundSurfaceY } from './ground'
 import { isHordeAuthority, setSharedWaves } from './horde-sync'
 import { takeAction } from './input'
 import { clearScatterInRadius } from './nature'
@@ -56,7 +57,13 @@ import {
 } from './vehicle-state'
 import * as weaponModels from './weapon-models'
 import { HammerModel, MinigunModel, PistolModel, RifleModel } from './weapon-models'
-import { bvhFor, type ColliderEntry, type GameWorld, spawnGroundY } from './world'
+import {
+  bvhFor,
+  type ColliderEntry,
+  type GameWorld,
+  probeSpawnSurfaceY,
+  spawnGroundY,
+} from './world'
 
 /**
  * THE ARMORED SPAWN DEPOT (owner vision): the spawn gear is a PERMANENT,
@@ -449,6 +456,31 @@ const DRIVE_BREAK_TYPES = new Set([
 const _impactBlockers: ColliderEntry[] = []
 const _impactPoint = new Vector3()
 const _impactDirection = new Vector3()
+const VEHICLE_RAM_RADIUS = 1.9
+const VEHICLE_MAX_SUPPORT_RISE = 0.45
+
+/** A heavy road vehicle follows terrain, roads and shallow curbs, never the
+ * highest walkable surface in the column (upper floors and roofs). */
+export function heavyVehicleSupportY(terrainY: number, sampledY: number | null): number {
+  if (sampledY === null || !Number.isFinite(sampledY)) return terrainY
+  return sampledY <= terrainY + VEHICLE_MAX_SUPPORT_RISE
+    ? Math.max(terrainY, sampledY)
+    : terrainY
+}
+
+/** Convert broken material into a visible loss of momentum without making a
+ * heavy convoy bounce or reverse. Repeated walls therefore cost speed while
+ * the truck still has enough mass to push through them. */
+export function speedAfterRamImpact(
+  speed: number,
+  removedVoxels: number,
+  felledTrees: number,
+): number {
+  if (removedVoxels <= 0 && felledTrees <= 0) return speed
+  const loss = 0.35 + Math.min(5, Math.max(0, removedVoxels) * 0.02) +
+    Math.max(0, felledTrees) * 1.1
+  return Math.sign(speed) * Math.max(0, Math.abs(speed) - loss)
+}
 
 /** Broad, conservative convoy sweep. Ground-like surfaces below axle height
  * are driveable; walls, furniture and other vertical solids block before the
@@ -496,9 +528,14 @@ function collectBodyBlockers(
 ): boolean {
   const cos = Math.cos(yaw)
   const sin = Math.sin(yaw)
+  const voxelTargets = out ? useDestruction.getState().targets : null
   let blocked = false
   for (const collider of colliders) {
-    if (collider.disabled || collider.nodeId === DEPOT_NODE_ID) continue
+    // Player-built walls voxelize immediately and disable their source
+    // collider. They still need to enter the ram list or the truck passes
+    // through a perfectly intact voxel wall without visually breaking it.
+    const voxelized = collider.disabled && voxelTargets?.has(collider.nodeId)
+    if ((collider.disabled && !voxelized) || collider.nodeId === DEPOT_NODE_ID) continue
     if (DRIVE_OVER_TYPES.has(collider.nodeType)) continue
     const box = collider.worldBox
     if (box.max.y <= y + 0.34 || box.min.y >= y + 1.9) continue
@@ -508,7 +545,7 @@ function collectBodyBlockers(
       const dx = px < box.min.x ? box.min.x - px : px > box.max.x ? px - box.max.x : 0
       const dz = pz < box.min.z ? box.min.z - pz : pz > box.max.z ? pz - box.max.z : 0
       if (dx * dx + dz * dz >= radius * radius) continue
-      blocked = true
+      if (!collider.disabled) blocked = true
       if (out && !out.some((entry) => entry.nodeId === collider.nodeId)) out.push(collider)
       break
     }
@@ -516,7 +553,7 @@ function collectBodyBlockers(
   return blocked
 }
 
-function collectArticulatedBlockers(
+export function collectArticulatedBlockers(
   colliders: readonly ColliderEntry[],
   y: number,
   trailer: { x: number; z: number; yaw: number },
@@ -566,14 +603,22 @@ function articulatedGroundY(
     [2.4, 0],
   ] as const) {
     const p = convoyLocalToWorld(lx, lz, trailer)
-    best = Math.max(best, spawnGroundY(world.colliders, p.x, p.z))
+    const terrain = groundSurfaceY(p.x, p.z)
+    best = Math.max(
+      best,
+      heavyVehicleSupportY(terrain, probeSpawnSurfaceY(world.colliders, p.x, p.z)),
+    )
   }
   for (const [lx, lz] of [
     [-2.2, 0],
     [1.8, 0],
   ] as const) {
     const p = convoyLocalToWorld(lx, lz, truck)
-    best = Math.max(best, spawnGroundY(world.colliders, p.x, p.z))
+    const terrain = groundSurfaceY(p.x, p.z)
+    best = Math.max(
+      best,
+      heavyVehicleSupportY(terrain, probeSpawnSurfaceY(world.colliders, p.x, p.z)),
+    )
   }
   return Number.isFinite(best) ? best : 0
 }
@@ -939,7 +984,9 @@ function SpawnDepot({ world }: { world: GameWorld }) {
           z: nextTruckZ,
           yaw: nextTruckYaw,
         })
-        if (Math.abs(convoyPose.speed) > 1.1) ramTreesAt(nose.x, nose.z, 1.45)
+        const felledTrees = Math.abs(convoyPose.speed) > 1.1
+          ? ramTreesAt(nose.x, nose.z, 1.45)
+          : 0
 
         _impactBlockers.length = 0
         let blocked = collectArticulatedBlockers(
@@ -952,7 +999,8 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         // A moving Cybertruck is a demolition tool. Break only vertical
         // structures/props (never the road or floor carrying it), then retry
         // the sweep in the same frame so a successful impact carries through.
-        if (blocked && Math.abs(convoyPose.speed) > 1.1) {
+        let removedVoxels = 0
+        if (_impactBlockers.length > 0 && Math.abs(convoyPose.speed) > 1.1) {
           _impactDirection.set(
             -Math.cos(nextTruckYaw) * direction,
             0,
@@ -966,7 +1014,13 @@ function SpawnDepot({ world }: { world: GameWorld }) {
               Math.max(box.min.y, Math.min(box.max.y, ny + 1.0)),
               Math.max(box.min.z, Math.min(box.max.z, nose.z)),
             )
-            damageTarget(world, collider.nodeId, _impactPoint, 1.45, _impactDirection)
+            removedVoxels += damageTarget(
+              world,
+              collider.nodeId,
+              _impactPoint,
+              VEHICLE_RAM_RADIUS,
+              _impactDirection,
+            )
           }
           blocked = collectArticulatedBlockers(
             world.colliders,
@@ -975,6 +1029,11 @@ function SpawnDepot({ world }: { world: GameWorld }) {
             candidateTruck,
           )
         }
+        convoyPose.speed = speedAfterRamImpact(
+          convoyPose.speed,
+          removedVoxels,
+          felledTrees,
+        )
         if (!blocked) {
           convoyPose.x = convoyPose.targetX = nextTrailer.x
           convoyPose.y = convoyPose.targetY = ny

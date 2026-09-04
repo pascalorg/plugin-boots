@@ -5,6 +5,7 @@ import {
   armoryStationPosition,
   breakerEngageable,
   breakerPosition,
+  collectArticulatedBlockers,
   convoyCanOccupy,
   buildStationPosition,
   DEPOT_NODE_ID,
@@ -15,7 +16,9 @@ import {
   depotLocalToWorld,
   depotPosition,
   GRAB_RANGE,
+  heavyVehicleSupportY,
   nearestGrabbable,
+  speedAfterRamImpact,
   stepTrailerYaw,
   trailerCenterFromHitch,
   TRAILER_HITCH_LENGTH,
@@ -250,6 +253,10 @@ describe('spawn depot layout', () => {
 })
 
 describe('Cybertruck convoy collision envelope', () => {
+  afterEach(() => {
+    resetDestruction()
+  })
+
   const box = (
     nodeId: string,
     nodeType: string,
@@ -280,6 +287,39 @@ describe('Cybertruck convoy collision envelope', () => {
     const ground = box('site-a', 'site', [100, 0.2, 100], [0, 0, 0])
     const own = box(DEPOT_NODE_ID, DEPOT_NODE_TYPE, [6, 3, 2.5], [0, 1.5, 0])
     expect(convoyCanOccupy([ground, own], 0, 0, 0, 0)).toBe(true)
+  })
+
+  test('an already-voxelized placed wall still enters the truck ram list', () => {
+    const wall = box('placed-wall', 'block', [0.2, 2.8, 3], [-2.65, 1.4, 1.02])
+    wall.disabled = true
+    useDestruction.setState({ targets: new Map([['placed-wall', {} as never]]) })
+    const impacts: ColliderEntry[] = []
+
+    // Disabled means its source collider no longer blocks; the live voxel
+    // target must nevertheless be damaged by the same truck overlap.
+    expect(
+      collectArticulatedBlockers(
+        [wall],
+        0,
+        { x: 20, z: 20, yaw: 0 },
+        { x: 0, z: 0, yaw: 0 },
+        impacts,
+      ),
+    ).toBe(false)
+    expect(impacts).toEqual([wall])
+  })
+
+  test('heavy support follows road grade but rejects an upper floor or roof', () => {
+    expect(heavyVehicleSupportY(0, 0.18)).toBeCloseTo(0.18)
+    expect(heavyVehicleSupportY(0, 2.8)).toBe(0)
+    expect(heavyVehicleSupportY(-1.2, null)).toBeCloseTo(-1.2)
+  })
+
+  test('breaking walls and trees costs momentum without reversing the truck', () => {
+    expect(speedAfterRamImpact(10, 100, 0)).toBeCloseTo(7.65)
+    expect(speedAfterRamImpact(-6, 0, 1)).toBeCloseTo(-4.55)
+    expect(speedAfterRamImpact(1, 10_000, 0)).toBe(0)
+    expect(speedAfterRamImpact(4, 0, 0)).toBe(4)
   })
 })
 
