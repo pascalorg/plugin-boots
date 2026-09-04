@@ -23,8 +23,20 @@ import {
   throwGrenade,
   throwVelocity,
   updateGrenades,
+  validateGrenadeEffectFrame,
   WAKE_AHEAD_FUSE,
 } from './grenade'
+
+describe('shared grenade effect wire boundary', () => {
+  test('accepts a bounded recent detonation ring and rejects hostile points', () => {
+    expect(validateGrenadeEffectFrame({ v: 1, e: [[4, 1.2, 3.4, -5.6]] })).toEqual({
+      v: 1,
+      e: [[4, 1.2, 3.4, -5.6]],
+    })
+    expect(validateGrenadeEffectFrame({ v: 1, e: [[4, Infinity, 0, 0]] })).toBeNull()
+    expect(validateGrenadeEffectFrame({ v: 1, e: Array.from({ length: 9 }, () => [1, 0, 0, 0]) })).toBeNull()
+  })
+})
 import { playerRig } from './player'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 

@@ -18,6 +18,16 @@ import {
 import { create } from 'zustand'
 import { sfx } from './audio'
 import { groundSurfaceY } from './ground'
+import {
+  type NetMessage,
+  onFrame,
+  onStateRequest,
+  onStateSnapshot,
+  publishFrame,
+  registerFrameKind,
+  requestState,
+  sendStateSnapshot,
+} from './net'
 import { getSession, hideForGame } from './session'
 import { bvhFor, type GameWorld, type GlassPane } from './world'
 
@@ -64,6 +74,173 @@ const _worldBox = new Box3()
 const _boxHit = new Vector3()
 const _inverse = new Matrix4()
 const _normalMat = new Vector3()
+
+// ── Shared pane damage ------------------------------------------------------
+
+export const GLASS_KIND = 'boots/glass' as const
+const GLASS_SYNC_CAP = 256
+type GlassWire = [
+  pane: number,
+  hits: number,
+  shattered: 0 | 1,
+  x: number,
+  y: number,
+  z: number,
+  nx: number,
+  ny: number,
+  nz: number,
+]
+type GlassFrame = { v: 1; h: GlassWire[] }
+type GlassSnapshot = { v: 1; s: Array<[number, number, 0 | 1]> }
+const outgoingGlass = new Map<number, GlassWire>()
+const seenGlass = new Map<string, { hits: number; shattered: boolean }>()
+let glassWorld: GameWorld | null = null
+let offGlassFrame: (() => void) | null = null
+let offGlassRequest: (() => void) | null = null
+let offGlassSnapshot: (() => void) | null = null
+
+const finite = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value)
+
+export function readGlassFrame(data: unknown): GlassFrame | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = data as Record<string, unknown>
+  if (raw.v !== 1 || !Array.isArray(raw.h) || raw.h.length > GLASS_SYNC_CAP) return null
+  const hits: GlassWire[] = []
+  for (const entry of raw.h) {
+    if (!Array.isArray(entry) || entry.length !== 9) return null
+    const [pane, count, shattered, x, y, z, nx, ny, nz] = entry
+    if (
+      !Number.isInteger(pane) || pane < 0 || pane >= GLASS_SYNC_CAP ||
+      !Number.isInteger(count) || count < 0 || count > 1_000_000 ||
+      (shattered !== 0 && shattered !== 1) ||
+      !finite(x) || !finite(y) || !finite(z) ||
+      Math.abs(x) > 100_000 || Math.abs(y) > 100_000 || Math.abs(z) > 100_000 ||
+      !finite(nx) || !finite(ny) || !finite(nz) ||
+      Math.abs(nx) > 1.01 || Math.abs(ny) > 1.01 || Math.abs(nz) > 1.01
+    ) return null
+    hits.push([pane, count, shattered, x, y, z, nx, ny, nz])
+  }
+  return { v: 1, h: hits }
+}
+
+export function readGlassSnapshot(data: unknown): GlassSnapshot | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = data as Record<string, unknown>
+  if (raw.v !== 1 || !Array.isArray(raw.s) || raw.s.length > GLASS_SYNC_CAP) return null
+  const states: GlassSnapshot['s'] = []
+  for (const entry of raw.s) {
+    if (!Array.isArray(entry) || entry.length !== 3) return null
+    const [pane, hits, shattered] = entry
+    if (
+      !Number.isInteger(pane) || pane < 0 || pane >= GLASS_SYNC_CAP ||
+      !Number.isInteger(hits) || hits < 0 || hits > 1_000_000 ||
+      (shattered !== 0 && shattered !== 1)
+    ) return null
+    states.push([pane, hits, shattered])
+  }
+  return { v: 1, s: states }
+}
+
+const _syncPoint = new Vector3()
+const _syncNormal = new Vector3()
+
+function paneIndex(pane: GlassPane): number {
+  return glassWorld?.glass.indexOf(pane) ?? -1
+}
+
+function publishGlassDamage(pane: GlassPane, point?: Vector3, normal?: Vector3, shattered = false): void {
+  const index = paneIndex(pane)
+  if (index < 0 || index >= GLASS_SYNC_CAP) return
+  const prior = outgoingGlass.get(index)
+  const p = point ?? pane.mesh.getWorldPosition(_syncPoint)
+  const n = normal ?? _syncNormal.set(0, 0, 1).transformDirection(pane.mesh.matrixWorld)
+  outgoingGlass.set(index, [
+    index,
+    (prior?.[1] ?? 0) + (point ? 1 : 0),
+    shattered || prior?.[2] === 1 ? 1 : 0,
+    Math.round(p.x * 1000) / 1000,
+    Math.round(p.y * 1000) / 1000,
+    Math.round(p.z * 1000) / 1000,
+    Math.round(n.x * 1000) / 1000,
+    Math.round(n.y * 1000) / 1000,
+    Math.round(n.z * 1000) / 1000,
+  ])
+  publishFrame(GLASS_KIND, { v: 1, h: [...outgoingGlass.values()] } satisfies GlassFrame)
+}
+
+function applyGlassFrame(msg: NetMessage<GlassFrame>): void {
+  const world = glassWorld
+  if (!world) return
+  for (const [index, hits, shattered, x, y, z, nx, ny, nz] of msg.data.h) {
+    const pane = world.glass[index]
+    if (!pane) continue
+    const key = `${msg.sessionId}:${index}`
+    const prior = seenGlass.get(key) ?? { hits: 0, shattered: false }
+    const nextHits = Math.max(prior.hits, hits)
+    seenGlass.set(key, { hits: nextHits, shattered: prior.shattered || shattered === 1 })
+    _syncPoint.set(x, y, z)
+    _syncNormal.set(nx, ny, nz)
+    for (let i = prior.hits; i < Math.min(nextHits, prior.hits + 3); i++) {
+      hitGlass({ pane, distance: 0, point: _syncPoint, normal: _syncNormal }, true)
+    }
+    if (!prior.shattered && shattered === 1) shatterPane(pane, true)
+  }
+}
+
+function glassSnapshot(world: GameWorld): GlassSnapshot {
+  const state = useGlass.getState()
+  const s: GlassSnapshot['s'] = []
+  for (let index = 0; index < world.glass.length && index < GLASS_SYNC_CAP; index++) {
+    const pane = world.glass[index]!
+    const hits = state.hits.get(pane.mesh) ?? 0
+    const shattered = state.shattered.has(pane.mesh) ? 1 : 0
+    if (hits > 0 || shattered) s.push([index, hits, shattered])
+  }
+  return { v: 1, s }
+}
+
+function applyGlassSnapshot(frame: GlassSnapshot): void {
+  const world = glassWorld
+  if (!world) return
+  const state = useGlass.getState()
+  for (const [index, desiredHits, shattered] of frame.s) {
+    const pane = world.glass[index]
+    if (!pane) continue
+    let current = state.hits.get(pane.mesh) ?? 0
+    pane.mesh.getWorldPosition(_syncPoint)
+    _syncNormal.set(0, 0, 1).transformDirection(pane.mesh.matrixWorld)
+    while (current < Math.min(desiredHits, 3)) {
+      hitGlass({ pane, distance: 0, point: _syncPoint, normal: _syncNormal }, true)
+      current++
+    }
+    if (shattered) shatterPane(pane, true)
+  }
+}
+
+export function startGlassSync(world: GameWorld): void {
+  glassWorld = world
+  registerFrameKind(GLASS_KIND, readGlassFrame, { ordered: false })
+  offGlassFrame ??= onFrame<GlassFrame>(GLASS_KIND, applyGlassFrame)
+  offGlassSnapshot ??= onStateSnapshot(GLASS_KIND, ({ state }) => {
+    const frame = readGlassSnapshot(state)
+    if (frame) applyGlassSnapshot(frame)
+  })
+  offGlassRequest ??= onStateRequest(({ of, from }) => {
+    if (of === GLASS_KIND && glassWorld) sendStateSnapshot(GLASS_KIND, from, glassSnapshot(glassWorld))
+  })
+  requestState(GLASS_KIND)
+}
+
+export function stopGlassSync(): void {
+  offGlassFrame?.()
+  offGlassRequest?.()
+  offGlassSnapshot?.()
+  offGlassFrame = offGlassRequest = offGlassSnapshot = null
+  outgoingGlass.clear()
+  seenGlass.clear()
+  glassWorld = null
+}
 
 export type GlassHit = { pane: GlassPane; distance: number; point: Vector3; normal: Vector3 }
 
@@ -359,7 +536,7 @@ function spawnPaneShards(pane: GlassPane): void {
   }
 }
 
-export function shatterPane(pane: GlassPane): void {
+export function shatterPane(pane: GlassPane, remote = false): void {
   // A grenade's deferred glass waves (40/80 ms setTimeout in explodeAt) can
   // outlive the session — Esc inside that window runs resetGlass first, and
   // a late shatter would then mark the STILL-RENDERING pane in the fresh
@@ -378,14 +555,16 @@ export function shatterPane(pane: GlassPane): void {
     version: state.version + 1,
   })
   sfx.glassShatter()
+  if (!remote) publishGlassDamage(pane, undefined, undefined, true)
 }
 
-export function hitGlass(hit: GlassHit): void {
+export function hitGlass(hit: GlassHit, remote = false): void {
   const state = useGlass.getState()
   const count = (state.hits.get(hit.pane.mesh) ?? 0) + 1
   state.hits.set(hit.pane.mesh, count)
   if (count >= 3) {
-    shatterPane(hit.pane)
+    shatterPane(hit.pane, true)
+    if (!remote) publishGlassDamage(hit.pane, hit.point, hit.normal, true)
     return
   }
   const quaternion = crackQuaternion(hit.normal)
@@ -405,6 +584,7 @@ export function hitGlass(hit: GlassHit): void {
     version: state.version + 1,
   })
   sfx.glassCrack()
+  if (!remote) publishGlassDamage(hit.pane, hit.point, hit.normal)
 }
 
 const _z = new Vector3(0, 0, 1)

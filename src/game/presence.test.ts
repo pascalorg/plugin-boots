@@ -388,6 +388,14 @@ describe('buildFrame — wire quantization', () => {
     expect(out.f).toBe(44)
   })
 
+  test('the resolved hitscan endpoint is centimeter-quantized onto the pose', () => {
+    const out = gameFrame()
+    buildFrame(localPose({ t: [12.345, 4.567, -8.901] }), out)
+    expect(out.t).toEqual([12.35, 4.57, -8.9])
+    buildFrame(localPose({ t: undefined }), out)
+    expect(out.t).toBeUndefined()
+  })
+
   test('wrapShots: byte-wrapped, non-negative, junk-proof', () => {
     expect(wrapShots(0)).toBe(0)
     expect(wrapShots(255)).toBe(255)

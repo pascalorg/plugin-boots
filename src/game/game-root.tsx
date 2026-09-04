@@ -38,13 +38,21 @@ import { Enemies } from './enemies'
 import { bots, debugFlags } from './enemies-state'
 import { frameOk, reportFrameCrash } from './frame-guard'
 import { PlacedFittings } from './fittings'
-import { GlassCracks, glassShardCensus, resetGlass, setGlassFloorProbe } from './glass'
-import { Grenades } from './grenade'
+import {
+  GlassCracks,
+  glassShardCensus,
+  resetGlass,
+  setGlassFloorProbe,
+  startGlassSync,
+  stopGlassSync,
+} from './glass'
+import { Grenades, startGrenadeSync, stopGrenadeSync } from './grenade'
 import { getGridAnchor, getStoreyLadder, gridTerrainY, normalizeStoreyLadder } from './grid'
 import { groundSurfaceY, resetGround } from './ground'
 import { GunTable } from './guntable'
 import { HostPostTuning, hostPostDebug } from './host-post'
-import { resetGameOperables } from './interact'
+import { startHordeSync, stopHordeSync } from './horde-sync'
+import { resetGameOperables, startOperableSync, stopOperableSync } from './interact'
 import { GameItems } from './item-place'
 import { advanceProgress, type LoadingSample, pendingLabel } from './loading'
 import { Nature } from './nature'
@@ -515,7 +523,9 @@ const _localPose: LocalPose = {
   s: 0,
   g: true,
   st: false,
+  a: 0,
   f: 0,
+  t: [0, 0, -1],
   nm: '',
 }
 
@@ -531,9 +541,13 @@ function sampleLocalPose(): LocalPose {
   _localPose.s = Math.min(1, playerRig.speed / MOVE.runSpeed)
   _localPose.g = playerRig.grounded
   _localPose.st = s.staggered
+  _localPose.a = playerRig.ads
   // Gunfire rides the pose (see presence-interp's header): the viewmodel bumps
   // this on every round fired, the publisher wraps it into the wire counter.
   _localPose.f = playerRig.shots
+  _localPose.t![0] = playerRig.shotTarget.x
+  _localPose.t![1] = playerRig.shotTarget.y
+  _localPose.t![2] = playerRig.shotTarget.z
   _localPose.nm = localDisplayName()
   return _localPose
 }
@@ -840,6 +854,10 @@ function ActiveGame() {
         // PvP hit damage rides the same transport (a per-victim counter). Game
         // phase only; inert without a bus or with an empty roster.
         startPvpSync()
+        startHordeSync()
+        startOperableSync()
+        startGrenadeSync()
+        startGlassSync(world)
         // Voice rides the same transport for SIGNALLING only (the speech goes
         // peer-to-peer). Feature-detected the same way, and it needs the eye
         // position for the proximity mix — playerRig, not the pose sampler, because
@@ -881,6 +899,10 @@ function ActiveGame() {
       // (session ended or a new one started) must not stop the new one.
       if (useBoots.getState().phase !== 'game' && getSessionSerial() === serial) {
         stopPvpSync()
+        stopHordeSync()
+        stopOperableSync()
+        stopGrenadeSync()
+        stopGlassSync()
         stopWorldSync() // before stopPresence: that call closes the transport
         stopVoice() // releases the microphone — see below
         stopPresence()

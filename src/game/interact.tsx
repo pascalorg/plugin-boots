@@ -26,6 +26,18 @@ import { ARMORY_STATION_LOCAL, armoryStationPosition, liveDepotLocalToWorld } fr
 import { takeAction } from './input'
 import { releaseNodeDecals } from './paint'
 import { playerRig } from './player'
+import { hordeAuthorityId } from './horde-sync'
+import {
+  localSessionId,
+  type NetMessage,
+  onFrame,
+  onStateRequest,
+  onStateSnapshot,
+  publishFrame,
+  registerFrameKind,
+  requestState,
+  sendStateSnapshot,
+} from './net'
 import { getSession } from './session'
 import { replicaDrawAudit } from './voxel-walls'
 import type { ColliderEntry, DoorEntry, GameWorld, OperableEntry } from './world'
@@ -302,6 +314,187 @@ const namedPoseLedger = new Map<
 /** The mounted component's operables — interactDebug reaches them through here. */
 let activeStates: Map<string, OperableState> | null = null
 
+// ── Shared operable state ---------------------------------------------------
+
+export const OPERABLE_KIND = 'boots/operable' as const
+export const OPERABLE_COMMAND_KIND = 'boots/operable-command' as const
+const OPERABLE_SYNC_CAP = 128
+
+type OperableWire = [nodeId: string, open: 0 | 1, hingeSign: -1 | 1]
+type OperableFrame = { v: 1; s: OperableWire[] }
+type OperableCommandFrame = { v: 1; c: Array<[string, number, 0 | 1, -1 | 1]> }
+
+let operableSyncActive = false
+let operableRevision = 0
+let operablePublishClock = 0
+let operableHandoffAccepted = false
+const operableCommands = new Map<string, [number, 0 | 1, -1 | 1]>()
+const pendingOperables = new Map<string, { open: boolean; sign: -1 | 1 }>()
+const seenOperableRevision = new Map<string, number>()
+let offOperableState: (() => void) | null = null
+let offOperableCommand: (() => void) | null = null
+let offOperableRequest: (() => void) | null = null
+let offOperableSnapshot: (() => void) | null = null
+
+export function readOperableFrame(data: unknown): OperableFrame | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = data as Record<string, unknown>
+  if (raw.v !== 1 || !Array.isArray(raw.s) || raw.s.length > OPERABLE_SYNC_CAP) return null
+  const states: OperableWire[] = []
+  for (const entry of raw.s) {
+    if (!Array.isArray(entry) || entry.length !== 3) return null
+    const [id, open, sign] = entry
+    if (typeof id !== 'string' || id.length === 0 || id.length > 160) return null
+    if ((open !== 0 && open !== 1) || (sign !== -1 && sign !== 1)) return null
+    states.push([id, open, sign])
+  }
+  return { v: 1, s: states }
+}
+
+export function readOperableCommand(data: unknown): OperableCommandFrame | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = data as Record<string, unknown>
+  if (raw.v !== 1 || !Array.isArray(raw.c) || raw.c.length > OPERABLE_SYNC_CAP) return null
+  const commands: OperableCommandFrame['c'] = []
+  for (const entry of raw.c) {
+    if (!Array.isArray(entry) || entry.length !== 4) return null
+    const [id, revision, open, sign] = entry
+    if (
+      typeof id !== 'string' || id.length === 0 || id.length > 160 ||
+      !Number.isInteger(revision) || revision < 0 || revision > 1_000_000_000 ||
+      (open !== 0 && open !== 1) || (sign !== -1 && sign !== 1)
+    ) return null
+    commands.push([id, revision, open, sign])
+  }
+  return { v: 1, c: commands }
+}
+
+function operableSnapshot(): OperableFrame {
+  const states: OperableWire[] = []
+  if (activeStates) {
+    for (const state of activeStates.values()) {
+      if (states.length >= OPERABLE_SYNC_CAP) break
+      const sign = state.hinged?.sign === -1 ? -1 : 1
+      states.push([state.nodeId, state.open ? 1 : 0, sign])
+    }
+  }
+  return { v: 1, s: states }
+}
+
+function applyOperableState(nodeId: string, open: boolean, sign: -1 | 1): void {
+  pendingOperables.set(nodeId, { open, sign })
+  const state = activeStates?.get(nodeId)
+  if (!state) return
+  if (state.open === open) {
+    if (open && state.hinged && state.hinged.sign !== sign) {
+      state.hinged.sign = sign
+      applyPose(state)
+      refreshColliderTransforms(state)
+    }
+    return
+  }
+  toggleOperable(state, { sign, broadcast: false })
+}
+
+function applyOperableFrame(frame: OperableFrame, sender: string | null): void {
+  const authority = hordeAuthorityId()
+  if (sender && authority && sender !== authority) {
+    // A lower-id late joiner becomes authority before its request reaches the
+    // incumbent. Adopt one incumbent snapshot, then reject every non-authority
+    // state thereafter. This preserves already-open doors through handoff.
+    if (authority !== localSessionId() || operableHandoffAccepted || pendingOperables.size > 0) return
+    operableHandoffAccepted = true
+  }
+  if (sender && sender === localSessionId()) return
+  for (const [nodeId, open, sign] of frame.s) applyOperableState(nodeId, open === 1, sign)
+}
+
+function publishOperableSnapshot(): void {
+  if (operableSyncActive) publishFrame(OPERABLE_KIND, operableSnapshot())
+}
+
+function publishOperableCommands(): void {
+  const c: OperableCommandFrame['c'] = []
+  for (const [nodeId, [revision, open, sign]] of operableCommands) {
+    c.push([nodeId, revision, open, sign])
+  }
+  publishFrame(OPERABLE_COMMAND_KIND, { v: 1, c } satisfies OperableCommandFrame)
+}
+
+function publishLocalOperableChange(state: OperableState): void {
+  if (!operableSyncActive) return
+  const mine = localSessionId()
+  if (!mine || hordeAuthorityId() === mine) {
+    publishOperableSnapshot()
+    return
+  }
+  const sign = state.hinged?.sign === -1 ? -1 : 1
+  operableCommands.set(state.nodeId, [++operableRevision, state.open ? 1 : 0, sign])
+  publishOperableCommands()
+}
+
+/** Bind after presence has opened the shared transport. */
+export function startOperableSync(): void {
+  if (operableSyncActive) return
+  operableSyncActive = true
+  registerFrameKind(OPERABLE_KIND, readOperableFrame)
+  registerFrameKind(OPERABLE_COMMAND_KIND, readOperableCommand, { ordered: false })
+  offOperableState = onFrame<OperableFrame>(OPERABLE_KIND, (msg) => {
+    applyOperableFrame(msg.data, msg.sessionId)
+  })
+  offOperableCommand = onFrame<OperableCommandFrame>(OPERABLE_COMMAND_KIND, (msg) => {
+    if (hordeAuthorityId() !== localSessionId()) return
+    let changed = false
+    for (const [nodeId, revision, open, sign] of msg.data.c) {
+      const key = `${msg.sessionId}:${nodeId}`
+      if (revision <= (seenOperableRevision.get(key) ?? -1)) continue
+      seenOperableRevision.set(key, revision)
+      applyOperableState(nodeId, open === 1, sign)
+      changed = true
+    }
+    if (changed) publishOperableSnapshot()
+  })
+  offOperableSnapshot = onStateSnapshot(OPERABLE_KIND, ({ state, msg }) => {
+    const frame = readOperableFrame(state)
+    if (frame) applyOperableFrame(frame, msg.sessionId)
+  })
+  offOperableRequest = onStateRequest(({ of, from }) => {
+    // Any existing peer can supply the handoff snapshot. applyOperableFrame
+    // still admits only the elected authority (or one pristine handoff).
+    if (of === OPERABLE_KIND) {
+      sendStateSnapshot(OPERABLE_KIND, from, operableSnapshot())
+    }
+  })
+  requestState(OPERABLE_KIND)
+}
+
+export function stopOperableSync(): void {
+  if (!operableSyncActive) return
+  operableSyncActive = false
+  offOperableState?.()
+  offOperableCommand?.()
+  offOperableRequest?.()
+  offOperableSnapshot?.()
+  offOperableState = offOperableCommand = offOperableRequest = offOperableSnapshot = null
+  operableCommands.clear()
+  pendingOperables.clear()
+  seenOperableRevision.clear()
+  operableRevision = 0
+  operablePublishClock = 0
+  operableHandoffAccepted = false
+}
+
+/** Low-rate retained heartbeat: heals a coalesced command/state without
+ * turning an animated door into a high-frequency network stream. */
+export function stepOperableSync(dt: number): void {
+  if (!operableSyncActive) return
+  operablePublishClock += Math.max(0, dt)
+  if (operablePublishClock < 0.5) return
+  operablePublishClock = 0
+  if (hordeAuthorityId() === localSessionId()) publishOperableSnapshot()
+  else if (operableCommands.size > 0) publishOperableCommands()
+}
+
 const UP = new Vector3(0, 1, 0)
 const tmpVec = new Vector3()
 const tmpQuat = new Quaternion()
@@ -501,7 +694,10 @@ function applyNamedPose(
 }
 
 /** Toggle open/close: retarget the animation and handle colliders + sfx. */
-export function toggleOperable(state: OperableState): void {
+export function toggleOperable(
+  state: OperableState,
+  sync?: { sign?: -1 | 1; broadcast?: boolean },
+): void {
   // Voxelized node: destruction owns it — no pose over a carved grid. The
   // one exception is the sealed-door handback (see DOOR_RESTORE_MAX_DAMAGE):
   // a lightly-shot CLOSED door re-takes its host leaf first, then swings.
@@ -521,8 +717,11 @@ export function toggleOperable(state: OperableState): void {
     if (state.kind === 'door-hinged' && state.hinged) {
       // Swing away from whichever side the player stands on (original frame:
       // positive local angle carries the +X panel toward -Z).
-      tmpVec.copy(playerRig.position).applyMatrix4(state.hinged.inverse0)
-      state.hinged.sign = tmpVec.z >= 0 ? 1 : -1
+      if (sync?.sign !== undefined) state.hinged.sign = sync.sign
+      else {
+        tmpVec.copy(playerRig.position).applyMatrix4(state.hinged.inverse0)
+        state.hinged.sign = tmpVec.z >= 0 ? 1 : -1
+      }
     }
     if (state.passable) setOpenColliders(state)
   }
@@ -530,6 +729,7 @@ export function toggleOperable(state: OperableState): void {
   // would wake wrong (see the header block).
   retireStaleBake(state.nodeId)
   sfx.doorCreak()
+  if (sync?.broadcast !== false) publishLocalOperableChange(state)
 }
 
 /** Advance every running animation by dt; settles poses and re-latches
@@ -735,6 +935,9 @@ export function mountInteract(world: GameWorld): Map<string, OperableState> {
   // plugin's own and die with the session.
   for (const [nodeId, state] of gameOperables) states.set(nodeId, state)
   activeStates = states
+  for (const [nodeId, pending] of pendingOperables) {
+    if (states.has(nodeId)) applyOperableState(nodeId, pending.open, pending.sign)
+  }
   return states
 }
 
@@ -812,6 +1015,8 @@ export function registerGameOperable(spec: GameOperableSpec): OperableState | nu
   }
   gameOperables.set(spec.nodeId, state)
   activeStates?.set(spec.nodeId, state)
+  const pending = pendingOperables.get(spec.nodeId)
+  if (pending) applyOperableState(spec.nodeId, pending.open, pending.sign)
   return state
 }
 
@@ -1002,6 +1207,7 @@ export function Interact({ world }: { world: GameWorld }) {
     const dt = Math.min(rawDt, 1 / 30)
 
     advanceOperables(states.values(), dt)
+    stepOperableSync(dt)
 
     // Ballistic stand-down: a node that voxelized while open (bullets broke
     // the leaf) hands its rays to the grid — the hidden host leaf must stop

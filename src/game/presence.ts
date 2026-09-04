@@ -166,6 +166,7 @@ export function framesEqual(a: PresenceFrame, b: PresenceFrame): boolean {
     a.w === b.w &&
     a.g === b.g &&
     a.st === b.st &&
+    Math.abs((a.a ?? 0) - (b.a ?? 0)) <= 0.02 &&
     a.f === b.f &&
     a.nm === b.nm &&
     Math.abs(a.p[0] - b.p[0]) <= POS_EPSILON &&
@@ -210,9 +211,13 @@ export type LocalPose = {
   s: number
   g: boolean
   st: boolean
+  /** Aim-down-sights blend; optional for old/test samplers. */
+  a?: number
   /** Monotone count of rounds this session has fired (playerRig.shots) — the
    * publisher wraps it into the wire's 0..255 counter. */
   f: number
+  /** Exact end of the latest resolved hitscan; optional for older samplers. */
+  t?: [number, number, number]
   /** Chosen display name (nickname.localDisplayName) — the tag peers show.
    * Optional so hand-built poses in tests need not carry it. */
   nm?: string
@@ -243,7 +248,13 @@ export function buildFrame(local: LocalPose, out: PresenceFrame): PresenceFrame 
   out.s = round2(local.s < 0 ? 0 : local.s > 1 ? 1 : local.s)
   out.g = local.g
   out.st = local.st
+  out.a = round2(Math.max(0, Math.min(1, local.a ?? 0)))
   out.f = wrapShots(local.f)
+  if (local.t) {
+    out.t = [round2(local.t[0]), round2(local.t[1]), round2(local.t[2])]
+  } else {
+    delete out.t
+  }
   out.nm = local.nm || undefined
   return out
 }
@@ -402,7 +413,9 @@ const emptyFrame = (): PresenceFrame => ({
   s: 0,
   g: true,
   st: false,
+  a: 0,
   f: 0,
+  t: undefined,
   nm: undefined,
 })
 
@@ -782,7 +795,9 @@ function wireCopy(frame: PresenceFrame): PresenceFrame {
     s: frame.s,
     g: frame.g,
     st: frame.st,
+    a: frame.a,
     f: frame.f,
+    ...(frame.t ? { t: [frame.t[0], frame.t[1], frame.t[2]] as [number, number, number] } : {}),
     nm: frame.nm,
   }
 }
@@ -799,7 +814,16 @@ function copyFrame(from: PresenceFrame, to: PresenceFrame): void {
   to.s = from.s
   to.g = from.g
   to.st = from.st
+  to.a = from.a
   to.f = from.f
+  if (from.t) {
+    to.t = to.t ?? [0, 0, 0]
+    to.t[0] = from.t[0]
+    to.t[1] = from.t[1]
+    to.t[2] = from.t[2]
+  } else {
+    delete to.t
+  }
   to.nm = from.nm
 }
 

@@ -77,7 +77,13 @@ import {
 import { footPlants, remoteFootstep } from './remote-footsteps'
 import { remoteLabel, sameNames } from './roster-names'
 import { getSession } from './session'
-import { avatarAimDirection, orientMuzzleFx } from './third-person-motion'
+import {
+  avatarAimDirection,
+  layerThirdPersonAim,
+  orientMuzzleFx,
+  pointMuzzleFxAt,
+  steerThirdPersonBody,
+} from './third-person-motion'
 import { isPeerTalking } from './voice'
 import {
   HammerModel,
@@ -1994,6 +2000,7 @@ function RemoteAvatar({
   const flashT = useRef(0)
   const lastShots = useRef(-1)
   const shotDirection = useRef(new Vector3(0, 0, -1))
+  const shotTarget = useRef(new Vector3())
   // Motion: displayed speed/direction, body yaw, landing, recoil (updateMotion);
   // the residual smoother between the sample and the root; the per-peer
   // adaptive interpolation delay, slewed. All plain objects, allocated once.
@@ -2076,6 +2083,7 @@ function RemoteAvatar({
     // peer's legs stop with it instead of treadmilling on the wire's `s`.
     const m = motion.current
     const sDisp = updateMotion(m, _drawn.x, _drawn.y, _drawn.z, _pose.yaw, _pose.g, _pose.st, shots, _pose.w, _pose.vy, dt)
+    steerThirdPersonBody(m, _pose.yaw, _pose.a, dt)
     const prevPhase = gaitPhase.current
     gaitPhase.current = advanceGait(prevPhase, _pose.g && !_pose.frozen ? sDisp : 0, dt)
     // The peer's own clock drives their breathing, so a lobby does not breathe
@@ -2096,6 +2104,7 @@ function RemoteAvatar({
     )
     blendArticulation(pose.current, _artic, dt)
     layerMotion(_layered, pose.current, m, _pose.yaw)
+    layerThirdPersonAim(_layered, _pose.a, gripFor(_pose.w))
 
     // Wire positions are EYE positions — plant the feet. The ROOT faces where
     // the body faces; the torso carries the rest of the view yaw (layerMotion).
@@ -2149,8 +2158,15 @@ function RemoteAvatar({
     // spray-can guard — a knife swing can never bloom a muzzle flash.
     const fx = fxRef.current
     if (fx) {
-      if (shots > 0) avatarAimDirection(shotDirection.current, _pose.yaw, _pose.pitch)
-      if (shots > 0 || flashT.current > 0) orientMuzzleFx(fx, shotDirection.current)
+      if (shots > 0) {
+        if (_pose.ht) {
+          shotTarget.current.set(_pose.tx, _pose.ty, _pose.tz)
+          pointMuzzleFxAt(fx, shotTarget.current)
+        } else {
+          avatarAimDirection(shotDirection.current, _pose.yaw, _pose.pitch)
+          orientMuzzleFx(fx, shotDirection.current)
+        }
+      }
       if (shots > 0) {
         fx.visible = true
         flashT.current = FLASH_LIFE_S

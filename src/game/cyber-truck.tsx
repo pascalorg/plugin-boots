@@ -1,5 +1,10 @@
 'use client'
 
+import { useFrame } from '@react-three/fiber'
+import { useRef } from 'react'
+import type { Group } from 'three'
+import { convoyPose } from './vehicle-state'
+
 /**
  * Presentational low-poly cyber truck in metre-scale MODEL SPACE: the origin
  * is the truck's ground-plane center, its nose points down -Z, and +X is right.
@@ -22,6 +27,39 @@ const WHEEL_POSITIONS: ReadonlyArray<readonly [number, number]> = [
   [-0.94, CYBER_TRUCK_WHEELBASE / 2],
   [0.94, CYBER_TRUCK_WHEELBASE / 2],
 ]
+
+const WHEEL_RADIUS = 0.42
+const MAX_WHEEL_STEER = 0.48
+
+function TruckWheel({ x, z }: { x: number; z: number }) {
+  const steerRef = useRef<Group>(null)
+  const rollRef = useRef<Group>(null)
+  const front = z < 0
+  useFrame((_, dt) => {
+    if (rollRef.current) {
+      rollRef.current.rotation.x += (convoyPose.speed / WHEEL_RADIUS) * Math.min(dt, 1 / 30)
+    }
+    if (front && steerRef.current) {
+      steerRef.current.rotation.y +=
+        (convoyPose.steer * MAX_WHEEL_STEER - steerRef.current.rotation.y) *
+        (1 - Math.exp(-14 * Math.min(dt, 1 / 30)))
+    }
+  })
+  return (
+    <group ref={steerRef} position={[x, 0.42, z]}>
+      <group ref={rollRef}>
+        <mesh rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[WHEEL_RADIUS, WHEEL_RADIUS, 0.3, 12]} />
+          <meshStandardMaterial color={TYRE} roughness={0.92} />
+        </mesh>
+        <mesh rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.19, 0.19, 0.315, 10]} />
+          <meshStandardMaterial color={TRIM} metalness={0.55} roughness={0.38} />
+        </mesh>
+      </group>
+    </group>
+  )
+}
 
 const SIDE_WINDOW_POSITIONS: ReadonlyArray<readonly [number, number]> = [
   [-0.902, -0.08],
@@ -200,18 +238,7 @@ export function CyberTruckModel() {
       </mesh>
 
       {/* Four low-sided chunky tyres; their radius puts contact exactly at y=0. */}
-      {WHEEL_POSITIONS.map(([x, z]) => (
-        <mesh key={`tyre:${x}:${z}`} position={[x, 0.42, z]} rotation={[0, 0, Math.PI / 2]}>
-          <cylinderGeometry args={[0.42, 0.42, 0.3, 12]} />
-          <meshStandardMaterial color={TYRE} roughness={0.92} />
-        </mesh>
-      ))}
-      {WHEEL_POSITIONS.map(([x, z]) => (
-        <mesh key={`hub:${x}:${z}`} position={[x, 0.42, z]} rotation={[0, 0, Math.PI / 2]}>
-          <cylinderGeometry args={[0.19, 0.19, 0.315, 10]} />
-          <meshStandardMaterial color={TRIM} metalness={0.55} roughness={0.38} />
-        </mesh>
-      ))}
+      {WHEEL_POSITIONS.map(([x, z]) => <TruckWheel key={`wheel:${x}:${z}`} x={x} z={z} />)}
       {/* Faceted fender rings keep the stainless body visibly clear of the
           tyres and make the wheel wells read from a chase camera. */}
       {WHEEL_POSITIONS.map(([x, z]) => (

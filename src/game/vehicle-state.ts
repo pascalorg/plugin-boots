@@ -17,6 +17,8 @@ export type VehicleFrame = {
   truckZ?: number
   truckYaw?: number
   speed: number
+  /** Normalized front-wheel steering input (-1 left, +1 right). */
+  steer?: number
   occupied: boolean
 }
 
@@ -34,6 +36,8 @@ export type ConvoyPose = VehicleFrame & {
   targetTruckYaw: number
   remoteDriver: string | null
   remoteAt: number
+  steer: number
+  targetSteer: number
 }
 
 export const convoyPose: ConvoyPose = {
@@ -46,6 +50,8 @@ export const convoyPose: ConvoyPose = {
   truckZ: 0,
   truckYaw: 0,
   speed: 0,
+  steer: 0,
+  targetSteer: 0,
   occupied: false,
   targetX: 0,
   targetY: 0,
@@ -86,6 +92,7 @@ export function resetConvoyPose(
   convoyPose.truckZ = convoyPose.targetTruckZ = truckZ
   convoyPose.truckYaw = convoyPose.targetTruckYaw = truckYaw
   convoyPose.speed = 0
+  convoyPose.steer = convoyPose.targetSteer = 0
   convoyPose.occupied = false
   convoyPose.remoteDriver = null
   convoyPose.remoteAt = 0
@@ -99,6 +106,7 @@ export function clearConvoyPose(): void {
   convoyPose.occupied = false
   convoyPose.remoteDriver = null
   convoyPose.remoteAt = 0
+  convoyPose.steer = convoyPose.targetSteer = 0
   vehicleRig.driving = false
   vehicleRig.view = 'first'
   vehicleRig.speed = 0
@@ -147,6 +155,9 @@ export function readVehicleFrame(data: unknown): VehicleFrame | null {
         }
       : {}),
     speed: Math.max(-20, Math.min(30, f.speed)),
+    ...(typeof f.steer === 'number' && Number.isFinite(f.steer)
+      ? { steer: Math.max(-1, Math.min(1, f.steer)) }
+      : {}),
     occupied: f.occupied,
   }
 }

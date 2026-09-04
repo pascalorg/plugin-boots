@@ -17,7 +17,8 @@ import { sfx } from './audio'
 import { CyberTruckModel } from './cyber-truck'
 import { DepotMirror } from './depot-mirror'
 import { damageTarget } from './destruction'
-import { armWaves, bots, damageBot, disarmWaves, waveState } from './enemies-state'
+import { bots, damageBot, waveState } from './enemies-state'
+import { isHordeAuthority, setSharedWaves } from './horde-sync'
 import { takeAction } from './input'
 import { clearScatterInRadius } from './nature'
 import {
@@ -579,6 +580,10 @@ function insideBody(
  * horde. That keeps a remote driver's truck lethal even though bots are not
  * world colliders. A full-health droid dies in one unmistakable impact. */
 function ramBotsWithConvoy(): number {
+  // The convoy pose exists on every browser, but bot health belongs to the
+  // elected simulator. Applying this overlap on followers made a remote
+  // truck appear to kill early, then briefly resurrect on the next snapshot.
+  if (!isHordeAuthority()) return 0
   let hit = 0
   const trailer = { x: convoyPose.x, z: convoyPose.z, yaw: convoyPose.yaw }
   const truck = {
@@ -735,6 +740,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       convoyPose.targetTruckZ = frame.truckZ ?? legacyTruck.z
       convoyPose.targetTruckYaw = frame.truckYaw ?? frame.yaw
       convoyPose.speed = frame.speed
+      convoyPose.targetSteer = frame.steer ?? 0
       convoyPose.occupied = frame.occupied
     }
 
@@ -785,6 +791,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
           truckZ: convoyPose.truckZ,
           truckYaw: convoyPose.truckYaw,
           speed: 0,
+          steer: 0,
           occupied: false,
         } satisfies VehicleFrame)
       }
@@ -858,6 +865,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
           truckZ: convoyPose.truckZ,
           truckYaw: convoyPose.truckYaw,
           speed: 0,
+          steer: 0,
           occupied: false,
         } satisfies VehicleFrame)
       } else {
@@ -871,6 +879,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         convoyPose.speed = approach(convoyPose.speed, target, rate * dt)
 
         const steer = (keys.has('KeyA') ? 1 : 0) - (keys.has('KeyD') ? 1 : 0)
+        convoyPose.steer = convoyPose.targetSteer = approach(convoyPose.steer, steer, dt * 5)
         const oldTruckYaw = convoyPose.truckYaw
         let nextTruckYaw = oldTruckYaw
         if (steer !== 0 && Math.abs(convoyPose.speed) > 0.08) {
@@ -976,6 +985,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
             truckZ: convoyPose.truckZ,
             truckYaw: convoyPose.truckYaw,
             speed: convoyPose.speed,
+            steer: convoyPose.steer,
             occupied: true,
           } satisfies VehicleFrame)
         }
@@ -999,6 +1009,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         convoyPose.truckZ += (convoyPose.targetTruckZ - convoyPose.truckZ) * k
         convoyPose.truckYaw +=
           shortestYawDelta(convoyPose.truckYaw, convoyPose.targetTruckYaw) * k
+        convoyPose.steer += (convoyPose.targetSteer - convoyPose.steer) * k
       }
     }
 
@@ -1348,16 +1359,7 @@ function TrailerRunningGear() {
         </mesh>
       ))}
       {TRAILER_WHEELS.map(([x, z]) => (
-        <group key={`wheel:${x}:${z}`} position={[x, 0.38, z]} rotation={[Math.PI / 2, 0, 0]}>
-          <mesh>
-            <cylinderGeometry args={[0.38, 0.38, 0.24, 12]} />
-            <meshStandardMaterial color="#15171a" roughness={0.95} />
-          </mesh>
-          <mesh position={[0, Math.sign(z) * 0.125, 0]}>
-            <cylinderGeometry args={[0.16, 0.16, 0.025, 10]} />
-            <meshStandardMaterial color={CASTING} metalness={0.55} roughness={0.4} />
-          </mesh>
-        </group>
+        <TrailerWheel key={`wheel:${x}:${z}`} x={x} z={z} />
       ))}
       <mesh position={[0, 0.3, 0]}>
         <boxGeometry args={[5.7, 0.16, 1.65]} />
@@ -1377,6 +1379,29 @@ function TrailerRunningGear() {
           <meshStandardMaterial color="#25282d" metalness={0.4} roughness={0.7} />
         </mesh>
       ))}
+    </group>
+  )
+}
+
+function TrailerWheel({ x, z }: { x: number; z: number }) {
+  const rollRef = useRef<Group>(null)
+  useFrame((_, dt) => {
+    if (rollRef.current) {
+      rollRef.current.rotation.y += (convoyPose.speed / 0.38) * Math.min(dt, 1 / 30)
+    }
+  })
+  return (
+    <group position={[x, 0.38, z]} rotation={[Math.PI / 2, 0, 0]}>
+      <group ref={rollRef}>
+        <mesh>
+          <cylinderGeometry args={[0.38, 0.38, 0.24, 12]} />
+          <meshStandardMaterial color="#15171a" roughness={0.95} />
+        </mesh>
+        <mesh position={[0, Math.sign(z) * 0.125, 0]}>
+          <cylinderGeometry args={[0.16, 0.16, 0.025, 10]} />
+          <meshStandardMaterial color={CASTING} metalness={0.55} roughness={0.4} />
+        </mesh>
+      </group>
     </group>
   )
 }
@@ -1507,8 +1532,7 @@ function BreakerPanel({ world }: { world: GameWorld }) {
     }
     const ePressed = session.input.state.keys.has('KeyE')
     if (near && ePressed && !prevE.current) {
-      if (waveState.armed) disarmWaves() // stand down — the lot powers off
-      else armWaves() // the ONLY combat trigger — the wave director takes over
+      setSharedWaves(!waveState.armed)
       sfx.breakerThrow() // heavy knife-switch clunk, both directions
     }
     prevE.current = ePressed

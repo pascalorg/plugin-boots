@@ -127,6 +127,23 @@ export const FRAME_KINDS = [
   // The one shared depot convoy pose. Only its current driver publishes;
   // late joiners recover the resting pose through the state-snapshot lane.
   'boots/vehicle',
+  // One elected simulation publishes the horde; a cumulative command lane
+  // carries switch changes and damage from every other player.
+  'boots/horde',
+  'boots/horde-command',
+  // Shared open/closed state for doors, windows and cabinets. Commands are
+  // separate so the authority's state stream cannot coalesce a player's E.
+  'boots/operable',
+  'boots/operable-command',
+  // Recent grenade detonations; a short cumulative ring survives host
+  // coalescing so every peer gets the same blast theatre and local hurt.
+  'boots/grenade',
+  // Combat-tree state and cumulative per-player damage. The elected horde
+  // simulator owns fire/fell timing so truck impacts and gunfire converge.
+  'boots/trees',
+  'boots/tree-command',
+  // Per-player cumulative glass hits plus late-join pane snapshots.
+  'boots/glass',
   // voice.ts → SIGNALLING ONLY. The audio itself never touches this bus: an
   // 8 000-byte JSON frame under latest-value coalescing would drop the middle
   // of every sentence. What travels here is one WebRTC description per peer

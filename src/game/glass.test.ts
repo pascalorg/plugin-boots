@@ -10,6 +10,8 @@ import {
   glassShardCount,
   glassShardFace,
   raycastGlass,
+  readGlassFrame,
+  readGlassSnapshot,
   resetGlass,
   shatterPane,
   useGlass,
@@ -27,6 +29,25 @@ import { bvhPrimeStats, type GameWorld, type GlassPane } from './world'
 
 afterEach(() => {
   resetGlass()
+})
+
+describe('shared glass wire boundary', () => {
+  test('accepts bounded hit records and pane snapshots', () => {
+    expect(readGlassFrame({ v: 1, h: [[2, 3, 1, 1, 2, 3, 0, 0, 1]] })).toEqual({
+      v: 1,
+      h: [[2, 3, 1, 1, 2, 3, 0, 0, 1]],
+    })
+    expect(readGlassSnapshot({ v: 1, s: [[2, 3, 1]] })).toEqual({
+      v: 1,
+      s: [[2, 3, 1]],
+    })
+  })
+
+  test('rejects hostile pane ids, normals and counts', () => {
+    expect(readGlassFrame({ v: 1, h: [[-1, 0, 0, 0, 0, 0, 0, 0, 1]] })).toBeNull()
+    expect(readGlassFrame({ v: 1, h: [[1, 0, 0, 0, 0, 0, 4, 0, 0]] })).toBeNull()
+    expect(readGlassSnapshot({ v: 1, s: [[1, -1, 0]] })).toBeNull()
+  })
 })
 
 describe('shatterPane session guard', () => {

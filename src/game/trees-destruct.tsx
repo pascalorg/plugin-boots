@@ -17,10 +17,20 @@ import { sfx, type TreeCrackleHandle } from './audio'
 import { spawnDebris } from './debris'
 import { spawnDust } from './dust'
 import { groundSurfaceY } from './ground'
+import { isHordeAuthority } from './horde-sync'
 import { scatter } from './nature'
 import { hideForGame } from './session'
 import { registerTreeRoutes } from './shooting'
 import { MAX_BLOBS, MAX_TIERS, type TreeParams, treeParamsAt } from './tree-species'
+import {
+  recordTreeDamage,
+  startTreeSync,
+  stepTreeSync,
+  stopTreeSync,
+  TREE_SYNC_CAP,
+  type TreeFrame,
+  type TreeStateWire,
+} from './tree-sync'
 import { collectHostForestMeshes, type GameWorld, type HostTreeNode } from './world'
 
 /**
@@ -394,6 +404,7 @@ const _ramPoint = new Vector3()
  * tree looks exactly like finishing it with a weapon instead of silently
  * deleting an instance. Returns the number newly felled. */
 export function ramTreesAt(x: number, z: number, radius: number, damage = TREE_HP * 2): number {
+  if (!isHordeAuthority()) return 0
   let felled = 0
   for (const tree of liveTrees) {
     if (tree.state === 'stump') continue
@@ -647,6 +658,53 @@ function applyTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): Tre
   return event
 }
 
+function applySharedTreeDamage(trees: CombatTree[], hit: TreeHit, damage: number): TreeDamageEvent {
+  const event = applyTreeDamage(trees, hit, damage)
+  recordTreeDamage(hit.treeId, hit.part, damage)
+  return event
+}
+
+const TREE_STATE_TO_WIRE: Record<TreeState, TreeStateWire> = {
+  healthy: 0,
+  burning: 1,
+  charred: 2,
+  stump: 3,
+}
+const TREE_WIRE_TO_STATE: readonly TreeState[] = ['healthy', 'burning', 'charred', 'stump']
+
+function snapshotTrees(trees: readonly CombatTree[]): TreeFrame {
+  const t: TreeFrame['t'] = []
+  for (let i = 0; i < trees.length && i < TREE_SYNC_CAP; i++) {
+    const tree = trees[i]!
+    t.push([
+      tree.id,
+      TREE_STATE_TO_WIRE[tree.state],
+      Math.round(tree.hp * 100) / 100,
+      Math.round(tree.canopyDamage * 100) / 100,
+      Math.round(tree.burnT * 100) / 100,
+      tree.charHits,
+    ])
+  }
+  return {
+    v: 1,
+    t,
+  }
+}
+
+function applyTreeSnapshot(trees: CombatTree[], frame: TreeFrame): void {
+  for (const [id, stateCode, hp, canopyDamage, burnT, charHits] of frame.t) {
+    const tree = trees[id]
+    if (!tree) continue
+    const state = TREE_WIRE_TO_STATE[stateCode]!
+    if (tree.state !== state || tree.charHits !== charHits) revision++
+    tree.state = state
+    tree.hp = hp
+    tree.canopyDamage = canopyDamage
+    tree.burnT = burnT
+    tree.charHits = charHits
+  }
+}
+
 // --- Rendering -------------------------------------------------------------
 
 const _matrix = new Matrix4()
@@ -868,11 +926,26 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
 
     liveTrees = trees
     revision++
+    startTreeSync({
+      snapshot: () => snapshotTrees(trees),
+      applySnapshot: (frame) => applyTreeSnapshot(trees, frame),
+      applyDamage: (treeId, part, damage) => {
+        const tree = trees[treeId]
+        if (!tree) return
+        const y = part === 'canopy'
+          ? tree.y + tree.params.crownCY * tree.scale
+          : tree.y + tree.params.trunkH * tree.scale * 0.45
+        _ramPoint.set(tree.x, y, tree.z)
+        applyTreeDamage(trees, { distance: 0, point: _ramPoint, treeId, part }, damage)
+      },
+      pristine: () => trees.every((tree) => tree.state === 'healthy' && tree.hp === TREE_HP),
+    })
     registerTreeRoutes<TreeHit>({
       raycast: (origin, direction, maxDist) => raycastTrees(trees, origin, direction, maxDist),
-      damage: (_world, hit, damage) => applyTreeDamage(trees, hit, damage),
+      damage: (_world, hit, damage) => applySharedTreeDamage(trees, hit, damage),
     })
     return () => {
+      stopTreeSync()
       registerTreeRoutes(null)
       if (liveTrees === trees) liveTrees = []
       crackle.current?.stop()
@@ -882,6 +955,7 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
 
   useFrame((_, rawDt) => {
     const dt = Math.min(rawDt, 1 / 30)
+    stepTreeSync(dt)
 
     // Burn progress → charred transitions (canopy collapses into voxels).
     _finishedBurning.length = 0

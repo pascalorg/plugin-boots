@@ -13,6 +13,7 @@ import { collideVoxelTargets, damageSegment, damageTarget, useDestruction } from
 import { spawnDust, spawnHaze } from './dust'
 import { raycastGlass, shatterPane } from './glass'
 import { bots, damageBot } from './enemies-state'
+import { type NetMessage, onFrame, publishFrame, registerFrameKind } from './net'
 import { perfEvent, perfSection } from './perf-monitor'
 import { damagePlayer, playerRig } from './player'
 import { getSession } from './session'
@@ -124,6 +125,76 @@ const pool: Grenade[] = Array.from({ length: POOL }, () => ({
 let cooldownLeft = 0
 /** Latest world seen by throw/update — explosion fallbacks read it. */
 let lastWorld: GameWorld | null = null
+
+export const GRENADE_EFFECT_KIND = 'boots/grenade' as const
+const GRENADE_EVENT_MEMORY = 8
+type GrenadeEffectFrame = { v: 1; e: Array<[number, number, number, number]> }
+const recentExplosions: GrenadeEffectFrame['e'] = []
+const seenExplosions = new Map<string, number>()
+let nextExplosionId = 1
+let grenadeSyncActive = false
+let offGrenadeFrame: (() => void) | null = null
+
+export function validateGrenadeEffectFrame(data: unknown): GrenadeEffectFrame | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = data as Record<string, unknown>
+  if (raw.v !== 1 || !Array.isArray(raw.e) || raw.e.length > GRENADE_EVENT_MEMORY) return null
+  const events: GrenadeEffectFrame['e'] = []
+  for (const entry of raw.e) {
+    if (!Array.isArray(entry) || entry.length !== 4) return null
+    const [id, x, y, z] = entry
+    if (
+      !Number.isInteger(id) || id < 1 || id > 1_000_000_000 ||
+      typeof x !== 'number' || !Number.isFinite(x) || Math.abs(x) > 100_000 ||
+      typeof y !== 'number' || !Number.isFinite(y) || Math.abs(y) > 100_000 ||
+      typeof z !== 'number' || !Number.isFinite(z) || Math.abs(z) > 100_000
+    ) return null
+    events.push([id, x, y, z])
+  }
+  return { v: 1, e: events }
+}
+
+const _remoteExplosion = new Vector3()
+
+function receiveGrenadeEffects(msg: NetMessage<GrenadeEffectFrame>): void {
+  if (!lastWorld) return
+  let seen = seenExplosions.get(msg.sessionId) ?? 0
+  for (const [id, x, y, z] of msg.data.e) {
+    if (id <= seen) continue
+    seen = id
+    _remoteExplosion.set(x, y, z)
+    explodeAt(lastWorld, _remoteExplosion, true)
+  }
+  seenExplosions.set(msg.sessionId, seen)
+}
+
+export function startGrenadeSync(): void {
+  if (grenadeSyncActive) return
+  grenadeSyncActive = true
+  registerFrameKind(GRENADE_EFFECT_KIND, validateGrenadeEffectFrame)
+  offGrenadeFrame = onFrame<GrenadeEffectFrame>(GRENADE_EFFECT_KIND, receiveGrenadeEffects)
+}
+
+export function stopGrenadeSync(): void {
+  if (!grenadeSyncActive) return
+  grenadeSyncActive = false
+  offGrenadeFrame?.()
+  offGrenadeFrame = null
+  recentExplosions.length = 0
+  seenExplosions.clear()
+}
+
+function publishExplosion(center: Vector3): void {
+  if (!grenadeSyncActive) return
+  recentExplosions.push([
+    nextExplosionId++,
+    Math.round(center.x * 100) / 100,
+    Math.round(center.y * 100) / 100,
+    Math.round(center.z * 100) / 100,
+  ])
+  if (recentExplosions.length > GRENADE_EVENT_MEMORY) recentExplosions.shift()
+  publishFrame(GRENADE_EFFECT_KIND, { v: 1, e: recentExplosions.map((entry) => [...entry]) } satisfies GrenadeEffectFrame)
+}
 
 /** True when G would actually throw (HUD pip state). */
 export function grenadeReady(): boolean {
@@ -384,8 +455,9 @@ const SCRAP = new Color('#5d5a52')
  * a 2–4 m fling to bots inside 6 m, camera shake inside 10 m, explosion
  * voice, dust storm. Exported for tests/E2E.
  */
-export function explodeAt(world: GameWorld, center: Vector3): void {
+export function explodeAt(world: GameWorld, center: Vector3, remote = false): void {
   perfEvent('grenade-boom')
+  if (!remote) publishExplosion(center)
   const explodeT0 = performance.now()
   // Open the debris window FIRST — the segment snaps it governs land both
   // on this frame (immediate carves) and 70 ms out (the outer ring).
@@ -395,8 +467,10 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
     destruct as { damageExplosion?: (w: GameWorld, c: Vector3, r: number) => number }
   ).damageExplosion
   const carveT0 = performance.now()
-  if (typeof boom === 'function') boom(world, center, BLAST_RADIUS)
-  else fallbackCarve(world, center)
+  if (!remote) {
+    if (typeof boom === 'function') boom(world, center, BLAST_RADIUS)
+    else fallbackCarve(world, center)
+  }
   perfSection('boom-carve-sync', performance.now() - carveT0)
 
   // Glass inside the blast shatters (shatterPane is idempotent) — but each
@@ -411,7 +485,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
   for (const pane of world.glass) {
     if (pane.mesh.getWorldPosition(_paneCenter).distanceTo(center) > BLAST_RADIUS) continue
     if (glassHits < GLASS_NOW) {
-      shatterPane(pane)
+      shatterPane(pane, remote)
     } else {
       if (!deferredPanes) deferredPanes = []
       deferredPanes.push(pane)
@@ -430,7 +504,7 @@ export function explodeAt(world: GameWorld, center: Vector3): void {
     const step = () => {
       glassT0 = performance.now()
       const end = Math.min(cursor + GLASS_MID, wave.length)
-      for (; cursor < end; cursor++) shatterPane(wave[cursor]!)
+      for (; cursor < end; cursor++) shatterPane(wave[cursor]!, remote)
       perfSection('boom-glass', performance.now() - glassT0)
       if (cursor < wave.length) setTimeout(step, 40)
     }

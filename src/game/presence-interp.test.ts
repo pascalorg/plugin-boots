@@ -128,6 +128,17 @@ describe('validateFrame — the trust boundary', () => {
     expect(validateFrame(frame({ f: 12.9 }))!.f).toBe(12)
     expect(validateFrame(frame({ f: 255 }))!.f).toBe(255)
   })
+
+  test('the exact shot target is copied when valid and omitted when hostile', () => {
+    const target: [number, number, number] = [12.25, 3.5, -7]
+    const input = frame({ t: target })
+    const out = validateFrame(input)!
+    expect(out.t).toEqual(target)
+    expect(out.t).not.toBe(target)
+    expect(validateFrame({ ...frame(), t: [1, 2] })!.t).toBeUndefined()
+    expect(validateFrame({ ...frame(), t: [1, Number.NaN, 3] })!.t).toBeUndefined()
+    expect(validateFrame({ ...frame(), t: [1e9, 0, 0] })!.t).toBeUndefined()
+  })
 })
 
 describe('shotsFired — a counter difference, not an event', () => {
@@ -271,6 +282,17 @@ describe('sampleAt — lerp between brackets', () => {
     // …and it reaches the newer count once the sample gets there.
     sampleAt(ring, 1100, out)
     expect(out.f).toBe(6)
+  })
+
+  test('the resolved shot target stays paired with the older fire counter', () => {
+    const ring = createRing()
+    push(ring, 1000, { f: 4, t: [4, 5, 6] })
+    push(ring, 1100, { f: 5, t: [8, 9, 10] })
+    const out = createSampledPose()
+    sampleAt(ring, 1050, out)
+    expect([out.f, out.ht, out.tx, out.ty, out.tz]).toEqual([4, true, 4, 5, 6])
+    sampleAt(ring, 1100, out)
+    expect([out.f, out.ht, out.tx, out.ty, out.tz]).toEqual([5, true, 8, 9, 10])
   })
 
   test('a lone snapshot and an extrapolated pose both carry its count', () => {

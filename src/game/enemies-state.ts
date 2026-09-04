@@ -384,7 +384,8 @@ export function spawnBot(
   x: number,
   z: number,
   groundY = groundSurfaceY(x, z),
-): void {
+  forcedId?: number,
+): Bot {
   // groundY: the probed terrain height at (x,z) — site hills lift the ring
   // point (settleGroundBot only ever probes DOWNWARD, so a bot born at 0
   // under a +1.6 m hill stayed buried until the first probe never freed it).
@@ -392,8 +393,9 @@ export function spawnBot(
   // without a collider set (tests, scripted spawns) still lands on the
   // terrain instead of at the lot plane's height.
   const y = kind === 'drone' ? groundY + 2.4 + Math.random() * 1.2 : groundY
-  const id = botId++
-  bots.push({
+  const id = forcedId ?? botId++
+  if (forcedId !== undefined) botId = Math.max(botId, forcedId + 1)
+  const bot: Bot = {
     id,
     kind,
     position: new Vector3(x, y, z),
@@ -424,7 +426,9 @@ export function spawnBot(
     doorFumbleT: 0,
     doorT: 0,
     visual: botVisualParams(id, kind, waveState.wave),
-  })
+  }
+  bots.push(bot)
+  return bot
 }
 
 // --- WAVE RING PLACEMENT: every spawn point stands on walkable ground -------

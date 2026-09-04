@@ -59,7 +59,11 @@ import {
   waveState,
 } from './enemies-state'
 import { perfEvent } from './perf-monitor'
+import { stepHordeSync } from './horde-sync'
 import { damagePlayer, playerRig } from './player'
+import { getRemotes } from './presence'
+import { latestSnapshot } from './presence-interp'
+import { recordEnemyHit } from './pvp-damage'
 import { getSession } from './session'
 import { type GameWorld, spawnGroundY } from './world'
 
@@ -160,6 +164,37 @@ const _droneFeet = new Vector3()
 const _chest = new Vector3()
 const _meleeDir = new Vector3()
 const _doorCenter = new Vector3()
+const _hordeTargetPos = new Vector3()
+const _hordeTarget = { position: _hordeTargetPos, sessionId: null as string | null, staggered: false }
+
+/** The elected simulator makes one target decision for everybody. Remote
+ * positions are the avatars it actually draws; a fresh ring snapshot covers
+ * the instant before their first rendered frame. */
+function nearestHordeTarget(bot: Bot, localStaggered: boolean, now: number) {
+  _hordeTargetPos.copy(playerRig.position)
+  _hordeTarget.sessionId = null
+  _hordeTarget.staggered = localStaggered
+  let bestSq = bot.position.distanceToSquared(_hordeTargetPos)
+  for (const remote of getRemotes().values()) {
+    if (remote.ph !== 'game') continue
+    const snap = latestSnapshot(remote.ring)
+    if (!snap) continue
+    const freshDraw = remote.drawnAt > 0 && now - remote.drawnAt < 500
+    const x = freshDraw ? remote.drawnX : snap.x
+    const y = freshDraw ? remote.drawnY : snap.y
+    const z = freshDraw ? remote.drawnZ : snap.z
+    const dx = x - bot.position.x
+    const dy = y - bot.position.y
+    const dz = z - bot.position.z
+    const dSq = dx * dx + dy * dy + dz * dz
+    if (dSq >= bestSq) continue
+    bestSq = dSq
+    _hordeTargetPos.set(x, y, z)
+    _hordeTarget.sessionId = remote.sessionId
+    _hordeTarget.staggered = snap.st
+  }
+  return _hordeTarget
+}
 
 /** Scratch for the ring placement below — one pair, reused per spawn. */
 const _ringXZ: [number, number] = [0, 0]
@@ -213,9 +248,9 @@ function spawnWave(world: GameWorld): void {
  * exact segment-vs-worldBox sweep (enemies-state.segmentHitsBox — a single
  * midpoint probe used to miss a door leaf near either end of the swing).
  * Gates ALL bot kinds, drones included. Attack-frames only, never per-frame. */
-export function meleeBlocked(world: GameWorld, bot: Bot): boolean {
+export function meleeBlocked(world: GameWorld, bot: Bot, target = playerRig.position): boolean {
   _chest.set(bot.position.x, bot.position.y + BOT_STATS[bot.kind].bodyY, bot.position.z)
-  _meleeDir.copy(playerRig.position).sub(_chest)
+  _meleeDir.copy(target).sub(_chest)
   const len = _meleeDir.length()
   if (len < 1e-4) return false
   _meleeDir.divideScalar(len)
@@ -303,11 +338,18 @@ export function Enemies({ world }: { world: GameWorld }) {
       heart.current = null
     }
 
+    // Exactly one browser advances the director and AI. Every other browser
+    // has already eased its local bot objects toward that authority's latest
+    // snapshot here, so rendering/raycasting sees the same horde.
+    const hordeAuthority = stepHordeSync(dt)
+
     // Wave director: peaceful grace → (breaker switch) → one-shot alert
     // countdown → waves. State transitions live in enemies-state's
     // tickWaveDirector (armed is the ONLY wake input — never gun pickups);
     // this layer turns the step into sfx, labels and spawns.
-    const step = tickWaveDirector(dt, bots.length)
+    const step = hordeAuthority
+      ? tickWaveDirector(dt, bots.length)
+      : { alertStarted: false, assaultStarted: false, waveDue: false }
     if (step.alertStarted) {
       // Distant machine spin-up under the ticking line (stop any stale
       // voice first — resetBots() mid-session re-arms the alert).
@@ -365,6 +407,26 @@ export function Enemies({ world }: { world: GameWorld }) {
       session.hud.wave(label)
     }
 
+    if (!hordeAuthority) {
+      let nearestDrone = Infinity
+      let sig = bots.length | 0
+      for (const bot of bots) {
+        if (bot.kind === 'drone') {
+          nearestDrone = Math.min(nearestDrone, bot.position.distanceTo(playerRig.position))
+        }
+        sig = (sig * 33 + bot.id) | 0
+        sig = (sig * 33 + (bot.state === 'dying' ? 1 : 0)) | 0
+      }
+      buzz.current?.setIntensity(
+        nearestDrone === Infinity ? 0 : Math.max(0, 1 - nearestDrone / 22) * 0.09,
+      )
+      if (sig !== signature.current) {
+        signature.current = sig
+        setTick((t) => t + 1)
+      }
+      return
+    }
+
     // Integrate bots.
     const frozen = debugFlags.botsFrozen // dev/E2E: hold poses, no attacks
     graceLeft = postStaggerGrace(prevStaggered, staggered, graceLeft, dt)
@@ -374,6 +436,7 @@ export function Enemies({ world }: { world: GameWorld }) {
     // per-bot cadence probe is never budgeted.
     resetBotProbeBudget()
     let nearestDrone = Infinity
+    const targetNow = Date.now()
     for (let i = bots.length - 1; i >= 0; i--) {
       const bot = bots[i]!
       const stats = BOT_STATS[bot.kind]
@@ -389,10 +452,13 @@ export function Enemies({ world }: { world: GameWorld }) {
       const fumbling = bot.doorId !== null && bot.doorFumbleT > 0
       if (!fumbling && bot.windupT <= 0) bot.phase += dt * (bot.kind === 'dog' ? 11 : 6)
 
+      const target = nearestHordeTarget(bot, staggered, targetNow)
+      const targetPosition = target.position
+      const targetStaggered = target.staggered
       _toPlayer.set(
-        playerRig.position.x - bot.position.x,
+        targetPosition.x - bot.position.x,
         0,
-        playerRig.position.z - bot.position.z,
+        targetPosition.z - bot.position.z,
       )
       const dist = _toPlayer.length()
       bot.yaw = Math.atan2(_toPlayer.x, _toPlayer.z)
@@ -403,7 +469,7 @@ export function Enemies({ world }: { world: GameWorld }) {
       // Drone reach is 3D (ground bots stay XZ): a drone parked high over
       // the roof you're under is NOT in range — it has to actually get to you.
       const reachDist =
-        bot.kind === 'drone' ? Math.hypot(dist, playerRig.position.y - bot.position.y) : dist
+        bot.kind === 'drone' ? Math.hypot(dist, targetPosition.y - bot.position.y) : dist
 
       // Drone altitude: hover over the player's head, plus whatever climb
       // the path probe has banked to clear walls/roofs under the path.
@@ -412,11 +478,11 @@ export function Enemies({ world }: { world: GameWorld }) {
         if (!frozen) {
           // Mercy: drones climb an extra meter and hold while you're staggered.
           const hoverY =
-            playerRig.position.y +
+            targetPosition.y +
             0.9 +
-            (staggered ? 1 : 0) +
+            (targetStaggered ? 1 : 0) +
             Math.sin(bot.phase * 0.7 + bot.seed) * 0.5
-          if (!staggered && reachDist > stats.reach) {
+          if (!targetStaggered && reachDist > stats.reach) {
             // Path-aware probe (enemies-state.dronePathBlocked): an exact
             // sweep along the intended displacement ~1.2 m ahead — vertical
             // intent included, so a dive toward the player reads the roof
@@ -473,14 +539,16 @@ export function Enemies({ world }: { world: GameWorld }) {
       if (windup === 'strike') {
         bot.attackCooldown = 1.1
         bot.strikeT = STRIKE_FLASH_S
-        const playerFeetY = playerRig.position.y - EYE_HEIGHT
+        const playerFeetY = targetPosition.y - EYE_HEIGHT
         const stillInReach =
           reachDist <= stats.reach + STRIKE_SLACK &&
           withinVerticalReach(bot.kind, bot.position.y, playerFeetY)
-        if (!staggered && graceLeft <= 0 && stillInReach && !meleeBlocked(world, bot)) {
+        const targetGrace = target.sessionId === null ? graceLeft : 0
+        if (!targetStaggered && targetGrace <= 0 && stillInReach && !meleeBlocked(world, bot, targetPosition)) {
           // bot→player XZ direction; damagePlayer normalizes and handles
           // knockback, directional flash, sfx and the stagger routing.
-          damagePlayer(stats.damage, { x: dirX, z: dirZ })
+          if (target.sessionId === null) damagePlayer(stats.damage, { x: dirX, z: dirZ })
+          else recordEnemyHit(target.sessionId, stats.damage, bot.position.x, bot.position.z)
         }
       }
 
@@ -494,7 +562,7 @@ export function Enemies({ world }: { world: GameWorld }) {
         // walk cycle keeps idling so frozen bots still read as alive.
       } else if (windup === 'winding') {
         // Planted: a body mid-swing does not steer.
-      } else if (staggered) {
+      } else if (targetStaggered) {
         // Mercy window: nobody attacks a downed player. Ground bots steer to
         // hold a 4–6 m standoff ring; drones freeze in place (climb above).
         if (grounded && dist > 0.001 && (dist < MERCY_MIN || dist > MERCY_MAX)) {
@@ -556,7 +624,7 @@ export function Enemies({ world }: { world: GameWorld }) {
         moveX = sx * stats.speed * advance
         moveZ = sz * stats.speed * advance
       } else if (bot.attackCooldown <= 0) {
-        if (meleeBlocked(world, bot)) {
+        if (meleeBlocked(world, bot, targetPosition)) {
           // In reach but a solid is between us (thin walls/door leaves beat
           // the reach radius): don't punch drywall — pause, then ground bots
           // wall-follow to a way in; drones just re-probe (walls are cover).
@@ -567,7 +635,7 @@ export function Enemies({ world }: { world: GameWorld }) {
           }
         } else if (
           graceLeft > 0 ||
-          !withinVerticalReach(bot.kind, bot.position.y, playerRig.position.y - EYE_HEIGHT)
+          !withinVerticalReach(bot.kind, bot.position.y, targetPosition.y - EYE_HEIGHT)
         ) {
           // Getting-up grace, or a player a storey above/below (a droid under
           // a balcony edge): hold, and look again shortly.

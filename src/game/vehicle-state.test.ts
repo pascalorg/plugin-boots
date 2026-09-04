@@ -28,9 +28,10 @@ describe('vehicle wire boundary', () => {
         truckZ: -7,
         truckYaw: Math.PI * 3,
         speed: 5,
+        steer: 4,
         occupied: true,
       }),
-    ).toMatchObject({ truckX: -1.5, truckZ: -7, truckYaw: Math.PI })
+    ).toMatchObject({ truckX: -1.5, truckZ: -7, truckYaw: Math.PI, steer: 1 })
   })
 
   test('rejects malformed and unbounded peer data', () => {

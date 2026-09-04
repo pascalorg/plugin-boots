@@ -11,7 +11,8 @@ import {
   useDestruction,
 } from './destruction'
 import { spawnDust } from './dust'
-import { bots, damageBot, raycastBots } from './enemies-state'
+import { bots, raycastBots } from './enemies-state'
+import { damageSharedBot } from './horde-sync'
 import { hitGlass, raycastGlass } from './glass'
 import type { HitmarkerKind } from './hud'
 import { playerRig } from './player'
@@ -593,7 +594,7 @@ function fireShot(world: GameWorld, weapon: WeaponDef): FireOutcome {
   }
 
   if (winner === 'bot' && botHit) {
-    damageBot(botHit.bot, weapon.damage)
+    damageSharedBot(botHit.bot, weapon.damage)
     // The round dropped it iff the state left 'alive' inside this shot.
     const killed = botHit.bot.state !== 'alive'
     // Metal chassis: sparks only, no dust.

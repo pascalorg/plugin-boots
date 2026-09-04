@@ -76,10 +76,15 @@ export type PresenceFrame = {
   s: number
   g: boolean
   st: boolean
+  /** Aim-down-sights blend. Soft-added; older peers default to hip fire. */
+  a?: number
   /** Chosen display name (soft, added after v1): the tag over this peer. */
   nm?: string
   /** Rounds fired this session, mod SHOT_COUNTER_MOD (see the header). */
   f: number
+  /** Exact world-space end of the latest resolved hitscan. Added softly:
+   * older peers omit it and receivers fall back to yaw/pitch. */
+  t?: [number, number, number]
 }
 
 /** Ring capacity — 24 snapshots ≈ 2 s of history at the 12 Hz base rate. */
@@ -159,7 +164,12 @@ export type Snapshot = {
   s: number
   g: boolean
   st: boolean
+  a: number
   f: number
+  tx: number
+  ty: number
+  tz: number
+  ht: boolean
 }
 
 export type SnapshotRing = {
@@ -185,7 +195,12 @@ export function createRing(cap = RING_CAP): SnapshotRing {
       s: 0,
       g: true,
       st: false,
+      a: 0,
       f: 0,
+      tx: 0,
+      ty: 0,
+      tz: 0,
+      ht: false,
     })
   }
   return { cap, slots, head: cap - 1, count: 0 }
@@ -210,7 +225,12 @@ export function pushSnapshot(ring: SnapshotRing, sentAt: number, frame: Presence
   slot.s = frame.s
   slot.g = frame.g
   slot.st = frame.st
+  slot.a = frame.a ?? 0
   slot.f = frame.f
+  slot.ht = frame.t !== undefined
+  slot.tx = frame.t?.[0] ?? 0
+  slot.ty = frame.t?.[1] ?? 0
+  slot.tz = frame.t?.[2] ?? 0
   ring.head = head
   if (ring.count < ring.cap) ring.count++
   return true
@@ -231,9 +251,15 @@ export type SampledPose = {
   s: number
   g: boolean
   st: boolean
+  a: number
   /** Fire counter of the snapshot whose moment this sample has REACHED — see
    * sampleAt for why it is the older side of a bracket, not the newer. */
   f: number
+  /** Exact target paired with `f`; false for older clients. */
+  ht: boolean
+  tx: number
+  ty: number
+  tz: number
   /** True once extrapolation hit its 200 ms cap — the pose is frozen. */
   frozen: boolean
   /** The velocity (m/s) this sample MOVED with: the bracket slope in the lerp
@@ -256,7 +282,12 @@ export function createSampledPose(): SampledPose {
     s: 0,
     g: true,
     st: false,
+    a: 0,
     f: 0,
+    ht: false,
+    tx: 0,
+    ty: 0,
+    tz: 0,
     frozen: false,
     vx: 0,
     vy: 0,
@@ -291,7 +322,12 @@ function copyPose(from: Snapshot, out: SampledPose): void {
   out.s = from.s
   out.g = from.g
   out.st = from.st
+  out.a = from.a
   out.f = from.f
+  out.ht = from.ht
+  out.tx = from.tx
+  out.ty = from.ty
+  out.tz = from.tz
   out.frozen = false
   out.vx = 0
   out.vy = 0
@@ -405,6 +441,7 @@ export function sampleAt(ring: SnapshotRing, renderTime: number, out: SampledPos
       out.w = b.w
       out.g = b.g
       out.st = b.st
+      out.a = a.a + (b.a - a.a) * alpha
       // …EXCEPT the fire counter, which rides the OLDER one. Every other
       // discrete field is a state we would rather show early than late; a shot
       // is an INSTANT, and taking b's count the moment we start bracketing the
@@ -413,6 +450,10 @@ export function sampleAt(ring: SnapshotRing, renderTime: number, out: SampledPos
       // time reaches the snapshot that carried it — and it stays monotone,
       // because the next bracket's older side is this bracket's newer one.
       out.f = a.f
+      out.ht = a.ht
+      out.tx = a.tx
+      out.ty = a.ty
+      out.tz = a.tz
       out.frozen = false
       return true
     }
@@ -643,7 +684,7 @@ const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Num
  * oversize weapon ids. Clamps `s` into [0,1] and folds `f` into 0..255 (soft
  * fields — never worth dropping a frame over; `f` may be absent entirely on an
  * older peer's frames). Returns a NORMALIZED copy, never the input — so no
- * attacker-owned object, prototype or getter is ever retained, and only the ten
+ * attacker-owned object, prototype or getter is ever retained, and only the
  * fields below can exist downstream.
  *
  * TOTAL by construction: any throw while reading the payload (a hostile
@@ -674,6 +715,18 @@ function readFrame(data: unknown): PresenceFrame | null {
   if (typeof f.w !== 'string' || f.w.length === 0 || f.w.length > WEAPON_ID_MAX) return null
   if (!isFiniteNumber(f.s)) return null
   if (typeof f.g !== 'boolean' || typeof f.st !== 'boolean') return null
+  const target = f.t
+  const normalizedTarget: [number, number, number] | undefined =
+    Array.isArray(target) &&
+    target.length === 3 &&
+    isFiniteNumber(target[0]) &&
+    isFiniteNumber(target[1]) &&
+    isFiniteNumber(target[2]) &&
+    Math.abs(target[0]) <= POS_LIMIT &&
+    Math.abs(target[1]) <= POS_LIMIT &&
+    Math.abs(target[2]) <= POS_LIMIT
+      ? [target[0], target[1], target[2]]
+      : undefined
   return {
     v: 1,
     ph: f.ph,
@@ -684,12 +737,14 @@ function readFrame(data: unknown): PresenceFrame | null {
     s: f.s < 0 ? 0 : f.s > 1 ? 1 : f.s,
     g: f.g,
     st: f.st,
+    a: isFiniteNumber(f.a) ? (f.a < 0 ? 0 : f.a > 1 ? 1 : f.a) : 0,
     // Soft field, like `s`, and for the same reason twice over: it was added
     // after v1 shipped (an older peer simply has none) and a nonsense count is
     // never worth dropping a whole pose over — the shot-delta cap upstream
     // already bounds what a bad one can cost. Normalized into 0..255 here so
     // nothing downstream has to think about it.
     f: isFiniteNumber(f.f) ? ((Math.trunc(f.f) % SHOT_COUNTER_MOD) + SHOT_COUNTER_MOD) % SHOT_COUNTER_MOD : 0,
+    ...(normalizedTarget ? { t: normalizedTarget } : {}),
     // Soft, like `f`: absent on an older peer, and a hostile value is capped,
     // never a dropped pose. Control chars stripped so canvas fillText can't be
     // fooled; length bounded so the tag texture never blows up.

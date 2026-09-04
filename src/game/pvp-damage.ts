@@ -181,15 +181,20 @@ type PvpFrame = {
   /** Cumulative vehicle impacts, kept separate so a ram can add vertical
    * launch without making a coalesced minigun burst throw somebody skyward. */
   rams?: Record<string, number>
+  /** Cumulative bot damage dealt by the elected horde simulator. The latest
+   * source point keeps the victim's red flash and shove directional. */
+  enemy?: Record<string, { n: number; x: number; z: number }>
 }
 
 /** Per-victim cumulative tags WE have landed (rebuilt into every frame so the
  * latest coalesced frame is self-sufficient). */
 const outgoing = new Map<string, number>()
 const outgoingRams = new Map<string, number>()
+const outgoingEnemy = new Map<string, { n: number; x: number; z: number }>()
 /** Per-shooter last counter we have already applied. */
 const seen = new Map<string, number>()
 const seenRams = new Map<string, number>()
+const seenEnemy = new Map<string, number>()
 /** Driver-side debounce: overlap lasts several frames but is one impact. */
 const rammedAt = new Map<string, number>()
 let active = false
@@ -204,20 +209,44 @@ export function validatePvpFrame(data: unknown): PvpFrame | null {
     if (typeof v === 'number' && Number.isFinite(v) && v >= 0) hits[k] = v
   }
   const rawRams = (data as { rams?: unknown }).rams
-  if (!rawRams || typeof rawRams !== 'object') return { hits }
   const rams: Record<string, number> = {}
-  for (const [k, v] of Object.entries(rawRams as Record<string, unknown>)) {
-    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) rams[k] = v
+  if (rawRams && typeof rawRams === 'object') {
+    for (const [k, v] of Object.entries(rawRams as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) rams[k] = v
+    }
   }
-  return { hits, rams }
+  const rawEnemy = (data as { enemy?: unknown }).enemy
+  const enemy: Record<string, { n: number; x: number; z: number }> = {}
+  if (rawEnemy && typeof rawEnemy === 'object') {
+    for (const [k, value] of Object.entries(rawEnemy as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue
+      const rec = value as Record<string, unknown>
+      if (
+        typeof rec.n === 'number' && Number.isFinite(rec.n) && rec.n >= 0 && rec.n <= 1_000_000 &&
+        typeof rec.x === 'number' && Number.isFinite(rec.x) && Math.abs(rec.x) <= 100_000 &&
+        typeof rec.z === 'number' && Number.isFinite(rec.z) && Math.abs(rec.z) <= 100_000
+      ) enemy[k] = { n: rec.n, x: rec.x, z: rec.z }
+    }
+  }
+  return {
+    hits,
+    ...(Object.keys(rams).length > 0 ? { rams } : {}),
+    ...(Object.keys(enemy).length > 0 ? { enemy } : {}),
+  }
 }
 
 function publishPvpCounters(): void {
   const hits: Record<string, number> = {}
   const rams: Record<string, number> = {}
+  const enemy: Record<string, { n: number; x: number; z: number }> = {}
   for (const [k, n] of outgoing) hits[k] = n
   for (const [k, n] of outgoingRams) rams[k] = n
-  publishFrame(PVP_KIND, { hits, ...(outgoingRams.size > 0 ? { rams } : {}) })
+  for (const [k, rec] of outgoingEnemy) enemy[k] = { ...rec }
+  publishFrame(PVP_KIND, {
+    hits,
+    ...(outgoingRams.size > 0 ? { rams } : {}),
+    ...(outgoingEnemy.size > 0 ? { enemy } : {}),
+  })
 }
 
 /** Shooter side (called from shooting.ts on a player hit): count the tag and
@@ -249,6 +278,18 @@ export function ramRemotePlayersAt(x: number, z: number, radius: number, now = D
   return hit
 }
 
+/** Horde-authority side: address damage to the player the shared bot chose. */
+export function recordEnemyHit(sessionId: string, damage: number, x: number, z: number): void {
+  if (!active || !(damage > 0)) return
+  const prior = outgoingEnemy.get(sessionId)
+  outgoingEnemy.set(sessionId, {
+    n: (prior?.n ?? 0) + damage,
+    x,
+    z,
+  })
+  publishPvpCounters()
+}
+
 const _fromDir = { x: 0, z: 0 }
 
 /** Victim side: apply any NEW tags addressed to us, hurt direction derived from
@@ -258,7 +299,14 @@ function onPvpFrame(msg: NetMessage<PvpFrame>): void {
   if (!mine) return
   const burst = consumeHits(msg.sessionId, msg.data.hits[mine], seen, MAX_BURST)
   const rams = consumeHits(msg.sessionId, msg.data.rams?.[mine], seenRams, 1)
-  if (burst <= 0 && rams <= 0) return
+  const enemyRec = msg.data.enemy?.[mine]
+  const enemyKey = `${msg.sessionId}:${mine}`
+  const enemyPrior = seenEnemy.get(enemyKey) ?? 0
+  const enemyDamage = enemyRec && enemyRec.n > enemyPrior
+    ? Math.min(60, enemyRec.n - enemyPrior)
+    : 0
+  if (enemyRec && enemyRec.n > enemyPrior) seenEnemy.set(enemyKey, enemyRec.n)
+  if (burst <= 0 && rams <= 0 && enemyDamage <= 0) return
   const shooter = getRemotes().get(msg.sessionId)
   let hasDir = false
   if (shooter && sampleRemoteNow(shooter)) {
@@ -277,6 +325,15 @@ function onPvpFrame(msg: NetMessage<PvpFrame>): void {
     playerRig.launch(5.8)
     playerRig.shake(3.2)
   }
+  if (enemyDamage > 0 && enemyRec) {
+    const dx = playerRig.position.x - enemyRec.x
+    const dz = playerRig.position.z - enemyRec.z
+    const len = Math.hypot(dx, dz)
+    damagePlayer(
+      enemyDamage,
+      len > 1e-4 ? { x: dx / len, z: dz / len } : undefined,
+    )
+  }
 }
 
 /**
@@ -291,8 +348,10 @@ export function startPvpSync(): void {
   active = true
   outgoing.clear()
   outgoingRams.clear()
+  outgoingEnemy.clear()
   seen.clear()
   seenRams.clear()
+  seenEnemy.clear()
   rammedAt.clear()
   registerFrameKind<PvpFrame>(PVP_KIND, validatePvpFrame, { ordered: false })
   offFrame = onFrame<PvpFrame>(PVP_KIND, onPvpFrame)
@@ -307,8 +366,10 @@ export function stopPvpSync(): void {
   offFrame = null
   outgoing.clear()
   outgoingRams.clear()
+  outgoingEnemy.clear()
   seen.clear()
   seenRams.clear()
+  seenEnemy.clear()
   rammedAt.clear()
 }
 
@@ -318,7 +379,9 @@ export function resetPvpForTests(): void {
   offFrame = null
   outgoing.clear()
   outgoingRams.clear()
+  outgoingEnemy.clear()
   seen.clear()
   seenRams.clear()
+  seenEnemy.clear()
   rammedAt.clear()
 }

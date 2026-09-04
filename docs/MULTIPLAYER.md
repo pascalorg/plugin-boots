@@ -1,9 +1,9 @@
 # Boots multiplayer
 
-Other builders in the same project appear INSIDE your game session and — as
-the shared-world work lands — break and build the same fort you do. The
-destination is a synchronous lobby. Avatars are simply the first kind of
-frame that works.
+Other builders in the same project appear INSIDE your game session and share
+the fort, destruction, operables, combat horde, glass, trees, grenades and
+depot convoy. The simulation uses outcome replication for permanent world
+changes and elected-authority snapshots for dynamic actors.
 
 Two layers, and the split matters:
 
@@ -12,7 +12,8 @@ Two layers, and the split matters:
   registered `kind` and owns the late-join handshake.
 - **kind owners.** `presence.ts` owns `'pose'` (this document's second half).
   `shared-world.ts` owns `'boots/world'` and `'boots/world-snap'` (Part 3).
-  `voice.ts` owns `'boots/voice'` (Part 5) — and is the one kind whose payload
+  Horde, operable, tree, glass, grenade and vehicle modules own their bounded
+  state/command lanes. `voice.ts` owns `'boots/voice'` (Part 5) — and is the one kind whose payload
   is not the thing being replicated: the bus carries the *handshake*, the audio
   goes peer-to-peer. None of the three knows anything about the others.
 
@@ -29,6 +30,12 @@ byte on the wire.
 | `src/game/presence-interp.ts` | PURE pose math: snapshot ring (cap 24), sampleAt (lerp / extrapolate ≤200 ms then freeze / >3 m teleport snap), staleness predicate, pose-frame validation. |
 | `src/game/presence.ts` | The AVATAR layer — one kind (`'pose'`) on the transport: publish policy, remote registry, crowd ceiling, join/leave events, QA counters. |
 | `src/game/remote-players.tsx` | R3F rendering: `<RemotePlayers/>` → `<RemoteAvatar>` rigs, articulation, weapon silhouettes, distance-faded name tags, HUD chip drive. |
+| `src/game/horde-sync.ts` | Elected-authority wave/bot simulation, 10 Hz bot snapshots, cumulative damage and breaker commands, handoff + late join. |
+| `src/game/interact.tsx` | Shared open/closed state and hinge direction for doors, windows and cabinets. |
+| `src/game/tree-sync.ts` | Elected-authority combat-tree snapshots and cumulative gun damage; truck impacts run only on the authority. |
+| `src/game/glass.tsx` | Cumulative pane hits/shatters and late-join glass state. |
+| `src/game/grenade.tsx` | Recent detonation ring so every player gets the same blast, local damage and effects. |
+| `src/game/guntable.tsx` | Single-driver articulated truck/trailer pose, occupancy and steering stream. |
 | `src/game/game-root.tsx` | Lifecycle wiring (start/stop keyed on the session serial), local pose sampler, `__boots.presence()` QA handle, toast wiring. |
 | `src/game/session.ts` | `exitGame` goodbye frame; scene-write sentinel with the remote-op discriminator. |
 | `src/game/hud.ts` | "N builders here" chip + muted join/leave toasts, voice chip. |
@@ -210,7 +217,9 @@ Rides the envelope as `kind: 'pose'`:
   "s": 0.62,          // horizontal speed normalized 0..1 (gait cadence)
   "g": true,          // grounded (false = airborne tuck pose)
   "st": false,        // staggered (true = slump pose)
-  "f": 37             // rounds fired this session, mod 256 (see Gunfire)
+  "a": 1,             // aim-down-sights blend, 0..1
+  "f": 37,            // rounds fired this session, mod 256 (see Gunfire)
+  "t": [4.2, 1.1, -8] // exact resolved endpoint of the latest shot
 }
 ```
 
