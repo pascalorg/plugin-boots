@@ -2,9 +2,10 @@
 
 import { type RootState, useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
-import { type PerspectiveCamera, Ray, Vector3 } from 'three'
+import { type PerspectiveCamera, Vector3 } from 'three'
 import { useBoots } from '../store'
 import { sfx } from './audio'
+import { cameraBoomDistance } from './camera-boom'
 import { EYE_HEIGHT, moveCapsule, PLAYER_CAPSULE } from './collision'
 import { collideVoxelWalls } from './destruction'
 import {
@@ -31,7 +32,12 @@ import { takeAction } from './input'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
 import { exitGame, getSession } from './session'
-import { convoyPose, vehicleChaseLookAhead, vehicleRig } from './vehicle-state'
+import {
+  convoyPose,
+  VEHICLE_COLLIDER_NODE_ID,
+  vehicleChaseLookAhead,
+  vehicleRig,
+} from './vehicle-state'
 import { type GameWorld, settleSpawnFeet } from './world'
 
 /**
@@ -108,8 +114,6 @@ const MAX_PITCH = Math.PI / 2 - 0.02
 const _vehicleLookAt = new Vector3()
 const _thirdDesired = new Vector3()
 const _thirdDirection = new Vector3()
-const _thirdHit = new Vector3()
-const _thirdRay = new Ray()
 
 const REGEN_DELAY = 4 // s after last damage before regen kicks in
 const REGEN_RATE = 12 // hp/s
@@ -583,11 +587,22 @@ export function Player({ world }: { world: GameWorld }) {
         // rear panel in the center of the chase view.
         const distance = 7.4
         const lift = 4.25 + Math.sin(playerRig.pitch) * 2.15
-        camera.position.set(
+        _thirdDesired.set(
           playerRig.position.x + Math.sin(playerRig.yaw) * distance,
           playerRig.position.y + lift,
           playerRig.position.z + Math.cos(playerRig.yaw) * distance,
         )
+        _thirdDirection.subVectors(_thirdDesired, playerRig.position)
+        const wanted = _thirdDirection.length()
+        const allowed = cameraBoomDistance(
+          playerRig.position,
+          _thirdDesired,
+          world.colliders,
+          VEHICLE_COLLIDER_NODE_ID,
+        )
+        camera.position
+          .copy(playerRig.position)
+          .addScaledVector(_thirdDirection, allowed / Math.max(wanted, 1e-6))
         const lookAhead = vehicleChaseLookAhead(vehicleRig.speed)
         _vehicleLookAt.set(
           playerRig.position.x - Math.cos(convoyPose.truckYaw) * lookAhead,
@@ -817,16 +832,10 @@ export function Player({ world }: { world: GameWorld }) {
       )
       _thirdDirection.subVectors(_thirdDesired, playerRig.position)
       const wanted = _thirdDirection.length()
-      _thirdDirection.multiplyScalar(1 / Math.max(wanted, 1e-6))
-      _thirdRay.set(playerRig.position, _thirdDirection)
-      let allowed = wanted
-      for (const collider of world.colliders) {
-        if (collider.disabled || collider.worldBox.containsPoint(playerRig.position)) continue
-        if (!_thirdRay.intersectBox(collider.worldBox, _thirdHit)) continue
-        const hitDistance = _thirdHit.distanceTo(playerRig.position)
-        if (hitDistance < allowed) allowed = Math.max(0.45, hitDistance - 0.16)
-      }
-      camera.position.copy(playerRig.position).addScaledVector(_thirdDirection, allowed)
+      const allowed = cameraBoomDistance(playerRig.position, _thirdDesired, world.colliders)
+      camera.position
+        .copy(playerRig.position)
+        .addScaledVector(_thirdDirection, allowed / Math.max(wanted, 1e-6))
       camera.rotation.order = 'YXZ'
       camera.rotation.set(playerRig.pitch, playerRig.yaw, 0)
     } else {

@@ -5,6 +5,9 @@
  */
 
 export const VEHICLE_KIND = 'boots/vehicle' as const
+/** All generated truck/trailer colliders share this id. Camera boom tests
+ * ignore them while still respecting authored walls around the convoy. */
+export const VEHICLE_COLLIDER_NODE_ID = '__boots-depot'
 /** Authoritative forward-speed ceiling shared by simulation and wire input.
  * 50 m/s is 180 km/h: deliberately fast enough for the endless road, while
  * keeping one 30 Hz physics step shorter than the truck's collision probes. */
@@ -20,6 +23,19 @@ export function vehicleChaseLookAhead(speed: number): number {
     VEHICLE_CHASE_MAX_LOOK_AHEAD,
     VEHICLE_CHASE_MIN_LOOK_AHEAD + safeSpeed * 0.12,
   )
+}
+
+export const VEHICLE_SPEEDOMETER_STEP_KPH = 5
+
+/** A stable, low-churn dashboard readout. Five km/h buckets avoid rewriting
+ * the HUD every animation frame while still making acceleration legible. */
+export function vehicleSpeedReadout(speed: number): string {
+  const safeSpeed = Number.isFinite(speed) ? speed : 0
+  const kph =
+    Math.round((Math.abs(safeSpeed) * 3.6) / VEHICLE_SPEEDOMETER_STEP_KPH) *
+    VEHICLE_SPEEDOMETER_STEP_KPH
+  const gear = safeSpeed < -0.15 ? 'R' : kph === 0 ? 'P' : 'D'
+  return `${gear} · ${kph} km/h`
 }
 
 export type VehicleFrame = {

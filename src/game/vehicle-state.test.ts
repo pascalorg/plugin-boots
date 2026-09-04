@@ -7,10 +7,12 @@ import {
   resetConvoyPose,
   shortestYawDelta,
   vehicleChaseLookAhead,
+  VEHICLE_COLLIDER_NODE_ID,
   VEHICLE_CHASE_MAX_LOOK_AHEAD,
   VEHICLE_CHASE_MIN_LOOK_AHEAD,
   VEHICLE_MAX_FORWARD_SPEED,
   vehicleRig,
+  vehicleSpeedReadout,
   wrapVehicleYaw,
 } from './vehicle-state'
 
@@ -81,6 +83,15 @@ describe('driver camera mode', () => {
     expect(vehicleChaseLookAhead(50)).toBe(VEHICLE_CHASE_MAX_LOOK_AHEAD)
     expect(vehicleChaseLookAhead(-50)).toBe(VEHICLE_CHASE_MAX_LOOK_AHEAD)
     expect(vehicleChaseLookAhead(Number.NaN)).toBe(VEHICLE_CHASE_MIN_LOOK_AHEAD)
+  })
+
+  test('dashboard speed is readable, directional, and low-churn', () => {
+    expect(vehicleSpeedReadout(0)).toBe('P · 0 km/h')
+    expect(vehicleSpeedReadout(10)).toBe('D · 35 km/h')
+    expect(vehicleSpeedReadout(50)).toBe('D · 180 km/h')
+    expect(vehicleSpeedReadout(-4)).toBe('R · 15 km/h')
+    expect(vehicleSpeedReadout(Number.NaN)).toBe('P · 0 km/h')
+    expect(VEHICLE_COLLIDER_NODE_ID).toBe('__boots-depot')
   })
 
   test('a new or cleared convoy always starts in first person', () => {

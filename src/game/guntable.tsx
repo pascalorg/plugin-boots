@@ -54,10 +54,12 @@ import {
   readVehicleFrame,
   resetConvoyPose,
   shortestYawDelta,
+  VEHICLE_COLLIDER_NODE_ID,
   wrapVehicleYaw,
   VEHICLE_KIND,
   VEHICLE_MAX_FORWARD_SPEED,
   vehicleRig,
+  vehicleSpeedReadout,
   type VehicleFrame,
 } from './vehicle-state'
 import * as weaponModels from './weapon-models'
@@ -346,7 +348,7 @@ export function nearestGrabbable(
 /** Every solid depot mesh registers under this single destruction key —
  * '__boots'-prefixed (the prevoxelize guard skips it) AND nodeType
  * 'fixture' (shooting sparks, grenades skip): armored twice over. */
-export const DEPOT_NODE_ID = '__boots-depot'
+export const DEPOT_NODE_ID = VEHICLE_COLLIDER_NODE_ID
 /** Outside shooting's DESTRUCTIBLE set and the grenade EXPLODABLE sets —
  * the QA P6R1 lane where hits only spark. Exported for the armor pin. */
 export const DEPOT_NODE_TYPE = 'fixture'
@@ -1361,7 +1363,7 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
     vehicleRig.speed = convoyPose.speed
 
     const prompt = vehicleRig.driving
-      ? `W/S throttle · A/D steer · Tab ${vehicleRig.view === 'first' ? 'third-person' : 'first-person'} · E exit`
+      ? `${vehicleSpeedReadout(convoyPose.speed)} · W/S throttle · A/D steer · Tab ${vehicleRig.view === 'first' ? 'third-person' : 'first-person'} · E exit`
       : nearDoor
         ? remotelyOccupied
           ? 'Cybertruck occupied'
