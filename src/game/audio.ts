@@ -51,6 +51,9 @@
  *   period) under a slow AM sweep, level ~0.05. start() is idempotent while
  *   running and works again after stop(); ALWAYS returns a handle (silent
  *   no-op without WebAudio) — no null check.
+ * - sfx.vehicleEngine() — { setMotion, stop } one continuously spatialized
+ *   combustion-engine loop. Every browser derives its pitch, load, distance
+ *   rolloff, and stereo bearing from the synchronized convoy pose.
  *
  * Phase-3 material one-shots: paperTear() (drywall skin ripping off in
  * plates), shingleRip() (roof sheet fly-off — drier/shorter than paperTear:
@@ -381,6 +384,38 @@ export function spatialPan(pan: number): number {
   return p < -SPATIAL_PAN_MAX ? -SPATIAL_PAN_MAX : p > SPATIAL_PAN_MAX ? SPATIAL_PAN_MAX : p
 }
 
+// ── Shared convoy engine: one state, locally spatialized for each listener ──
+
+export const VEHICLE_ENGINE_MAX_M = 90
+export const VEHICLE_ENGINE_REFERENCE_SPEED = 10
+
+export type VehicleEngineMix = {
+  level: number
+  pitchHz: number
+  pulseHz: number
+  cutoffHz: number
+}
+
+/** Pure engine mapping. Occupancy is the ignition state already carried by
+ * vehicle frames; speed supplies RPM, while distance controls attenuation. */
+export function vehicleEngineMix(
+  speed: number,
+  occupied: boolean,
+  distance: number,
+): VehicleEngineMix {
+  const safeSpeed = Number.isFinite(speed) ? Math.abs(speed) : 0
+  const rpm = Math.min(1, safeSpeed / VEHICLE_ENGINE_REFERENCE_SPEED)
+  const safeDistance = Number.isFinite(distance) ? Math.max(0, distance) : 0
+  const range = Math.max(0, 1 - safeDistance / VEHICLE_ENGINE_MAX_M)
+  const attenuation = range * range
+  return {
+    level: occupied ? (0.055 + 0.075 * rpm) * attenuation : 0,
+    pitchHz: 46 + 76 * rpm,
+    pulseHz: 12 + 22 * rpm,
+    cutoffHz: Math.max(480, 1900 + 1800 * rpm - safeDistance * 18),
+  }
+}
+
 /**
  * gain → lowpass ("air") → stereo pan → `out` (the master compressor). Every
  * sound that comes from a place in the world — a peer's shot, a peer's step, a
@@ -681,6 +716,13 @@ export type SirenLoopHandle = {
 /** Handle returned by sfx.spray() — the paint-tool aerosol hiss loop. */
 export type SprayHandle = {
   start: () => void
+  stop: () => void
+}
+
+/** Handle returned by sfx.vehicleEngine(). The pose itself is synchronized;
+ * each listener supplies distance/pan so one shared motion sounds spatial. */
+export type VehicleEngineHandle = {
+  setMotion: (speed: number, occupied: boolean, distance: number, pan?: number) => void
   stop: () => void
 }
 
@@ -1411,6 +1453,79 @@ export const sfx = {
         oscB.stop(end)
         wobble.stop(end)
         swell.stop(end)
+      },
+    }
+  },
+
+  /**
+   * Low combustion loop for the Cybertruck. Two detuned engine orders and a
+   * cylinder-fire tremolo make it read as machinery rather than one clean
+   * tone. The synchronized convoy supplies speed/ignition; distance and pan
+   * are resolved independently for each listener. ALWAYS returns a handle.
+   */
+  vehicleEngine(): VehicleEngineHandle {
+    const c = ensureContext()
+    if (!c || !master) return { setMotion: () => {}, stop: () => {} }
+    const fundamental = c.createOscillator()
+    fundamental.type = 'sawtooth'
+    fundamental.frequency.value = 46
+    const harmonic = c.createOscillator()
+    harmonic.type = 'triangle'
+    harmonic.frequency.value = 93
+    const tone = c.createBiquadFilter()
+    tone.type = 'lowpass'
+    tone.frequency.value = 1900
+    tone.Q.value = 0.72
+    const combustion = c.createGain()
+    combustion.gain.value = 0.82
+    const pulse = c.createOscillator()
+    pulse.type = 'sine'
+    pulse.frequency.value = 12
+    const pulseDepth = c.createGain()
+    pulseDepth.gain.value = 0.16
+    pulse.connect(pulseDepth)
+    pulseDepth.connect(combustion.gain)
+    const gain = c.createGain()
+    gain.gain.value = 0
+    const panner = typeof c.createStereoPanner === 'function' ? c.createStereoPanner() : null
+    fundamental.connect(tone)
+    harmonic.connect(tone)
+    tone.connect(combustion)
+    combustion.connect(gain)
+    if (panner) {
+      gain.connect(panner)
+      panner.connect(master)
+    } else {
+      gain.connect(master)
+    }
+    fundamental.start()
+    harmonic.start()
+    pulse.start()
+    let stopped = false
+    fundamental.onended = () => {
+      gain.disconnect()
+      pulseDepth.disconnect()
+    }
+    return {
+      setMotion: (speed, occupied, distance, pan = 0) => {
+        if (stopped) return
+        const mix = vehicleEngineMix(speed, occupied, distance)
+        const t = c.currentTime
+        fundamental.frequency.setTargetAtTime(mix.pitchHz, t, 0.08)
+        harmonic.frequency.setTargetAtTime(mix.pitchHz * 2.03, t, 0.08)
+        pulse.frequency.setTargetAtTime(mix.pulseHz, t, 0.08)
+        tone.frequency.setTargetAtTime(mix.cutoffHz, t, 0.12)
+        gain.gain.setTargetAtTime(mix.level * (panner ? PAN_MONO_COMP : 1), t, 0.09)
+        panner?.pan.setTargetAtTime(spatialPan(pan), t, 0.08)
+      },
+      stop: () => {
+        if (stopped) return
+        stopped = true
+        gain.gain.setTargetAtTime(0.0001, c.currentTime, 0.05)
+        const end = c.currentTime + 0.35
+        fundamental.stop(end)
+        harmonic.stop(end)
+        pulse.stop(end)
       },
     }
   },

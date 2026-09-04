@@ -20,9 +20,12 @@ import {
   trailerCenterFromHitch,
   TRAILER_HITCH_LENGTH,
   TRAILER_MAX_ARTICULATION,
+  truckYawRate,
   TRUCK_HITCH_X,
+  VEHICLE_MAX_STEER_ANGLE,
   worldToDepotLocal,
 } from './guntable'
+import { CYBER_TRUCK_WHEELBASE } from './cyber-truck'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -282,6 +285,18 @@ describe('Cybertruck convoy collision envelope', () => {
 })
 
 describe('articulated trailer kinematics', () => {
+  test('full steering lock gives a tight, physical turning radius', () => {
+    const speed = 10
+    const yawRate = truckYawRate(speed, 1)
+    const radius = speed / yawRate
+    expect(radius).toBeCloseTo(CYBER_TRUCK_WHEELBASE / Math.tan(VEHICLE_MAX_STEER_ANGLE), 10)
+    expect(radius).toBeLessThan(6)
+    expect(radius).toBeGreaterThan(CYBER_TRUCK_WHEELBASE)
+    expect(truckYawRate(-speed, 1)).toBeCloseTo(-yawRate, 12)
+    expect(truckYawRate(speed, -1)).toBeCloseTo(-yawRate, 12)
+    expect(truckYawRate(0, 1)).toBe(0)
+  })
+
   test('the truck turns first and the trailer follows instead of rotating as one block', () => {
     const trailerYaw = stepTrailerYaw(0, 0.55, 6, 1 / 30)
     expect(trailerYaw).toBeGreaterThan(0)

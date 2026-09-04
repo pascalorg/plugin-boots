@@ -35,6 +35,8 @@ import {
   SPATIAL_PAN_MAX,
   spatialPan,
   SPEED_OF_SOUND_MS,
+  VEHICLE_ENGINE_MAX_M,
+  vehicleEngineMix,
 } from './audio'
 import { FEEL } from './feel'
 import { MOVE } from './movement'
@@ -75,6 +77,35 @@ describe('handle-returning loop voices never null (WebAudio absent)', () => {
       crackle.stop()
       crackle.stop()
     }).not.toThrow()
+  })
+
+  test('vehicleEngine(): shared-motion loop is safe without WebAudio', () => {
+    const engine = sfx.vehicleEngine()
+    expect(() => {
+      engine.setMotion(0, false, 0)
+      engine.setMotion(6, true, 12, -0.5)
+      engine.stop()
+      engine.stop()
+      engine.setMotion(10, true, 0, 1)
+    }).not.toThrow()
+  })
+})
+
+describe('vehicleEngineMix — synchronized RPM with listener-local distance', () => {
+  test('ignition gates sound and distance rolls it to silence', () => {
+    expect(vehicleEngineMix(8, false, 0).level).toBe(0)
+    expect(vehicleEngineMix(8, true, 0).level).toBeGreaterThan(0)
+    expect(vehicleEngineMix(8, true, 30).level).toBeLessThan(vehicleEngineMix(8, true, 0).level)
+    expect(vehicleEngineMix(8, true, VEHICLE_ENGINE_MAX_M).level).toBe(0)
+  })
+
+  test('speed raises pitch/load equally for forward and reverse', () => {
+    const idle = vehicleEngineMix(0, true, 0)
+    const forward = vehicleEngineMix(10, true, 0)
+    const reverse = vehicleEngineMix(-10, true, 0)
+    expect(forward.pitchHz).toBeGreaterThan(idle.pitchHz)
+    expect(forward.pulseHz).toBeGreaterThan(idle.pulseHz)
+    expect(reverse).toEqual(forward)
   })
 })
 

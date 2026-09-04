@@ -13,8 +13,8 @@ import {
   Vector3,
 } from 'three'
 import { useBoots } from '../store'
-import { sfx } from './audio'
-import { CyberTruckModel } from './cyber-truck'
+import { sfx, type VehicleEngineHandle } from './audio'
+import { CYBER_TRUCK_WHEELBASE, CyberTruckModel } from './cyber-truck'
 import { DepotMirror } from './depot-mirror'
 import { damageTarget } from './destruction'
 import { bots, damageBot, waveState } from './enemies-state'
@@ -355,8 +355,11 @@ const VEHICLE_MAX_REVERSE = 4
 const VEHICLE_ACCEL = 7
 const VEHICLE_BRAKE = 10
 const VEHICLE_COAST = 4
-const VEHICLE_STEER_RATE = 0.78
-const VEHICLE_PUBLISH_HZ = 10
+/** Real front-wheel steering geometry: a 33° lock gives this long truck a
+ * useful ~5.5 m centerline radius instead of the old speed-dependent 12.8 m
+ * circle. The trailer still follows through its hitch and articulation cap. */
+export const VEHICLE_MAX_STEER_ANGLE = 0.58
+const VEHICLE_PUBLISH_HZ = 12
 const REMOTE_DRIVER_TIMEOUT_MS = 1800
 /** Tractor center → rear hitch and trailer center → front hitch add to the
  * initial six-metre separation. The trailer yaw follows the standard
@@ -364,6 +367,13 @@ const REMOTE_DRIVER_TIMEOUT_MS = 1800
 export const TRUCK_HITCH_X = 2.75
 export const TRAILER_HITCH_LENGTH = 3.25
 export const TRAILER_MAX_ARTICULATION = Math.PI * 0.39
+
+/** Bicycle-model yaw rate (rad/s). Reverse naturally flips the turn. */
+export function truckYawRate(speed: number, steer: number): number {
+  if (!Number.isFinite(speed) || !Number.isFinite(steer)) return 0
+  const input = Math.max(-1, Math.min(1, steer))
+  return (speed / CYBER_TRUCK_WHEELBASE) * Math.tan(input * VEHICLE_MAX_STEER_ANGLE)
+}
 
 export function stepTrailerYaw(
   trailerYaw: number,
@@ -686,11 +696,21 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   const strutsRef = useRef<Group>(null)
   const vehiclePrompt = useRef<string | null>(null)
   const publishClock = useRef(0)
+  const engineRef = useRef<VehicleEngineHandle | null>(null)
   const solidRefs = useRef<(Mesh | null)[]>([])
   useFixtureColliders(world, solidRefs)
   const solid = (i: number) => (mesh: Mesh | null) => {
     solidRefs.current[i] = mesh
   }
+
+  useEffect(() => {
+    const engine = sfx.vehicleEngine()
+    engineRef.current = engine
+    return () => {
+      engine.stop()
+      if (engineRef.current === engine) engineRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     const initialYaw = depotWorldYaw(world)
@@ -804,12 +824,15 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   }, [center.x, center.z, groundY, world])
 
   // Priority -2: claim E before doors (-1) and move the root before Player
-  // follows the cab at priority 0. Remote poses ease between 10 Hz packets;
+  // follows the cab at priority 0. Remote poses ease between 12 Hz packets;
   // the local driver remains exact and publishes latest-value frames.
-  useFrame((_, rawDt) => {
+  useFrame(({ camera }, rawDt) => {
     const root = rootRef.current
     const session = getSession()
-    if (!root || !session || !convoyPose.ready) return
+    if (!root || !session || !convoyPose.ready) {
+      engineRef.current?.setMotion(0, false, 0)
+      return
+    }
     const dt = Math.min(rawDt, 1 / 30)
     const now = Date.now()
 
@@ -882,11 +905,9 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         convoyPose.steer = convoyPose.targetSteer = approach(convoyPose.steer, steer, dt * 5)
         const oldTruckYaw = convoyPose.truckYaw
         let nextTruckYaw = oldTruckYaw
-        if (steer !== 0 && Math.abs(convoyPose.speed) > 0.08) {
-          const direction = convoyPose.speed >= 0 ? 1 : -1
-          const speedScale = Math.min(1, Math.abs(convoyPose.speed) / 3)
+        if (Math.abs(convoyPose.steer) > 0.001 && Math.abs(convoyPose.speed) > 0.08) {
           nextTruckYaw = wrapVehicleYaw(
-            nextTruckYaw + steer * direction * VEHICLE_STEER_RATE * speedScale * dt,
+            nextTruckYaw + truckYawRate(convoyPose.speed, convoyPose.steer) * dt,
           )
         }
         const nextTruckX =
@@ -1038,6 +1059,24 @@ function SpawnDepot({ world }: { world: GameWorld }) {
     }
     if (strutsRef.current) strutsRef.current.visible = !panelsClosed
     root.updateWorldMatrix(true, true)
+
+    // Engine audio is derived from the same interpolated convoy pose every
+    // player renders. Only listener-relative distance/bearing is local, so a
+    // remote drive-by has the same RPM but moves naturally across the ears.
+    const engineDx = convoyPose.truckX - camera.position.x
+    const engineDy = convoyPose.y + 0.75 - camera.position.y
+    const engineDz = convoyPose.truckZ - camera.position.z
+    const engineDistance = Math.hypot(engineDx, engineDy, engineDz)
+    const cameraRight = camera.matrixWorld.elements
+    const enginePan =
+      engineDistance > 0.001
+        ? (engineDx * cameraRight[0]! +
+            engineDy * cameraRight[1]! +
+            engineDz * cameraRight[2]!) /
+          engineDistance
+        : 0
+    engineRef.current?.setMotion(convoyPose.speed, panelsClosed, engineDistance, enginePan)
+
     refreshConvoyColliders(world)
 
     if (Math.abs(convoyPose.speed) > 1.1) {
