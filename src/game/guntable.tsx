@@ -1365,7 +1365,7 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
       : nearDoor
         ? remotelyOccupied
           ? 'Cybertruck occupied'
-          : 'Press E — drive Cybertruck'
+          : 'Press E — drive truck'
         : null
     if (session && prompt !== vehiclePrompt.current) {
       vehiclePrompt.current = prompt
