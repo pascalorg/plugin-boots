@@ -573,17 +573,22 @@ function fireShot(world: GameWorld, weapon: WeaponDef): FireOutcome {
   const playerHit = pvpRoutes ? pvpRoutes.raycast(_origin, _direction, bestDist + TIE) : null
   if (playerHit && (!botHit || playerHit.distance < botHit.distance)) winner = 'player'
 
+  // The third-person gun is offset from the eye ray. Preserve the exact end
+  // of this resolved hitscan so its short muzzle tracer can converge on the
+  // crosshair target instead of inheriting the arm's inward grip angle.
+  const shotDistance =
+    winner === 'bot' && botHit
+      ? botHit.distance
+      : winner === 'player' && playerHit
+        ? playerHit.distance
+        : bestDist
+  playerRig.shotTarget.copy(_origin).addScaledVector(_direction, shotDistance)
+
   // SMASH weapons (warhammer): heavy area knockback around the impact —
   // whatever class the blow landed on (a whiff still shoves at max reach).
   // Runs BEFORE the class dispatch so a killed bot still flings its pack.
   if (weapon.smashRadius !== undefined) {
-    const impactDist =
-      winner === 'bot' && botHit
-        ? botHit.distance
-        : winner === 'player' && playerHit
-          ? playerHit.distance
-          : bestDist
-    _smashCenter.copy(_origin).addScaledVector(_direction, impactDist)
+    _smashCenter.copy(_origin).addScaledVector(_direction, shotDistance)
     smashKnockback(_smashCenter, weapon.range * 1.5)
   }
 

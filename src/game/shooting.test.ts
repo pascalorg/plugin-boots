@@ -108,6 +108,19 @@ afterEach(() => {
   // leaf the next test file opens (that is what broke door-stale-pose and
   // door-repose under `bun test --randomize`).
   playerRig.position.set(0, 0, 0)
+  playerRig.shotTarget.set(0, 0, -1)
+})
+
+describe('third-person tracer target', () => {
+  test('records the exact resolved hitscan endpoint for the offset muzzle', () => {
+    resetDestruction()
+    const world = makeWorld()
+    aimFrom(0, 1.35, 5)
+    expect(fire(world, GUN)).toBe('wall')
+    expect(playerRig.shotTarget.x).toBeCloseTo(0)
+    expect(playerRig.shotTarget.y).toBeCloseTo(1.35)
+    expect(playerRig.shotTarget.z).toBeCloseTo(0.06)
+  })
 })
 
 describe('tear routing: tearRadius rules walls, holeRadius rules volumes', () => {

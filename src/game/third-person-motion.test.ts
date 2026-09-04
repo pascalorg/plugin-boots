@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test'
+import { Group, Quaternion, Vector3 } from 'three'
 import { createArticulation, createMotion } from './remote-players'
 import {
+  avatarAimDirection,
   layerThirdPersonAim,
+  orientMuzzleFx,
+  pointMuzzleFxAt,
   steerThirdPersonBody,
   THIRD_PERSON_AIM_LEAN,
   THIRD_PERSON_AIM_ROLL,
@@ -53,5 +57,43 @@ describe('third-person ADS body steering', () => {
     motion.bodyYaw = 0.4
     expect(steerThirdPersonBody(motion, 1.2, 0, 1 / 60)).toBe(0.4)
     expect(motion.bodyYaw).toBe(0.4)
+  })
+})
+
+describe('third-person shot direction', () => {
+  const worldForward = (fx: Group) =>
+    new Vector3(0, 0, -1).applyQuaternion(fx.getWorldQuaternion(new Quaternion())).normalize()
+
+  test('removes inherited arm yaw so the tracer follows the authoritative aim ray', () => {
+    const root = new Group()
+    const arm = new Group()
+    const fx = new Group()
+    root.rotation.set(0.12, 0.7, -0.04)
+    arm.rotation.set(0.8, 0.45, 0)
+    root.add(arm)
+    arm.add(fx)
+
+    const expected = avatarAimDirection(new Vector3(), 1.1, 0.24)
+    orientMuzzleFx(fx, expected)
+    expect(worldForward(fx).dot(expected)).toBeGreaterThan(0.999999)
+  })
+
+  test('converges the offset muzzle on the actual hitscan target', () => {
+    const root = new Group()
+    const arm = new Group()
+    const fx = new Group()
+    root.position.set(4, 1, -2)
+    root.rotation.set(-0.1, -0.8, 0.06)
+    arm.position.set(0.3, 1.2, 0)
+    arm.rotation.set(1.0, 0.38, 0)
+    fx.position.set(0, 0.05, -0.61)
+    root.add(arm)
+    arm.add(fx)
+
+    const target = new Vector3(-8, 3, -14)
+    pointMuzzleFxAt(fx, target)
+    const muzzle = fx.getWorldPosition(new Vector3())
+    const expected = target.clone().sub(muzzle).normalize()
+    expect(worldForward(fx).dot(expected)).toBeGreaterThan(0.999999)
   })
 })

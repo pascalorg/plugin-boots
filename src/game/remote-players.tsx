@@ -17,6 +17,7 @@ import {
   RingGeometry,
   SphereGeometry,
   TorusGeometry,
+  Vector3,
 } from 'three'
 import { type RemoteShotKind, sfx } from './audio'
 import { EYE_HEIGHT } from './collision'
@@ -76,6 +77,7 @@ import {
 import { footPlants, remoteFootstep } from './remote-footsteps'
 import { remoteLabel, sameNames } from './roster-names'
 import { getSession } from './session'
+import { avatarAimDirection, orientMuzzleFx } from './third-person-motion'
 import { isPeerTalking } from './voice'
 import {
   HammerModel,
@@ -125,8 +127,8 @@ import {
  * hear or see other players shoot"). The pose carries a fire counter, so this
  * file compares it against the last count it SAW for that peer and turns each
  * new round into a muzzle flash + tracer streak at the actual muzzle of the
- * actual gun they are holding — the fx hang off the weapon group, so they
- * inherit the whole arm chain for free and point exactly where the peer aims —
+ * actual gun they are holding — the fx hang off the weapon group for position,
+ * then cancel the grip arm's inward yaw so they point exactly where the peer aims —
  * plus one sfx.remoteShot voiced at their distance and bearing. The flash grows
  * slightly with range so a firefight across the lot still reads; the IMPACT end
  * needs nothing from here, because a remote carve already throws its own dust
@@ -1427,7 +1429,6 @@ const TRACER_MATERIAL = new MeshBasicMaterial({
   opacity: 0.75,
   transparent: true,
 })
-
 const _tint = new Color()
 const tintedMaterials = new Map<number, { vest: MeshStandardMaterial; band: MeshStandardMaterial }>()
 
@@ -1992,6 +1993,7 @@ function RemoteAvatar({
   }).current
   const flashT = useRef(0)
   const lastShots = useRef(-1)
+  const shotDirection = useRef(new Vector3(0, 0, -1))
   // Motion: displayed speed/direction, body yaw, landing, recoil (updateMotion);
   // the residual smoother between the sample and the root; the per-peer
   // adaptive interpolation delay, slewed. All plain objects, allocated once.
@@ -2147,6 +2149,8 @@ function RemoteAvatar({
     // spray-can guard — a knife swing can never bloom a muzzle flash.
     const fx = fxRef.current
     if (fx) {
+      if (shots > 0) avatarAimDirection(shotDirection.current, _pose.yaw, _pose.pitch)
+      if (shots > 0 || flashT.current > 0) orientMuzzleFx(fx, shotDirection.current)
       if (shots > 0) {
         fx.visible = true
         flashT.current = FLASH_LIFE_S

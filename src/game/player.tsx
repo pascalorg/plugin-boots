@@ -194,6 +194,10 @@ export const playerRig = {
    * two bangs on their screen.
    */
   shots: 0,
+  /** Exact world-space end of the latest local hitscan. Third-person muzzle
+   * effects converge from the offset gun barrel to this point, so the visible
+   * tracer and the crosshair never disagree. */
+  shotTarget: new Vector3(0, 0, -1),
   /** Knockback: queue an XZ impulse (m/s); consumed into velocity next frame. */
   shove(dirX: number, dirZ: number, power: number): void {
     const len = Math.hypot(dirX, dirZ)

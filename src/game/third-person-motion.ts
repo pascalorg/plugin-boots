@@ -1,3 +1,4 @@
+import { type Object3D, Quaternion, Vector3 } from 'three'
 import type { AvatarArticulation, AvatarMotion, Grip } from './remote-players'
 import { wrapAngle } from './presence'
 
@@ -7,6 +8,43 @@ import { wrapAngle } from './presence'
 export const THIRD_PERSON_AIM_LEAN = 0.075
 export const THIRD_PERSON_AIM_ROLL = 0.025
 export const THIRD_PERSON_AIM_TURN_RATE = 18
+
+const FX_FORWARD = new Vector3(0, 0, -1)
+const _fxDirection = new Vector3()
+const _fxOrigin = new Vector3()
+const _fxParentWorld = new Quaternion()
+const _fxWorld = new Quaternion()
+
+/** Point a muzzle effect's local -Z axis along a world-space direction while
+ * leaving its muzzle position parented to the gun. This removes the arm IK's
+ * inward yaw from flashes/tracers without changing the hand grip. */
+export function orientMuzzleFx(fx: Object3D, worldDirection: Vector3): void {
+  if (worldDirection.lengthSq() < 1e-12) return
+  _fxDirection.copy(worldDirection).normalize()
+  _fxWorld.setFromUnitVectors(FX_FORWARD, _fxDirection)
+  if (fx.parent) {
+    fx.parent.updateWorldMatrix(true, false)
+    fx.parent.getWorldQuaternion(_fxParentWorld)
+    fx.quaternion.copy(_fxParentWorld.invert()).multiply(_fxWorld)
+  } else {
+    fx.quaternion.copy(_fxWorld)
+  }
+}
+
+/** Aim from the gun's real muzzle position to the resolved hitscan endpoint.
+ * The over-the-shoulder camera and the barrel therefore converge on the same
+ * target instead of drawing parallel lines past one another. */
+export function pointMuzzleFxAt(fx: Object3D, worldTarget: Vector3): void {
+  fx.getWorldPosition(_fxOrigin)
+  _fxDirection.subVectors(worldTarget, _fxOrigin)
+  orientMuzzleFx(fx, _fxDirection)
+}
+
+/** Authoritative view direction used by remote peers, matching shooting.ts. */
+export function avatarAimDirection(out: Vector3, yaw: number, pitch: number): Vector3 {
+  const cp = Math.cos(pitch)
+  return out.set(-Math.sin(yaw) * cp, Math.sin(pitch), -Math.cos(yaw) * cp)
+}
 
 export function layerThirdPersonAim(
   out: AvatarArticulation,

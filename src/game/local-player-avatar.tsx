@@ -25,7 +25,11 @@ import {
   placeRoot,
   updateMotion,
 } from './remote-players'
-import { layerThirdPersonAim, steerThirdPersonBody } from './third-person-motion'
+import {
+  layerThirdPersonAim,
+  pointMuzzleFxAt,
+  steerThirdPersonBody,
+} from './third-person-motion'
 import { vehicleRig } from './vehicle-state'
 
 export const LOCAL_AVATAR_NAME = 'boots-local-avatar'
@@ -125,6 +129,7 @@ export function LocalPlayerAvatar() {
 
     const fx = refs.fx.current
     if (fx) {
+      if (shots > 0 || flashT.current > 0) pointMuzzleFxAt(fx, playerRig.shotTarget)
       if (shots > 0) {
         fx.visible = true
         flashT.current = LOCAL_FLASH_LIFE_S
