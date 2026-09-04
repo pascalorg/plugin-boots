@@ -22,6 +22,8 @@ import {
 import { MAX_WIRE_TEXT, WORLD_KIND, WORLD_SNAP_KIND } from './net-world'
 import { untilNet } from './net-retry'
 import { Nature } from './nature'
+import { type PaintedNode, winningPaint } from './paint-keep'
+import { PAINT_PALETTE } from './paint'
 import { NodeLedger, PreviewAperture, PreviewItem, PreviewPiece } from './preview'
 import type { DestroyedNode } from './save-demolition'
 import { canonicalRecordOrder, electSlots } from './shared-derive'
@@ -55,9 +57,10 @@ type OverviewBuilds = {
   items: Array<{ key: string; value: PlacedItem }>
   apertures: Array<{ key: string; value: PlacedAperture }>
   destroyed: DestroyedNode[]
+  painted: PaintedNode[]
 }
 
-const EMPTY: OverviewBuilds = { pieces: [], items: [], apertures: [], destroyed: [] }
+const EMPTY: OverviewBuilds = { pieces: [], items: [], apertures: [], destroyed: [], painted: [] }
 
 function runtimeId(id: string): number {
   let hash = 2166136261
@@ -66,6 +69,32 @@ function runtimeId(id: string): number {
     hash = Math.imul(hash, 16777619)
   }
   return hash >>> 0
+}
+
+/** Keep the material-effect inputs referentially stable while more strokes of
+ * an already-dominant colour arrive. The room can send paint at 15 Hz; there
+ * is no reason to clone every affected scene material again until the visible
+ * editor projection actually changes. */
+function retainStableNodeLanes(previous: OverviewBuilds, next: OverviewBuilds): OverviewBuilds {
+  if (
+    previous.destroyed.length === next.destroyed.length &&
+    previous.destroyed.every(
+      (entry, index) =>
+        entry.nodeId === next.destroyed[index]?.nodeId && entry.kind === next.destroyed[index]?.kind,
+    )
+  ) {
+    next.destroyed = previous.destroyed
+  }
+  if (
+    previous.painted.length === next.painted.length &&
+    previous.painted.every(
+      (entry, index) =>
+        entry.nodeId === next.painted[index]?.nodeId && entry.color === next.painted[index]?.color,
+    )
+  ) {
+    next.painted = previous.painted
+  }
+  return next
 }
 
 export function overviewBuilds(world: SharedWorld): OverviewBuilds {
@@ -130,7 +159,41 @@ export function overviewBuilds(world: SharedWorld): OverviewBuilds {
   const destroyed = damagedNodes(world)
     .filter((nodeId) => world.nodes.get(nodeId)?.killed === true)
     .map((nodeId) => ({ nodeId, kind: 'wall' as const }))
-  return { pieces, items, apertures, destroyed }
+
+  // The game renders the exact shared cell coats. The normal editor has no
+  // voxel replicas to receive those cells, so show the same truthful summary
+  // that Keep paint would commit: one dominant material colour per host scene
+  // node. Votes are proportional to splat area, making a broad coat beat a
+  // small later mark; holes remain holes because NodeLedger tints only meshes
+  // that actually exist. Runtime-only Boots targets have no editor scene node
+  // and are intentionally omitted.
+  const paintVotes = new Map<string, Map<number, number>>()
+  const paintStrokes = new Map<string, number>()
+  for (const rec of liveRecords(world.strokes)) {
+    const swatch = PAINT_PALETTE[rec.color]
+    if (!swatch || rec.node.startsWith('__boots')) continue
+    const nodeId = rec.node.replace(/#(?:p\d+|residual)$/, '')
+    let votes = paintVotes.get(nodeId)
+    if (!votes) {
+      votes = new Map()
+      paintVotes.set(nodeId, votes)
+    }
+    votes.set(rec.color, (votes.get(rec.color) ?? 0) + Math.PI * rec.radius * rec.radius)
+    paintStrokes.set(nodeId, (paintStrokes.get(nodeId) ?? 0) + 1)
+  }
+  const painted: PaintedNode[] = []
+  for (const nodeId of [...paintVotes.keys()].sort()) {
+    const color = winningPaint(paintVotes.get(nodeId)!)
+    if (color === null) continue
+    const swatch = PAINT_PALETTE[color]!
+    painted.push({
+      nodeId,
+      color: swatch.hex,
+      colorName: swatch.name,
+      cells: paintStrokes.get(nodeId) ?? 0,
+    })
+  }
+  return { pieces, items, apertures, destroyed, painted }
 }
 
 function readOverviewDelta(data: unknown): SharedDelta | null {
@@ -188,7 +251,7 @@ export function SpectatorBuilds() {
       () => {
         stop = startOverviewBuilds((world) => {
           worldRef.current = world
-          setBuilds(overviewBuilds(world))
+          setBuilds((previous) => retainStableNodeLanes(previous, overviewBuilds(world)))
         })
         return stop !== null
       },
@@ -197,7 +260,9 @@ export function SpectatorBuilds() {
       // A late API catalog can resolve models that arrived on the wire first.
       // The next room frame would also refresh, but this removes that wait.
       const world = worldRef.current
-      if (alive && world) setBuilds(overviewBuilds(world))
+      if (alive && world) {
+        setBuilds((previous) => retainStableNodeLanes(previous, overviewBuilds(world)))
+      }
     })
     return () => {
       alive = false
@@ -210,7 +275,7 @@ export function SpectatorBuilds() {
 
   return (
     <group userData={{ __boots: true, __bootsSpectatorWorld: true }}>
-      <NodeLedger destroyed={builds.destroyed} painted={[]} />
+      <NodeLedger destroyed={builds.destroyed} painted={builds.painted} />
       {builds.pieces.map(({ key, value }) => (
         <PreviewPiece key={key} piece={value} />
       ))}

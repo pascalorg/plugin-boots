@@ -8,11 +8,13 @@ import {
   setStoreyLadder,
 } from './grid'
 import { type CatalogEntry, OPENING_ENTRIES, setCatalog } from './inventory'
+import { PAINT_PALETTE } from './paint'
 import { overviewBuilds } from './spectator-world'
 import {
   addLocalAperture,
   addLocalItem,
   addLocalPiece,
+  addLocalStroke,
   createSharedWorld,
   killRecord,
   mergeDelta,
@@ -85,5 +87,71 @@ describe('editor spectator world', () => {
     killRecord(peer, 'items', item.id)
     mergeDelta(viewer, snapshotOf(peer), 'peer')
     expect(overviewBuilds(viewer).items).toEqual([])
+  })
+
+  test('projects shared spray paint into the editor with a stable dominant coat', () => {
+    const peer = createSharedWorld('peer')
+    const viewer = createSharedWorld('viewer')
+    setGridStamp(peer, 42)
+    setGridStamp(viewer, 42)
+
+    // Two small red marks lose to one broad blue pass. Roof member strokes
+    // collapse onto their actual editor scene node; game-only targets do not.
+    addLocalStroke(peer, {
+      node: 'host-wall-7',
+      color: 3,
+      x: 1,
+      y: 1,
+      z: 0,
+      radius: 0.1,
+    })
+    addLocalStroke(peer, {
+      node: 'host-wall-7',
+      color: 3,
+      x: 1.2,
+      y: 1,
+      z: 0,
+      radius: 0.1,
+    })
+    addLocalStroke(peer, {
+      node: 'host-wall-7',
+      color: 8,
+      x: 1.1,
+      y: 1,
+      z: 0,
+      radius: 0.3,
+    })
+    addLocalStroke(peer, {
+      node: 'host-roof-2#p0',
+      color: 6,
+      x: 0,
+      y: 4,
+      z: 0,
+      radius: 0.2,
+    })
+    addLocalStroke(peer, {
+      node: '__boots-piece-peer#9',
+      color: 4,
+      x: 0,
+      y: 1,
+      z: 0,
+      radius: 0.4,
+    })
+
+    mergeDelta(viewer, snapshotOf(peer), 'peer')
+    expect(overviewBuilds(viewer).painted).toEqual([
+      {
+        nodeId: 'host-roof-2',
+        color: PAINT_PALETTE[6]!.hex,
+        colorName: PAINT_PALETTE[6]!.name,
+        cells: 1,
+      },
+      {
+        nodeId: 'host-wall-7',
+        color: PAINT_PALETTE[8]!.hex,
+        colorName: PAINT_PALETTE[8]!.name,
+        cells: 3,
+      },
+    ])
   })
 })
