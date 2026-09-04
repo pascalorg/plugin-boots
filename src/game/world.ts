@@ -2379,10 +2379,21 @@ export function gridAudit(): {
   }
 }
 
-export function collectWorld(): GameWorld {
-  // Whole-building presence: bake the snapshot at true stacked elevations,
-  // never mid-lerp (see snapLevelsForSnapshot).
-  snapLevelsForSnapshot()
+export type CollectWorldOptions = {
+  /** Gameplay needs canonical stacked levels. Editor spectators must preserve
+   * the host's current presentation (including exploded/isolate views). */
+  snapLevels?: boolean
+  /** Spectator visuals never raycast, so they need no background BVH build. */
+  primeBvhs?: boolean
+  /** Leave the process-wide gameplay ground probe alone for read-only views. */
+  installGround?: boolean
+}
+
+export function collectWorld(options: CollectWorldOptions = {}): GameWorld {
+  // Whole-building gameplay presence: bake the snapshot at true stacked
+  // elevations, never mid-lerp (see snapLevelsForSnapshot). A read-only
+  // editor observer explicitly opts out so opening Boots cannot move levels.
+  if (options.snapLevels !== false) snapLevelsForSnapshot()
   // …and then COMPOSE what that just moved, before a single matrix is read.
   composeSceneMatrices()
 
@@ -2532,7 +2543,7 @@ export function collectWorld(): GameWorld {
   // stale (or absent) probe would put a driveway's height ceiling and the
   // lot floor back on the y = 0 plane. Everything that used to assume y = 0
   // reads from here on (game-root resets it on teardown).
-  installGroundProbes({ colliders, site }, lotEdge)
+  if (options.installGround !== false) installGroundProbes({ colliders, site }, lotEdge)
   const roadFootprints = collectRoadFootprints(colliders)
   const hostTrees = collectHostTrees(nodes)
   // The build lattice adopts the building's frame — identity when nothing
@@ -2541,7 +2552,9 @@ export function collectWorld(): GameWorld {
   // …and its storeys adopt the building's REAL level elevations (the level
   // groups are already snapped to their stacked bases — see above). No
   // registered levels → undefined, the grid keeps uniform 2.8 storeys.
-  const storeyLadder = deriveStoreyLadder(collectStackedLevels(), nodes) ?? undefined
+  const storeyLadder = options.snapLevels === false
+    ? undefined
+    : deriveStoreyLadder(collectStackedLevels(), nodes) ?? undefined
 
   // Spawn: outside the building along +X of its center, eye toward it.
   // XZ first; Y then SETTLES onto whatever actually stands there —
@@ -2569,7 +2582,7 @@ export function collectWorld(): GameWorld {
   // Background BVH fill — AFTER the spawn probe above so the 1–2 colliders
   // the settle touched are already cached, and with the spawn known so the
   // queue builds nearest-first. No-op wherever workers can't run.
-  primeColliderBvhs(colliders, spawn)
+  if (options.primeBvhs !== false) primeColliderBvhs(colliders, spawn)
 
   // Telemetry only (the game is whole-building; nothing gameplay-side keys
   // on this). The editor's active level lives on the VIEWER's selection —

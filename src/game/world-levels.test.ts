@@ -113,6 +113,21 @@ function buildTwoStoreys(trueYA: number, trueYB: number): { levelA: Group; level
 }
 
 describe('collectWorld across stacked levels', () => {
+  test('read-only collection preserves the editor level presentation', () => {
+    const { levelB } = buildTwoStoreys(0, 2.8)
+    const displayedY = levelB.position.y
+
+    const world = collectWorld({
+      snapLevels: false,
+      installGround: false,
+      primeBvhs: false,
+    })
+
+    expect(levelB.visible).toBe(false)
+    expect(levelB.position.y).toBe(displayedY)
+    expect([...world.walls.keys()]).toEqual(['wall_a'])
+  })
+
   test('snaps hidden/mid-lerp levels to true Y BEFORE the walk — both storeys collected at stacked elevations', () => {
     const { levelB } = buildTwoStoreys(0, 2.8)
     const world = collectWorld()

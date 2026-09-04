@@ -681,8 +681,15 @@ function approach(value: number, target: number, amount: number): number {
 
 /** Kept export name — game-root mounts <GunTable/>; it now builds the
  * armored spawn depot in place of the loose tables. */
-export function GunTable({ world }: { world: GameWorld }) {
-  return <SpawnDepot world={world} />
+export function GunTable({
+  world,
+  spectator = false,
+}: {
+  world: GameWorld
+  /** Draw and follow the shared convoy without gameplay input or colliders. */
+  spectator?: boolean
+}) {
+  return <SpawnDepot spectator={spectator} world={world} />
 }
 
 // Depot paint: weathered two-tone steel (per-mesh colors, no textures).
@@ -726,7 +733,7 @@ const RUST_PATCHES: Array<{
  * register as '__boots-depot' / 'fixture' colliders: they block movement,
  * bots and bullets, but never voxelize — bullets spark, grenades wash over.
  */
-function SpawnDepot({ world }: { world: GameWorld }) {
+function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean }) {
   const center = useMemo(() => depotPosition(world), [world])
   // Seat the container on whatever actually stands under its footprint —
   // the same probe that settles the player (spawnGroundY skips '__boots'
@@ -746,7 +753,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   const publishClock = useRef(0)
   const engineRef = useRef<VehicleEngineHandle | null>(null)
   const solidRefs = useRef<(Mesh | null)[]>([])
-  useFixtureColliders(world, solidRefs)
+  useFixtureColliders(world, solidRefs, !spectator)
   const solid = (i: number) => (mesh: Mesh | null) => {
     solidRefs.current[i] = mesh
   }
@@ -830,26 +837,28 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         convoyPose.truckYaw = convoyPose.targetTruckYaw
       }
     })
-    const offRequest = onStateRequest(({ of, from }) => {
-      const mine = localSessionId()
-      if (of !== VEHICLE_KIND || !mine) return
-      if (!shouldAnswerStateRequest(mine, from, getParticipants())) return
-      sendStateSnapshot(VEHICLE_KIND, from, {
-        x: convoyPose.x,
-        y: convoyPose.y,
-        z: convoyPose.z,
-        yaw: convoyPose.yaw,
-        truckX: convoyPose.truckX,
-        truckZ: convoyPose.truckZ,
-        truckYaw: convoyPose.truckYaw,
-        speed: convoyPose.speed,
-        occupied: false,
-      } satisfies VehicleFrame)
-    })
+    const offRequest = spectator
+      ? () => {}
+      : onStateRequest(({ of, from }) => {
+          const mine = localSessionId()
+          if (of !== VEHICLE_KIND || !mine) return
+          if (!shouldAnswerStateRequest(mine, from, getParticipants())) return
+          sendStateSnapshot(VEHICLE_KIND, from, {
+            x: convoyPose.x,
+            y: convoyPose.y,
+            z: convoyPose.z,
+            yaw: convoyPose.yaw,
+            truckX: convoyPose.truckX,
+            truckZ: convoyPose.truckZ,
+            truckYaw: convoyPose.truckYaw,
+            speed: convoyPose.speed,
+            occupied: false,
+          } satisfies VehicleFrame)
+        })
     requestState(VEHICLE_KIND)
 
     return () => {
-      if (vehicleRig.driving) {
+      if (!spectator && vehicleRig.driving) {
         publishFrame(VEHICLE_KIND, {
           x: convoyPose.x,
           y: convoyPose.y,
@@ -869,7 +878,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       getSession()?.hud.prompt(null, 'vehicle')
       clearConvoyPose()
     }
-  }, [center.x, center.z, groundY, world])
+  }, [center.x, center.z, groundY, spectator, world])
 
   // Priority -2: claim E before doors (-1) and move the root before Player
   // follows the cab at priority 0. Remote poses ease between 12 Hz packets;
@@ -877,7 +886,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
   useFrame(({ camera }, rawDt) => {
     const root = rootRef.current
     const session = getSession()
-    if (!root || !session || !convoyPose.ready) {
+    if (!root || !convoyPose.ready) {
       engineRef.current?.setMotion(0, false, 0)
       return
     }
@@ -899,12 +908,14 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       yaw: convoyPose.truckYaw,
     }
     const door = convoyLocalToWorld(DRIVER_DOOR_LOCAL[0], DRIVER_DOOR_LOCAL[1], truckPose)
-    const nearDoor =
+    const nearDoor = Boolean(
+      session &&
       Math.hypot(playerRig.position.x - door.x, playerRig.position.z - door.z) <=
-      VEHICLE_ENTER_RANGE
+        VEHICLE_ENTER_RANGE,
+    )
     const remotelyOccupied = convoyPose.remoteDriver !== null
 
-    if (vehicleRig.driving) {
+    if (session && vehicleRig.driving) {
       if (takeAction(session.input.state.actions, 'Tab')) {
         vehicleRig.view = vehicleRig.view === 'first' ? 'third' : 'first'
         session.hud.hint(
@@ -1074,7 +1085,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         }
       }
     } else {
-      if (nearDoor && !remotelyOccupied && takeAction(session.input.state.actions, 'KeyE')) {
+      if (session && nearDoor && !remotelyOccupied && takeAction(session.input.state.actions, 'KeyE')) {
         vehicleRig.driving = true
         convoyPose.occupied = true
         convoyPose.speed = 0
@@ -1139,9 +1150,9 @@ function SpawnDepot({ world }: { world: GameWorld }) {
         : 0
     engineRef.current?.setMotion(convoyPose.speed, panelsClosed, engineDistance, enginePan)
 
-    refreshConvoyColliders(world)
+    if (!spectator) refreshConvoyColliders(world)
 
-    if (Math.abs(convoyPose.speed) > 1.1) {
+    if (!spectator && Math.abs(convoyPose.speed) > 1.1) {
       const currentNose = convoyLocalToWorld(-3.0, 0, {
         x: convoyPose.truckX,
         z: convoyPose.truckZ,
@@ -1168,7 +1179,7 @@ function SpawnDepot({ world }: { world: GameWorld }) {
           ? 'Cybertruck occupied'
           : 'Press E — drive Cybertruck'
         : null
-    if (prompt !== vehiclePrompt.current) {
+    if (session && prompt !== vehiclePrompt.current) {
       vehiclePrompt.current = prompt
       session.hud.prompt(prompt, 'vehicle')
     }
@@ -1358,26 +1369,28 @@ function SpawnDepot({ world }: { world: GameWorld }) {
       />
 
       {/* ── ARMORY RACK (center bay): the full loadout ─────────────────── */}
-      <StationLogic
-        world={world}
-        at={armoryAt}
-        nodeId="__boots-depot-armory"
-        taken={geared}
-        prompt="Press E — gear up"
-        promptOwner="guntable"
-        onPickup={() => {
-          // GUNS ONLY (owner call 2026-08-29): builder + paint are the
-          // spawn loadout, so the armory's E hands over the weapons rack —
-          // and nothing else. Gear ONLY — the wave director never reads
-          // ownership; combat waits for the breaker panel on the end wall.
-          const s = useBoots.getState()
-          s.giveWeapon('pistol')
-          s.giveWeapon('rifle')
-          s.giveWeapon('minigun')
-          s.giveWeapon('hammer')
-          s.setWeapon('rifle')
-        }}
-      />
+      {!spectator && (
+        <StationLogic
+          world={world}
+          at={armoryAt}
+          nodeId="__boots-depot-armory"
+          taken={geared}
+          prompt="Press E — gear up"
+          promptOwner="guntable"
+          onPickup={() => {
+            // GUNS ONLY (owner call 2026-08-29): builder + paint are the
+            // spawn loadout, so the armory's E hands over the weapons rack —
+            // and nothing else. Gear ONLY — the wave director never reads
+            // ownership; combat waits for the breaker panel on the end wall.
+            const s = useBoots.getState()
+            s.giveWeapon('pistol')
+            s.giveWeapon('rifle')
+            s.giveWeapon('minigun')
+            s.giveWeapon('hammer')
+            s.setWeapon('rifle')
+          }}
+        />
+      )}
       {/* rack rails on the back wall */}
       {[1.68, 0.72].map((y) => (
         <mesh key={y} position={[0, y, -1.11]}>
@@ -1421,10 +1434,10 @@ function SpawnDepot({ world }: { world: GameWorld }) {
        * mirror so people check themselves". A glazed wall cabinet with a
        * Pascaline inside who copies you — the only place in a first-person
        * game where you get to see the avatar everyone else sees. */}
-      <DepotMirror world={world} />
+      {!spectator && <DepotMirror world={world} />}
 
       {/* ── BREAKER PANEL (right end wall, outside): the combat opt-in ── */}
-      <BreakerPanel world={world} />
+      <BreakerPanel interactive={!spectator} world={world} />
       {/* twin red alarm gyros DIRECTLY ABOVE THE LEVER (owner ask — they
        * pair with the siren sound the throw triggers, so they must be in
        * your face when you work the handle, not hidden up on the roof).
@@ -1571,7 +1584,13 @@ const _look = new Vector3()
  * Rendered inside the depot's root group: local +z here faces OUTWARD
  * along the container's +x end (rotation π/2).
  */
-function BreakerPanel({ world }: { world: GameWorld }) {
+function BreakerPanel({
+  world,
+  interactive,
+}: {
+  world: GameWorld
+  interactive: boolean
+}) {
   const at = useMemo(() => breakerPosition(world), [world])
   const leverRef = useRef<Group>(null)
   const leverAngle = useRef(LEVER_UP)
@@ -1583,12 +1602,13 @@ function BreakerPanel({ world }: { world: GameWorld }) {
   // claimable for as long as the session runs; the engageable gate (not
   // arbitration) is what keeps stray presses out.
   useEffect(() => {
+    if (!interactive) return
     const entry = { x: at.x, z: at.z, taken: false }
     grabTables.set(BREAKER_NODE_ID, entry)
     return () => {
       grabTables.delete(BREAKER_NODE_ID)
     }
-  }, [at])
+  }, [at, interactive])
 
   useFrame(({ camera }, dt) => {
     // The throw (both directions): chase armed's target pose at the 0.4 s
@@ -1601,7 +1621,7 @@ function BreakerPanel({ world }: { world: GameWorld }) {
     }
 
     const session = getSession()
-    if (!session) return
+    if (!interactive || !session) return
     liveDepotLocalToWorld(world, BREAKER_LOCAL[0], BREAKER_LOCAL[1], at)
     const entry = grabTables.get(BREAKER_NODE_ID)
     if (entry) {
@@ -1988,8 +2008,13 @@ function FallbackSirenBeacon() {
  * DESTRUCTIBLE set and the grenade EXPLODABLE sets, so the depot blocks
  * movement, bots and bullets forever and only ever sparks.
  */
-function useFixtureColliders(world: GameWorld, solidRefs: { current: (Mesh | null)[] }) {
+function useFixtureColliders(
+  world: GameWorld,
+  solidRefs: { current: (Mesh | null)[] },
+  enabled = true,
+) {
   useEffect(() => {
+    if (!enabled) return
     const entries: ColliderEntry[] = []
     for (const mesh of solidRefs.current) {
       if (!mesh) continue
@@ -2016,7 +2041,7 @@ function useFixtureColliders(world: GameWorld, solidRefs: { current: (Mesh | nul
     return () => {
       for (const entry of entries) entry.disabled = true
     }
-  }, [world, solidRefs])
+  }, [world, solidRefs, enabled])
 }
 
 /**

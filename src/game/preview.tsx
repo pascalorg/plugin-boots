@@ -215,7 +215,7 @@ export function restoreNodePreview(ledger: PreviewLedger): void {
 
 /** The ledger lane, as a component: applied on mount, restored on unmount
  * and on any change of the captured lists. */
-function NodeLedger({
+export function NodeLedger({
   destroyed,
   painted,
 }: {
@@ -290,7 +290,7 @@ export function previewPiecePose(piece: PlacedPiece): {
  * (collider push, voxel cladding), which a preview has no use for and no
  * GameWorld to reach.
  */
-function PreviewPiece({ piece }: { piece: PlacedPiece }) {
+export function PreviewPiece({ piece }: { piece: PlacedPiece }) {
   const geometry = previewPieceGeometry(piece)
   if (!geometry) return null
   const { position, rotation } = previewPiecePose(piece)
@@ -318,7 +318,7 @@ function PreviewPiece({ piece }: { piece: PlacedPiece }) {
  * the truthful preview is the furniture. It is new geometry standing where
  * there was none — that alone reads as pending.
  */
-function PreviewItem({ item }: { item: PlacedItem }) {
+export function PreviewItem({ item }: { item: PlacedItem }) {
   const holderRef = useRef<Group>(null)
   useEffect(() => {
     const holder = holderRef.current
@@ -357,7 +357,7 @@ export function wallFrameFromScene(wallId: string): WallFrame | null {
  * real node. The wall is NOT cut: the hole only exists after Save, so the
  * mock sits on the wall exactly as it did in-game.
  */
-function PreviewAperture({ placed }: { placed: PlacedAperture }) {
+export function PreviewAperture({ placed }: { placed: PlacedAperture }) {
   const frame = useMemo(() => wallFrameFromScene(placed.wallId), [placed.wallId])
   if (!frame) return null // wall deleted or not rendered — nothing to pose against
   const bottom = placed.v - placed.height / 2

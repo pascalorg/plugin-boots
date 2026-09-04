@@ -870,15 +870,25 @@ function treePlacements(world: GameWorld): TreePlacement[] {
 const _finishedBurning: number[] = []
 const _flickerColor = new Color()
 
-export function TreesDestruct({ world }: { world: GameWorld }) {
+export function TreesDestruct({
+  world,
+  spectator = false,
+}: {
+  world: GameWorld
+  /** Receive and draw shared tree state without becoming a simulator. */
+  spectator?: boolean
+}) {
   const scene = useThree((s) => s.scene)
   const trees = useMemo(() => {
     const host = world.hostTrees ?? []
     return buildTreesFrom([
       ...withoutHostOverlap(treePlacements(world), host),
-      ...hostTreePlacements(host),
+      // The editor already draws its authored trees. Gameplay replaces them
+      // with destructible instances; the overview keeps the originals and
+      // adds only Boots' deterministic grove, avoiding double trunks.
+      ...(spectator ? [] : hostTreePlacements(host)),
     ])
-  }, [world])
+  }, [world, spectator])
 
   // UNIT geometries — every dimension lives in the instance matrices, so
   // one geometry per PART serves all species (5 draw calls total).
@@ -919,31 +929,36 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
     // the scene store is never written. hideForGame skips already-hidden
     // objects, so effect re-runs (world refresh, Fast Refresh) are safe.
     const host = world.hostTrees ?? []
-    if (host.length > 0) {
+    if (!spectator && host.length > 0) {
       for (const tree of host) hideForGame(tree.root)
       for (const mesh of collectHostForestMeshes(scene, host)) hideForGame(mesh)
     }
 
     liveTrees = trees
     revision++
-    startTreeSync({
-      snapshot: () => snapshotTrees(trees),
-      applySnapshot: (frame) => applyTreeSnapshot(trees, frame),
-      applyDamage: (treeId, part, damage) => {
-        const tree = trees[treeId]
-        if (!tree) return
-        const y = part === 'canopy'
-          ? tree.y + tree.params.crownCY * tree.scale
-          : tree.y + tree.params.trunkH * tree.scale * 0.45
-        _ramPoint.set(tree.x, y, tree.z)
-        applyTreeDamage(trees, { distance: 0, point: _ramPoint, treeId, part }, damage)
+    startTreeSync(
+      {
+        snapshot: () => snapshotTrees(trees),
+        applySnapshot: (frame) => applyTreeSnapshot(trees, frame),
+        applyDamage: (treeId, part, damage) => {
+          const tree = trees[treeId]
+          if (!tree) return
+          const y = part === 'canopy'
+            ? tree.y + tree.params.crownCY * tree.scale
+            : tree.y + tree.params.trunkH * tree.scale * 0.45
+          _ramPoint.set(tree.x, y, tree.z)
+          applyTreeDamage(trees, { distance: 0, point: _ramPoint, treeId, part }, damage)
+        },
+        pristine: () => trees.every((tree) => tree.state === 'healthy' && tree.hp === TREE_HP),
       },
-      pristine: () => trees.every((tree) => tree.state === 'healthy' && tree.hp === TREE_HP),
-    })
-    registerTreeRoutes<TreeHit>({
-      raycast: (origin, direction, maxDist) => raycastTrees(trees, origin, direction, maxDist),
-      damage: (_world, hit, damage) => applySharedTreeDamage(trees, hit, damage),
-    })
+      { receiveOnly: spectator },
+    )
+    if (!spectator) {
+      registerTreeRoutes<TreeHit>({
+        raycast: (origin, direction, maxDist) => raycastTrees(trees, origin, direction, maxDist),
+        damage: (_world, hit, damage) => applySharedTreeDamage(trees, hit, damage),
+      })
+    }
     return () => {
       stopTreeSync()
       registerTreeRoutes(null)
@@ -951,7 +966,7 @@ export function TreesDestruct({ world }: { world: GameWorld }) {
       crackle.current?.stop()
       crackle.current = null
     }
-  }, [trees, world, scene])
+  }, [trees, world, scene, spectator])
 
   useFrame((_, rawDt) => {
     const dt = Math.min(rawDt, 1 / 30)

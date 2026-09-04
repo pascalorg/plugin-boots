@@ -12,6 +12,7 @@ import {
   stopSpectating,
 } from './presence'
 import { RemotePlayers } from './remote-players'
+import { SpectatorWorld } from './spectator-world'
 import { livePlayerNames, sameNames } from './roster-names'
 import { beginEntry } from './mic-gate'
 import { enterGame } from './session'
@@ -48,7 +49,9 @@ import { ListenPill, listenPillText } from './voice-overlay'
  * dropped in still gets everyone's pose frames through a RECEIVE-ONLY presence
  * subscription (startSpectating publishes no avatar of its own), and renders
  * those exact avatars — movement, aim, firing — with the same <RemotePlayers/>
- * the players already see of each other.
+ * the players already see of each other. SpectatorBuilds separately projects
+ * the shared construction CRDT into preview-only meshes, so walls, furniture,
+ * doors and windows also move through the editor live without writing nodes.
  *
  * BIND RETRY. The host installs the collab bus asynchronously (after realtime
  * auth), so the first bind attempt often finds nothing. `untilNet` re-tries
@@ -359,6 +362,7 @@ export function SpectatorPlayers() {
   if (phase !== 'editor' || !bound) return null
   return (
     <>
+      <SpectatorWorld />
       <RemotePlayers spectator />
       <SpectatorHint text={spectatorHintText(names)} event={lastEvent} hidden={suppressed} />
     </>

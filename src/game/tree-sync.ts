@@ -59,6 +59,7 @@ let offState: (() => void) | null = null
 let offCommand: (() => void) | null = null
 let offRequest: (() => void) | null = null
 let offSnapshot: (() => void) | null = null
+let receiveOnly = false
 
 const finite = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value)
@@ -119,6 +120,14 @@ function publishSnapshot(): void {
 
 function applySnapshot(frame: TreeFrame, sender: string | null): void {
   if (!adapter || (sender && sender === localSessionId())) return
+  // An editor observer is deliberately absent from horde election, so its
+  // own collaboration id must never masquerade as the simulator. Active
+  // players already admit frames from only the elected authority; accepting
+  // their receive stream directly keeps the overview current at 5 Hz.
+  if (receiveOnly) {
+    adapter.applySnapshot(frame)
+    return
+  }
   const authority = hordeAuthorityId()
   if (sender && authority && sender !== authority) {
     if (authority !== localSessionId() || handoffAccepted || !adapter.pristine()) return
@@ -184,19 +193,25 @@ export function recordTreeDamage(treeId: number, part: 'trunk' | 'canopy', damag
   publishCommands()
 }
 
-export function startTreeSync(next: TreeSyncAdapter): void {
+export function startTreeSync(
+  next: TreeSyncAdapter,
+  options: { receiveOnly?: boolean } = {},
+): void {
   adapter = next
+  receiveOnly = options.receiveOnly === true
   registerFrameKind(TREE_KIND, readTreeFrame)
   registerFrameKind(TREE_COMMAND_KIND, readTreeCommand, { ordered: false })
   offState ??= onFrame<TreeFrame>(TREE_KIND, (msg) => applySnapshot(msg.data, msg.sessionId))
-  offCommand ??= onFrame<TreeCommandFrame>(TREE_COMMAND_KIND, applyCommand)
+  if (!receiveOnly) offCommand ??= onFrame<TreeCommandFrame>(TREE_COMMAND_KIND, applyCommand)
   offSnapshot ??= onStateSnapshot(TREE_KIND, ({ state, msg }) => {
     const frame = readTreeFrame(state)
     if (frame) applySnapshot(frame, msg.sessionId)
   })
-  offRequest ??= onStateRequest(({ of, from }) => {
-    if (of === TREE_KIND && adapter) sendStateSnapshot(TREE_KIND, from, adapter.snapshot())
-  })
+  if (!receiveOnly) {
+    offRequest ??= onStateRequest(({ of, from }) => {
+      if (of === TREE_KIND && adapter) sendStateSnapshot(TREE_KIND, from, adapter.snapshot())
+    })
+  }
   requestState(TREE_KIND)
 }
 
@@ -212,10 +227,11 @@ export function stopTreeSync(): void {
   publishClock = 0
   commandClock = 0
   handoffAccepted = false
+  receiveOnly = false
 }
 
 export function stepTreeSync(dt: number): void {
-  if (!adapter) return
+  if (!adapter || receiveOnly) return
   publishClock += Math.max(0, dt)
   commandClock += Math.max(0, dt)
   if (hordeAuthorityId() === localSessionId()) {
