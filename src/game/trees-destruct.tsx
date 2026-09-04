@@ -20,6 +20,7 @@ import { groundSurfaceY } from './ground'
 import { isHordeAuthority } from './horde-sync'
 import { scatter, scatterGroundY } from './nature'
 import {
+  canonicalRoadAlong,
   ROAD_RENDER_HALF_LENGTH,
   ROAD_WIDTH,
   roadLocalPoint,
@@ -878,11 +879,14 @@ function treePlacements(world: GameWorld): TreePlacement[] {
   const road = roadLoopFrame(world)
   const building = world.buildingAabb
   // 24 divides the 840 m wrap period exactly, so spacing continues across
-  // the seam instead of betraying the teleport with one oversized gap.
-  for (let along = -408; along <= 408; along += 24) {
+  // the seam instead of betraying the teleport with one oversized gap. The
+  // unreachable visual aprons repeat the reachable corridor's tree traits.
+  const roadTreeHalf = Math.floor((ROAD_RENDER_HALF_LENGTH - 12) / 24) * 24
+  for (let along = -roadTreeHalf; along <= roadTreeHalf; along += 24) {
     if (Math.abs(along) < 30) continue
     for (const side of [-1, 1]) {
-      const hash = Math.abs(Math.sin(along * 12.9898 + side * 78.233))
+      const repeatedAlong = canonicalRoadAlong(along)
+      const hash = Math.abs(Math.sin(repeatedAlong * 12.9898 + side * 78.233))
       const across = side * (ROAD_WIDTH / 2 + 5.2 + hash * 3.8)
       const p = roadLocalPoint(road, along, across)
       if (

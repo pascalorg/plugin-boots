@@ -9,6 +9,18 @@ export const VEHICLE_KIND = 'boots/vehicle' as const
  * 50 m/s is 180 km/h: deliberately fast enough for the endless road, while
  * keeping one 30 Hz physics step shorter than the truck's collision probes. */
 export const VEHICLE_MAX_FORWARD_SPEED = 50
+export const VEHICLE_CHASE_MIN_LOOK_AHEAD = 2
+export const VEHICLE_CHASE_MAX_LOOK_AHEAD = 8
+
+/** Third-person focus moves down the road with speed, leaving the truck low
+ * in frame and giving the driver useful sight distance at highway velocity. */
+export function vehicleChaseLookAhead(speed: number): number {
+  const safeSpeed = Number.isFinite(speed) ? Math.abs(speed) : 0
+  return Math.min(
+    VEHICLE_CHASE_MAX_LOOK_AHEAD,
+    VEHICLE_CHASE_MIN_LOOK_AHEAD + safeSpeed * 0.12,
+  )
+}
 
 export type VehicleFrame = {
   x: number

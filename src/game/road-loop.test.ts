@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { Vector3 } from 'three'
 import {
+  canonicalRoadAlong,
   isRoadWrapJump,
   pointOnEndlessRoad,
   ROAD_LOOP_HALF_LENGTH,
+  ROAD_RENDER_HALF_LENGTH,
+  ROAD_VISUAL_OVERSCAN,
   roadLocalCoordinates,
   roadLocalPoint,
   roadLoopFrame,
@@ -32,6 +35,17 @@ describe('endless road loop', () => {
     expect(wrapped.along).toBeCloseTo(-ROAD_LOOP_HALF_LENGTH + 0.1, 8)
     expect(wrapped.across).toBeCloseTo(2, 8)
     expect(isRoadWrapJump(shift.x, shift.z)).toBe(true)
+  })
+
+  test('renders an unreachable road apron past both portals as deep as the horizon', () => {
+    expect(ROAD_VISUAL_OVERSCAN).toBeGreaterThanOrEqual(600)
+    expect(ROAD_RENDER_HALF_LENGTH).toBe(ROAD_LOOP_HALF_LENGTH + ROAD_VISUAL_OVERSCAN)
+    expect(canonicalRoadAlong(ROAD_LOOP_HALF_LENGTH + 12)).toBe(
+      -ROAD_LOOP_HALF_LENGTH + 12,
+    )
+    expect(canonicalRoadAlong(-ROAD_LOOP_HALF_LENGTH - 12)).toBe(
+      ROAD_LOOP_HALF_LENGTH - 12,
+    )
   })
 
   test('never teleports an off-road vehicle and exposes a vegetation-clear footprint', () => {

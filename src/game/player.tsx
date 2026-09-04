@@ -31,7 +31,7 @@ import { takeAction } from './input'
 import { MOVE, type MoveConfig, projectOnWalkableSlope, stepVelocity } from './movement'
 import { perfEvent } from './perf-monitor'
 import { exitGame, getSession } from './session'
-import { vehicleRig } from './vehicle-state'
+import { convoyPose, vehicleChaseLookAhead, vehicleRig } from './vehicle-state'
 import { type GameWorld, settleSpawnFeet } from './world'
 
 /**
@@ -576,9 +576,9 @@ export function Player({ world }: { world: GameWorld }) {
       }
       if (vehicleRig.view === 'third') {
         // Stable chase/orbit view: mouse yaw circles the convoy and pitch
-        // lifts the boom, while the target remains the live cab. Keeping the
-        // true playerRig position in the seat preserves every interaction and
-        // network invariant; only the cosmetic camera moves.
+        // lifts the boom, while focus leads along the truck's true heading.
+        // Keeping the true playerRig position in the seat preserves every
+        // interaction and network invariant; only the cosmetic camera moves.
         // High enough to see over the supply trailer instead of placing its
         // rear panel in the center of the chase view.
         const distance = 7.4
@@ -588,10 +588,11 @@ export function Player({ world }: { world: GameWorld }) {
           playerRig.position.y + lift,
           playerRig.position.z + Math.cos(playerRig.yaw) * distance,
         )
+        const lookAhead = vehicleChaseLookAhead(vehicleRig.speed)
         _vehicleLookAt.set(
-          playerRig.position.x,
+          playerRig.position.x - Math.cos(convoyPose.truckYaw) * lookAhead,
           playerRig.position.y + 0.55,
-          playerRig.position.z,
+          playerRig.position.z + Math.sin(convoyPose.truckYaw) * lookAhead,
         )
         camera.lookAt(_vehicleLookAt)
       } else {

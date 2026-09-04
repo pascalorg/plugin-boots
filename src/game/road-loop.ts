@@ -4,7 +4,10 @@ import type { GameWorld } from './world'
  * continues past the wrap plane so neither end can enter the camera frustum
  * during the one-frame authoritative translation. */
 export const ROAD_LOOP_HALF_LENGTH = 420
-export const ROAD_RENDER_HALF_LENGTH = 470
+/** Unreachable scenery beyond EACH wrap plane. It is at least as deep as the
+ * 600 m horizon, so the road cannot expose a hard end before the convoy wraps. */
+export const ROAD_VISUAL_OVERSCAN = 640
+export const ROAD_RENDER_HALF_LENGTH = ROAD_LOOP_HALF_LENGTH + ROAD_VISUAL_OVERSCAN
 export const ROAD_WIDTH = 8.4
 export const ROAD_WRAP_HALF_WIDTH = 11
 
@@ -49,6 +52,16 @@ export function roadLocalCoordinates(
   const dx = x - frame.x
   const dz = z - frame.z
   return { along: dx * cos - dz * sin, across: dx * sin + dz * cos }
+}
+
+/** The repeating scenery coordinate corresponding to any rendered apron
+ * point. Decorations beyond a portal use this seed so what was visible ahead
+ * immediately matches the reachable corridor after the invisible wrap. */
+export function canonicalRoadAlong(along: number): number {
+  const span = ROAD_LOOP_HALF_LENGTH * 2
+  return (
+    ((((along + ROAD_LOOP_HALF_LENGTH) % span) + span) % span) - ROAD_LOOP_HALF_LENGTH
+  )
 }
 
 /** Extra grass/tree rejection footprint for Boots' generated road. */

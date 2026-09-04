@@ -6,6 +6,9 @@ import {
   readVehicleFrame,
   resetConvoyPose,
   shortestYawDelta,
+  vehicleChaseLookAhead,
+  VEHICLE_CHASE_MAX_LOOK_AHEAD,
+  VEHICLE_CHASE_MIN_LOOK_AHEAD,
   VEHICLE_MAX_FORWARD_SPEED,
   vehicleRig,
   wrapVehicleYaw,
@@ -72,6 +75,14 @@ describe('convoy transform', () => {
 })
 
 describe('driver camera mode', () => {
+  test('third-person focus looks farther down the road as speed rises', () => {
+    expect(vehicleChaseLookAhead(0)).toBe(VEHICLE_CHASE_MIN_LOOK_AHEAD)
+    expect(vehicleChaseLookAhead(10)).toBeCloseTo(3.2)
+    expect(vehicleChaseLookAhead(50)).toBe(VEHICLE_CHASE_MAX_LOOK_AHEAD)
+    expect(vehicleChaseLookAhead(-50)).toBe(VEHICLE_CHASE_MAX_LOOK_AHEAD)
+    expect(vehicleChaseLookAhead(Number.NaN)).toBe(VEHICLE_CHASE_MIN_LOOK_AHEAD)
+  })
+
   test('a new or cleared convoy always starts in first person', () => {
     vehicleRig.view = 'third'
     resetConvoyPose(0, 0, 0, 0)
