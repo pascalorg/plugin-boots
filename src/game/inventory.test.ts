@@ -9,6 +9,9 @@ import {
   isOpeningEntry,
   MENU_CATEGORY_CAP,
   MENU_COLUMNS,
+  MENU_PANEL_MAX_WIDTH_PX,
+  MENU_THUMB_MAX_PX,
+  MENU_THUMB_MIN_PX,
   mergeCatalog,
   moveSelection,
   OPENING_ENTRIES,
@@ -106,6 +109,15 @@ describe('moveSelection', () => {
 describe('menu state (headless)', () => {
   test('closed by default; nothing here can open it without a DOM', () => {
     expect(isItemMenuOpen()).toBe(false)
+  })
+})
+
+describe('menu presentation scale', () => {
+  test('uses a large desktop surface without sacrificing the narrow-screen floor', () => {
+    expect(MENU_PANEL_MAX_WIDTH_PX).toBeGreaterThanOrEqual(1000)
+    expect(MENU_THUMB_MAX_PX).toBeGreaterThanOrEqual(110)
+    expect(MENU_THUMB_MIN_PX).toBeGreaterThanOrEqual(72)
+    expect(MENU_THUMB_MAX_PX).toBeGreaterThan(MENU_THUMB_MIN_PX)
   })
 })
 

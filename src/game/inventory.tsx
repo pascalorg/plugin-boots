@@ -184,6 +184,12 @@ export const OPENING_ENTRIES: readonly OpeningEntry[] = [
 export const MENU_CATEGORY_CAP = 32
 /** Fixed grid columns — keyboard Up/Down move by exactly one row. */
 export const MENU_COLUMNS = 4
+/** Desktop catalog scale. The original 720 px / 72 px layout occupied barely
+ * a third of a modern fullscreen canvas; keep the small-screen floor while
+ * letting the selection surface and thumbnails read at normal game-menu size. */
+export const MENU_PANEL_MAX_WIDTH_PX = 1040
+export const MENU_THUMB_MIN_PX = 72
+export const MENU_THUMB_MAX_PX = 112
 
 /** The bundled system catalog, defensively: under bun test the editor
  * package is a zustand-shaped stub without CATALOG_ITEMS. */
@@ -402,8 +408,8 @@ export function openItemMenu(
 
   const panel = document.createElement('div')
   panel.style.cssText =
-    'display:flex;flex-direction:column;gap:10px;width:min(720px,88%);max-height:78%;' +
-    `padding:14px 16px;border-radius:10px;background:rgba(16,18,22,0.94);color:#fff;font:${FONT};` +
+    `display:flex;flex-direction:column;gap:14px;width:min(${MENU_PANEL_MAX_WIDTH_PX}px,94vw);max-height:min(86vh,860px);` +
+    `box-sizing:border-box;padding:20px 22px;border-radius:14px;background:rgba(16,18,22,0.94);color:#fff;font:${FONT};` +
     'border:1px solid rgba(255,255,255,0.12);box-shadow:0 12px 48px rgba(0,0,0,0.55)'
   root.appendChild(panel)
 
@@ -411,21 +417,21 @@ export function openItemMenu(
   title.style.cssText = 'display:flex;align-items:baseline;gap:10px'
   const titleText = document.createElement('span')
   titleText.textContent = 'ITEM CATALOG'
-  titleText.style.cssText = 'font-size:14px;letter-spacing:0.18em'
+  titleText.style.cssText = 'font-size:18px;letter-spacing:0.18em'
   const titleHint = document.createElement('span')
   titleHint.textContent = 'click or arrows + Enter · Q/E tabs · I close'
-  titleHint.style.cssText = 'font-size:11px;color:rgba(255,255,255,0.45)'
+  titleHint.style.cssText = 'font-size:12px;color:rgba(255,255,255,0.55)'
   title.appendChild(titleText)
   title.appendChild(titleHint)
   panel.appendChild(title)
 
   const tabs = document.createElement('div')
   tabs.style.cssText =
-    'display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;flex-shrink:0;padding-bottom:4px'
+    'display:flex;gap:8px;flex-wrap:nowrap;overflow-x:auto;flex-shrink:0;padding-bottom:5px'
   panel.appendChild(tabs)
 
   const grid = document.createElement('div')
-  grid.style.cssText = `display:grid;grid-template-columns:repeat(${MENU_COLUMNS},1fr);gap:8px;overflow-y:auto;padding:2px`
+  grid.style.cssText = `display:grid;grid-template-columns:repeat(${MENU_COLUMNS},minmax(0,1fr));gap:12px;overflow-y:auto;padding:3px`
   panel.appendChild(grid)
 
   if (items.length === 0) {
@@ -440,7 +446,7 @@ export function openItemMenu(
     tab.type = 'button'
     tab.textContent = `${index + 1} ${category}`
     tab.style.cssText =
-      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;white-space:nowrap;` +
+      `font:${FONT};font-size:13px;letter-spacing:0.06em;padding:7px 12px;border-radius:999px;cursor:pointer;white-space:nowrap;` +
       'background:transparent;color:rgba(255,255,255,0.75);border:1px solid rgba(255,255,255,0.2)'
     tab.addEventListener('click', () => setCategory(index))
     tabs.appendChild(tab)
@@ -491,7 +497,7 @@ function refreshOpenMenuCatalog(): void {
     tab.type = 'button'
     tab.textContent = `${index + 1} ${category}`
     tab.style.cssText =
-      `font:${FONT};letter-spacing:0.06em;padding:5px 10px;border-radius:999px;cursor:pointer;white-space:nowrap;` +
+      `font:${FONT};font-size:13px;letter-spacing:0.06em;padding:7px 12px;border-radius:999px;cursor:pointer;white-space:nowrap;` +
       'background:transparent;color:rgba(255,255,255,0.75);border:1px solid rgba(255,255,255,0.2)'
     tab.addEventListener('click', () => setCategory(index))
     open.tabsEl.appendChild(tab)
@@ -545,8 +551,8 @@ function rebuildGrid(): void {
   open.cardEls = open.page.map((item, index) => {
     const card = document.createElement('div')
     card.style.cssText =
-      'display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 6px;' +
-      `border-radius:8px;cursor:pointer;background:rgba(255,255,255,0.05);border:${CARD_BORDER}`
+      'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:12px 8px;' +
+      `min-height:128px;border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.05);border:${CARD_BORDER}`
     const img = document.createElement('img')
     img.src = item.thumbnail
     img.alt = ''
@@ -554,12 +560,14 @@ function rebuildGrid(): void {
     img.draggable = false
     // Thumbnails are public-CORS Supabase PNGs; a failed image just leaves
     // the name label (no retry, no placeholder churn).
-    img.style.cssText = 'width:72px;height:72px;object-fit:contain;pointer-events:none'
+    img.style.cssText =
+      `width:clamp(${MENU_THUMB_MIN_PX}px,9vw,${MENU_THUMB_MAX_PX}px);` +
+      `height:clamp(${MENU_THUMB_MIN_PX}px,9vw,${MENU_THUMB_MAX_PX}px);object-fit:contain;pointer-events:none`
     img.addEventListener('error', () => img.remove())
     const label = document.createElement('div')
     label.textContent = item.name
     label.style.cssText =
-      'font-size:11px;color:rgba(255,255,255,0.85);text-align:center;line-height:1.25;' +
+      'font-size:clamp(11px,1vw,14px);color:rgba(255,255,255,0.9);text-align:center;line-height:1.3;' +
       'max-height:2.6em;overflow:hidden'
     card.appendChild(img)
     card.appendChild(label)
