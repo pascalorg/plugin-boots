@@ -26,6 +26,7 @@ import {
   pendingApertureRects,
   rectsOverlap,
   snapApertureU,
+  updateItemPlacementTrigger,
   useItems,
   type WallAim,
   wallPlacementFrame,
@@ -277,6 +278,25 @@ describe('useItems store', () => {
     expect(moved).toMatchObject({ id: original.id, position: [4, 0, 5] })
     expect(useItems.getState().moving).toBeNull()
     expect(useItems.getState().armed).toBeNull()
+  })
+
+  test('L drop owns its click through release before the hammer can place', () => {
+    const original = useItems.getState().addItem(asset(), [1, 0, 2], 0)
+    useItems.getState().beginMove(original.id)
+    useItems.getState().finishMove([4, 0, 5], 0)
+
+    // The store has finished moving, but this same physical press still
+    // belongs to item placement for all later frame consumers.
+    expect(useItems.getState().moving).toBeNull()
+    expect(useItems.getState().armed).toBeNull()
+    expect(itemGhostActive()).toBe(true)
+    expect(itemPlacementActive()).toBe(true)
+
+    updateItemPlacementTrigger(true)
+    expect(itemPlacementActive()).toBe(true)
+    updateItemPlacementTrigger(false)
+    expect(itemGhostActive()).toBe(false)
+    expect(itemPlacementActive()).toBe(false)
   })
 
   test('itemGhostActive tracks arm/disarm (menu closed headless)', () => {

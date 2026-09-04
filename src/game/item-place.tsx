@@ -188,6 +188,23 @@ type ItemsState = {
 
 let itemId = 1
 
+/**
+ * A moved placement owns the physical LMB press through button-up.
+ *
+ * GameItems runs one frame before Builder. Dropping a moved item clears
+ * `armed`/`moving` immediately, so without this latch Builder observes the
+ * very same still-held press as a fresh hammer click and places a wall. The
+ * latch also keeps every trigger consumer (weapon, paint, builder) quiet
+ * until the player releases LMB; the following press is genuinely new.
+ */
+let itemPlacementTriggerCaptured = false
+
+/** Release the moved-placement trigger only on physical button-up. Exported
+ * so the ownership contract can be covered without mounting the R3F tree. */
+export function updateItemPlacementTrigger(firing: boolean): void {
+  if (!firing) itemPlacementTriggerCaptured = false
+}
+
 export const useItems = create<ItemsState>((set, get) => ({
   items: [],
   armed: null,
@@ -216,6 +233,7 @@ export const useItems = create<ItemsState>((set, get) => ({
     const moving = get().moving
     if (!moving || moving.kind !== 'item') return null
     const placed: PlacedItem = { ...moving, position, yaw }
+    itemPlacementTriggerCaptured = true
     set((state) => ({ items: [...state.items, placed], armed: null, moving: null }))
     return placed
   },
@@ -223,6 +241,7 @@ export const useItems = create<ItemsState>((set, get) => ({
     const moving = get().moving
     if (!moving || moving.kind !== 'aperture') return null
     const placed: PlacedAperture = { ...moving, wallId, u, v }
+    itemPlacementTriggerCaptured = true
     set((state) => ({ items: [...state.items, placed], armed: null, moving: null }))
     return placed
   },
@@ -246,13 +265,17 @@ export const useItems = create<ItemsState>((set, get) => ({
     return stored
   },
   removeItem: (id) => set((s) => ({ items: s.items.filter((p) => p.id !== id) })),
-  resolveItems: () => set({ items: [], moving: null }),
+  resolveItems: () => {
+    itemPlacementTriggerCaptured = false
+    set({ items: [], moving: null })
+  },
 }))
 
 /** True while a placed-item ghost owns the trigger (armed + menu closed) —
  * viewmodel.tsx's fire gate reads this (manager wiring). */
 export function itemGhostActive(): boolean {
-  return useItems.getState().armed !== null && !isItemMenuOpen()
+  return itemPlacementTriggerCaptured ||
+    (useItems.getState().armed !== null && !isItemMenuOpen())
 }
 
 /** True for the entire placement interaction, including the catalog itself.
@@ -261,7 +284,10 @@ export function itemGhostActive(): boolean {
  * hidden until the placement is dropped or cancelled. */
 export function itemPlacementActive(): boolean {
   const state = useItems.getState()
-  return isItemMenuOpen() || state.armed !== null || state.moving !== null
+  return itemPlacementTriggerCaptured ||
+    isItemMenuOpen() ||
+    state.armed !== null ||
+    state.moving !== null
 }
 
 /** Placement budget — every other lane has one (turbo clad FIFO, debris
@@ -1586,6 +1612,7 @@ export function GameItems({ world }: { world: GameWorld }) {
     () => () => {
       closeItemMenu(false)
       useItems.getState().cancelMove()
+      updateItemPlacementTrigger(false)
       disposeItemModels()
     },
     [],
@@ -1595,6 +1622,10 @@ export function GameItems({ world }: { world: GameWorld }) {
     const session = getSession()
     const ghost = ghostRef.current
     if (!session || !ghost) return
+    // The L-move drop owns its press through button-up. Because this frame
+    // runs before Builder, releasing here lets the hammer preview return on
+    // release while guaranteeing only a later, fresh press can place it.
+    updateItemPlacementTrigger(session.input.state.firing)
     frame.current++
     const state = useItems.getState()
 
