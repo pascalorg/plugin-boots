@@ -6,6 +6,7 @@ import {
   readVehicleFrame,
   resetConvoyPose,
   shortestYawDelta,
+  VEHICLE_MAX_FORWARD_SPEED,
   vehicleRig,
   wrapVehicleYaw,
 } from './vehicle-state'
@@ -14,7 +15,14 @@ describe('vehicle wire boundary', () => {
   test('accepts and normalizes a finite shared pose', () => {
     expect(
       readVehicleFrame({ x: 4, y: 0.5, z: -8, yaw: Math.PI * 3, speed: 90, occupied: true }),
-    ).toEqual({ x: 4, y: 0.5, z: -8, yaw: Math.PI, speed: 30, occupied: true })
+    ).toEqual({
+      x: 4,
+      y: 0.5,
+      z: -8,
+      yaw: Math.PI,
+      speed: VEHICLE_MAX_FORWARD_SPEED,
+      occupied: true,
+    })
   })
 
   test('preserves the articulated truck pose when a current peer includes it', () => {

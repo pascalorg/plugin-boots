@@ -20,15 +20,23 @@ import {
   heavyVehicleSupportY,
   nearestGrabbable,
   speedAfterRamImpact,
+  stepVehicleSpeed,
   stepTrailerYaw,
   trailerCenterFromHitch,
   TRAILER_HITCH_LENGTH,
   TRAILER_MAX_ARTICULATION,
   truckYawRate,
   TRUCK_HITCH_X,
+  VEHICLE_HIGH_SPEED_ACCEL,
+  VEHICLE_LAUNCH_SPEED,
   worldToDepotLocal,
 } from './guntable'
-import { CYBER_TRUCK_MAX_STEER_ANGLE, CYBER_TRUCK_WHEELBASE } from './cyber-truck'
+import {
+  cyberTruckSteerAtSpeed,
+  CYBER_TRUCK_MAX_STEER_ANGLE,
+  CYBER_TRUCK_WHEELBASE,
+} from './cyber-truck'
+import { VEHICLE_MAX_FORWARD_SPEED } from './vehicle-state'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -353,6 +361,14 @@ describe('articulated trailer kinematics', () => {
     expect(truckYawRate(0, 1)).toBe(0)
   })
 
+  test('high-speed steering keeps the launch turning radius but opens safely on the road', () => {
+    expect(cyberTruckSteerAtSpeed(10, 1)).toBe(1)
+    expect(cyberTruckSteerAtSpeed(50, 1)).toBeCloseTo(0.24, 12)
+    const highwayRadius = 50 / truckYawRate(50, 1)
+    expect(highwayRadius).toBeGreaterThan(20)
+    expect(highwayRadius).toBeLessThan(35)
+  })
+
   test('the truck turns first and the trailer follows instead of rotating as one block', () => {
     const trailerYaw = stepTrailerYaw(0, 0.55, 6, 1 / 30)
     expect(trailerYaw).toBeGreaterThan(0)
@@ -380,6 +396,26 @@ describe('articulated trailer kinematics', () => {
     const yaw = stepTrailerYaw(0, Math.PI, -20, 1)
     const articulation = Math.atan2(Math.sin(Math.PI - yaw), Math.cos(Math.PI - yaw))
     expect(Math.abs(articulation)).toBeLessThanOrEqual(TRAILER_MAX_ARTICULATION + 1e-9)
+  })
+})
+
+describe('progressive truck acceleration', () => {
+  test('launches strongly, then keeps gaining a little speed until 180 km/h', () => {
+    expect(stepVehicleSpeed(0, 1, 1)).toBe(7)
+    expect(stepVehicleSpeed(VEHICLE_LAUNCH_SPEED, 1, 1)).toBe(
+      VEHICLE_LAUNCH_SPEED + VEHICLE_HIGH_SPEED_ACCEL,
+    )
+
+    let speed = 0
+    for (let second = 0; second < 60; second++) speed = stepVehicleSpeed(speed, 1, 1)
+    expect(speed).toBe(VEHICLE_MAX_FORWARD_SPEED)
+    expect(stepVehicleSpeed(speed, 1, 1)).toBe(VEHICLE_MAX_FORWARD_SPEED)
+  })
+
+  test('coasting and opposite throttle still slow a high-speed convoy', () => {
+    expect(stepVehicleSpeed(40, 0, 1)).toBe(36)
+    expect(stepVehicleSpeed(40, -1, 1)).toBe(30)
+    expect(stepVehicleSpeed(-2, 1, 0.1)).toBeCloseTo(-1, 12)
   })
 })
 

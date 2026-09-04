@@ -404,7 +404,12 @@ export function vehicleEngineMix(
   distance: number,
 ): VehicleEngineMix {
   const safeSpeed = Number.isFinite(speed) ? Math.abs(speed) : 0
-  const rpm = Math.min(1, safeSpeed / VEHICLE_ENGINE_REFERENCE_SPEED)
+  const speedRatio = safeSpeed / VEHICLE_ENGINE_REFERENCE_SPEED
+  // Preserve the original idle→10 m/s curve byte-for-byte, then let engine
+  // load keep rising gently with the new highway acceleration. Log growth
+  // avoids a shrill oscillator even at the 50 m/s vehicle ceiling.
+  const rpm =
+    speedRatio <= 1 ? speedRatio : 1 + Math.min(0.45, Math.log2(speedRatio) * 0.18)
   const safeDistance = Number.isFinite(distance) ? Math.max(0, distance) : 0
   const range = Math.max(0, 1 - safeDistance / VEHICLE_ENGINE_MAX_M)
   const attenuation = range * range

@@ -5,6 +5,10 @@
  */
 
 export const VEHICLE_KIND = 'boots/vehicle' as const
+/** Authoritative forward-speed ceiling shared by simulation and wire input.
+ * 50 m/s is 180 km/h: deliberately fast enough for the endless road, while
+ * keeping one 30 Hz physics step shorter than the truck's collision probes. */
+export const VEHICLE_MAX_FORWARD_SPEED = 50
 
 export type VehicleFrame = {
   x: number
@@ -154,7 +158,7 @@ export function readVehicleFrame(data: unknown): VehicleFrame | null {
           truckYaw: wrapVehicleYaw(f.truckYaw),
         }
       : {}),
-    speed: Math.max(-20, Math.min(30, f.speed)),
+    speed: Math.max(-20, Math.min(VEHICLE_MAX_FORWARD_SPEED, f.speed)),
     ...(typeof f.steer === 'number' && Number.isFinite(f.steer)
       ? { steer: Math.max(-1, Math.min(1, f.steer)) }
       : {}),

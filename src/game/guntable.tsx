@@ -16,6 +16,7 @@ import {
 import { useBoots } from '../store'
 import { sfx, type VehicleEngineHandle } from './audio'
 import {
+  cyberTruckSteerAtSpeed,
   CYBER_TRUCK_MAX_STEER_ANGLE,
   CYBER_TRUCK_WHEELBASE,
   CyberTruckModel,
@@ -55,6 +56,7 @@ import {
   shortestYawDelta,
   wrapVehicleYaw,
   VEHICLE_KIND,
+  VEHICLE_MAX_FORWARD_SPEED,
   vehicleRig,
   type VehicleFrame,
 } from './vehicle-state'
@@ -364,9 +366,12 @@ export const VEHICLE_ENTER_RANGE = 2.25
  * through the cargo box. */
 export const TRAILER_DECK_LIFT = 0.84
 
-const VEHICLE_MAX_FORWARD = 10
+/** The original 10 m/s cap is now the end of the launch gear. Holding W on a
+ * clear road keeps adding a smaller amount of speed up to 180 km/h. */
+export const VEHICLE_LAUNCH_SPEED = 10
 const VEHICLE_MAX_REVERSE = 4
 const VEHICLE_ACCEL = 7
+export const VEHICLE_HIGH_SPEED_ACCEL = 1.25
 const VEHICLE_BRAKE = 10
 const VEHICLE_COAST = 4
 /** Real front-wheel steering geometry: a 33° lock gives this long truck a
@@ -384,8 +389,32 @@ export const TRAILER_MAX_ARTICULATION = Math.PI * 0.39
 /** Bicycle-model yaw rate (rad/s). Reverse naturally flips the turn. */
 export function truckYawRate(speed: number, steer: number): number {
   if (!Number.isFinite(speed) || !Number.isFinite(steer)) return 0
-  const input = Math.max(-1, Math.min(1, steer))
+  const input = cyberTruckSteerAtSpeed(speed, steer)
   return (speed / CYBER_TRUCK_WHEELBASE) * Math.tan(input * CYBER_TRUCK_MAX_STEER_ANGLE)
+}
+
+/** One deterministic throttle step. Forward drive launches strongly to the
+ * former speed cap, then ALWAYS keeps accelerating gently while W is held.
+ * Opposite throttle brakes first; no throttle coasts the heavy convoy down. */
+export function stepVehicleSpeed(speed: number, throttle: number, dt: number): number {
+  if (!Number.isFinite(speed) || !Number.isFinite(throttle) || !Number.isFinite(dt) || dt <= 0) {
+    return Number.isFinite(speed) ? speed : 0
+  }
+  const input = Math.max(-1, Math.min(1, throttle))
+  if (input > 0) {
+    const rate =
+      speed < 0
+        ? VEHICLE_BRAKE
+        : speed < VEHICLE_LAUNCH_SPEED
+          ? VEHICLE_ACCEL
+          : VEHICLE_HIGH_SPEED_ACCEL
+    return approach(speed, VEHICLE_MAX_FORWARD_SPEED, rate * dt)
+  }
+  if (input < 0) {
+    const rate = speed > 0 ? VEHICLE_BRAKE : VEHICLE_ACCEL
+    return approach(speed, -VEHICLE_MAX_REVERSE, rate * dt)
+  }
+  return approach(speed, 0, VEHICLE_COAST * dt)
 }
 
 export function stepTrailerYaw(
@@ -1103,12 +1132,7 @@ function SpawnDepot({ world, spectator }: { world: GameWorld; spectator: boolean
       } else {
         const keys = session.input.state.keys
         const throttle = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0)
-        const target =
-          throttle > 0 ? VEHICLE_MAX_FORWARD : throttle < 0 ? -VEHICLE_MAX_REVERSE : 0
-        const rate = throttle === 0 ? VEHICLE_COAST : Math.sign(target) === Math.sign(convoyPose.speed) || convoyPose.speed === 0
-          ? VEHICLE_ACCEL
-          : VEHICLE_BRAKE
-        convoyPose.speed = approach(convoyPose.speed, target, rate * dt)
+        convoyPose.speed = stepVehicleSpeed(convoyPose.speed, throttle, dt)
 
         const steer = (keys.has('KeyA') ? 1 : 0) - (keys.has('KeyD') ? 1 : 0)
         convoyPose.steer = convoyPose.targetSteer = approach(convoyPose.steer, steer, dt * 5)

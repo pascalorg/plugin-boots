@@ -31,6 +31,16 @@ const WHEEL_POSITIONS: ReadonlyArray<readonly [number, number]> = [
 const WHEEL_RADIUS = 0.42
 /** Shared by the visible front wheels and the bicycle steering model. */
 export const CYBER_TRUCK_MAX_STEER_ANGLE = 0.58
+/** Full steering lock remains available around buildings. Above this speed,
+ * lock falls inversely with velocity, keeping high-speed yaw rate bounded. */
+export const CYBER_TRUCK_FULL_STEER_SPEED = 12
+
+export function cyberTruckSteerAtSpeed(speed: number, steer: number): number {
+  if (!Number.isFinite(speed) || !Number.isFinite(steer)) return 0
+  const input = Math.max(-1, Math.min(1, steer))
+  const scale = Math.min(1, CYBER_TRUCK_FULL_STEER_SPEED / Math.max(1, Math.abs(speed)))
+  return input * scale
+}
 
 function TruckWheel({ x, z }: { x: number; z: number }) {
   const steerRef = useRef<Group>(null)
@@ -42,7 +52,9 @@ function TruckWheel({ x, z }: { x: number; z: number }) {
     }
     if (front && steerRef.current) {
       steerRef.current.rotation.y +=
-        (convoyPose.steer * CYBER_TRUCK_MAX_STEER_ANGLE - steerRef.current.rotation.y) *
+        (cyberTruckSteerAtSpeed(convoyPose.speed, convoyPose.steer) *
+          CYBER_TRUCK_MAX_STEER_ANGLE -
+          steerRef.current.rotation.y) *
         (1 - Math.exp(-14 * Math.min(dt, 1 / 30)))
     }
   })

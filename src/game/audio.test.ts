@@ -36,6 +36,7 @@ import {
   spatialPan,
   SPEED_OF_SOUND_MS,
   VEHICLE_ENGINE_MAX_M,
+  VEHICLE_ENGINE_REFERENCE_SPEED,
   vehicleEngineMix,
 } from './audio'
 import { FEEL } from './feel'
@@ -106,6 +107,15 @@ describe('vehicleEngineMix — synchronized RPM with listener-local distance', (
     expect(forward.pitchHz).toBeGreaterThan(idle.pitchHz)
     expect(forward.pulseHz).toBeGreaterThan(idle.pulseHz)
     expect(reverse).toEqual(forward)
+  })
+
+  test('highway acceleration keeps raising engine load above the old speed ceiling', () => {
+    const oldCeiling = vehicleEngineMix(VEHICLE_ENGINE_REFERENCE_SPEED, true, 0)
+    const highway = vehicleEngineMix(40, true, 0)
+    expect(highway.pitchHz).toBeGreaterThan(oldCeiling.pitchHz)
+    expect(highway.pulseHz).toBeGreaterThan(oldCeiling.pulseHz)
+    expect(highway.level).toBeGreaterThan(oldCeiling.level)
+    expect(highway.pitchHz).toBeLessThan(170)
   })
 })
 
