@@ -362,7 +362,10 @@ export function SpectatorPlayers() {
   if (phase !== 'editor' || !bound) return null
   return (
     <>
-      <SpectatorWorld />
+      {/* The environment is substantial (instanced grass + trees). Keep the
+          normal editor at zero Boots render cost until a live player exists;
+          their first presence frame mounts the complete shared overview. */}
+      {watching && <SpectatorWorld />}
       <RemotePlayers spectator />
       <SpectatorHint text={spectatorHintText(names)} event={lastEvent} hidden={suppressed} />
     </>
