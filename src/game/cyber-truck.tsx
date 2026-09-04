@@ -29,7 +29,8 @@ const WHEEL_POSITIONS: ReadonlyArray<readonly [number, number]> = [
 ]
 
 const WHEEL_RADIUS = 0.42
-const MAX_WHEEL_STEER = 0.48
+/** Shared by the visible front wheels and the bicycle steering model. */
+export const CYBER_TRUCK_MAX_STEER_ANGLE = 0.58
 
 function TruckWheel({ x, z }: { x: number; z: number }) {
   const steerRef = useRef<Group>(null)
@@ -41,7 +42,7 @@ function TruckWheel({ x, z }: { x: number; z: number }) {
     }
     if (front && steerRef.current) {
       steerRef.current.rotation.y +=
-        (convoyPose.steer * MAX_WHEEL_STEER - steerRef.current.rotation.y) *
+        (convoyPose.steer * CYBER_TRUCK_MAX_STEER_ANGLE - steerRef.current.rotation.y) *
         (1 - Math.exp(-14 * Math.min(dt, 1 / 30)))
     }
   })

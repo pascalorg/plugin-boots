@@ -22,10 +22,9 @@ import {
   TRAILER_MAX_ARTICULATION,
   truckYawRate,
   TRUCK_HITCH_X,
-  VEHICLE_MAX_STEER_ANGLE,
   worldToDepotLocal,
 } from './guntable'
-import { CYBER_TRUCK_WHEELBASE } from './cyber-truck'
+import { CYBER_TRUCK_MAX_STEER_ANGLE, CYBER_TRUCK_WHEELBASE } from './cyber-truck'
 import { bvhFor, type ColliderEntry, type GameWorld } from './world'
 
 /**
@@ -289,7 +288,10 @@ describe('articulated trailer kinematics', () => {
     const speed = 10
     const yawRate = truckYawRate(speed, 1)
     const radius = speed / yawRate
-    expect(radius).toBeCloseTo(CYBER_TRUCK_WHEELBASE / Math.tan(VEHICLE_MAX_STEER_ANGLE), 10)
+    expect(radius).toBeCloseTo(
+      CYBER_TRUCK_WHEELBASE / Math.tan(CYBER_TRUCK_MAX_STEER_ANGLE),
+      10,
+    )
     expect(radius).toBeLessThan(6)
     expect(radius).toBeGreaterThan(CYBER_TRUCK_WHEELBASE)
     expect(truckYawRate(-speed, 1)).toBeCloseTo(-yawRate, 12)

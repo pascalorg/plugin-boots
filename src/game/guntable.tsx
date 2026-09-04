@@ -14,7 +14,11 @@ import {
 } from 'three'
 import { useBoots } from '../store'
 import { sfx, type VehicleEngineHandle } from './audio'
-import { CYBER_TRUCK_WHEELBASE, CyberTruckModel } from './cyber-truck'
+import {
+  CYBER_TRUCK_MAX_STEER_ANGLE,
+  CYBER_TRUCK_WHEELBASE,
+  CyberTruckModel,
+} from './cyber-truck'
 import { DepotMirror } from './depot-mirror'
 import { damageTarget } from './destruction'
 import { bots, damageBot, waveState } from './enemies-state'
@@ -358,7 +362,6 @@ const VEHICLE_COAST = 4
 /** Real front-wheel steering geometry: a 33° lock gives this long truck a
  * useful ~5.5 m centerline radius instead of the old speed-dependent 12.8 m
  * circle. The trailer still follows through its hitch and articulation cap. */
-export const VEHICLE_MAX_STEER_ANGLE = 0.58
 const VEHICLE_PUBLISH_HZ = 12
 const REMOTE_DRIVER_TIMEOUT_MS = 1800
 /** Tractor center → rear hitch and trailer center → front hitch add to the
@@ -372,7 +375,7 @@ export const TRAILER_MAX_ARTICULATION = Math.PI * 0.39
 export function truckYawRate(speed: number, steer: number): number {
   if (!Number.isFinite(speed) || !Number.isFinite(steer)) return 0
   const input = Math.max(-1, Math.min(1, steer))
-  return (speed / CYBER_TRUCK_WHEELBASE) * Math.tan(input * VEHICLE_MAX_STEER_ANGLE)
+  return (speed / CYBER_TRUCK_WHEELBASE) * Math.tan(input * CYBER_TRUCK_MAX_STEER_ANGLE)
 }
 
 export function stepTrailerYaw(
