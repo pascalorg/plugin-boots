@@ -49,6 +49,18 @@ bun run check-types
 
 Host wiring follows the [plugin guide](https://editor.pascal.app/docs/developers/plugins): pin the package, add it to `transpilePackages`, `extendPluginDiscovery(async () => [bootsPlugin])`, `registerEditorHostPanel(bootsHostPanel)`. Ships `defaultInstalled: false` — users enable it per scene from the Plugins panel.
 
+## Read-only viewers
+
+A viewer that renders saved projects without `@pascal-app/editor` loads the render-only entry. It registers the same plugin id and `boots:job` kind (schema, defaults and the cone renderer) without the inspector parameters, the first-person game or the host panel:
+
+```ts
+import { bootsRenderPlugin } from '@pascal-app/plugin-boots/render'
+
+extendPluginDiscovery(async () => [bootsRenderPlugin])
+```
+
+`bun run check:render` bundles `./render` and fails if anything in it reaches `@pascal-app/editor` or `next`.
+
 ## License
 
 MIT
